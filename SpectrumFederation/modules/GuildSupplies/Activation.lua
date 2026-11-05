@@ -445,6 +445,11 @@ function GS.EventCountsTowardLiveProgress(record, event)
     if type(event) ~= "table" then
         return false
     end
+    -- #457 informational withdrawals never contribute to progress/rankings.
+    if event.type == "withdrawal"
+        or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL) then
+        return false
+    end
     if not GS.IsLiveActive(record) then
         return true
     end
@@ -457,6 +462,11 @@ end
 -- live marker); a post-cutover timestamp alone must not mint live credit (#389 A2).
 function GS.AssignProductionCredit(record, event)
     if type(event) ~= "table" then
+        return false
+    end
+    if event.type == "withdrawal"
+        or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL) then
+        event.gsProductionCredit = false
         return false
     end
     if not GS.IsLiveActive(record) then

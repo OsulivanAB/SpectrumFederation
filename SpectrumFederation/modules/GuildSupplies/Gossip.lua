@@ -12,7 +12,7 @@ GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
 -- Wire schema for sf.guildsupplies.config. Schema 4 (#447) carries attributed
 -- adjustment unitCopper on ledger events; schema-3 peers drop that field.
 -- Guild Gossip matches by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 4
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 5
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -109,6 +109,11 @@ local function ClearArchivePageBuffer(campaignId)
     local pages = 0
     if type(buf.pages) == "table" then
         for _ in pairs(buf.pages) do
+            pages = pages + 1
+        end
+    end
+    if type(buf.recipePages) == "table" then
+        for _ in pairs(buf.recipePages) do
             pages = pages + 1
         end
     end
@@ -272,6 +277,11 @@ local function ArchivePageBufferIsEmpty(buf)
             return false
         end
     end
+    if type(buf.recipePages) == "table" then
+        for _ in pairs(buf.recipePages) do
+            return false
+        end
+    end
     return true
 end
 
@@ -412,7 +422,11 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
         return eligibility
     end
 
-    local function MetaBody(pageCount, requestedInline, eligibility)
+    local recipes = archive.recipes or {}
+    local recipeIds = SortedItemIds(recipes)
+    local recipesFp = FingerprintBody(recipes)
+
+    local function MetaBody(pageCount, requestedInline, eligibility, recipesInline, recipePageCount)
         return {
             kind = "campaign-archive",
             campaignId = campaignId,
@@ -427,16 +441,28 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             eligibilityItemCount = #eligIds,
             eligibility = eligibility,
             requestedItems = requestedInline,
+            recipeCount = #recipeIds,
+            recipesFingerprint = recipesFp,
+            recipes = recipesInline,
+            recipePageCount = recipePageCount,
         }
     end
 
     -- Prefer inline when both maps are small AND the wrapped body fits wire.
-    local canInline = (#ids <= ARCHIVE_PAGE_ITEMS and #eligIds <= ARCHIVE_PAGE_ITEMS)
+    local canInline = (#ids <= ARCHIVE_PAGE_ITEMS and #eligIds <= ARCHIVE_PAGE_ITEMS
+        and #recipeIds <= ARCHIVE_PAGE_ITEMS)
     if canInline then
         local inlineElig = EligibilityScalars(true)
-        local inlineBody = MetaBody(1, (#ids > 0) and items or {}, inlineElig)
+        local inlineRecipes = (#recipeIds > 0) and recipes or {}
+        local inlineBody = MetaBody(1, (#ids > 0) and items or {}, inlineElig, inlineRecipes, nil)
         if EstimateWireRecordBytes(exportId, inlineBody) <= budget then
             out[#out + 1] = { id = exportId, body = inlineBody }
+            return out
+        end
+        -- Items may fit without recipes; fall through to page recipes separately.
+        local withoutRecipes = MetaBody(1, (#ids > 0) and items or {}, inlineElig, nil, nil)
+        if #recipeIds == 0 and EstimateWireRecordBytes(exportId, withoutRecipes) <= budget then
+            out[#out + 1] = { id = exportId, body = withoutRecipes }
             return out
         end
     end
@@ -461,9 +487,9 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     table.sort(pageKeys, function(a, b)
         return tostring(a) < tostring(b)
     end)
-    if #pageKeys < 1 then
+    if #pageKeys < 1 and #recipeIds < 1 then
         local emptyElig = EligibilityScalars(false)
-        local emptyBody = MetaBody(1, {}, emptyElig)
+        local emptyBody = MetaBody(1, {}, emptyElig, nil, nil)
         if EstimateWireRecordBytes(exportId, emptyBody) > budget then
             DebugWarn("archive export %s: empty meta exceeds wire budget", tostring(campaignId))
             return {}
@@ -551,8 +577,16 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             tostring(campaignId))
         return {}
     end
+    if #pageKeys < 1 and #recipeIds > 0 and #pageSlices < 1 then
+        pageSlices[1] = { items = {}, elig = {} }
+    end
     local pageCount = #pageSlices
-    if pageCount < 1 or pageCount > maxPages then
+    if pageCount > maxPages then
+        DebugWarn("archive export %s: pageCount=%s exceeds ceiling",
+            tostring(campaignId), tostring(pageCount))
+        return {}
+    end
+    if pageCount < 1 and #recipeIds < 1 then
         DebugWarn("archive export %s: pageCount=%s exceeds ceiling",
             tostring(campaignId), tostring(pageCount))
         return {}
@@ -580,7 +614,82 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     end
 
     local metaElig = EligibilityScalars(false) -- scalars only; items on pages
-    local metaBody = MetaBody(pageCount, nil, metaElig)
+    -- Prefer recipes on meta when they fit; otherwise page them.
+    local recipePages = {}
+    local metaRecipes = nil
+    local recipePageCount = nil
+    if #recipeIds > 0 then
+        local trialMeta = MetaBody(pageCount, nil, metaElig, recipes, nil)
+        if EstimateWireRecordBytes(exportId, trialMeta) <= budget then
+            metaRecipes = recipes
+        else
+            -- Pack recipes one-or-more per page under wire budget.
+            local rSlice, rCount = {}, 0
+            local function flushRecipes()
+                if rCount < 1 then return true end
+                if #recipePages >= maxPages then return false end
+                recipePages[#recipePages + 1] = rSlice
+                rSlice, rCount = {}, 0
+                return true
+            end
+            for ri = 1, #recipeIds do
+                local rid = recipeIds[ri]
+                local trial = {}
+                for k, v in pairs(rSlice) do trial[k] = v end
+                trial[rid] = recipes[rid]
+                local trialBody = {
+                    kind = "campaign-archive-recipe-page",
+                    campaignId = campaignId,
+                    datasetId = datasetId,
+                    page = #recipePages + 1,
+                    pageCount = 1,
+                    recipes = trial,
+                }
+                local trialId = exportId .. ":rp" .. tostring(#recipePages + 1)
+                local over = EstimateWireRecordBytes(trialId, trialBody) > budget
+                    or (rCount + 1) > maxItemsPerPage
+                if rCount > 0 and over then
+                    if not flushRecipes() then
+                        DebugWarn("archive export %s: recipe pages exceed ceiling", tostring(campaignId))
+                        return {}
+                    end
+                    trial = { [rid] = recipes[rid] }
+                    trialBody.recipes = trial
+                    trialBody.page = #recipePages + 1
+                    trialId = exportId .. ":rp" .. tostring(#recipePages + 1)
+                    if EstimateWireRecordBytes(trialId, trialBody) > budget then
+                        DebugWarn("archive export %s: single recipe exceeds wire budget", tostring(campaignId))
+                        return {}
+                    end
+                    rSlice, rCount = trial, 1
+                elseif rCount < 1 and over then
+                    DebugWarn("archive export %s: single recipe exceeds wire budget", tostring(campaignId))
+                    return {}
+                else
+                    rSlice, rCount = trial, rCount + 1
+                end
+            end
+            if not flushRecipes() then
+                DebugWarn("archive export %s: recipe pages exceed ceiling", tostring(campaignId))
+                return {}
+            end
+            recipePageCount = #recipePages
+            for rp = 1, #recipePages do
+                recipePages[rp] = {
+                    id = exportId .. ":rp" .. tostring(rp),
+                    body = {
+                        kind = "campaign-archive-recipe-page",
+                        campaignId = campaignId,
+                        datasetId = datasetId,
+                        page = rp,
+                        pageCount = recipePageCount,
+                        recipes = recipePages[rp],
+                    },
+                }
+            end
+        end
+    end
+    local metaBody = MetaBody(pageCount, nil, metaElig, metaRecipes, recipePageCount)
     if EstimateWireRecordBytes(exportId, metaBody) > budget then
         DebugWarn("archive export %s: meta exceeds wire budget", tostring(campaignId))
         return {}
@@ -588,6 +697,9 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     out[#out + 1] = { id = exportId, body = metaBody }
     for i = 1, #pages do
         out[#out + 1] = pages[i]
+    end
+    for i = 1, #recipePages do
+        out[#out + 1] = recipePages[i]
     end
     return out
 end
@@ -2139,18 +2251,30 @@ local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker
     if type(exportId) ~= "string" or exportId == "" or type(event) ~= "table" then
         return
     end
+    local exportEvent = event
+    if (event.type == "withdrawal"
+            or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL))
+        and GS.ExportableWithdrawalEvent then
+        exportEvent = GS.ExportableWithdrawalEvent(event) or event
+    end
     local existing = exportState.byId[exportId]
     local prev = existing and existing.body
     if prev and prev.kind == "gs-ledger-event"
         and prev.cutoverMarker == cutoverMarker
-        and prev.datasetId == datasetId
-        and prev.event == event then
-        return
+        and prev.datasetId == datasetId then
+        -- Withdrawals compare by value: stored ORIGIN vs RELAY must not diverge.
+        if prev.event == exportEvent then
+            return
+        end
+        if type(prev.event) == "table" and type(exportEvent) == "table"
+            and GS._DeepEqualOps and GS._DeepEqualOps(prev.event, exportEvent) then
+            return
+        end
     end
     UpsertExportBody(exportId, {
         kind = "gs-ledger-event",
         datasetId = datasetId,
-        event = event,
+        event = exportEvent,
         cutoverMarker = cutoverMarker,
     })
 end
@@ -2185,10 +2309,16 @@ function GS.RefreshLedgerEventExport(record, event)
         liveMarker = record.liveCutover.cutoverMarker
     end
     local cutoverMarker = ExportCutoverMarkerForEvent(event, liveMarker)
+    local exportEvent = event
+    if (event.type == "withdrawal"
+            or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL))
+        and GS.ExportableWithdrawalEvent then
+        exportEvent = GS.ExportableWithdrawalEvent(event) or event
+    end
     local body = {
         kind = "gs-ledger-event",
         datasetId = record.datasetId,
-        event = event,
+        event = exportEvent,
         cutoverMarker = cutoverMarker,
     }
     if not providerRegistered then
@@ -2513,6 +2643,42 @@ local function GetRecordBody(recordId)
     return { id = r.id, versionFp = r.versionFp, body = r.body }
 end
 
+--- Ordinary archive ingress equality (inline shortcut + final paged assembly).
+-- Normalizes only supported legacy representation differences (nil vs {} recipes)
+-- without mutating saved archives. Unlike adoption ArchiveCoreEqual, this path
+-- still compares bankTab and eligibility — authoritative ordinary-ingress fields.
+local function OrdinaryArchiveEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    if not GS._DeepEqualOps then
+        return false
+    end
+    local aNorm = {
+        schemaVersion = a.schemaVersion,
+        campaignId = a.campaignId,
+        datasetId = a.datasetId,
+        requestedItems = a.requestedItems,
+        recipes = type(a.recipes) == "table" and a.recipes or {},
+        generation = a.generation,
+        archivedAt = a.archivedAt,
+        bankTab = a.bankTab,
+        eligibility = a.eligibility,
+    }
+    local bNorm = {
+        schemaVersion = b.schemaVersion,
+        campaignId = b.campaignId,
+        datasetId = b.datasetId,
+        requestedItems = b.requestedItems,
+        recipes = type(b.recipes) == "table" and b.recipes or {},
+        generation = b.generation,
+        archivedAt = b.archivedAt,
+        bankTab = b.bankTab,
+        eligibility = b.eligibility,
+    }
+    return GS._DeepEqualOps(aNorm, bNorm)
+end
+
 local function ValidateAndApply(record, ctx)
     ctx = ctx or {}
     if type(record) ~= "table" or record.id == nil or type(record.body) ~= "table" then
@@ -2650,7 +2816,8 @@ local function ValidateAndApply(record, ctx)
         return "pending", "missing_predecessor"
     end
 
-    if body.kind == "campaign-archive" or body.kind == "campaign-archive-page" then
+    if body.kind == "campaign-archive" or body.kind == "campaign-archive-page"
+        or body.kind == "campaign-archive-recipe-page" then
         if not localRecord then
             return "pending", "awaiting_dataset"
         end
@@ -2683,10 +2850,13 @@ local function ValidateAndApply(record, ctx)
                 campaignId = body.campaignId,
                 datasetId = body.datasetId,
                 requestedItems = body.requestedItems,
+                recipes = body.recipes,
                 generation = body.generation,
                 archivedAt = body.archivedAt,
+                bankTab = body.bankTab,
+                eligibility = body.eligibility,
             }
-            if GS._DeepEqualOps and GS._DeepEqualOps(existing, inline) then
+            if OrdinaryArchiveEqual(existing, inline) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end
@@ -2702,7 +2872,8 @@ local function ValidateAndApply(record, ctx)
                 end
             end
         end
-        if body.kind == "campaign-archive-page" then
+        if body.kind == "campaign-archive-page"
+            or body.kind == "campaign-archive-recipe-page" then
             local page = tonumber(body.page)
             local pageCount = tonumber(body.pageCount)
             if not page or page ~= math.floor(page) or page < 1 then
@@ -2731,6 +2902,16 @@ local function ValidateAndApply(record, ctx)
                     end
                 end
             end
+            if type(body.recipes) == "table" then
+                local n = 0
+                local maxRecipes = GS.MAX_RECIPES or 32
+                for _ in pairs(body.recipes) do
+                    n = n + 1
+                    if n > maxPageItems or n > maxRecipes then
+                        return "rejected", "invalid_campaign_archive"
+                    end
+                end
+            end
         end
         local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES
             or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
@@ -2750,12 +2931,14 @@ local function ValidateAndApply(record, ctx)
                 return "rejected", "full"
             end
             -- Page-first: preflight page capacity before allocating an empty slot.
-            if body.kind == "campaign-archive-page"
+            if (body.kind == "campaign-archive-page"
+                    or body.kind == "campaign-archive-recipe-page")
                 and (archivePageBufferPages or 0) >= maxPages then
                 return "rejected", "full"
             end
             buf = {
                 pages = {},
+                recipePages = {},
                 datasetId = body.datasetId,
                 sourcePeer = sender,
                 at = now,
@@ -2785,6 +2968,28 @@ local function ValidateAndApply(record, ctx)
             buf.at = now
             if tonumber(body.pageCount) then
                 buf.pageCount = tonumber(body.pageCount)
+            end
+        elseif body.kind == "campaign-archive-recipe-page" then
+            buf.recipePages = buf.recipePages or {}
+            local page = tonumber(body.page)
+            if buf.recipePages[page] then
+                if GS._DeepEqualOps and not GS._DeepEqualOps(buf.recipePages[page], body) then
+                    ClearArchivePageBuffer(body.campaignId)
+                    return "rejected", "id_conflict"
+                end
+            else
+                if (archivePageBufferPages or 0) >= maxPages then
+                    if createdEmpty and ArchivePageBufferIsEmpty(buf) then
+                        ClearArchivePageBuffer(body.campaignId)
+                    end
+                    return "rejected", "full"
+                end
+                archivePageBufferPages = (archivePageBufferPages or 0) + 1
+                buf.recipePages[page] = body
+            end
+            buf.at = now
+            if tonumber(body.pageCount) then
+                buf.recipePageCount = tonumber(body.pageCount)
             end
         else
             local page = tonumber(body.page)
@@ -2832,12 +3037,42 @@ local function ValidateAndApply(record, ctx)
             end
             return eligibility
         end
+        local function AssembleRecipes()
+            if type(meta.recipes) == "table" then
+                return meta.recipes
+            end
+            local recipePageCount = tonumber(meta.recipePageCount) or tonumber(buf.recipePageCount)
+            if not recipePageCount or recipePageCount < 1 then
+                return {}
+            end
+            local merged, got = {}, 0
+            buf.recipePages = buf.recipePages or {}
+            for page = 1, recipePageCount do
+                local p = buf.recipePages[page]
+                if type(p) ~= "table" or type(p.recipes) ~= "table" then
+                    return nil, "missing_predecessor"
+                end
+                for k, v in pairs(p.recipes) do
+                    merged[k] = v
+                    got = got + 1
+                end
+            end
+            if type(meta.recipeCount) == "number" and got ~= meta.recipeCount then
+                return nil, "missing_predecessor"
+            end
+            return merged
+        end
         if type(meta.requestedItems) == "table" then
+            local recipes, recipesErr = AssembleRecipes()
+            if recipesErr then
+                return "pending", recipesErr
+            end
             archive = {
                 schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
                 campaignId = meta.campaignId,
                 datasetId = meta.datasetId,
                 requestedItems = meta.requestedItems,
+                recipes = recipes or {},
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
                 bankTab = tonumber(meta.bankTab),
@@ -2874,11 +3109,16 @@ local function ValidateAndApply(record, ctx)
             if wantElig ~= nil and eligGot ~= wantElig then
                 return "pending", "missing_predecessor"
             end
+            local recipes, recipesErr = AssembleRecipes()
+            if recipesErr then
+                return "pending", recipesErr
+            end
             archive = {
                 schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
                 campaignId = meta.campaignId,
                 datasetId = meta.datasetId,
                 requestedItems = merged,
+                recipes = recipes or {},
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
                 bankTab = tonumber(meta.bankTab),
@@ -2892,7 +3132,9 @@ local function ValidateAndApply(record, ctx)
         end
         local existing = localRecord.campaignArchives[body.campaignId]
         if existing then
-            if GS._DeepEqualOps and GS._DeepEqualOps(existing, archive) then
+            -- Normalize absent vs empty recipes for compare only (do not mutate
+            -- the saved archive). Same OrdinaryArchiveEqual as the inline shortcut.
+            if OrdinaryArchiveEqual(existing, archive) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end
@@ -4625,6 +4867,12 @@ function GS.NotifyLocalDurableChange(reason)
         GS.NotifyUI(reason)
     end
 end
+
+-- Test seams for exporter → provider archive regressions (#457).
+GS._BuildArchiveExportBodiesForTest = BuildArchiveExportBodies
+GS._EstimateWireRecordBytesForTest = EstimateWireRecordBytes
+GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
+GS._ValidateAndApplyForTest = ValidateAndApply
 
 -- Hook Initialize to register the provider after the durable root is ready.
 local _previousInitialize = GS.Initialize
