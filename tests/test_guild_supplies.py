@@ -13,6 +13,7 @@ PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 LUA_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_tests.lua"
 LUA_RENAME_424_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_rename_424_tests.lua"
 LUA_UI_453_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_453_tests.lua"
+LUA_457_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_457_tests.lua"
 GS_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildSupplies"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-supplies" / "index.md"
 ADAPTER = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip" / "05_GuildAdapter.lua"
@@ -95,15 +96,36 @@ def test_guild_supplies_raid_supply_ui_453():
     assert "453: combined filters cover removed-item donations" in result.stdout
 
 
+def test_guild_supplies_quick_withdraw_457():
+    """Focused #457 recipe arithmetic, receipts, and trade-batch coverage."""
+    assert LUA_457_TESTS.exists()
+    result = subprocess.run(
+        [_lua51(), str(LUA_457_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Supplies #457 Quick Withdraw tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "guild_supplies_457_tests: ok" in result.stdout
+
+
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")
     gossip = toc.find("modules/GuildGossip/10_PublicAPI.lua")
     state = toc.find("modules/GuildSupplies/State.lua")
     authority = toc.find("modules/GuildSupplies/Authority.lua")
+    recipes = toc.find("modules/GuildSupplies/Recipes.lua")
     operations = toc.find("modules/GuildSupplies/Operations.lua")
     campaigns = toc.find("modules/GuildSupplies/Campaigns.lua")
     activation = toc.find("modules/GuildSupplies/Activation.lua")
     ledger = toc.find("modules/GuildSupplies/Ledger.lua")
+    withdrawals = toc.find("modules/GuildSupplies/Withdrawals.lua")
     admission = toc.find("modules/GuildSupplies/Admission.lua")
     valuation = toc.find("modules/GuildSupplies/Valuation.lua")
     gs_gossip = toc.find("modules/GuildSupplies/Gossip.lua")
@@ -113,11 +135,16 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     rankings_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     troubleshooting_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+    withdraw_workflow = toc.find("modules/LootHelper/ConsumablesWithdrawWorkflow.lua")
+    withdraw_runtime = toc.find("modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    trade_handoff = toc.find("modules/LootHelper/ConsumablesTradeHandoff.lua")
+    consumables_runtime = toc.find("modules/LootHelper/ConsumablesRuntime.lua")
     assert 0 <= item_display < config_page < manage_page < logs_page < rankings_page < troubleshooting_page
     obs = toc.find("modules/LootHelper/ConsumablesObservation.lua")
     assert 0 <= obs
-    assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < valuation < gs_gossip
+    assert 0 <= gossip < state < authority < recipes < operations < campaigns < activation < ledger < withdrawals < admission < valuation < gs_gossip
     assert 0 <= config_page < manage_page < logs_page < rankings_page < troubleshooting_page
+    assert 0 <= withdraw_workflow < withdraw_runtime < trade_handoff < consumables_runtime
 
 
 def test_demand_driven_guild_apis_exist():

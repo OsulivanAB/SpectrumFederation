@@ -80,14 +80,27 @@ def test_consumables_verification_production_lua():
 
 
 def test_consumables_runtime_is_guild_bank_deposit_only():
+    """Deposit assistant stays trade-free. #457 Quick Withdraw trade handoff is
+    isolated in ConsumablesTradeHandoff / ConsumablesWithdraw* modules."""
     root = REPO_ROOT / "SpectrumFederation" / "modules"
-    paths = list(root.rglob("Consumables*.lua")) + [SYNC_TRANSPORT]
+    # Exclude #457 withdraw/trade modules from the deposit-only guard.
+    excluded = {
+        "ConsumablesTradeHandoff.lua",
+        "ConsumablesWithdrawRuntime.lua",
+        "ConsumablesWithdrawWorkflow.lua",
+    }
+    paths = [
+        path for path in root.rglob("Consumables*.lua")
+        if path.name not in excluded
+    ] + [SYNC_TRANSPORT]
     combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
     for removed in (
         "AcceptTrade",
         "InitiateTrade",
         "ClickTradeButton",
-        "TRADE_",
+        "TRADE_SHOW",
+        "TRADE_CLOSED",
+        "TRADE_ACCEPT_UPDATE",
         "OnUpdate",
         "NewTicker",
         "AddCrafter",
@@ -97,6 +110,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
         "WithdrawEvents",
     ):
         assert removed not in combined, removed
+    # Trade handoff must never auto-accept or initiate trades (#457).
+    handoff = (root / "LootHelper" / "ConsumablesTradeHandoff.lua").read_text(encoding="utf-8")
+    assert "AcceptTrade" not in handoff
+    assert "InitiateTrade" not in handoff
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "function W.DepositEvents" in workflow
     runtime = RUNTIME.read_text(encoding="utf-8")

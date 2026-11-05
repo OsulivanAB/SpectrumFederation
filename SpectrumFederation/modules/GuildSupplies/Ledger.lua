@@ -39,6 +39,8 @@ GS.MAX_TXN_CONFLICT_BODIES = 8
 GS.LEDGER_EVENT = {
     DONATION = "donation",
     ADJUSTMENT = "adjustment",
+    -- #457 informational Quick Withdraw receipts (never production credit).
+    WITHDRAWAL = "withdrawal",
 }
 
 GS.VERIFICATION = {
@@ -2154,8 +2156,10 @@ function GS.ValidateLedgerEventLists(accounting, datasetId)
     if type(live) ~= "table" or type(archive) ~= "table" then
         return false, "invalid_accounting"
     end
-    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    -- #457: informational withdrawals share these arrays under a separate count
+    -- cap, so the array-length ceiling includes MAX_WITHDRAWAL_EVENTS headroom.
+    local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
     -- Always-cheap overflow gate (no pairs walk).
     if #live > maxLive or #archive > maxArch then
         return false, "ledger_overflow"
@@ -3317,6 +3321,12 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
         return false, "invalid_event"
     end
     local typ = event.type
+    if typ == GS.LEDGER_EVENT.WITHDRAWAL or typ == "withdrawal" then
+        if GS.ValidateWithdrawalEventBody then
+            return GS.ValidateWithdrawalEventBody(event, datasetId)
+        end
+        return false, "unsupported_kind"
+    end
     if typ ~= GS.LEDGER_EVENT.DONATION and typ ~= GS.LEDGER_EVENT.ADJUSTMENT
         and typ ~= "CONSUMABLE_DONATION" and typ ~= "CONSUMABLE_ADJUSTMENT" then
         return false, "invalid_kind"
@@ -3622,6 +3632,23 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     end
     if event.datasetId and event.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
+    end
+
+    -- #457 informational withdrawals: separate admission path (no editor gate,
+    -- no donation credit). Still requires authenticated same-guild membership.
+    if event.type == GS.LEDGER_EVENT.WITHDRAWAL or event.type == "withdrawal" then
+        if not GS.AdmitWithdrawalEvent then
+            return "rejected", "unsupported_kind"
+        end
+        local senderGuid = member and member.guid
+            or (admissionCtx.sender and tostring(admissionCtx.sender))
+        return GS.AdmitWithdrawalEvent(record, event, {
+            senderGuid = senderGuid,
+            memberAuthenticated = member ~= nil,
+            allowRelayOfOrigin = true,
+            forceRelay = member and senderGuid and event.actorGuid
+                and senderGuid ~= event.actorGuid,
+        })
     end
 
     -- Authenticated live cutover conflict blocks unsafe canonical writes.

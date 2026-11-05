@@ -13,7 +13,8 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 | Preview as Non-Admin | `SF.LootHelperImpersonation` overlay |
 | Campaign lifecycle / archives / local eligibility | `Campaigns.lua` via `start-campaign` + config ops |
 | Guarded activation + cutover marker | `Activation.lua` |
-| Configuration + accounting gossip | `Gossip.lua` provider `sf.guildsupplies.config` (`PROVIDER_SCHEMA = 4`; GG equality gate) |
+| Configuration + accounting gossip | `Gossip.lua` provider `sf.guildsupplies.config` (`PROVIDER_SCHEMA = 5`; GG equality gate) |
+| Quick Withdraw recipes (#457) | Campaign-scoped `recipes` via `set-recipe`; bank helper + runtime trade handoff; informational `withdrawal` receipts |
 | Local-action commits | `ApplyStaged*` + `_AuthorizeCommit` (local player only) |
 | Authenticated remote admission | `AdmitRemote*` — transport sender + verified guild/rank policy |
 | Dataset adoption | Explicit authorized editor confirmation; replace, never merge |

@@ -1769,8 +1769,243 @@ function Runtime:RebuildReview()
         if empty.GoalMet then empty.GoalMet:Hide() end
         y = 24
     end
+    -- #457 Quick Withdraw section below deposits (independent eligibility).
+    y, index = self:AppendQuickWithdrawSection(frame, y, index)
     frame.Child:SetHeight(math.max(1, y))
     self:SyncMobileButton()
+end
+
+function Runtime:AppendQuickWithdrawSection(frame, y, index)
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not WR or not WR.ShouldShowHelper then
+        return y, index
+    end
+    local show, reason, ctx, access = WR.ShouldShowHelper()
+    if not show and reason ~= "allowance_exhausted" then
+        return y, index
+    end
+    if not ctx then
+        return y, index
+    end
+    y = y + 8
+    index = index + 1
+    local header = self:AcquireRow(index)
+    header:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, -y)
+    header.Text:SetText(Loc("GUILD_SUPPLIES_QUICK_WITHDRAW", "Quick Withdraw"))
+    header.Text:Show()
+    header.boundItemId = nil
+    if header.IconButton then header.IconButton:Hide() end
+    if header.Progress then header.Progress:Hide() end
+    header.Edit:Hide()
+    header.Edit:SetScript("OnEnterPressed", nil)
+    header.Button:Hide()
+    header.Button:SetScript("OnClick", nil)
+    if header.GoalMet then header.GoalMet:Hide() end
+    y = y + 22
+
+    if access and access.reason == "allowance_exhausted" then
+        index = index + 1
+        local note = self:AcquireRow(index)
+        note:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        note.Text:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_ALLOWANCE",
+            "Daily withdrawal allowance exhausted."))
+        note.Text:Show()
+        if note.IconButton then note.IconButton:Hide() end
+        if note.Progress then note.Progress:Hide() end
+        note.Edit:Hide()
+        note.Button:Hide()
+        if note.GoalMet then note.GoalMet:Hide() end
+        y = y + 22
+        return y, index
+    end
+
+    local GS = SF.GuildSupplies
+    local recipes = GS and GS.ListCampaignRecipes and GS.ListCampaignRecipes(ctx.record) or {}
+    local maxRows = 512
+    for i = 1, #recipes do
+        if index >= maxRows then break end
+        local recipe = recipes[i]
+        local itemId = tonumber(recipe.itemId)
+        local available = true
+        if GS and GS.RecipeAvailability then
+            available = GS.RecipeAvailability(ctx.record, {
+                itemId = itemId,
+                reagents = recipe.reagents,
+            }) and true or false
+        end
+        index = index + 1
+        local row = self:AcquireRow(index)
+        row:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        row.Text:Hide()
+        if row.IconButton then
+            row.IconButton:Show()
+            if row.Icon then
+                row.Icon:SetTexture(self:ItemIcon(itemId))
+            end
+            self:BindItemTooltip(row.IconButton, itemId)
+        end
+        if row.Progress then
+            row.Progress:Show()
+            local name = self:ItemName(itemId) or tostring(itemId)
+            if not available then
+                name = name .. " " .. Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE_MARK", "(unavailable)")
+            end
+            row.Progress:SetText(name)
+        end
+        row.boundItemId = itemId
+        row.Edit:Show()
+        row.Edit:SetNumeric(true)
+        local draftKey = tostring(itemId)
+        local editing = row.Edit.HasFocus and row.Edit:HasFocus()
+        if not (editing and row._qwDraftKey == draftKey) then
+            local draft = WR.craftDrafts and WR.craftDrafts[draftKey]
+            row.Edit:SetText(tostring(draft or 0))
+        end
+        row._qwDraftKey = draftKey
+        row.Edit:SetScript("OnTextChanged", function(edit)
+            if not available then return end
+            local n = tonumber(edit:GetText()) or 0
+            if n < 0 then n = 0 end
+            WR.craftDrafts = WR.craftDrafts or {}
+            WR.craftDrafts[draftKey] = math.floor(n)
+        end)
+        row.Button:Hide()
+        row.Button:SetScript("OnClick", nil)
+        if row.GoalMet then
+            if available then
+                row.GoalMet:Hide()
+            else
+                row.GoalMet:SetText(Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE_MARK", "(unavailable)"))
+                row.GoalMet:Show()
+                row.Edit:Hide()
+            end
+        end
+        if not available then
+            row.Edit:Disable()
+        else
+            row.Edit:Enable()
+        end
+        y = y + 26
+    end
+
+    index = index + 1
+    local action = self:AcquireRow(index)
+    action:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+    action.Text:Hide()
+    if action.IconButton then action.IconButton:Hide() end
+    if action.Progress then action.Progress:Hide() end
+    action.Edit:Hide()
+    if action.GoalMet then action.GoalMet:Hide() end
+    action.Button:Show()
+    action.Button:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BUTTON", "Withdraw"))
+    local busy = (WR.IsBusy and WR.IsBusy())
+        or self.depositWork or self.depositIntent
+    local anyPositive = false
+    if WR.craftDrafts then
+        for k, v in pairs(WR.craftDrafts) do
+            if (tonumber(v) or 0) > 0 then
+                local recipe = ctx.recipes[tostring(k)]
+                if recipe and GS and GS.RecipeAvailability
+                    and GS.RecipeAvailability(ctx.record, recipe) then
+                    anyPositive = true
+                    break
+                end
+            end
+        end
+    end
+    if busy or not anyPositive or (access and not access.canWithdraw) then
+        action.Button:Disable()
+    else
+        action.Button:Enable()
+    end
+    action.Button:SetScript("OnClick", function()
+        self:BeginQuickWithdraw()
+    end)
+    y = y + 26
+
+    -- Pending trade handoff status / clear in the helper.
+    local H = SF.ConsumablesTradeHandoff
+    if H and H.PendingSnapshot then
+        local totals = H.PendingSnapshot()
+        local pendingAny = false
+        for _ in pairs(totals) do pendingAny = true break end
+        if pendingAny then
+            index = index + 1
+            local pending = self:AcquireRow(index)
+            pending:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+            pending.Text:SetText(Loc("GUILD_SUPPLIES_TRADE_PENDING_SHORT",
+                "Pending trade handoff active."))
+            pending.Text:Show()
+            if pending.IconButton then pending.IconButton:Hide() end
+            if pending.Progress then pending.Progress:Hide() end
+            pending.Edit:Hide()
+            pending.Button:Show()
+            pending.Button:SetText(Loc("GUILD_SUPPLIES_TRADE_CLEAR", "Clear"))
+            pending.Button:Enable()
+            pending.Button:SetScript("OnClick", function()
+                if H.ClearPending then H.ClearPending() end
+                self:RebuildReview()
+            end)
+            if pending.GoalMet then pending.GoalMet:Hide() end
+            y = y + 26
+        end
+    end
+    return y, index
+end
+
+function Runtime:BeginQuickWithdraw()
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not WR or not WR.BeginWithdraw then return end
+    local selections = {}
+    if WR.craftDrafts then
+        for k, v in pairs(WR.craftDrafts) do
+            selections[tostring(k)] = tonumber(v) or 0
+        end
+    end
+    local ok, err, plan = WR.BeginWithdraw(selections, {
+        onSettle = function(result)
+            local status = result and result.reason or "done"
+            if self.review and self.review.Status then
+                self.review.Status:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_RESULT",
+                    "Withdraw: %s"):format(tostring(status)))
+            end
+        end,
+    })
+    if ok then
+        self:RebuildReview()
+        return
+    end
+    if err == "shortage" and plan and SF.SettingsUI and SF.SettingsUI.Dialogs then
+        local Dialogs = SF.SettingsUI.Dialogs
+        local lines = {
+            Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
+                "There aren’t enough reagents to fulfill your request."),
+        }
+        for i = 1, #(plan.shortages or {}) do
+            local s = plan.shortages[i]
+            local name = self:ItemName(s.itemId) or tostring(s.itemId)
+            lines[#lines + 1] = string.format("%s: %d / %d (missing %d)",
+                name, s.available, s.requested, s.missing)
+        end
+        if Dialogs.ConfirmChoice then
+            Dialogs:ConfirmChoice({
+                title = Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
+                    "There aren’t enough reagents to fulfill your request."),
+                message = table.concat(lines, "\n"),
+                confirmText = Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
+                cancelText = Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
+                onConfirm = function()
+                    WR.BeginWithdraw(selections, { allowPartial = true })
+                    self:RebuildReview()
+                end,
+            })
+        end
+        return
+    end
+    if self.review and self.review.Status then
+        self.review.Status:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
+            "Withdraw blocked: %s"):format(tostring(err or "unknown")))
+    end
 end
 
 function Runtime:Commit(profile, token, events)
@@ -2311,6 +2546,10 @@ function Runtime:OnBankClosed()
             self:FinishDeposit(true)
         end
     end
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.OnBankClosed then
+        WR.OnBankClosed()
+    end
     self.bankOpen = false
     -- Bank-close is the visit boundary for local quantity overrides. Tab
     -- switches alone must not clear them.
@@ -2321,12 +2560,24 @@ end
 
 function Runtime:MaybeAutoReview()
     if self.autoReviewedThisOpen then return end
+    local Routing = SF.ConsumablesRouting
+    if not SF.Consumables or not Routing then return end
+
+    -- #457: Quick Withdraw can open the helper without depositable items,
+    -- deposit permission, or free bank slots. Deposit reminder preference does
+    -- not suppress withdrawal visibility when withdraw access + recipes exist.
+    local WR = SF.ConsumablesWithdrawRuntime
+    local withdrawShow = WR and WR.ShouldShowHelper and select(1, WR.ShouldShowHelper())
+    if withdrawShow then
+        self.autoReviewedThisOpen = true
+        self:ShowReview()
+        return
+    end
+
     if not self:RemindersEnabled() then
         self.autoReviewedThisOpen = true
         return
     end
-    local Routing = SF.ConsumablesRouting
-    if not SF.Consumables or not Routing then return end
     local collected = self:Collect()
     if not collected then return end
     -- Carried requested items remain eligible even when every finite goal is
@@ -2401,6 +2652,10 @@ function Runtime:OnEvent(event, arg1)
         elseif event == "BAG_UPDATE_DELAYED" and self.depositIntent then
             self:FinishDeposit(false)
         end
+        local WR = SF.ConsumablesWithdrawRuntime
+        if event == "BAG_UPDATE_DELAYED" and WR and WR.OnBagOrBankUpdate then
+            WR.OnBagOrBankUpdate()
+        end
         if InCombat() then
             self.reviewRefreshPending = true
             return
@@ -2454,6 +2709,10 @@ function Runtime:OnEvent(event, arg1)
             if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif self.depositIntent then
             self:FinishDeposit(false)
+        end
+        local WR = SF.ConsumablesWithdrawRuntime
+        if WR and WR.OnBagOrBankUpdate then
+            WR.OnBagOrBankUpdate()
         end
         -- Always resync after deposit bookkeeping. Tab changes during an
         -- in-flight deposit or confirmation intent still take this event, and

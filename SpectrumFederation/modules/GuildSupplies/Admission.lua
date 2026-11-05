@@ -13,7 +13,10 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- Older schema-3 peers drop unknown unitCopper when reconstructing stored
 -- events and can relay that stripped history; they are incompatible under
 -- Guild Gossip's strict equality. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 4
+-- #457 Quick Withdraw recipes + informational withdrawal receipts require a
+-- strict provider gate so mixed-version peers cannot partially sync unknown
+-- shapes. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 5
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -1503,6 +1506,7 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
                 },
                 bankTab = nil,
                 requestedItems = {},
+                recipes = {},
                 generation = 0,
                 configSeq = 0,
                 eventSeq = 0,
@@ -1772,6 +1776,18 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         end
         return eligibility
     end
+    local function AssembleRecipesFromMeta()
+        if type(meta.recipes) == "table" then
+            return meta.recipes
+        end
+        local recipePageCount = tonumber(meta.recipePageCount)
+        if not recipePageCount or recipePageCount < 1 then
+            return {}
+        end
+        -- Adoption assembly currently pages items only; recipe pages arrive via
+        -- Gossip live admission. Absent recipe pages → empty map (fail soft).
+        return {}
+    end
     if type(meta.requestedItems) == "table" then
         -- Inline small archive (no pages required).
         return {
@@ -1779,6 +1795,7 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             campaignId = meta.campaignId,
             datasetId = meta.datasetId,
             requestedItems = meta.requestedItems,
+            recipes = AssembleRecipesFromMeta(),
             generation = meta.generation,
             archivedAt = meta.archivedAt,
             bankTab = tonumber(meta.bankTab),
@@ -1827,6 +1844,7 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         campaignId = meta.campaignId,
         datasetId = meta.datasetId,
         requestedItems = merged,
+        recipes = AssembleRecipesFromMeta(),
         generation = meta.generation,
         archivedAt = meta.archivedAt,
         bankTab = tonumber(meta.bankTab),
@@ -1848,7 +1866,12 @@ local function ArchiveCoreEqual(a, b)
     if a.generation ~= b.generation or a.archivedAt ~= b.archivedAt then
         return false
     end
-    return DeepEqual(a.requestedItems, b.requestedItems)
+    if not DeepEqual(a.requestedItems, b.requestedItems) then
+        return false
+    end
+    local aRecipes = type(a.recipes) == "table" and a.recipes or {}
+    local bRecipes = type(b.recipes) == "table" and b.recipes or {}
+    return DeepEqual(aRecipes, bRecipes)
 end
 
 --- When core archive identity matches, prefer the gossip-assembled body so
@@ -3005,6 +3028,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                 },
                 bankTab = nil,
                 requestedItems = {},
+                recipes = {},
                 generation = 0,
                 configSeq = 0,
                 eventSeq = 0,
@@ -5658,11 +5682,32 @@ local function StageParentArchive(record, parentId, timestamp)
             }
         end
     end
+    local recipesCopy = {}
+    if GS.CopyRecipes then
+        local copied, copyErr = GS.CopyRecipes(cfg.recipes)
+        if type(copied) ~= "table" then
+            return nil, copyErr or "invalid_accounting"
+        end
+        recipesCopy = copied
+    elseif type(cfg.recipes) == "table" then
+        for k, v in pairs(cfg.recipes) do
+            if type(v) == "table" then
+                local reagents = {}
+                if type(v.reagents) == "table" then
+                    for rk, rv in pairs(v.reagents) do
+                        reagents[rk] = rv
+                    end
+                end
+                recipesCopy[k] = { itemId = v.itemId, reagents = reagents }
+            end
+        end
+    end
     return {
         schemaVersion = GS.SCHEMA_VERSION,
         campaignId = parentId,
         datasetId = record.datasetId,
         requestedItems = itemsCopy,
+        recipes = recipesCopy,
         generation = generation,
         archivedAt = timestamp,
     }, nil
@@ -5749,6 +5794,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
     -- campaign-independent policy heads — do not retain losing-campaign heads
     -- that would mis-classify confirmed chosen-campaign edits as conflicts.
     local projItems = {}
+    local projRecipes = {}
     local projElig = {}
     local shadowHeads = {}
     if type(ops.heads) == "table" then
@@ -5773,6 +5819,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         accounting = {
             _consumables = {
                 requestedItems = projItems,
+                recipes = projRecipes,
                 eligibility = projElig,
                 bankTab = header and header.bankTabAtStart,
                 configSeq = tonumber(cfg.configSeq) or 0,
@@ -5910,6 +5957,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         promoteOps = orderedPromote,
         slotsNeeded = #orderedPromote,
         projectedItems = projItems,
+        projectedRecipes = projRecipes,
         projectedEligibility = projElig,
         projectedBankTab = shadow.accounting._consumables.bankTab,
         hasProjectedBankTab = true,
@@ -5973,6 +6021,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
 
     -- Sibling switch: keep generation; reconstruct off-record then publish atomically.
     local previousItems = cfg.requestedItems
+    local previousRecipes = cfg.recipes
     local previousEligibility = cfg.eligibility
     local previousBankTab = cfg.bankTab
     local previousConfigSeq = cfg.configSeq
@@ -5996,6 +6045,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
 
     local function rollbackActivation()
         cfg.requestedItems = previousItems
+        cfg.recipes = previousRecipes
         cfg.eligibility = previousEligibility
         cfg.bankTab = previousBankTab
         cfg.configSeq = previousConfigSeq
@@ -6105,6 +6155,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     end
 
     cfg.requestedItems = plan.projectedItems or {}
+    cfg.recipes = plan.projectedRecipes or {}
     cfg.eligibility = plan.projectedEligibility or {}
     -- Always publish the projected tab, including an explicitly captured nil
     -- from the chosen campaign's bankTabAtStart.
@@ -6245,12 +6296,14 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
     end
 
     local previousItems = cfg.requestedItems
+    local previousRecipes = cfg.recipes
     local previousGeneration = cfg.generation
     local previousEligibility = cfg.eligibility
     local previousConfigSeq = cfg.configSeq
     local previousCurrent = record.currentCampaignId
 
     cfg.requestedItems = {}
+    cfg.recipes = {}
     cfg.generation = currentGen + 1
     cfg.eligibility = {}
     -- Original startedAt / boundary timestamps — never receipt time.
@@ -6285,6 +6338,7 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
         local postOk, postErr = GS._ValidateGuildRecordStructure(stored.guildKey, record)
         if not postOk then
             cfg.requestedItems = previousItems
+            cfg.recipes = previousRecipes
             cfg.generation = previousGeneration
             cfg.eligibility = previousEligibility
             cfg.configSeq = previousConfigSeq
@@ -6579,7 +6633,8 @@ local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, 
         end
     elseif authBody.kind == GS.KIND.SET_EDITOR_RANK
         or authBody.kind == GS.KIND.SET_BANK_TAB
-        or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+        or authBody.kind == GS.KIND.SET_REQUESTED_ITEM
+        or authBody.kind == GS.KIND.SET_RECIPE then
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(shadow, authBody)
             if not ok then
@@ -6672,7 +6727,8 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                         if class == "apply" then
                             count = count + 1
                             if authBody.kind == GS.KIND.SET_BANK_TAB
-                                or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+                                or authBody.kind == GS.KIND.SET_REQUESTED_ITEM
+                                or authBody.kind == GS.KIND.SET_RECIPE then
                                 if not shadowConsumables
                                     and type(record.accounting) == "table"
                                     and type(record.accounting._consumables) == "table" then
@@ -6699,6 +6755,25 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                                             end
                                         end
                                         shadowConsumables.requestedItems = items
+                                    end
+                                    if GS.CloneRecipesMap then
+                                        shadowConsumables.recipes = GS.CloneRecipesMap(liveCfg.recipes)
+                                    elseif type(liveCfg.recipes) == "table" then
+                                        local recipes = {}
+                                        for rk, rv in pairs(liveCfg.recipes) do
+                                            if type(rv) == "table" then
+                                                local copy = { itemId = rv.itemId, reagents = {} }
+                                                if type(rv.reagents) == "table" then
+                                                    for rrk, rrv in pairs(rv.reagents) do
+                                                        copy.reagents[rrk] = rrv
+                                                    end
+                                                end
+                                                recipes[rk] = copy
+                                            end
+                                        end
+                                        shadowConsumables.recipes = recipes
+                                    else
+                                        shadowConsumables.recipes = {}
                                     end
                                     if type(liveCfg.eligibility) == "table" then
                                         local elig = {}
