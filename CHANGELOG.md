@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.6] - 2026-11-05
+
+### Fixed
+- Fix Raid Check completion visibility for initiating admin (#449)
+
 ## [1.5.18-beta.5] - 2026-11-04
 
 ### Changed
