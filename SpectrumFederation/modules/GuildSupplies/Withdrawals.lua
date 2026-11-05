@@ -79,6 +79,11 @@ function GS.ValidateWithdrawalEventBody(event, datasetId)
     if not id then
         return false, "invalid_id"
     end
+    -- Distinct receipt namespace (matches BuildWithdrawalReceipts gsw1:… IDs).
+    -- Must not occupy editor adjustment / donation operation IDs (gs1:…).
+    if id:sub(1, 5) ~= "gsw1:" then
+        return false, "invalid_id"
+    end
     local eventDataset = BoundedString(event.datasetId)
     if not eventDataset then
         return false, "invalid_dataset"
@@ -112,8 +117,7 @@ function GS.ValidateWithdrawalEventBody(event, datasetId)
     if not tab or tab ~= math.floor(tab) or tab < 1 or tab > (GS.MAX_BANK_TAB or 8) then
         return false, "invalid_bank_tab"
     end
-    local ts = tonumber(event.timestamp)
-    if not ts or ts ~= math.floor(ts) or ts < 0 then
+    if not (GS.IsFiniteNonnegInt and GS.IsFiniteNonnegInt(event.timestamp)) then
         return false, "invalid_timestamp"
     end
     local provenance = event.provenance

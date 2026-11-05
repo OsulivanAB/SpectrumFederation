@@ -198,8 +198,38 @@ function H.EnqueueConfirmed(amounts, meta)
     if type(amounts) ~= "table" then
         return nil, "invalid_amounts"
     end
+    meta = type(meta) == "table" and meta or {}
+    local cur = CaptureContext()
+    -- Prefer the withdrawal's captured guild/character; require nonempty and
+    -- agreement with current identity before mutating batches.
+    local guildKey = meta.guildKey
+    local playerGuid = meta.playerGuid
+    if type(guildKey) ~= "string" or guildKey == "" then
+        guildKey = cur.guildKey
+    end
+    if type(playerGuid) ~= "string" or playerGuid == "" then
+        playerGuid = cur.playerGuid
+    end
+    if type(guildKey) ~= "string" or guildKey == ""
+        or type(playerGuid) ~= "string" or playerGuid == "" then
+        return nil, "missing_identity"
+    end
+    if tostring(guildKey) ~= tostring(cur.guildKey or "")
+        or tostring(playerGuid) ~= tostring(cur.playerGuid or "") then
+        return nil, "context_mismatch"
+    end
     if not EnsureContextOrClear() then
         return nil, "context_mismatch"
+    end
+    if type(state.context) == "table" then
+        local boundGuild = state.context.guildKey
+        local boundGuid = state.context.playerGuid
+        if boundGuild and tostring(boundGuild) ~= tostring(guildKey) then
+            return nil, "context_mismatch"
+        end
+        if boundGuid and tostring(boundGuid) ~= tostring(playerGuid) then
+            return nil, "context_mismatch"
+        end
     end
     local cleaned = {}
     local units = 0
@@ -219,17 +249,22 @@ function H.EnqueueConfirmed(amounts, meta)
     end
     local completedAt = Now()
     local batch = {
-        id = (meta and meta.operationId) or ("tw:" .. tostring(completedAt) .. ":" .. tostring(#state.batches + 1)),
+        id = meta.operationId or ("tw:" .. tostring(completedAt) .. ":" .. tostring(#state.batches + 1)),
         completedAt = completedAt,
         expiresAt = completedAt + (H.BATCH_TTL_SECONDS or 3600),
         amounts = cleaned,
+        guildKey = guildKey,
+        playerGuid = playerGuid,
     }
     local nextBatches, appendErr = W.AppendTradeBatch(state.batches, batch, H.MAX_BATCHES)
     if not nextBatches then
         return nil, appendErr or "full"
     end
     state.batches = nextBatches
-    state.context = CaptureContext()
+    state.context = {
+        guildKey = guildKey,
+        playerGuid = playerGuid,
+    }
     state.status = "pending"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_PENDING",
         "Pending trade handoff ready. Open a trade to offer withdrawn reagents.")
@@ -496,12 +531,16 @@ function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts)
         state.batches = (W.ConsumeTradeBatches(state.batches, deliveredAmounts, now))
     end
     if next(ambiguousAmounts) then
+        -- Only mark unresolved when ambiguity hits a surviving tracked batch.
+        local beforeAmbiguous = AnyBatchAmbiguous(state.batches)
         state.batches = W.BindTradeAmbiguity(state.batches, ambiguousAmounts, now)
-        state.status = "unresolved"
-        state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
-            "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
-        H.RefreshStatusUI()
-        return
+        if AnyBatchAmbiguous(state.batches) or beforeAmbiguous then
+            state.status = "unresolved"
+            state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
+                "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
+            H.RefreshStatusUI()
+            return
+        end
     end
     local remaining = AggregatePending()
     local anyLeft = false

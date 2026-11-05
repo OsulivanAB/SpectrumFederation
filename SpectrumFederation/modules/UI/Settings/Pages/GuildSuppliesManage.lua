@@ -1096,7 +1096,8 @@ local function EnsureRecipeEditorUi()
 	return ui
 end
 
-local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText)
+local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText, opts)
+	opts = opts or {}
 	local described = DescribeItem(itemId)
 	if row.Icon then
 		if described.icon then
@@ -1116,7 +1117,19 @@ local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText
 			row.Warning:Hide()
 		end
 	end
+	-- Preserve focused text only while this pooled row still represents the same
+	-- item and editor session. Otherwise load the incoming item's draft.
+	local sameIdentity = opts.priorItemId ~= nil
+		and tonumber(opts.priorItemId) == tonumber(itemId)
+		and opts.priorSession ~= nil
+		and opts.priorSession == recipeEditorDraft.sessionId
 	local editing = row.Edit and row.Edit.HasFocus and row.Edit:HasFocus()
+	if editing and not sameIdentity then
+		if row.Edit.ClearFocus then
+			row.Edit:ClearFocus()
+		end
+		editing = false
+	end
 	if not editing then
 		row.Edit:SetText(qtyText or "0")
 	end
@@ -1238,6 +1251,14 @@ local function RefreshRecipeEditor()
 				ui.reagentRows[i] = r
 			end
 			local row = ui.reagentRows[i]
+			local priorItemId = row._boundItemId
+			local priorSession = row.Edit and row.Edit._sfRecipeSession
+			-- Capture the outgoing item's draft before rebinding the pooled row.
+			if priorItemId and row.Edit
+				and row.Edit.HasFocus and row.Edit:HasFocus()
+				and priorSession == recipeEditorDraft.sessionId then
+				recipeEditorDraft.reagentTexts[tostring(priorItemId)] = row.Edit:GetText() or ""
+			end
 			row._boundItemId = itemId
 			-- Rebind OnTextChanged to the currently displayed item ID every layout.
 			row.Edit._sfRecipeSession = recipeEditorDraft.sessionId
@@ -1265,7 +1286,10 @@ local function RefreshRecipeEditor()
 			elseif perCraft > 0 then
 				warnText = RecipeAvailabilityWarning(record, rowRecipe)
 			end
-			y = y + LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warnText)
+			y = y + LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warnText, {
+				priorItemId = priorItemId,
+				priorSession = priorSession,
+			})
 		end
 	end
 	for j = #rows + 1, #ui.reagentRows do
@@ -1453,7 +1477,18 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 			"error")
 		return
 	end
-	if not RecipeCanEdit() or not RecipeHasRequestedReagents() then
+	local openingExisting = type(existingRecipe) == "table"
+	-- Creation requires requested reagents. Existing saved recipes (including
+	-- orphan-only) may open for guarded edit/delete.
+	if not RecipeCanEdit() then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_DISABLED_UNAUTHORIZED_FMT",
+				"Your guild rank does not permit %s."):format(
+				Loc("GUILD_SUPPLIES_DISABLED_ACTION_RECIPES", "editing Quick Withdraw recipes")),
+			"error")
+		return
+	end
+	if not openingExisting and not RecipeHasRequestedReagents() then
 		ctx.section:SetMessage(
 			Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
 				"Add requested items to the current campaign before configuring recipes."),
@@ -1477,7 +1512,7 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 	recipeEditorDraft.open = true
 	recipeEditorDraft.contextKey = RecipeDraftContextKey()
 	recipeEditorDraft.outputItemId = itemId
-	recipeEditorDraft.isExisting = type(existingRecipe) == "table"
+	recipeEditorDraft.isExisting = openingExisting
 	recipeEditorDraft.boundGuildKey = (ctxInfo and ctxInfo.guildKey) or (rec and rec._guildKey)
 	recipeEditorDraft.boundDatasetId = rec and rec.datasetId
 	recipeEditorDraft.boundCampaignId = rec and rec.currentCampaignId
@@ -2148,7 +2183,13 @@ local function Definition()
 						showDetailTooltip = true,
 						getItems = RecipeRows,
 						enabled = function()
-							return RecipeCanEdit() and RecipeHasRequestedReagents()
+							-- Saved recipes remain editable/deletable even when every
+							-- reagent is orphaned (no current requested items).
+							if not RecipeCanEdit() then
+								return false
+							end
+							local rows = RecipeRows()
+							return type(rows) == "table" and #rows > 0
 						end,
 						getDisabledTooltip = function()
 							local tip = DisabledNeedCampaignTip(
@@ -2156,9 +2197,14 @@ local function Definition()
 							if tip then
 								return tip
 							end
-							if not RecipeHasRequestedReagents() then
-								return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
-									"Add requested items to the current campaign before configuring recipes.")
+							local rows = RecipeRows()
+							if type(rows) ~= "table" or #rows < 1 then
+								if not RecipeHasRequestedReagents() then
+									return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+										"Add requested items to the current campaign before configuring recipes.")
+								end
+								return Loc("GUILD_SUPPLIES_RECIPES_NONE",
+									"No saved Quick Withdraw recipes yet.")
 							end
 							return nil
 						end,

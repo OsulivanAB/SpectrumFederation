@@ -3104,7 +3104,37 @@ local function ValidateAndApply(record, ctx)
         end
         local existing = localRecord.campaignArchives[body.campaignId]
         if existing then
-            if GS._DeepEqualOps and GS._DeepEqualOps(existing, archive) then
+            -- Normalize absent vs empty recipes for compare only (do not mutate
+            -- the saved archive). Matches inline shortcut + ArchiveCoreEqual.
+            local function archiveEq(a, b)
+                if type(a) ~= "table" or type(b) ~= "table" then
+                    return false
+                end
+                local aNorm = {
+                    schemaVersion = a.schemaVersion,
+                    campaignId = a.campaignId,
+                    datasetId = a.datasetId,
+                    requestedItems = a.requestedItems,
+                    recipes = type(a.recipes) == "table" and a.recipes or {},
+                    generation = a.generation,
+                    archivedAt = a.archivedAt,
+                    bankTab = a.bankTab,
+                    eligibility = a.eligibility,
+                }
+                local bNorm = {
+                    schemaVersion = b.schemaVersion,
+                    campaignId = b.campaignId,
+                    datasetId = b.datasetId,
+                    requestedItems = b.requestedItems,
+                    recipes = type(b.recipes) == "table" and b.recipes or {},
+                    generation = b.generation,
+                    archivedAt = b.archivedAt,
+                    bankTab = b.bankTab,
+                    eligibility = b.eligibility,
+                }
+                return GS._DeepEqualOps and GS._DeepEqualOps(aNorm, bNorm)
+            end
+            if archiveEq(existing, archive) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end

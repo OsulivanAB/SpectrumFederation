@@ -517,6 +517,11 @@ local function LedgerEstablishesNameGuid(record, name, guid)
         if type(ev) ~= "table" then
             return false
         end
+        -- Informational withdrawal receipts must not establish donor/attributed
+        -- name↔GUID provenance (live or archived).
+        if IsWithdrawalLedgerEvent(ev) then
+            return false
+        end
         local sideGuid = ValidGuid(ev.actorGuid) or ValidGuid(ev.donorGuid)
         if sideGuid == guid then
             if NormName(ev.actor) == name or NormName(ev.donor) == name then
@@ -2254,7 +2259,6 @@ local function TrimEventArchive(record)
     end
     local maxDon = GS.MAX_ARCHIVED_EVENTS or 4096
     local maxWd = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024
-    local maxTotal = maxDon + maxWd
     local removedIds = {}
     local removedTxn = {}
     local function noteRemoved(ev)
@@ -2269,46 +2273,43 @@ local function TrimEventArchive(record)
             removedTxn[#removedTxn + 1] = txn
         end
     end
-    local function removeAt(idx)
-        noteRemoved(archive[idx])
-        table.remove(archive, idx)
-    end
-    local trimmed = false
-    while true do
-        local total = #archive
-        local nonWithdraw = CountNonWithdrawalEvents(archive)
-        local withdrawals = total - nonWithdraw
-        if total <= maxTotal and nonWithdraw <= maxDon and withdrawals <= maxWd then
-            break
-        end
-        local removeIdx = nil
-        -- Prefer trimming oldest withdrawals when over the withdrawal or combined cap.
-        if withdrawals > maxWd or total > maxTotal then
-            for i = 1, total do
-                if IsWithdrawalLedgerEvent(archive[i]) then
-                    removeIdx = i
-                    break
-                end
-            end
-        end
-        if not removeIdx and nonWithdraw > maxDon then
-            for i = 1, total do
-                if not IsWithdrawalLedgerEvent(archive[i]) then
-                    removeIdx = i
-                    break
-                end
-            end
-        end
-        if not removeIdx then
-            removeIdx = 1
-        end
-        removeAt(removeIdx)
-        trimmed = true
-    end
-    if not trimmed then
+    -- Count once per kind, then compact linearly. Evict only the oldest excess
+    -- rows of the kind that exceeds its independent cap (donation overflow must
+    -- not remove below-cap receipts, and vice versa).
+    local total = #archive
+    local nonWithdraw = CountNonWithdrawalEvents(archive)
+    local withdrawals = total - nonWithdraw
+    local excessDon = nonWithdraw - maxDon
+    if excessDon < 0 then excessDon = 0 end
+    local excessWd = withdrawals - maxWd
+    if excessWd < 0 then excessWd = 0 end
+    if excessDon < 1 and excessWd < 1 then
         return false
     end
-    record.accounting._consumableEventArchive = archive
+    local kept = {}
+    local dropDon = excessDon
+    local dropWd = excessWd
+    for i = 1, total do
+        local ev = archive[i]
+        local isWd = IsWithdrawalLedgerEvent(ev)
+        if isWd then
+            if dropWd > 0 then
+                noteRemoved(ev)
+                dropWd = dropWd - 1
+            else
+                kept[#kept + 1] = ev
+            end
+        else
+            if dropDon > 0 then
+                noteRemoved(ev)
+                dropDon = dropDon - 1
+            else
+                kept[#kept + 1] = ev
+            end
+        end
+    end
+    record.accounting._consumableEventArchive = kept
+    archive = kept
     BumpAccountingMutation(record)
     -- Coalesce ledger + valuation export drops into one order compaction and
     -- one provider/manifest notification for this trusted retention trim.

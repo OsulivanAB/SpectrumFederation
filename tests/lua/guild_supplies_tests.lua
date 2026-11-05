@@ -46210,28 +46210,31 @@ do
     -- Adoption isolation: temporary offline record must not notify live export.
     local liveCount = descAcceptedLedgerCount(record)
     local liveNotify = world.notifyChanged or 0
+    -- Same-dataset / different-record temporary identity: adoption isolation is
+    -- the record identity + adoptionReplay flag, not merely a different datasetId.
     local temp = {
-        datasetId = "gs1:adoption-temp",
+        datasetId = record.datasetId,
         _guildKey = record._guildKey or "club:42",
-        currentCampaignId = "camp-temp",
-        campaigns = { ["camp-temp"] = { id = "camp-temp" } },
-        campaignArchives = {},
+        currentCampaignId = record.currentCampaignId,
+        campaigns = record.campaigns,
+        campaignArchives = record.campaignArchives,
         accounting = {
             _mutationSeq = 0,
             _consumables = {
-                generation = 1,
+                generation = tonumber(record.accounting._consumables.generation) or 1,
                 eventSeq = 0,
-                bankTab = 2,
+                bankTab = tonumber(record.accounting._consumables.bankTab) or 2,
             },
             _consumableEvents = {},
             _consumableEventArchive = {},
         },
     }
+    assertTrue(temp ~= record, "457-pub: temp is distinct table identity")
     local tempEvent = makeWithdrawalEvent(temp, {
         tag = "adopt-iso",
         id = "gsw1:pub:adopt-iso:10:1",
-        campaignId = "camp-temp",
-        generation = 1,
+        campaignId = temp.currentCampaignId,
+        generation = tonumber(temp.accounting._consumables.generation),
     })
     local stIso = select(1, GS.AdmitWithdrawalEvent(temp, tempEvent, {
         senderGuid = "Player-1-Bob",
@@ -46239,6 +46242,9 @@ do
         adoptionReplay = true,
     }))
     assertEq(stIso, "accepted", "457-pub: adoptionReplay admit onto temp record")
+    -- Assert isolation immediately — before any later live admission.
+    assertEq(world.notifyChanged or 0, liveNotify,
+        "457-pub: adoptionReplay did not notify live export")
     assertEq(descAcceptedLedgerCount(record), liveCount,
         "457-pub: adoptionReplay did not change live acceptedLedgerCount")
     assertEq(prov.api.GetRecordBody("gs:le:" .. tempEvent.id), nil,
@@ -46254,6 +46260,7 @@ do
         operationId = "op-offline-cur",
     })
     local beforeOffline = descAcceptedLedgerCount(record)
+    local notifyBeforeLive = world.notifyChanged or 0
     local stOff = select(1, GS:AdmitLedgerEvent(viaOffline, {
         sender = "Dave-Garona",
         member = {
@@ -46268,8 +46275,8 @@ do
         "457-pub: ordinary offlineRecord=current publishes body")
     assertEq(descAcceptedLedgerCount(record), beforeOffline + 1,
         "457-pub: ordinary offlineRecord=current updates acceptedLedgerCount")
-    assertTrue((world.notifyChanged or 0) >= liveNotify,
-        "457-pub: live notify path remains available")
+    assertTrue((world.notifyChanged or 0) > notifyBeforeLive,
+        "457-pub: subsequent live admission notifies")
 end
 
 SF.TSM = nil

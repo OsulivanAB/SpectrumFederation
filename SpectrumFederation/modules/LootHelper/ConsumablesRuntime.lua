@@ -1821,7 +1821,18 @@ function Runtime:FormatQuickWithdrawSettlement(result)
     return table.concat(parts, " ")
 end
 
-function Runtime:SetQuickWithdrawStatus(text)
+function Runtime:SetQuickWithdrawStatus(text, opts)
+    opts = type(opts) == "table" and opts or {}
+    -- Scope status to the visit/operation that produced it. A late settlement
+    -- from an earlier bank visit must not overwrite a newer visit's feedback.
+    local token = opts.visitToken
+    if token ~= nil then
+        if self._quickWithdrawVisitToken ~= nil
+            and tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
+            return
+        end
+        self._quickWithdrawStatusVisitToken = token
+    end
     self._quickWithdrawStatus = text
     if self.review and self.review.Status and type(text) == "string" then
         self.review.Status:SetText(text)
@@ -2063,7 +2074,11 @@ function Runtime:BeginQuickWithdraw()
     end
     local boundSelections = WR.CopyCraftSelections and WR.CopyCraftSelections(selections) or selections
     local function SettleHandler(result)
-        self:SetQuickWithdrawStatus(self:FormatQuickWithdrawSettlement(result))
+        result = type(result) == "table" and result or {}
+        self:SetQuickWithdrawStatus(self:FormatQuickWithdrawSettlement(result), {
+            visitToken = result.visitToken,
+            operationId = result.operationId,
+        })
         self:RebuildReview()
     end
     local function StartWithdraw(opts)
@@ -2704,9 +2719,16 @@ function Runtime:OnBankClosed()
         WR.OnBankClosed()
     end
     self.bankOpen = false
-    -- Bank-close is the visit boundary for local quantity overrides. Tab
-    -- switches alone must not clear them.
+    -- Bank-close is the visit boundary for local quantity overrides and status.
+    -- Tab switches alone must not clear them. Clear visit-scoped status so a
+    -- later open does not inherit prior settlement text; in-flight settle
+    -- callbacks still match via visitToken.
     self.qtyOverrides = {}
+    if not (WR and WR.IsBusy and WR.IsBusy()) then
+        self._quickWithdrawStatus = nil
+        self._quickWithdrawVisitToken = nil
+        self._quickWithdrawStatusVisitToken = nil
+    end
     self:HideReviewForBankLifecycle()
     self:RefreshReminder()
 end

@@ -692,9 +692,15 @@ function WR.QuickWithdrawConfirmationStillValid(bound)
     return true, nil, preview
 end
 
+--- Bank slot count. Returns nil when the slot cannot be observed (unavailable),
+-- 0 when the slot is empty, otherwise the stack count. Do not treat unavailable
+-- as an observed empty slot.
 local function BankSlotCount(bankTab, slot)
-    if not GetGuildBankItemInfo then return 0 end
+    if not GetGuildBankItemInfo then return nil end
     local texture, count = GetGuildBankItemInfo(bankTab, slot)
+    if texture == nil and count == nil then
+        return nil
+    end
     if not texture then return 0 end
     return FloorQty(count)
 end
@@ -711,21 +717,52 @@ local function DetachWithdrawWork()
     WR.work = nil
 end
 
-local function CancelObserveTimer(work)
-    if work and work.observeTimer and work.observeTimer.Cancel then
-        work.observeTimer:Cancel()
-        work.observeTimer = nil
+local function CancelTimerHandle(handle)
+    if handle and handle.Cancel then
+        pcall(function() handle:Cancel() end)
     end
 end
 
+local function CancelObserveTimer(work)
+    if not work then return end
+    CancelTimerHandle(work.observeTimer)
+    work.observeTimer = nil
+end
+
+local function CancelFinalizeTimer(work)
+    if not work then return end
+    CancelTimerHandle(work.timer)
+    work.timer = nil
+end
+
+--- Prefer cancellable NewTimer; fall back to After (no cancel handle).
+local function ScheduleOneShot(delay, callback)
+    delay = tonumber(delay) or 0
+    if delay < 0 then delay = 0 end
+    if C_Timer and C_Timer.NewTimer then
+        return C_Timer.NewTimer(delay, callback)
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(delay, callback)
+    else
+        callback()
+    end
+    return nil
+end
+
 local function ScheduleObserve(work, delay)
-    if not work or not C_Timer or not C_Timer.After then return end
+    if not work then return end
     CancelObserveTimer(work)
     delay = tonumber(delay) or OBSERVE_INITIAL
-    work.observeTimer = C_Timer.After(delay, function()
-        if WR.work == work then
-            WR.ObservePending()
-        end
+    work.observeGen = (tonumber(work.observeGen) or 0) + 1
+    local gen = work.observeGen
+    local pendingRef = work.pendingStep
+    work.observeTimer = ScheduleOneShot(delay, function()
+        if WR.work ~= work then return end
+        if work.observeGen ~= gen then return end
+        if work.pendingStep ~= pendingRef then return end
+        work.observeTimer = nil
+        WR.ObservePending()
     end)
 end
 
@@ -776,9 +813,7 @@ local function StopWork(reason, partial)
     work.settled = true
     DetachWithdrawWork()
     CancelObserveTimer(work)
-    if work and work.timer and work.timer.Cancel then
-        work.timer:Cancel()
-    end
+    CancelFinalizeTimer(work)
     Debug("Info", "withdraw stop reason=%s confirmed=%s",
         tostring(reason), tostring(work and work.confirmedTotal or 0))
     if work and work.movementStarted then
@@ -813,6 +848,8 @@ local function StopWork(reason, partial)
             unresolved = work.unresolved,
             receiptError = work.receiptError,
             partial = partial,
+            operationId = work.operationId,
+            visitToken = work.visitToken,
         })
     end
     local Runtime = Host()
@@ -821,6 +858,8 @@ local function StopWork(reason, partial)
     end
 end
 
+--- Commit receipts/handoff once for the confirmed map. Must run after the
+-- evidence decision for any pending movement — never before.
 local function CommitConfirmed(work)
     if type(work) ~= "table" then return true end
     if work.receiptCommitted and work.handoffCommitted then return true end
@@ -853,7 +892,11 @@ local function CommitConfirmed(work)
     local H = SF.ConsumablesTradeHandoff
     if not work.handoffCommitted then
         if any and H and H.EnqueueConfirmed then
-            H.EnqueueConfirmed(confirmed, { operationId = work.operationId })
+            H.EnqueueConfirmed(confirmed, {
+                operationId = work.operationId,
+                guildKey = work.guildKey,
+                playerGuid = work.playerGuid,
+            })
         end
         work.handoffCommitted = true
     end
@@ -1015,14 +1058,23 @@ function WR.BeginWithdraw(selections, opts)
         return false, "allowance", plan
     end
 
+    local visitToken = (GetServerTime and GetServerTime() or time())
+        .. ":" .. tostring(operationId)
+    local playerGuid = UnitGUID and UnitGUID("player") or nil
+    local RuntimeHost = Host()
+    if RuntimeHost then
+        RuntimeHost._quickWithdrawVisitToken = visitToken
+    end
     AttachWithdrawWork({
         operationId = operationId,
+        visitToken = visitToken,
         campaignId = ctx.campaignId,
         datasetId = ctx.datasetId,
         generation = ctx.generation,
         configSeq = ctx.configSeq,
         bankTab = ctx.bankTab,
         guildKey = ctx.guildKey,
+        playerGuid = playerGuid,
         requested = requested,
         take = authorized.take,
         selections = selections,
@@ -1033,6 +1085,7 @@ function WR.BeginWithdraw(selections, opts)
         index = 1,
         lockWaits = 0,
         movementStarted = false,
+        bankClosed = false,
         startedAt = GetServerTime and GetServerTime() or time(),
         places = {},
         onSettle = opts.onSettle,
@@ -1086,14 +1139,20 @@ function WR.PlaceNext()
     local work = WR.work
     if not work then return end
     if work.pendingStep then return end
+    -- Exhausted queue before allowance/context for a nonexistent next pickup.
+    if work.index > #work.queue then
+        WR.FinalizeWork()
+        return
+    end
+    if work.bankClosed then
+        CommitConfirmed(work)
+        StopWork("bank_closed", true)
+        return
+    end
     local okCtx, why = WR.ContextStillValid(work)
     if not okCtx then
         CommitConfirmed(work)
         StopWork(why, true)
-        return
-    end
-    if work.index > #work.queue then
-        WR.FinalizeWork()
         return
     end
     if not CursorEmpty() then
@@ -1122,11 +1181,11 @@ function WR.PlaceNext()
             StopWork("locked", true)
             return
         end
-        if C_Timer and C_Timer.After then
-            C_Timer.After(0.1, function()
-                if WR.work == work and not work.pendingStep then WR.PlaceNext() end
-            end)
-        end
+        ScheduleOneShot(0.1, function()
+            if WR.work == work and not work.pendingStep and not work.bankClosed then
+                WR.PlaceNext()
+            end
+        end)
         return
     end
     work.lockWaits = 0
@@ -1178,7 +1237,7 @@ function WR.PlaceNext()
         local afterBags = WR.BagCount(step.itemId)
         local afterSlot = BankSlotCount(work.bankTab, step.slot)
         if Workflow and Workflow.InterpretWithdrawal then
-            local actual = Workflow.InterpretWithdrawal({
+            local actual, whyInterp = Workflow.InterpretWithdrawal({
                 guildOk = true,
                 observedTab = work.bankTab,
                 configuredTab = work.bankTab,
@@ -1187,7 +1246,7 @@ function WR.PlaceNext()
                 afterBags = afterBags,
                 placedSlots = { { before = beforeSlot, after = afterSlot } },
             })
-            if FloorQty(actual) > 0 then
+            if whyInterp ~= "bank_unavailable" and FloorQty(actual) > 0 then
                 local key = tostring(step.itemId)
                 work.confirmed[key] = (work.confirmed[key] or 0) + actual
                 work.confirmedTotal = (work.confirmedTotal or 0) + actual
@@ -1228,7 +1287,7 @@ function WR.ObservePending()
     local step = pending
     local afterBags = WR.BagCount(step.itemId)
     local afterSlot = BankSlotCount(work.bankTab, step.slot)
-    local actual = Workflow.InterpretWithdrawal({
+    local actual, interpWhy = Workflow.InterpretWithdrawal({
         guildOk = true,
         observedTab = work.bankTab,
         configuredTab = work.bankTab,
@@ -1240,6 +1299,28 @@ function WR.ObservePending()
     local now = GetServerTime and GetServerTime() or time()
     local elapsed = now - (pending.observeStartedAt or now)
     local fromTimer = elapsed >= SETTLE_SECONDS
+    -- Unavailable bank data is not an observed empty slot; keep waiting until
+    -- the settle deadline, then report the pending movement unresolved.
+    if interpWhy == "bank_unavailable" then
+        if fromTimer or work.bankClosed then
+            CancelObserveTimer(work)
+            work.unresolved = {
+                itemId = step.itemId,
+                slot = step.slot,
+                intended = step.count,
+                actual = 0,
+                reason = "bank_unavailable",
+            }
+            work.pendingStep = nil
+            CommitConfirmed(work)
+            StopWork(work.bankClosed and "bank_closed_unresolved" or "unresolved", true)
+            return
+        end
+        local nextDelay = math.min(OBSERVE_MAX, (pending.observeDelay or OBSERVE_INITIAL) * 2)
+        pending.observeDelay = nextDelay
+        ScheduleObserve(work, nextDelay)
+        return
+    end
     local uncertain = fromTimer and actual < FloorQty(step.count)
     local disposition = Workflow.WithdrawalDisposition(actual, step.count, fromTimer, uncertain)
     if disposition == "commit" and actual >= FloorQty(step.count) then
@@ -1248,13 +1329,14 @@ function WR.ObservePending()
         work.confirmed[key] = (work.confirmed[key] or 0) + actual
         work.confirmedTotal = (work.confirmedTotal or 0) + actual
         work.pendingStep = nil
-        if C_Timer and C_Timer.After then
-            C_Timer.After(0, function()
-                if WR.work == work then WR.PlaceNext() end
-            end)
-        else
-            WR.PlaceNext()
+        if work.bankClosed then
+            CommitConfirmed(work)
+            StopWork("bank_closed", true)
+            return
         end
+        ScheduleOneShot(0, function()
+            if WR.work == work then WR.PlaceNext() end
+        end)
         return
     end
     if disposition == "unresolved" or (fromTimer and actual <= 0) then
@@ -1267,14 +1349,20 @@ function WR.ObservePending()
         }
         work.pendingStep = nil
         CommitConfirmed(work)
-        StopWork("unresolved", true)
+        StopWork(work.bankClosed and "bank_closed_unresolved" or "unresolved", true)
         return
     end
     if disposition == "drop" and fromTimer then
         CancelObserveTimer(work)
+        work.unresolved = {
+            itemId = step.itemId,
+            slot = step.slot,
+            intended = step.count,
+            actual = actual,
+        }
         work.pendingStep = nil
         CommitConfirmed(work)
-        StopWork("unresolved", true)
+        StopWork(work.bankClosed and "bank_closed_unresolved" or "unresolved", true)
         return
     end
     local nextDelay = math.min(OBSERVE_MAX, (pending.observeDelay or OBSERVE_INITIAL) * 2)
@@ -1290,8 +1378,12 @@ function WR.FinalizeWork()
     if work.pendingStep then return end
     if work.settling then return end
     work.settling = true
+    local finishGen = (tonumber(work.finalizeGen) or 0) + 1
+    work.finalizeGen = finishGen
     local function finish()
         if WR.work ~= work then return end
+        if work.finalizeGen ~= finishGen then return end
+        work.timer = nil
         if work.pendingStep then
             work.settling = nil
             return
@@ -1311,30 +1403,61 @@ function WR.FinalizeWork()
         end
         StopWork(partial and "partial" or "complete", partial)
     end
-    if C_Timer and C_Timer.After then
-        work.timer = C_Timer.After(SETTLE_SECONDS, finish)
-    else
-        finish()
-    end
+    CancelFinalizeTimer(work)
+    work.timer = ScheduleOneShot(SETTLE_SECONDS, finish)
 end
 
+--- Bank close: freeze further pickups. Settle reliable pending evidence within
+-- a bounded window; otherwise report the pending movement unresolved. Never
+-- discard uncertain movement as ordinary unfilled quantity, and never commit
+-- receipts/handoff before the evidence decision.
 function WR.OnBankClosed()
     local work = WR.work
-    if work then
+    if not work then return end
+    work.bankClosed = true
+    CancelObserveTimer(work)
+    CancelFinalizeTimer(work)
+    if work.pendingStep then
+        -- One immediate observation attempt, then a bounded settle window.
         WR.ObservePending()
-        if WR.work then
-            CommitConfirmed(work)
-            -- StopWork clears only processed craft drafts when movement started;
-            -- do not wipe unrelated unprocessed recipe inputs on bank close.
-            StopWork("bank_closed", true)
+        if WR.work ~= work then return end
+        if work.pendingStep then
+            work.closeFinalizeGen = (tonumber(work.closeFinalizeGen) or 0) + 1
+            local gen = work.closeFinalizeGen
+            local pendingRef = work.pendingStep
+            work.observeTimer = ScheduleOneShot(SETTLE_SECONDS, function()
+                if WR.work ~= work then return end
+                if work.closeFinalizeGen ~= gen then return end
+                if work.pendingStep ~= pendingRef then return end
+                work.observeTimer = nil
+                -- Deadline: still pending → explicitly unresolved (not unfilled).
+                local step = work.pendingStep
+                work.unresolved = {
+                    itemId = step.itemId,
+                    slot = step.slot,
+                    intended = step.count,
+                    actual = 0,
+                    reason = "bank_closed_deadline",
+                }
+                work.pendingStep = nil
+                CommitConfirmed(work)
+                StopWork("bank_closed_unresolved", true)
+            end)
+            return
         end
+    end
+    if WR.work == work then
+        CommitConfirmed(work)
+        StopWork("bank_closed", true)
     end
 end
 
 function WR.OnBagOrBankUpdate()
-    if WR.work then
-        WR.ObservePending()
-    end
+    local work = WR.work
+    if not work or not work.pendingStep then return end
+    -- Coalesce burst updates into one observation pass; cancel prior timer.
+    CancelObserveTimer(work)
+    ScheduleObserve(work, 0)
 end
 
 -- Expose for Runtime integration / tests.

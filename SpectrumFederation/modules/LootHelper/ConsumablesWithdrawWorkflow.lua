@@ -140,6 +140,7 @@ end
 
 --- Interpret confirmed bag gains vs bank losses for one item movement.
 -- API invocation / cursor pickup alone is not success — both sides must move.
+-- Unavailable bank observations (`after == nil`) are not treated as empty slots.
 function W.InterpretWithdrawal(intent)
     intent = intent or {}
     if not intent.guildOk then
@@ -149,19 +150,32 @@ function W.InterpretWithdrawal(intent)
         return 0, "wrong_tab"
     end
     local bankLoss
+    local bankUnavailable = false
     if intent.placedSlots ~= nil then
         bankLoss = 0
         if type(intent.placedSlots) == "table" then
             for i = 1, #intent.placedSlots do
                 local row = intent.placedSlots[i]
                 if type(row) == "table" then
-                    local loss = FloorQty(row.before) - FloorQty(row.after)
-                    if loss > 0 then bankLoss = bankLoss + loss end
+                    if row.after == nil then
+                        bankUnavailable = true
+                    else
+                        local loss = FloorQty(row.before) - FloorQty(row.after)
+                        if loss > 0 then bankLoss = bankLoss + loss end
+                    end
                 end
             end
         end
     else
-        bankLoss = math.max(0, FloorQty(intent.beforeTab) - FloorQty(intent.afterTab))
+        if intent.afterTab == nil then
+            bankUnavailable = true
+            bankLoss = 0
+        else
+            bankLoss = math.max(0, FloorQty(intent.beforeTab) - FloorQty(intent.afterTab))
+        end
+    end
+    if bankUnavailable then
+        return 0, "bank_unavailable"
     end
     local bagGain = math.max(0, FloorQty(intent.afterBags) - FloorQty(intent.beforeBags))
     local actual = math.min(FloorQty(intent.intendedQty), bankLoss, bagGain)
@@ -608,25 +622,39 @@ function W.ResolveTradeDelivery(offered, bagBefore, bagAfterFn, bothAccepted)
     local delivered = {}
     local ambiguous = {}
     local hadOffers = false
+    local function IsTrackedObligation(key)
+        return bagBefore[key] ~= nil or bagBefore[tonumber(key)] ~= nil
+    end
     if not bothAccepted then
-        return delivered, ambiguous, "cancelled", next(offered) ~= nil
+        -- Unrelated manual offers do not create handoff obligations.
+        local relevant = false
+        for k, offQty in pairs(offered) do
+            if FloorQty(offQty) > 0 and IsTrackedObligation(tostring(k)) then
+                relevant = true
+                break
+            end
+        end
+        return delivered, ambiguous, "cancelled", relevant
     end
     for k, offQty in pairs(offered) do
         offQty = FloorQty(offQty)
         if offQty > 0 then
-            hadOffers = true
             local key = tostring(k)
-            local before = FloorQty(bagBefore[key] or bagBefore[tonumber(key)])
-            local after = FloorQty(bagAfterFn(key))
-            local lost = before - after
-            if lost < 0 then lost = 0 end
-            local proven = math.min(offQty, lost)
-            if proven > 0 then
-                delivered[key] = proven
-            end
-            local unverified = offQty - proven
-            if unverified > 0 then
-                ambiguous[key] = unverified
+            -- Limit delivery/ambiguity accounting to tracked pending obligations.
+            if IsTrackedObligation(key) then
+                hadOffers = true
+                local before = FloorQty(bagBefore[key] or bagBefore[tonumber(key)])
+                local after = FloorQty(bagAfterFn(key))
+                local lost = before - after
+                if lost < 0 then lost = 0 end
+                local proven = math.min(offQty, lost)
+                if proven > 0 then
+                    delivered[key] = proven
+                end
+                local unverified = offQty - proven
+                if unverified > 0 then
+                    ambiguous[key] = unverified
+                end
             end
         end
     end
@@ -641,8 +669,9 @@ function W.ResolveTradeDelivery(offered, bagBefore, bagAfterFn, bothAccepted)
     end
     for k, offQty in pairs(offered) do
         offQty = FloorQty(offQty)
-        if offQty > 0 then
-            ambiguous[tostring(k)] = offQty
+        local key = tostring(k)
+        if offQty > 0 and IsTrackedObligation(key) then
+            ambiguous[key] = offQty
         end
     end
     return delivered, ambiguous, "ambiguous", true
