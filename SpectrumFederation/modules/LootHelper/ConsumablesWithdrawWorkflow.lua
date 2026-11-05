@@ -206,6 +206,173 @@ function W.CapacityBlocksPlan(freeCompatibleSlots, requiredNewStacks)
     return need > free
 end
 
+--- True when source stack planning could not satisfy authorized take.
+function W.SourcePlanIncomplete(remainingUnfilled)
+    return FloorQty(remainingUnfilled) > 0
+end
+
+--- @param carriedBags { { bag=number, slots={ {slot, empty?, itemId?, count?, locked?}... } }... }
+-- @param take {[itemKey]=qty}
+-- @param stackLimitForItem fun(itemId:number):number
+-- @return ok, err, plan { destinations, freeCompatibleSlots, requiredNewStacks }
+function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
+    take = type(take) == "table" and take or {}
+    carriedBags = type(carriedBags) == "table" and carriedBags or {}
+    local grid = {}
+    local freeCompatibleSlots = 0
+    for i = 1, #carriedBags do
+        local bagRow = carriedBags[i]
+        local bagId = tonumber(bagRow and bagRow.bag)
+        if bagId ~= nil then
+            local slots = type(bagRow.slots) == "table" and bagRow.slots or {}
+            local copySlots = {}
+            for s = 1, #slots do
+                local row = slots[s]
+                if type(row) == "table" then
+                    if row.empty then
+                        copySlots[s] = { slot = row.slot or s, empty = true }
+                        freeCompatibleSlots = freeCompatibleSlots + 1
+                    else
+                        copySlots[s] = {
+                            slot = row.slot or s,
+                            itemId = tonumber(row.itemId),
+                            count = FloorQty(row.count),
+                            locked = row.locked and true or false,
+                        }
+                    end
+                end
+            end
+            grid[#grid + 1] = { bag = bagId, slots = copySlots }
+        end
+    end
+    table.sort(grid, function(a, b)
+        return (tonumber(a.bag) or 0) < (tonumber(b.bag) or 0)
+    end)
+
+    local keys = {}
+    for k in pairs(take) do
+        keys[#keys + 1] = tostring(k)
+    end
+    table.sort(keys)
+
+    local destinations = {}
+    local requiredNewStacks = 0
+
+    local function findFirstEmpty()
+        for gi = 1, #grid do
+            local bagId = grid[gi].bag
+            local slots = grid[gi].slots
+            for si = 1, #slots do
+                if slots[si].empty then
+                    return gi, si, bagId, slots[si].slot or si
+                end
+            end
+        end
+        return nil
+    end
+
+    for ki = 1, #keys do
+        local key = keys[ki]
+        local itemId = tonumber(key)
+        local qty = FloorQty(take[key] or take[itemId])
+        if itemId and qty > 0 then
+            local maxStack = 1000
+            if type(stackLimitForItem) == "function" then
+                maxStack = FloorQty(stackLimitForItem(itemId))
+                if maxStack < 1 then maxStack = 1 end
+            end
+            local remaining = qty
+            for gi = 1, #grid do
+                if remaining < 1 then break end
+                local bagId = grid[gi].bag
+                local slots = grid[gi].slots
+                for si = 1, #slots do
+                    if remaining < 1 then break end
+                    local slot = slots[si]
+                    if not slot.empty and not slot.locked and slot.itemId == itemId then
+                        local room = maxStack - FloorQty(slot.count)
+                        if room > 0 then
+                            local put = math.min(remaining, room)
+                            destinations[#destinations + 1] = {
+                                itemId = itemId,
+                                bag = bagId,
+                                slot = slot.slot or si,
+                                count = put,
+                                merge = true,
+                            }
+                            slot.count = FloorQty(slot.count) + put
+                            remaining = remaining - put
+                        end
+                    end
+                end
+            end
+            while remaining > 0 do
+                local gi, si, bagId, slotNum = findFirstEmpty()
+                if not gi then
+                    return false, "bag_capacity", {
+                        destinations = destinations,
+                        freeCompatibleSlots = freeCompatibleSlots,
+                        requiredNewStacks = requiredNewStacks,
+                    }
+                end
+                local slot = grid[gi].slots[si]
+                local put = math.min(remaining, maxStack)
+                destinations[#destinations + 1] = {
+                    itemId = itemId,
+                    bag = bagId,
+                    slot = slotNum,
+                    count = put,
+                    merge = false,
+                }
+                slot.empty = nil
+                slot.itemId = itemId
+                slot.count = put
+                slot.locked = false
+                requiredNewStacks = requiredNewStacks + 1
+                remaining = remaining - put
+            end
+        end
+    end
+    return true, nil, {
+        destinations = destinations,
+        freeCompatibleSlots = freeCompatibleSlots,
+        requiredNewStacks = requiredNewStacks,
+    }
+end
+
+--- Consume destination rows for one bank move of `need` units (mutates destRows list).
+-- @return dest { bag, slot, count, merge }|nil
+function W.TakeDestinationForMove(destRows, itemId, need)
+    need = FloorQty(need)
+    itemId = tonumber(itemId)
+    if need < 1 or not itemId or type(destRows) ~= "table" then
+        return nil
+    end
+    for i = 1, #destRows do
+        local row = destRows[i]
+        if type(row) == "table" and tonumber(row.itemId) == itemId then
+            local have = FloorQty(row.count)
+            if have < 1 then
+                table.remove(destRows, i)
+                return W.TakeDestinationForMove(destRows, itemId, need)
+            end
+            if have <= need then
+                table.remove(destRows, i)
+                return row
+            end
+            row.count = have - need
+            return {
+                itemId = itemId,
+                bag = row.bag,
+                slot = row.slot,
+                count = need,
+                merge = row.merge,
+            }
+        end
+    end
+    return nil
+end
+
 --- Oldest-batch-first consumption for trade handoff (#457 D3).
 -- @param batches { {id, expiresAt, amounts={[itemId]=qty}}... } oldest first
 -- @param delivered {[itemId]=qty}
@@ -252,16 +419,193 @@ function W.ConsumeTradeBatches(batches, delivered, now)
                 break
             end
             if any then
-                out[#out + 1] = {
+                local row = {
                     id = batch.id,
                     completedAt = batch.completedAt,
                     expiresAt = batch.expiresAt,
                     amounts = nextAmounts,
                 }
+                if type(batch.ambiguous) == "table" then
+                    local ambCopy = {}
+                    for ak, av in pairs(batch.ambiguous) do
+                        if FloorQty(av) > 0 then
+                            ambCopy[tostring(ak)] = FloorQty(av)
+                        end
+                    end
+                    if next(ambCopy) then
+                        row.ambiguous = ambCopy
+                    end
+                end
+                out[#out + 1] = row
             end
         end
     end
     return out, consumed
+end
+
+-- #457 trade handoff repair: pure delivery / ambiguity decisions (no WoW API).
+--- @return delivered, ambiguousAmounts, outcome ("completed"|"ambiguous"|"cancelled"), hadOffers
+function W.ResolveTradeDelivery(offered, bagBefore, bagAfterFn, bothAccepted)
+    offered = type(offered) == "table" and offered or {}
+    bagBefore = type(bagBefore) == "table" and bagBefore or {}
+    bagAfterFn = type(bagAfterFn) == "function" and bagAfterFn or function() return 0 end
+    local delivered = {}
+    local ambiguous = {}
+    local hadOffers = false
+    if not bothAccepted then
+        return delivered, ambiguous, "cancelled", next(offered) ~= nil
+    end
+    for k, offQty in pairs(offered) do
+        offQty = FloorQty(offQty)
+        if offQty > 0 then
+            hadOffers = true
+            local key = tostring(k)
+            local before = FloorQty(bagBefore[key] or bagBefore[tonumber(key)])
+            local after = FloorQty(bagAfterFn(key))
+            local lost = before - after
+            if lost < 0 then lost = 0 end
+            local proven = math.min(offQty, lost)
+            if proven > 0 then
+                delivered[key] = proven
+            end
+            local unverified = offQty - proven
+            if unverified > 0 then
+                ambiguous[key] = unverified
+            end
+        end
+    end
+    if not hadOffers then
+        return delivered, ambiguous, "cancelled", false
+    end
+    if next(ambiguous) then
+        return delivered, ambiguous, "ambiguous", true
+    end
+    if next(delivered) then
+        return delivered, ambiguous, "completed", true
+    end
+    for k, offQty in pairs(offered) do
+        offQty = FloorQty(offQty)
+        if offQty > 0 then
+            ambiguous[tostring(k)] = offQty
+        end
+    end
+    return delivered, ambiguous, "ambiguous", true
+end
+
+--- Bind unresolved trade quantities to oldest batches (per-batch ambiguous map).
+function W.BindTradeAmbiguity(batches, ambiguousAmounts, now)
+    batches = type(batches) == "table" and batches or {}
+    ambiguousAmounts = type(ambiguousAmounts) == "table" and ambiguousAmounts or {}
+    now = tonumber(now) or 0
+    local need = {}
+    for k, v in pairs(ambiguousAmounts) do
+        local qty = FloorQty(v)
+        if qty > 0 then
+            need[tostring(k)] = qty
+        end
+    end
+    if not next(need) then
+        return batches
+    end
+    local out = {}
+    for i = 1, #batches do
+        local batch = batches[i]
+        if type(batch) ~= "table" then
+            -- skip
+        elseif tonumber(batch.expiresAt) and now >= tonumber(batch.expiresAt) then
+            -- expired batch drops its ambiguity with it
+        else
+            local amounts = type(batch.amounts) == "table" and batch.amounts or {}
+            local amb = {}
+            if type(batch.ambiguous) == "table" then
+                for ak, av in pairs(batch.ambiguous) do
+                    amb[tostring(ak)] = FloorQty(av)
+                end
+            end
+            for key, qty in pairs(amounts) do
+                local k = tostring(key)
+                local bind = need[k] or 0
+                if bind > 0 then
+                    local offerable = FloorQty(qty) - FloorQty(amb[k])
+                    local take = math.min(bind, offerable)
+                    if take > 0 then
+                        amb[k] = (amb[k] or 0) + take
+                        need[k] = bind - take
+                    end
+                end
+            end
+            local row = {
+                id = batch.id,
+                completedAt = batch.completedAt,
+                expiresAt = batch.expiresAt,
+                amounts = amounts,
+            }
+            if next(amb) then
+                row.ambiguous = amb
+            end
+            out[#out + 1] = row
+        end
+    end
+    return out
+end
+
+--- #457 trade handoff repair: plan stack-level trade offers (one slot per placement).
+-- @param stacksByItem {[itemKey]={ {bag, slot, count}, ... }...}
+-- @return moves { {itemKey, qty, bag, slot}, ... }, deferred {[itemKey]=qty}
+function W.PlanTradePrefillMoves(pending, alreadyOffered, stacksByItem, freeSlots, maxSlots)
+    pending = type(pending) == "table" and pending or {}
+    alreadyOffered = type(alreadyOffered) == "table" and alreadyOffered or {}
+    stacksByItem = type(stacksByItem) == "table" and stacksByItem or {}
+    freeSlots = FloorQty(freeSlots)
+    maxSlots = FloorQty(maxSlots)
+    if maxSlots > 0 and freeSlots > maxSlots then
+        freeSlots = maxSlots
+    end
+    local moves = {}
+    local deferred = {}
+    local slotsLeft = freeSlots
+    local keys = {}
+    for k in pairs(pending) do
+        keys[#keys + 1] = tostring(k)
+    end
+    table.sort(keys)
+    for i = 1, #keys do
+        local key = keys[i]
+        local want = FloorQty(pending[key] or pending[tonumber(key)])
+        local offered = FloorQty(alreadyOffered[key] or alreadyOffered[tonumber(key)])
+        local need = math.max(0, want - offered)
+        if need > 0 then
+            local stacks = stacksByItem[key] or stacksByItem[tonumber(key)] or {}
+            local remainingNeed = need
+            for s = 1, #stacks do
+                if remainingNeed < 1 then break end
+                if slotsLeft < 1 then
+                    deferred[key] = (deferred[key] or 0) + remainingNeed
+                    remainingNeed = 0
+                    break
+                end
+                local st = stacks[s]
+                if type(st) == "table" and not st.locked then
+                    local have = FloorQty(st.count)
+                    if have > 0 then
+                        local take = math.min(have, remainingNeed)
+                        moves[#moves + 1] = {
+                            itemKey = key,
+                            qty = take,
+                            bag = st.bag,
+                            slot = st.slot,
+                        }
+                        remainingNeed = remainingNeed - take
+                        slotsLeft = slotsLeft - 1
+                    end
+                end
+            end
+            if remainingNeed > 0 then
+                deferred[key] = (deferred[key] or 0) + remainingNeed
+            end
+        end
+    end
+    return moves, deferred
 end
 
 --- Independent expiry: do not extend older batches when adding a new one.

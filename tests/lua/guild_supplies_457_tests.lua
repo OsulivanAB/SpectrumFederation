@@ -122,6 +122,35 @@ do
     assertEq(W.CapacityBlocksPlan(1, 2), true, "bag capacity blocks")
 end
 
+-- Multi-item bag destination reservation (shared empty-slot pool)
+do
+    local bags = {
+        { bag = 0, slots = {
+            { slot = 1, empty = true },
+            { slot = 2, empty = true },
+        } },
+        { bag = 5, slots = {
+            { slot = 1, itemId = 10, count = 18, locked = false },
+        } },
+    }
+    local ok, err, plan = W.PlanMultiItemBagDestinations(bags, { ["10"] = 5, ["20"] = 20 }, function()
+        return 20
+    end)
+    assertTrue(ok, "multi dest: " .. tostring(err))
+    assertEq(plan.requiredNewStacks, 2, "two empty stacks after merge on item 10")
+    local destRows = {}
+    for i = 1, #plan.destinations do
+        destRows[i] = plan.destinations[i]
+    end
+    assertEq(destRows[1].count, 2, "merge portion for item 10")
+    assertEq(destRows[2].count, 3, "empty slot portion for item 10")
+    local d1 = W.TakeDestinationForMove(destRows, 10, 2)
+    assertTrue(d1 ~= nil and d1.merge, "take merge row")
+    assertEq(d1.count, 2, "merge qty")
+    assertEq(W.SourcePlanIncomplete(1), true, "source incomplete")
+    assertEq(W.SourcePlanIncomplete(0), false, "source complete")
+end
+
 -- Withdrawal interpret / disposition
 do
     local actual = W.InterpretWithdrawal({
@@ -189,6 +218,51 @@ do
     )
     assertEq(toOffer["10"], 6, "offer remaining pending after manual")
     assertTrue(deferred["20"] ~= nil, "second item deferred by slot")
+
+    local moves, def2 = W.PlanTradePrefillMoves(
+        { ["10"] = 15 },
+        {},
+        { ["10"] = {
+            { bag = 0, slot = 2, count = 5 },
+            { bag = 0, slot = 5, count = 20 },
+        } },
+        2,
+        6
+    )
+    assertEq(#moves, 2, "multi-stack same item uses two slots")
+    assertEq(moves[1].qty + moves[2].qty, 15, "exact quantity across stacks")
+    assertEq(def2["10"] or 0, 0, "fully planned stacks")
+
+    local delivered, amb, outcome = W.ResolveTradeDelivery(
+        { ["10"] = 5 },
+        { ["10"] = 10 },
+        function() return 8 end,
+        true
+    )
+    assertEq(outcome, "ambiguous", "partial bag loss is ambiguous")
+    assertEq(delivered["10"], 2, "proven delivery capped to bag loss")
+    assertEq(amb["10"], 3, "unverified portion ambiguous")
+
+    local _, ambOnly, outcome2 = W.ResolveTradeDelivery(
+        { ["10"] = 4 },
+        { ["10"] = 10 },
+        function() return 10 end,
+        true
+    )
+    assertEq(outcome2, "ambiguous", "accepted without bag loss")
+    assertEq(ambOnly["10"], 4, "all offered becomes ambiguous")
+
+    local batches = {
+        { id = "a", completedAt = 1, expiresAt = 5000, amounts = { ["10"] = 5 } },
+        { id = "b", completedAt = 2, expiresAt = 20000, amounts = { ["10"] = 5 } },
+    }
+    local bound = W.BindTradeAmbiguity(batches, { ["10"] = 6 }, 100)
+    assertEq(bound[1].ambiguous["10"], 5, "oldest batch owns ambiguity first")
+    assertEq(bound[2].ambiguous["10"], 1, "remainder on newer batch")
+    local pruned = (W.ConsumeTradeBatches(bound, {}, 10000))
+    assertEq(#pruned, 1, "expired batch ambiguity dropped with batch")
+    assertEq(pruned[1].id, "b", "surviving batch remains")
+    assertEq(pruned[1].ambiguous["10"], 1, "surviving ambiguity intact")
 end
 
 -- Receipt validation / accounting isolation helpers

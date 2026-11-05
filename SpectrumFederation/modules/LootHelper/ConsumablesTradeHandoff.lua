@@ -13,10 +13,10 @@ H.MAX_PENDING_UNITS = 100000
 H.TRADE_SLOTS = 6 -- normal transferable slots; enchanting slot unused
 
 local state = {
-    batches = {}, -- oldest first
-    ambiguous = {}, -- {[itemId]=qty} paused from auto re-offer
+    batches = {}, -- oldest first; optional per-batch ambiguous map
     status = nil, -- player-visible status string key/detail
     statusDetail = nil,
+    context = nil, -- { playerGuid, guildKey }
     tradeLifecycleId = 0,
     prefillAttemptedFor = nil, -- lifecycle id
     prefillActive = false,
@@ -54,6 +54,53 @@ local function FloorQty(n)
     return math.floor(n)
 end
 
+local function CaptureContext()
+    local guid = UnitGUID and UnitGUID("player")
+    local guildKey = nil
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.CurrentContext then
+        local ctx = WR.CurrentContext()
+        if type(ctx) == "table" then
+            guildKey = ctx.guildKey
+        end
+    end
+    if not guildKey then
+        local GS = SF.GuildSupplies
+        local record = GS and GS.GetCurrentRecord and select(1, GS:GetCurrentRecord())
+        if type(record) == "table" then
+            guildKey = record._guildKey
+        end
+    end
+    return {
+        playerGuid = guid,
+        guildKey = guildKey,
+    }
+end
+
+local function ContextMatches()
+    if type(state.context) ~= "table" then
+        return true
+    end
+    local cur = CaptureContext()
+    if state.context.playerGuid and cur.playerGuid
+        and tostring(state.context.playerGuid) ~= tostring(cur.playerGuid) then
+        return false
+    end
+    if state.context.guildKey and cur.guildKey
+        and tostring(state.context.guildKey) ~= tostring(cur.guildKey) then
+        return false
+    end
+    return true
+end
+
+local function EnsureContextOrClear()
+    if not ContextMatches() then
+        H.Reset()
+        return false
+    end
+    return true
+end
+
 local function CountPendingUnits(batches)
     local n = 0
     if type(batches) ~= "table" then return 0 end
@@ -68,11 +115,26 @@ local function CountPendingUnits(batches)
     return n
 end
 
+local function AnyBatchAmbiguous(batches)
+    if type(batches) ~= "table" then return false end
+    for i = 1, #batches do
+        local amb = batches[i] and batches[i].ambiguous
+        if type(amb) == "table" then
+            for _, qty in pairs(amb) do
+                if FloorQty(qty) > 0 then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 function H.Reset()
     state.batches = {}
-    state.ambiguous = {}
     state.status = nil
     state.statusDetail = nil
+    state.context = nil
     state.tradeLifecycleId = 0
     state.prefillAttemptedFor = nil
     state.prefillActive = false
@@ -108,6 +170,7 @@ end
 
 --- Capacity check before starting a withdrawal that will enqueue `units`.
 function H.CanAcceptUnits(units)
+    H.PendingSnapshot()
     units = FloorQty(units)
     if units < 1 then return true end
     if #state.batches >= (H.MAX_BATCHES or 32) then
@@ -123,6 +186,9 @@ end
 function H.EnqueueConfirmed(amounts, meta)
     if type(amounts) ~= "table" then
         return nil, "invalid_amounts"
+    end
+    if not EnsureContextOrClear() then
+        return nil, "context_mismatch"
     end
     local cleaned = {}
     local units = 0
@@ -152,6 +218,7 @@ function H.EnqueueConfirmed(amounts, meta)
         return nil, appendErr or "full"
     end
     state.batches = nextBatches
+    state.context = CaptureContext()
     state.status = "pending"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_PENDING",
         "Pending trade handoff ready. Open a trade to offer withdrawn reagents.")
@@ -163,7 +230,6 @@ end
 
 function H.ClearPending()
     state.batches = {}
-    state.ambiguous = {}
     state.status = "cleared"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_CLEARED",
         "Pending trade handoff cleared. Withdrawal history was not changed.")
@@ -171,16 +237,17 @@ function H.ClearPending()
 end
 
 local function AggregatePending()
-    local totals = H.PendingSnapshot()
-    -- Exclude ambiguous quantities from automatic re-offer.
-    if type(state.ambiguous) == "table" then
-        for k, v in pairs(state.ambiguous) do
+    local _, alive = H.PendingSnapshot()
+    local totals = {}
+    for i = 1, #alive do
+        local b = alive[i]
+        local amounts = type(b.amounts) == "table" and b.amounts or {}
+        local amb = type(b.ambiguous) == "table" and b.ambiguous or {}
+        for k, v in pairs(amounts) do
             local key = tostring(k)
-            local left = FloorQty(totals[key]) - FloorQty(v)
+            local left = FloorQty(v) - FloorQty(amb[key] or amb[tonumber(key)])
             if left > 0 then
-                totals[key] = left
-            else
-                totals[key] = nil
+                totals[key] = (totals[key] or 0) + left
             end
         end
     end
@@ -192,6 +259,17 @@ local function CursorBusy()
     return GetCursorInfo() ~= nil
 end
 
+local function CarriedBagIds()
+    local R = SF.ConsumablesRouting
+    local bags = {}
+    for bag = 0, 5 do
+        if not R or not R.IsCarriedBag or R.IsCarriedBag(bag) then
+            bags[#bags + 1] = bag
+        end
+    end
+    return bags
+end
+
 local function PlayerBagCount(itemId)
     itemId = tonumber(itemId)
     if not itemId or not GetItemCount then return 0 end
@@ -199,10 +277,10 @@ local function PlayerBagCount(itemId)
 end
 
 local function TradeSlotItemId(slot)
+    if slot == 7 then return nil, 0 end
     if not GetTradePlayerItemInfo then return nil, 0 end
     local name, texture, count = GetTradePlayerItemInfo(slot)
     if not name then return nil, 0 end
-    -- Prefer link parse when available.
     local link = GetTradePlayerItemLink and GetTradePlayerItemLink(slot)
     local id = nil
     if type(link) == "string" then
@@ -234,40 +312,68 @@ local function CountFreeTradeSlots()
     return free
 end
 
-local function FindBagItemLocation(itemId, need)
-    -- Prefer containers that can supply `need` without locked items.
-    if not C_Container or not C_Container.GetContainerNumSlots then
-        return nil
-    end
+local function CollectCarriedStacks(itemId)
     itemId = tonumber(itemId)
-    need = FloorQty(need)
-    for bag = 0, NUM_BAG_SLOTS or 4 do
+    if not itemId or not C_Container or not C_Container.GetContainerNumSlots then
+        return {}
+    end
+    local stacks = {}
+    local bags = CarriedBagIds()
+    for bi = 1, #bags do
+        local bag = bags[bi]
         local slots = C_Container.GetContainerNumSlots(bag) or 0
         for slot = 1, slots do
             local info = C_Container.GetContainerItemInfo(bag, slot)
-            if info and tonumber(info.itemID) == itemId and not info.isLocked then
+            if info and tonumber(info.itemID) == itemId then
                 local count = FloorQty(info.stackCount)
                 if count > 0 then
-                    return bag, slot, count
+                    stacks[#stacks + 1] = {
+                        bag = bag,
+                        slot = slot,
+                        count = count,
+                        locked = info.isLocked and true or false,
+                    }
                 end
             end
         end
     end
-    return nil
+    table.sort(stacks, function(a, b)
+        if a.bag ~= b.bag then return a.bag < b.bag end
+        return a.slot < b.slot
+    end)
+    return stacks
 end
 
-local function PlaceOneOffer(itemId, qty)
+local function CollectStacksByItemKeys(totals)
+    local byItem = {}
+    for key in pairs(totals) do
+        byItem[key] = CollectCarriedStacks(tonumber(key))
+    end
+    return byItem
+end
+
+local function PlaceOfferFromStack(bag, slot, qty)
     if CursorBusy() then
         return false, "cursor_busy"
     end
-    local bag, slot, have = FindBagItemLocation(itemId, qty)
-    if not bag then
+    bag = tonumber(bag)
+    slot = tonumber(slot)
+    qty = FloorQty(qty)
+    if not bag or not slot or qty < 1 then
         return false, "not_carried"
     end
-    local take = math.min(FloorQty(qty), FloorQty(have))
-    if take < 1 then
+    if not C_Container or not C_Container.GetContainerItemInfo then
+        return false, "unsupported"
+    end
+    local info = C_Container.GetContainerItemInfo(bag, slot)
+    if not info or info.isLocked then
+        return false, "locked"
+    end
+    local have = FloorQty(info.stackCount)
+    if have < 1 then
         return false, "not_carried"
     end
+    local take = math.min(qty, have)
     if take < have and C_Container.SplitContainerItem then
         C_Container.SplitContainerItem(bag, slot, take)
     elseif C_Container.PickupContainerItem then
@@ -275,7 +381,6 @@ local function PlaceOneOffer(itemId, qty)
     else
         return false, "unsupported"
     end
-    -- Click first free trade slot.
     if not ClickTradeButton then
         ClearCursor()
         return false, "unsupported"
@@ -295,7 +400,22 @@ local function PlaceOneOffer(itemId, qty)
     return false, "no_slot"
 end
 
+local function DepositOrWithdrawBusy()
+    local Runtime = SF.ConsumablesRuntime
+    if Runtime and (Runtime.depositWork or Runtime.depositIntent) then
+        return true
+    end
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.IsBusy and WR.IsBusy() then
+        return true
+    end
+    return false
+end
+
 function H.TryPrefillTrade()
+    if not EnsureContextOrClear() then
+        return
+    end
     local totals = AggregatePending()
     local any = false
     for _ in pairs(totals) do any = true break end
@@ -312,9 +432,7 @@ function H.TryPrefillTrade()
         H.RefreshStatusUI()
         return
     end
-    -- Deposit/withdraw mutual exclusion: if a bank movement owns the cursor path.
-    local Runtime = SF.ConsumablesRuntime
-    if Runtime and (Runtime._depositWork or Runtime._withdrawWork) then
+    if DepositOrWithdrawBusy() then
         state.status = "blocked"
         state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_BUSY",
             "Finish the bank movement before trade offering can continue.")
@@ -324,23 +442,18 @@ function H.TryPrefillTrade()
     state.prefillAttemptedFor = state.tradeLifecycleId
     state.prefillActive = true
     local offered = AlreadyOfferedCounts()
-    local carried = {}
-    for itemKey, qty in pairs(totals) do
-        carried[itemKey] = PlayerBagCount(tonumber(itemKey))
-    end
+    local stacksByItem = CollectStacksByItemKeys(totals)
     local free = CountFreeTradeSlots()
-    local toOffer, deferred = W.PlanTradePrefill(totals, offered, carried, free, H.TRADE_SLOTS)
+    local moves, deferred = W.PlanTradePrefillMoves(totals, offered, stacksByItem, free, H.TRADE_SLOTS)
     local placed = 0
-    local keys = {}
-    for k in pairs(toOffer) do keys[#keys + 1] = k end
-    table.sort(keys)
-    for i = 1, #keys do
-        local key = keys[i]
-        local ok, result = PlaceOneOffer(tonumber(key), toOffer[key])
+    for i = 1, #moves do
+        local mv = moves[i]
+        local ok, result = PlaceOfferFromStack(mv.bag, mv.slot, mv.qty)
         if ok then
             placed = placed + (tonumber(result) or 0)
         else
-            deferred[key] = (deferred[key] or 0) + FloorQty(toOffer[key])
+            local key = tostring(mv.itemKey)
+            deferred[key] = (deferred[key] or 0) + FloorQty(mv.qty)
             if result == "cursor_busy" then
                 break
             end
@@ -364,31 +477,25 @@ function H.TryPrefillTrade()
 end
 
 --- Verify successful trade delivery and consume oldest matching batches.
--- Acceptance flags / TRADE_CLOSED alone are insufficient — require observed
--- outgoing quantities that left the player's bags.
-function H.OnTradeCompleted(deliveredAmounts, ambiguous)
-    if ambiguous then
-        -- Pause automatic re-offer of the affected portion.
-        deliveredAmounts = type(deliveredAmounts) == "table" and deliveredAmounts or {}
-        for k, v in pairs(deliveredAmounts) do
-            local key = tostring(k)
-            state.ambiguous[key] = (state.ambiguous[key] or 0) + FloorQty(v)
-        end
+function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts)
+    deliveredAmounts = type(deliveredAmounts) == "table" and deliveredAmounts or {}
+    ambiguousAmounts = type(ambiguousAmounts) == "table" and ambiguousAmounts or {}
+    local now = Now()
+    if next(deliveredAmounts) then
+        state.batches = (W.ConsumeTradeBatches(state.batches, deliveredAmounts, now))
+    end
+    if next(ambiguousAmounts) then
+        state.batches = W.BindTradeAmbiguity(state.batches, ambiguousAmounts, now)
         state.status = "unresolved"
         state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
             "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
         H.RefreshStatusUI()
         return
     end
-    if type(deliveredAmounts) ~= "table" then
-        return
-    end
-    local nextBatches = W.ConsumeTradeBatches(state.batches, deliveredAmounts, Now())
-    state.batches = nextBatches
     local remaining = AggregatePending()
-    local any = false
-    for _ in pairs(remaining) do any = true break end
-    if any then
+    local anyLeft = false
+    for _ in pairs(remaining) do anyLeft = true break end
+    if anyLeft then
         state.status = "pending"
         state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_REMAINING",
             "Some pending reagents remain for a later trade.")
@@ -401,7 +508,6 @@ function H.OnTradeCompleted(deliveredAmounts, ambiguous)
 end
 
 function H.OnTradeCancelled()
-    -- Retain unexpired quantities; do not consume.
     state.status = "pending"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_CANCELLED",
         "Trade cancelled. Pending reagents remain available until they expire.")
@@ -448,11 +554,8 @@ function H.RefreshStatusUI()
     local totals = select(1, H.PendingSnapshot())
     local any = false
     for _ in pairs(totals) do any = true break end
-    local ambiguousAny = false
-    if type(state.ambiguous) == "table" then
-        for _ in pairs(state.ambiguous) do ambiguousAny = true break end
-    end
-    if not any and not ambiguousAny and state.status ~= "unresolved" then
+    local ambiguousAny = AnyBatchAmbiguous(state.batches)
+    if not any and not ambiguousAny and state.status ~= "unresolved" and state.status ~= "cleared" then
         if state.statusFrame then state.statusFrame:Hide() end
         return
     end
@@ -465,17 +568,31 @@ function H.RefreshStatusUI()
     f:Show()
 end
 
+local function TradeAcceptFlag(v)
+    return tonumber(v) == 1
+end
+
 function H.EnsureListeners()
     if state.listenersAttached then return end
     if not CreateFrame then return end
+    if #state.batches > 0 and not state.context then
+        state.context = CaptureContext()
+    end
     local frame = CreateFrame("Frame", "SpectrumFederationTradeHandoff")
     state.frame = frame
     frame:RegisterEvent("TRADE_SHOW")
     frame:RegisterEvent("TRADE_CLOSED")
     frame:RegisterEvent("TRADE_ACCEPT_UPDATE")
     frame:RegisterEvent("PLAYER_LOGOUT")
-    frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-    local acceptSnapshot = { player = false, target = false, bagBefore = nil }
+    frame:RegisterEvent("PLAYER_GUILD_UPDATE")
+
+    local tradeSession = {
+        bagBefore = nil,
+        offeredSnapshot = nil,
+        playerAccepted = false,
+        targetAccepted = false,
+        closedHandled = false,
+    }
 
     local function SnapshotPendingBags()
         local totals = AggregatePending()
@@ -486,65 +603,81 @@ function H.EnsureListeners()
         return snap
     end
 
+    local function CaptureOfferSnapshot()
+        local snap = AlreadyOfferedCounts()
+        if next(snap) then
+            tradeSession.offeredSnapshot = snap
+        end
+    end
+
     frame:SetScript("OnEvent", function(_, event, ...)
-        if event == "PLAYER_LOGOUT" or event == "PLAYER_ENTERING_WORLD" then
-            -- Reload/logout clears runtime handoff.
-            if event == "PLAYER_LOGOUT" then
-                H.Reset()
-            end
+        if event == "PLAYER_LOGOUT" or event == "PLAYER_GUILD_UPDATE" then
+            H.Reset()
+            return
+        end
+        if not EnsureContextOrClear() then
             return
         end
         if event == "TRADE_SHOW" then
             state.tradeLifecycleId = state.tradeLifecycleId + 1
             state.prefillAttemptedFor = nil
-            acceptSnapshot.player = false
-            acceptSnapshot.target = false
-            acceptSnapshot.bagBefore = SnapshotPendingBags()
-            -- Expiry while trade is open stops further automatic additions.
+            tradeSession.closedHandled = false
+            tradeSession.playerAccepted = false
+            tradeSession.targetAccepted = false
+            tradeSession.offeredSnapshot = nil
+            tradeSession.bagBefore = SnapshotPendingBags()
             local totals = AggregatePending()
-            local any = false
-            for _ in pairs(totals) do any = true break end
-            if any then
+            local anyPending = false
+            for _ in pairs(totals) do anyPending = true break end
+            if anyPending then
                 H.TryPrefillTrade()
+                CaptureOfferSnapshot()
             end
             return
         end
         if event == "TRADE_ACCEPT_UPDATE" then
-            local player, target = GetTradePlayerSelected and GetTradePlayerSelected() or nil, nil
-            -- Retail: GetTradePlayerSelected may not exist; use events' args when present.
             local a1, a2 = ...
-            if a1 ~= nil then acceptSnapshot.player = a1 and true or false end
-            if a2 ~= nil then acceptSnapshot.target = a2 and true or false end
+            if a1 ~= nil then
+                tradeSession.playerAccepted = TradeAcceptFlag(a1)
+            end
+            if a2 ~= nil then
+                tradeSession.targetAccepted = TradeAcceptFlag(a2)
+            end
+            CaptureOfferSnapshot()
             return
         end
         if event == "TRADE_CLOSED" then
-            -- TRADE_CLOSED alone is not success. Compare bag counts for pending items.
-            local before = acceptSnapshot.bagBefore or {}
-            local delivered = {}
-            local anyDelivered = false
-            local ambiguous = false
-            for k, beforeCount in pairs(before) do
-                local afterCount = PlayerBagCount(tonumber(k))
-                local lost = FloorQty(beforeCount) - FloorQty(afterCount)
-                if lost > 0 then
-                    delivered[k] = lost
-                    anyDelivered = true
+            if tradeSession.closedHandled then
+                tradeSession.bagBefore = nil
+                tradeSession.offeredSnapshot = nil
+                return
+            end
+            tradeSession.closedHandled = true
+            local offered = tradeSession.offeredSnapshot
+            if type(offered) ~= "table" or not next(offered) then
+                local live = AlreadyOfferedCounts()
+                if next(live) then
+                    offered = live
                 end
             end
-            -- If both accepted and bags decreased, treat as success.
-            -- If bags decreased without clear accept state, still consume (items left).
-            -- If accept was true for both but bags did not decrease, ambiguous.
-            local bothAccepted = acceptSnapshot.player and acceptSnapshot.target
-            if bothAccepted and not anyDelivered then
-                ambiguous = true
-                -- Pause the amounts that were offered.
-                delivered = AlreadyOfferedCounts()
-            elseif not anyDelivered then
+            offered = type(offered) == "table" and offered or {}
+            local before = tradeSession.bagBefore or {}
+            local bothAccepted = tradeSession.playerAccepted and tradeSession.targetAccepted
+            local delivered, ambiguousAmounts, outcome = W.ResolveTradeDelivery(
+                offered,
+                before,
+                function(key) return PlayerBagCount(tonumber(key)) end,
+                bothAccepted
+            )
+            tradeSession.bagBefore = nil
+            tradeSession.offeredSnapshot = nil
+            tradeSession.playerAccepted = false
+            tradeSession.targetAccepted = false
+            if outcome == "cancelled" then
                 H.OnTradeCancelled()
                 return
             end
-            H.OnTradeCompleted(delivered, ambiguous)
-            acceptSnapshot.bagBefore = nil
+            H.OnTradeCompleted(delivered, ambiguousAmounts)
             return
         end
     end)
@@ -554,3 +687,4 @@ end
 -- Test hooks
 H._state = state
 H._AggregatePending = AggregatePending
+H._TradeAcceptFlag = TradeAcceptFlag
