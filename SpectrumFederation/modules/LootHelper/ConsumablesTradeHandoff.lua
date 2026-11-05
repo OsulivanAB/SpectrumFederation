@@ -23,6 +23,10 @@ local state = {
     listenersAttached = false,
     frame = nil,
     statusFrame = nil,
+    -- Authority for the open trade: bag snapshot + batch ids at TRADE_SHOW.
+    -- Clear/reset/expiry of those obligations nulls this so late close cannot
+    -- consume or pause batches enqueued after Clear.
+    tradeSessionAuthority = nil,
 }
 
 local function Loc(key, default)
@@ -149,6 +153,7 @@ function H.Reset()
     state.tradeLifecycleId = 0
     state.prefillAttemptedFor = nil
     state.prefillActive = false
+    state.tradeSessionAuthority = nil
     H.RefreshStatusUI()
 end
 
@@ -276,10 +281,42 @@ end
 
 function H.ClearPending()
     state.batches = {}
+    -- Drop open-trade settlement authority so a late TRADE_CLOSED cannot apply
+    -- the old bag snapshot to batches enqueued after this Clear. Does not touch
+    -- the player's live trade offer slots.
+    state.tradeSessionAuthority = nil
     state.status = "cleared"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_CLEARED",
         "Pending trade handoff cleared. Withdrawal history was not changed.")
     H.RefreshStatusUI()
+end
+
+local function PartitionBatchesByAuthority(batches, allowedIds)
+    local eligible, protected = {}, {}
+    batches = type(batches) == "table" and batches or {}
+    allowedIds = type(allowedIds) == "table" and allowedIds or nil
+    for i = 1, #batches do
+        local b = batches[i]
+        if type(b) == "table" and allowedIds and allowedIds[b.id] then
+            eligible[#eligible + 1] = b
+        else
+            protected[#protected + 1] = b
+        end
+    end
+    return eligible, protected
+end
+
+local function ConcatBatches(a, b)
+    local out = {}
+    a = type(a) == "table" and a or {}
+    b = type(b) == "table" and b or {}
+    for i = 1, #a do
+        out[#out + 1] = a[i]
+    end
+    for i = 1, #b do
+        out[#out + 1] = b[i]
+    end
+    return out
 end
 
 local function AggregatePending()
@@ -523,24 +560,38 @@ function H.TryPrefillTrade()
 end
 
 --- Verify successful trade delivery and consume oldest matching batches.
-function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts)
+-- opts.obligationIds: when set, only those batch ids (the open trade's original
+-- surviving obligations) may be consumed or marked ambiguous. Newer batches
+-- enqueued after Clear/expiry remain intact.
+function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts, opts)
     deliveredAmounts = type(deliveredAmounts) == "table" and deliveredAmounts or {}
     ambiguousAmounts = type(ambiguousAmounts) == "table" and ambiguousAmounts or {}
+    opts = type(opts) == "table" and opts or {}
     local now = Now()
+    local allowedIds = opts.obligationIds
+    local working = state.batches
+    local protected = nil
+    if type(allowedIds) == "table" then
+        working, protected = PartitionBatchesByAuthority(state.batches, allowedIds)
+    end
     if next(deliveredAmounts) then
-        state.batches = (W.ConsumeTradeBatches(state.batches, deliveredAmounts, now))
+        working = (W.ConsumeTradeBatches(working, deliveredAmounts, now))
     end
     if next(ambiguousAmounts) then
-        -- Only mark unresolved when ambiguity hits a surviving tracked batch.
-        local beforeAmbiguous = AnyBatchAmbiguous(state.batches)
-        state.batches = W.BindTradeAmbiguity(state.batches, ambiguousAmounts, now)
-        if AnyBatchAmbiguous(state.batches) or beforeAmbiguous then
+        -- Derive unresolved status from surviving relevant obligations only.
+        -- Do not sample ambiguity before expiry pruning (beforeAmbiguous), or
+        -- an all-expired set can leave stale unresolved status.
+        working = W.BindTradeAmbiguity(working, ambiguousAmounts, now)
+        state.batches = protected and ConcatBatches(working, protected) or working
+        if AnyBatchAmbiguous(working) then
             state.status = "unresolved"
             state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
                 "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
             H.RefreshStatusUI()
             return
         end
+    else
+        state.batches = protected and ConcatBatches(working, protected) or working
     end
     local remaining = AggregatePending()
     local anyLeft = false
@@ -695,8 +746,21 @@ function H.EnsureListeners()
             tradeSession.targetAccepted = false
             tradeSession.offeredSnapshot = nil
             tradeSession.active = true
-            tradeSession.bagBefore = SnapshotPendingBags()
-            local totals = AggregatePending()
+            local totals, alive = H.PendingSnapshot()
+            local batchIds = {}
+            for i = 1, #alive do
+                local b = alive[i]
+                if type(b) == "table" and b.id ~= nil then
+                    batchIds[b.id] = true
+                end
+            end
+            -- Bind settlement to obligations present at show. ClearPending /
+            -- Reset null this so a later same-item enqueue is not consumed.
+            state.tradeSessionAuthority = {
+                lifecycleId = state.tradeLifecycleId,
+                bagBefore = SnapshotPendingBags(),
+                batchIds = batchIds,
+            }
             local anyPending = false
             for _ in pairs(totals) do anyPending = true break end
             if anyPending then
@@ -718,7 +782,6 @@ function H.EnsureListeners()
         end
         if event == "TRADE_CLOSED" then
             if tradeSession.closedHandled then
-                tradeSession.bagBefore = nil
                 tradeSession.offeredSnapshot = nil
                 return
             end
@@ -736,23 +799,49 @@ function H.EnsureListeners()
             -- Keep explicit {} from an active trade (player cleared all offers).
             -- Do not replace a prior non-empty snapshot with empty live reads after slots clear.
             offered = type(offered) == "table" and offered or {}
-            local before = tradeSession.bagBefore or {}
+            local auth = state.tradeSessionAuthority
+            state.tradeSessionAuthority = nil
             local bothAccepted = tradeSession.playerAccepted and tradeSession.targetAccepted
-            local delivered, ambiguousAmounts, outcome = W.ResolveTradeDelivery(
-                offered,
-                before,
-                function(key) return PlayerBagCount(tonumber(key)) end,
-                bothAccepted
-            )
-            tradeSession.bagBefore = nil
             tradeSession.offeredSnapshot = nil
             tradeSession.playerAccepted = false
             tradeSession.targetAccepted = false
+            -- Clear/reset during the open trade drops authority: do not apply
+            -- old bag evidence to current (possibly newly enqueued) batches.
+            if type(auth) ~= "table" or type(auth.bagBefore) ~= "table" then
+                if bothAccepted then
+                    H.OnTradeCancelled()
+                else
+                    H.OnTradeCancelled()
+                end
+                return
+            end
+            -- Drop authority keys whose original batches expired or were cleared.
+            local survivingIds = {}
+            local _, aliveNow = H.PendingSnapshot()
+            for i = 1, #aliveNow do
+                local b = aliveNow[i]
+                if type(b) == "table" and b.id ~= nil and auth.batchIds and auth.batchIds[b.id] then
+                    survivingIds[b.id] = true
+                end
+            end
+            if not next(survivingIds) then
+                -- All original obligations expired/cleared before settlement.
+                H.OnTradeCancelled()
+                return
+            end
+            local delivered, ambiguousAmounts, outcome = W.ResolveTradeDelivery(
+                offered,
+                auth.bagBefore,
+                function(key) return PlayerBagCount(tonumber(key)) end,
+                bothAccepted
+            )
             if outcome == "cancelled" then
                 H.OnTradeCancelled()
                 return
             end
-            H.OnTradeCompleted(delivered, ambiguousAmounts)
+            H.OnTradeCompleted(delivered, ambiguousAmounts, {
+                obligationIds = survivingIds,
+            })
             return
         end
     end)

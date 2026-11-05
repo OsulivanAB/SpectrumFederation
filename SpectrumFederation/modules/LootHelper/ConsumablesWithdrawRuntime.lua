@@ -735,6 +735,21 @@ local function CancelFinalizeTimer(work)
     work.timer = nil
 end
 
+local function CancelCloseSettleTimer(work)
+    if not work then return end
+    CancelTimerHandle(work.closeSettleTimer)
+    work.closeSettleTimer = nil
+end
+
+--- Cancel every timer this work owns. Each callback clears only its own handle;
+-- terminal paths must cancel all owned handles so a later callback cannot clear
+-- another continuation's ownership.
+local function CancelOwnedWorkTimers(work)
+    CancelObserveTimer(work)
+    CancelFinalizeTimer(work)
+    CancelCloseSettleTimer(work)
+end
+
 --- Prefer cancellable NewTimer; fall back to After (no cancel handle).
 local function ScheduleOneShot(delay, callback)
     delay = tonumber(delay) or 0
@@ -752,6 +767,11 @@ end
 
 local function ScheduleObserve(work, delay)
     if not work then return end
+    -- After bank close, the close-settle deadline owns terminal observation.
+    -- Do not schedule a competing observeTimer that could clear that ownership.
+    if work.bankClosed then
+        return
+    end
     CancelObserveTimer(work)
     delay = tonumber(delay) or OBSERVE_INITIAL
     work.observeGen = (tonumber(work.observeGen) or 0) + 1
@@ -812,8 +832,7 @@ local function StopWork(reason, partial)
     if work.settled then return end
     work.settled = true
     DetachWithdrawWork()
-    CancelObserveTimer(work)
-    CancelFinalizeTimer(work)
+    CancelOwnedWorkTimers(work)
     Debug("Info", "withdraw stop reason=%s confirmed=%s",
         tostring(reason), tostring(work and work.confirmedTotal or 0))
     if work and work.movementStarted then
@@ -1058,13 +1077,18 @@ function WR.BeginWithdraw(selections, opts)
         return false, "allowance", plan
     end
 
-    local visitToken = (GetServerTime and GetServerTime() or time())
-        .. ":" .. tostring(operationId)
-    local playerGuid = UnitGUID and UnitGUID("player") or nil
+    -- Bind status to the active bank visit token from Runtime. Do not invent a
+    -- parallel operation-only token that survives into a later visit.
     local RuntimeHost = Host()
-    if RuntimeHost then
-        RuntimeHost._quickWithdrawVisitToken = visitToken
+    local visitToken = RuntimeHost and RuntimeHost._quickWithdrawVisitToken
+    if type(visitToken) ~= "string" or visitToken == "" then
+        visitToken = (GetServerTime and GetServerTime() or time())
+            .. ":" .. tostring(operationId)
+        if RuntimeHost then
+            RuntimeHost._quickWithdrawVisitToken = visitToken
+        end
     end
+    local playerGuid = UnitGUID and UnitGUID("player") or nil
     AttachWithdrawWork({
         operationId = operationId,
         visitToken = visitToken,
@@ -1303,7 +1327,7 @@ function WR.ObservePending()
     -- the settle deadline, then report the pending movement unresolved.
     if interpWhy == "bank_unavailable" then
         if fromTimer or work.bankClosed then
-            CancelObserveTimer(work)
+            CancelOwnedWorkTimers(work)
             work.unresolved = {
                 itemId = step.itemId,
                 slot = step.slot,
@@ -1324,7 +1348,7 @@ function WR.ObservePending()
     local uncertain = fromTimer and actual < FloorQty(step.count)
     local disposition = Workflow.WithdrawalDisposition(actual, step.count, fromTimer, uncertain)
     if disposition == "commit" and actual >= FloorQty(step.count) then
-        CancelObserveTimer(work)
+        CancelOwnedWorkTimers(work)
         local key = tostring(step.itemId)
         work.confirmed[key] = (work.confirmed[key] or 0) + actual
         work.confirmedTotal = (work.confirmedTotal or 0) + actual
@@ -1340,7 +1364,7 @@ function WR.ObservePending()
         return
     end
     if disposition == "unresolved" or (fromTimer and actual <= 0) then
-        CancelObserveTimer(work)
+        CancelOwnedWorkTimers(work)
         work.unresolved = {
             itemId = step.itemId,
             slot = step.slot,
@@ -1353,7 +1377,7 @@ function WR.ObservePending()
         return
     end
     if disposition == "drop" and fromTimer then
-        CancelObserveTimer(work)
+        CancelOwnedWorkTimers(work)
         work.unresolved = {
             itemId = step.itemId,
             slot = step.slot,
@@ -1415,8 +1439,10 @@ function WR.OnBankClosed()
     local work = WR.work
     if not work then return end
     work.bankClosed = true
+    -- Cancel observation/finalize before the close deadline owns its own handle.
     CancelObserveTimer(work)
     CancelFinalizeTimer(work)
+    CancelCloseSettleTimer(work)
     if work.pendingStep then
         -- One immediate observation attempt, then a bounded settle window.
         WR.ObservePending()
@@ -1425,11 +1451,13 @@ function WR.OnBankClosed()
             work.closeFinalizeGen = (tonumber(work.closeFinalizeGen) or 0) + 1
             local gen = work.closeFinalizeGen
             local pendingRef = work.pendingStep
-            work.observeTimer = ScheduleOneShot(SETTLE_SECONDS, function()
+            -- Distinct closeSettleTimer so ObservePending / bag updates cannot
+            -- CancelObserveTimer the deadline ownership away.
+            work.closeSettleTimer = ScheduleOneShot(SETTLE_SECONDS, function()
                 if WR.work ~= work then return end
                 if work.closeFinalizeGen ~= gen then return end
                 if work.pendingStep ~= pendingRef then return end
-                work.observeTimer = nil
+                work.closeSettleTimer = nil
                 -- Deadline: still pending → explicitly unresolved (not unfilled).
                 local step = work.pendingStep
                 work.unresolved = {
@@ -1455,6 +1483,11 @@ end
 function WR.OnBagOrBankUpdate()
     local work = WR.work
     if not work or not work.pendingStep then return end
+    if work.bankClosed then
+        -- Observe once under the close deadline; do not schedule a competing timer.
+        WR.ObservePending()
+        return
+    end
     -- Coalesce burst updates into one observation pass; cancel prior timer.
     CancelObserveTimer(work)
     ScheduleObserve(work, 0)

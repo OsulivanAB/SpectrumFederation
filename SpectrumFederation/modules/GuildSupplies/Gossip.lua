@@ -2643,6 +2643,42 @@ local function GetRecordBody(recordId)
     return { id = r.id, versionFp = r.versionFp, body = r.body }
 end
 
+--- Ordinary archive ingress equality (inline shortcut + final paged assembly).
+-- Normalizes only supported legacy representation differences (nil vs {} recipes)
+-- without mutating saved archives. Unlike adoption ArchiveCoreEqual, this path
+-- still compares bankTab and eligibility — authoritative ordinary-ingress fields.
+local function OrdinaryArchiveEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    if not GS._DeepEqualOps then
+        return false
+    end
+    local aNorm = {
+        schemaVersion = a.schemaVersion,
+        campaignId = a.campaignId,
+        datasetId = a.datasetId,
+        requestedItems = a.requestedItems,
+        recipes = type(a.recipes) == "table" and a.recipes or {},
+        generation = a.generation,
+        archivedAt = a.archivedAt,
+        bankTab = a.bankTab,
+        eligibility = a.eligibility,
+    }
+    local bNorm = {
+        schemaVersion = b.schemaVersion,
+        campaignId = b.campaignId,
+        datasetId = b.datasetId,
+        requestedItems = b.requestedItems,
+        recipes = type(b.recipes) == "table" and b.recipes or {},
+        generation = b.generation,
+        archivedAt = b.archivedAt,
+        bankTab = b.bankTab,
+        eligibility = b.eligibility,
+    }
+    return GS._DeepEqualOps(aNorm, bNorm)
+end
+
 local function ValidateAndApply(record, ctx)
     ctx = ctx or {}
     if type(record) ~= "table" or record.id == nil or type(record.body) ~= "table" then
@@ -2809,26 +2845,18 @@ local function ValidateAndApply(record, ctx)
         if localRecord.campaignArchives[body.campaignId] and body.kind == "campaign-archive"
             and type(body.requestedItems) == "table" then
             local existing = localRecord.campaignArchives[body.campaignId]
-            -- Normalize missing recipes to {} so pre-#457 archives equal upgraded peers.
-            local existingNorm = {
-                schemaVersion = existing.schemaVersion,
-                campaignId = existing.campaignId,
-                datasetId = existing.datasetId,
-                requestedItems = existing.requestedItems,
-                recipes = type(existing.recipes) == "table" and existing.recipes or {},
-                generation = existing.generation,
-                archivedAt = existing.archivedAt,
-            }
             local inline = {
                 schemaVersion = body.schemaVersion or GS.SCHEMA_VERSION,
                 campaignId = body.campaignId,
                 datasetId = body.datasetId,
                 requestedItems = body.requestedItems,
-                recipes = type(body.recipes) == "table" and body.recipes or {},
+                recipes = body.recipes,
                 generation = body.generation,
                 archivedAt = body.archivedAt,
+                bankTab = body.bankTab,
+                eligibility = body.eligibility,
             }
-            if GS._DeepEqualOps and GS._DeepEqualOps(existingNorm, inline) then
+            if OrdinaryArchiveEqual(existing, inline) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end
@@ -3105,36 +3133,8 @@ local function ValidateAndApply(record, ctx)
         local existing = localRecord.campaignArchives[body.campaignId]
         if existing then
             -- Normalize absent vs empty recipes for compare only (do not mutate
-            -- the saved archive). Matches inline shortcut + ArchiveCoreEqual.
-            local function archiveEq(a, b)
-                if type(a) ~= "table" or type(b) ~= "table" then
-                    return false
-                end
-                local aNorm = {
-                    schemaVersion = a.schemaVersion,
-                    campaignId = a.campaignId,
-                    datasetId = a.datasetId,
-                    requestedItems = a.requestedItems,
-                    recipes = type(a.recipes) == "table" and a.recipes or {},
-                    generation = a.generation,
-                    archivedAt = a.archivedAt,
-                    bankTab = a.bankTab,
-                    eligibility = a.eligibility,
-                }
-                local bNorm = {
-                    schemaVersion = b.schemaVersion,
-                    campaignId = b.campaignId,
-                    datasetId = b.datasetId,
-                    requestedItems = b.requestedItems,
-                    recipes = type(b.recipes) == "table" and b.recipes or {},
-                    generation = b.generation,
-                    archivedAt = b.archivedAt,
-                    bankTab = b.bankTab,
-                    eligibility = b.eligibility,
-                }
-                return GS._DeepEqualOps and GS._DeepEqualOps(aNorm, bNorm)
-            end
-            if archiveEq(existing, archive) then
+            -- the saved archive). Same OrdinaryArchiveEqual as the inline shortcut.
+            if OrdinaryArchiveEqual(existing, archive) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end
@@ -4867,6 +4867,11 @@ function GS.NotifyLocalDurableChange(reason)
         GS.NotifyUI(reason)
     end
 end
+
+-- Test seams for exporter → provider archive regressions (#457).
+GS._BuildArchiveExportBodiesForTest = BuildArchiveExportBodies
+GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
+GS._ValidateAndApplyForTest = ValidateAndApply
 
 -- Hook Initialize to register the provider after the durable root is ready.
 local _previousInitialize = GS.Initialize

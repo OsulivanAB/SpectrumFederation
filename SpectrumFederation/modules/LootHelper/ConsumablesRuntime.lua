@@ -1827,8 +1827,10 @@ function Runtime:SetQuickWithdrawStatus(text, opts)
     -- from an earlier bank visit must not overwrite a newer visit's feedback.
     local token = opts.visitToken
     if token ~= nil then
-        if self._quickWithdrawVisitToken ~= nil
-            and tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
+        -- Require an active matching visit token. Nil current token means the
+        -- visit ended (or never started); reject stale writes.
+        if self._quickWithdrawVisitToken == nil
+            or tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
             return
         end
         self._quickWithdrawStatusVisitToken = token
@@ -2687,8 +2689,17 @@ function Runtime:OnBankOpened()
     self.bankOpen = true
     if first then
         self.autoReviewedThisOpen = false
-        -- Fresh visit: do not reuse prior manual quantity overrides.
+        -- Fresh visit: do not reuse prior manual quantity overrides or prior
+        -- visit status. Rotate the visit token so a late settle from the prior
+        -- visit cannot overwrite this visit's feedback.
         self.qtyOverrides = {}
+        self._quickWithdrawVisitSeq = (tonumber(self._quickWithdrawVisitSeq) or 0) + 1
+        self._quickWithdrawVisitToken = "visit:" .. tostring(self._quickWithdrawVisitSeq)
+        self._quickWithdrawStatus = nil
+        self._quickWithdrawStatusVisitToken = nil
+        if self.review and self.review.Status then
+            self.review.Status:SetText("")
+        end
         -- Banner-initiated tab selection must run before SyncReviewWithGuildBank
         -- so BankAccess can see the configured tab as usable when appropriate.
         self:ConsumeBannerBankNavigation()
@@ -2719,16 +2730,10 @@ function Runtime:OnBankClosed()
         WR.OnBankClosed()
     end
     self.bankOpen = false
-    -- Bank-close is the visit boundary for local quantity overrides and status.
-    -- Tab switches alone must not clear them. Clear visit-scoped status so a
-    -- later open does not inherit prior settlement text; in-flight settle
-    -- callbacks still match via visitToken.
+    -- Quantity overrides end with the visit. Keep the visit token while closed
+    -- so a settle-while-closed callback can still publish originating-operation
+    -- status; the next OnBankOpened rotates the token and clears status.
     self.qtyOverrides = {}
-    if not (WR and WR.IsBusy and WR.IsBusy()) then
-        self._quickWithdrawStatus = nil
-        self._quickWithdrawVisitToken = nil
-        self._quickWithdrawStatusVisitToken = nil
-    end
     self:HideReviewForBankLifecycle()
     self:RefreshReminder()
 end

@@ -1725,10 +1725,10 @@ do
 end
 
 ---------------------------------------------------------------------------
--- A–F production-path regressions (repair batch after 318e8884)
+-- A–G production-path regressions (repair batch after b238e1d7)
 ---------------------------------------------------------------------------
 
--- A: receipt ID namespace, finite timestamps, provenance exclusion
+-- A: receipt ID namespace, finite timestamps, provenance exclusion + real adjustment
 do
     if not GS.AdmitWithdrawalEvent then
         loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
@@ -1742,7 +1742,14 @@ do
             campaignArchives = {},
             accounting = {
                 _mutationSeq = 0,
-                _consumables = { generation = 1, eventSeq = 0, bankTab = 1 },
+                _consumables = {
+                    generation = 1,
+                    eventSeq = 0,
+                    bankTab = 1,
+                    requestedItems = {
+                        ["10"] = { itemId = 10, goal = 5 },
+                    },
+                },
                 _consumableEvents = {},
                 _consumableEventArchive = {},
             },
@@ -1769,7 +1776,6 @@ do
         if overrides then for k, v in pairs(overrides) do e[k] = v end end
         return e
     end
-    -- Reject non-gsw1: IDs so receipts cannot occupy editor adjustment ops.
     local stBad = select(1, GS.AdmitWithdrawalEvent(makeRec(), wd({
         id = "gs1:Player-1-ISO:nonce:9",
     }), { senderGuid = "Player-1-ISO", memberAuthenticated = true }))
@@ -1786,7 +1792,6 @@ do
         senderGuid = "Player-1-ISO", memberAuthenticated = true,
     }))
     assertEq(stOk, "accepted", "A: valid gsw1 receipt admitted")
-    -- Receipt-only provenance must not bind donor identity via ledger history.
     if GS.ResolveDonorIdentity then
         local savedReady = GS.WitnessRelationshipsReady
         local savedResolve = GS.ResolveUniqueCharacterGuid
@@ -1795,7 +1800,6 @@ do
         local name, guid = GS.ResolveDonorIdentity(record, "Alice-Realm", "Player-1-ISO")
         assertEq(name, "Alice-Realm", "A: donor name preserved")
         assertEq(guid, nil, "A: receipt-only history does not bind GUID")
-        -- Archived receipt equally excluded.
         record.accounting._consumableEventArchive = {
             record.accounting._consumableEvents[1],
         }
@@ -1805,22 +1809,41 @@ do
         GS.WitnessRelationshipsReady = savedReady
         GS.ResolveUniqueCharacterGuid = savedResolve
     end
-    -- Authorized adjustment after receipt must not conflict on a gsw1 id.
-    if GS.ApplyAdjustmentMutation then
-        local adjOk, adjWhy = GS.ApplyAdjustmentMutation(record, {
-            id = "gs1:Player-1-ISO:nonce:1",
-            type = "CONSUMABLE_ADJUSTMENT",
-            itemId = 10,
-            quantity = 1,
-            generation = 1,
-            timestamp = 1001,
-            actor = "Alice-Realm",
-            actorGuid = "Player-1-ISO",
-            writer = "Player-1-ISO",
-        }, { localWrite = true })
-        assertTrue(adjOk == true or adjWhy ~= "id_conflict",
-            "A: adjustment after receipt is not id_conflict: " .. tostring(adjWhy))
+
+    -- Forged ordinary-event id on the adjustment boundary must be rejected as a
+    -- withdrawal; the legitimate adjustment on that same id must then succeed.
+    local adjRecord = makeRec()
+    local forgedId = "gs1:Player-1-ISO:nonce:1"
+    local stForged = select(1, GS.AdmitWithdrawalEvent(adjRecord, wd({
+        id = forgedId,
+    }), { senderGuid = "Player-1-ISO", memberAuthenticated = true }))
+    assertEq(stForged, "rejected", "A: forged gs1 withdrawal at adjustment boundary rejected")
+    assertEq(#adjRecord.accounting._consumableEvents, 0, "A: forged receipt not stored")
+    assertTrue(GS.ApplyAdjustmentMutation ~= nil, "A: ApplyAdjustmentMutation present")
+    local adjOk, adjWhy = GS.ApplyAdjustmentMutation(adjRecord, {
+        id = forgedId,
+        kind = GS.KIND.ADJUST_QUANTITY,
+        target = { itemId = 10 },
+        value = { itemId = 10, quantity = 1 },
+        timestamp = 1001,
+        actorName = "Alice-Realm",
+        actorGuid = "Player-1-ISO",
+    }, { localWrite = true })
+    assertEq(adjOk, true, "A: legitimate adjustment accepted after forged reject: " .. tostring(adjWhy))
+    assertEq(adjWhy, "accepted", "A: adjustment reason accepted not permissive other")
+    local quarantined = adjRecord.accounting._consumables
+        and adjRecord.accounting._consumables._conflicts
+    assertTrue(quarantined == nil or next(quarantined) == nil,
+        "A: no quarantine after successful adjustment")
+    local sawAdj = false
+    for i = 1, #adjRecord.accounting._consumableEvents do
+        local e = adjRecord.accounting._consumableEvents[i]
+        if e and e.id == forgedId and (e.type == GS.LEDGER_EVENT.ADJUSTMENT
+            or e.type == "CONSUMABLE_ADJUSTMENT") then
+            sawAdj = true
+        end
     end
+    assertTrue(sawAdj, "A: adjustment event stored on shared id boundary")
 end
 
 -- B: independent archive retention (donation overflow must not evict receipts)
@@ -1839,26 +1862,6 @@ do
             _consumableEventArchive = {},
         },
     }
-    local arch = record.accounting._consumableEventArchive
-    -- 10 donations + 2 withdrawals (wd under cap): donation overflow must keep both wd.
-    for i = 1, 10 do
-        arch[#arch + 1] = {
-            type = "CONSUMABLE_DONATION", id = "don:" .. i, itemId = 1, quantity = 1,
-            generation = 1, timestamp = i, txnId = "txn:don:" .. i,
-        }
-    end
-    for i = 1, 2 do
-        arch[#arch + 1] = {
-            type = "withdrawal", id = "gsw1:trim:wd:" .. i, itemId = 10, quantity = 1,
-            generation = 1, timestamp = 100 + i,
-        }
-    end
-    assertTrue(GS.ShelvePriorGenerationsOnRecord(record) or true, "B: shelve/trim callable")
-    -- Force trim via Shelve if archive already over — call Trim through shelve path
-    -- by bumping generation with prior-gen live empties.
-    record.accounting._consumables.generation = 2
-    GS.ShelvePriorGenerationsOnRecord(record)
-    -- Directly invoke trim by exceeding caps again if shelve no-op with empty live.
     local function countKinds(list)
         local d, w = 0, 0
         for i = 1, #list do
@@ -1866,8 +1869,7 @@ do
         end
         return d, w
     end
-    -- Re-seed and call internal trim by overflowing then shelving.
-    arch = {}
+    local arch = {}
     record.accounting._consumableEventArchive = arch
     for i = 1, 10 do
         arch[#arch + 1] = {
@@ -1881,19 +1883,15 @@ do
             generation = 1, timestamp = 200 + i,
         }
     end
-    -- Push prior-gen live rows to trigger shelve→trim.
-    for i = 1, 1 do
-        record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
-            type = "CONSUMABLE_DONATION", id = "live:old:" .. i, itemId = 1, quantity = 1,
-            generation = 1, timestamp = 1, txnId = "txn:live:" .. i,
-        }
-    end
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        type = "CONSUMABLE_DONATION", id = "live:old:1", itemId = 1, quantity = 1,
+        generation = 1, timestamp = 1, txnId = "txn:live:1",
+    }
     GS.ShelvePriorGenerationsOnRecord(record)
     local d, w = countKinds(record.accounting._consumableEventArchive)
     assertTrue(d <= maxDon, "B: donations capped got=" .. tostring(d))
     assertEq(w, 2, "B: donation overflow preserved below-cap receipts got=" .. tostring(w))
 
-    -- Withdrawal-only overflow.
     arch = {}
     record.accounting._consumableEventArchive = arch
     record.accounting._consumableEvents = {}
@@ -1916,7 +1914,274 @@ do
     GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = savedWd
 end
 
--- E: trade handoff identity + unrelated offer isolation
+-- C: ordinary archive exporter → provider (13-item page boundary + field compare)
+do
+    if not GS.AdmitWithdrawalEvent then
+        loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+    end
+    SF.GuildGossip = SF.GuildGossip or {}
+    local providers = {}
+    SF.GuildGossip.RegisterProvider = function(spec)
+        providers[spec.id] = { api = spec, id = spec.id }
+        return true
+    end
+    SF.GuildGossip.GetProvider = function(id) return providers[id] end
+    SF.GuildGossip.Init = function() end
+    SF.GuildGossip.SetProviderEnabled = function() end
+    SF.GuildGossip.GetGuildIdentity = function()
+        return { guildKey = "club:arch" }
+    end
+    SF.GuildGossip.GetGuildMember = function(name)
+        return {
+            name = name,
+            guid = "Player-1-Arch",
+            rankOrder = 1,
+            guildKey = "club:arch",
+        }
+    end
+    loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
+    assertTrue(type(GS._BuildArchiveExportBodiesForTest) == "function",
+        "C: real archive exporter seam")
+    assertTrue(type(GS._ValidateAndApplyForTest) == "function",
+        "C: real ValidateAndApply seam")
+    assertTrue(type(GS._OrdinaryArchiveEqualForTest) == "function",
+        "C: ordinary archive equal seam")
+
+    local function makeItems(n)
+        local items = {}
+        for i = 1, n do
+            items[tostring(i)] = { itemId = i, goal = 1 }
+        end
+        return items
+    end
+    local campId = "camp-arch-c"
+    local archive = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = campId,
+        datasetId = "gs1:arch",
+        requestedItems = makeItems(13),
+        recipes = {},
+        generation = 2,
+        archivedAt = 5000,
+        bankTab = 3,
+        eligibility = {
+            baselineEstablished = true,
+            baselineAt = 100,
+            tabEligibleFrom = 200,
+            items = { ["1"] = 10, ["2"] = 20 },
+        },
+    }
+    local parts = GS._BuildArchiveExportBodiesForTest(campId, archive, {
+        datasetId = "gs1:arch",
+    })
+    assertTrue(#parts >= 2, "C: 13 items cross page boundary parts=" .. tostring(#parts))
+    local metaBody, pageBodies = nil, {}
+    for i = 1, #parts do
+        local b = parts[i].body
+        if b.kind == "campaign-archive" then
+            metaBody = b
+        elseif b.kind == "campaign-archive-page" then
+            pageBodies[#pageBodies + 1] = b
+        end
+    end
+    assertTrue(metaBody ~= nil, "C: meta body exported")
+    assertTrue(#pageBodies >= 1, "C: at least one item page")
+    assertTrue(type(metaBody.requestedItems) ~= "table" or next(metaBody.requestedItems) == nil,
+        "C: paged meta does not inline all requested items")
+
+    local function freshRecord(existingArchive)
+        return {
+            datasetId = "gs1:arch",
+            _guildKey = "club:arch",
+            activation = "staged",
+            currentCampaignId = "camp-live",
+            campaigns = {
+                [campId] = { id = campId },
+                ["camp-live"] = { id = "camp-live" },
+            },
+            campaignArchives = existingArchive and { [campId] = existingArchive } or {},
+            accounting = {
+                _consumables = { generation = 3, bankTab = 1, requestedItems = {} },
+            },
+            permission = { editorRankPosition = 1 },
+        }
+    end
+    local function installRecord(rec)
+        GS.IsRootReady = function() return true end
+        GS.IsSupportedActivation = function() return true end
+        GS.GetCurrentContext = function()
+            return { guildKey = "club:arch", ready = true, actorGuid = "Player-1-Arch" }
+        end
+        GS._root = { guilds = { ["club:arch"] = rec } }
+        GS.SenderHasEditorAuthority = function() return true end
+        GS.AuthenticateTransportSender = function(sender)
+            return {
+                name = sender,
+                guid = "Player-1-Arch",
+                rankOrder = 1,
+                guildKey = "club:arch",
+            }
+        end
+    end
+    local function applyBody(body, sender)
+        return GS._ValidateAndApplyForTest({
+            id = "gs:ca-test:" .. tostring(body.kind) .. ":" .. tostring(body.page or "meta"),
+            versionFp = "fp",
+            body = body,
+        }, { sender = sender or "Alice-Arch" })
+    end
+    local function deliverParts(orderMetaFirst)
+        local ordered = {}
+        if orderMetaFirst then
+            ordered[#ordered + 1] = metaBody
+            for i = 1, #pageBodies do ordered[#ordered + 1] = pageBodies[i] end
+        else
+            for i = 1, #pageBodies do ordered[#ordered + 1] = pageBodies[i] end
+            ordered[#ordered + 1] = metaBody
+        end
+        local lastSt, lastWhy
+        for i = 1, #ordered do
+            lastSt, lastWhy = applyBody(ordered[i])
+        end
+        return lastSt, lastWhy
+    end
+
+    -- Metadata-first assembly admits a fresh archive.
+    local rec1 = freshRecord(nil)
+    installRecord(rec1)
+    local st1, why1 = deliverParts(true)
+    assertEq(st1, "accepted", "C: metadata-first admit: " .. tostring(why1))
+    assertTrue(rec1.campaignArchives[campId] ~= nil, "C: archive stored metadata-first")
+    assertEq(rec1.campaignArchives[campId].bankTab, 3, "C: bankTab preserved")
+    assertEq(rec1.campaignArchives[campId].generation, 2, "C: generation preserved")
+
+    -- Page-first assembly admits.
+    local rec2 = freshRecord(nil)
+    installRecord(rec2)
+    local st2, why2 = deliverParts(false)
+    assertEq(st2, "accepted", "C: page-first admit: " .. tostring(why2))
+    assertTrue(rec2.campaignArchives[campId] ~= nil, "C: archive stored page-first")
+
+    -- Legacy nil recipes equals {} peer (inline duplicate path).
+    local legacy = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = campId,
+        datasetId = "gs1:arch",
+        requestedItems = makeItems(5),
+        -- recipes intentionally absent (nil)
+        generation = 2,
+        archivedAt = 5000,
+        bankTab = 3,
+        eligibility = archive.eligibility,
+    }
+    local inlineParts = GS._BuildArchiveExportBodiesForTest(campId, {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = campId,
+        datasetId = "gs1:arch",
+        requestedItems = makeItems(5),
+        recipes = {},
+        generation = 2,
+        archivedAt = 5000,
+        bankTab = 3,
+        eligibility = archive.eligibility,
+    }, { datasetId = "gs1:arch" })
+    assertEq(#inlineParts, 1, "C: 5 items inline as single body")
+    local recLegacy = freshRecord(legacy)
+    installRecord(recLegacy)
+    local stDup, whyDup = applyBody(inlineParts[1].body)
+    assertEq(stDup, "duplicate", "C: legacy nil recipes vs {} is duplicate: " .. tostring(whyDup))
+    assertTrue(recLegacy.campaignArchives[campId].recipes == nil,
+        "C: compare must not mutate saved nil recipes")
+
+    -- Changed authoritative fields must not be accepted as duplicates.
+    local function conflictCase(label, mutate)
+        local base = {
+            schemaVersion = GS.SCHEMA_VERSION,
+            campaignId = campId,
+            datasetId = "gs1:arch",
+            requestedItems = makeItems(5),
+            recipes = {},
+            generation = 2,
+            archivedAt = 5000,
+            bankTab = 3,
+            eligibility = {
+                baselineEstablished = true,
+                baselineAt = 100,
+                tabEligibleFrom = 200,
+                items = { ["1"] = 10 },
+            },
+        }
+        local changed = {}
+        for k, v in pairs(base) do changed[k] = v end
+        mutate(changed)
+        local bodies = GS._BuildArchiveExportBodiesForTest(campId, changed, { datasetId = "gs1:arch" })
+        local rec = freshRecord(base)
+        local savedGen = rec.campaignArchives[campId].generation
+        local savedTab = rec.campaignArchives[campId].bankTab
+        installRecord(rec)
+        local st, why = applyBody(bodies[1].body)
+        assertEq(st, "rejected", "C: " .. label .. " rejected not duplicate: " .. tostring(why))
+        assertEq(why, "id_conflict", "C: " .. label .. " id_conflict")
+        assertEq(rec.campaignArchives[campId].generation, savedGen,
+            "C: " .. label .. " preserves saved generation")
+        assertEq(rec.campaignArchives[campId].bankTab, savedTab,
+            "C: " .. label .. " preserves saved bankTab")
+    end
+    conflictCase("recipes", function(a)
+        a.recipes = { ["100"] = { itemId = 100, reagents = { ["1"] = 1 } } }
+    end)
+    conflictCase("bankTab", function(a) a.bankTab = 9 end)
+    conflictCase("eligibility", function(a)
+        a.eligibility = {
+            baselineEstablished = true,
+            baselineAt = 100,
+            tabEligibleFrom = 200,
+            items = { ["1"] = 99 },
+        }
+    end)
+    conflictCase("generation", function(a) a.generation = 9 end)
+    conflictCase("requestedItems", function(a)
+        a.requestedItems = makeItems(4)
+    end)
+    do
+        local base = {
+            schemaVersion = GS.SCHEMA_VERSION,
+            campaignId = campId,
+            datasetId = "gs1:arch",
+            requestedItems = makeItems(5),
+            recipes = {},
+            generation = 2,
+            archivedAt = 5000,
+            bankTab = 3,
+            eligibility = archive.eligibility,
+        }
+        local changed = {}
+        for k, v in pairs(base) do changed[k] = v end
+        changed.datasetId = "gs1:other"
+        local bodies = GS._BuildArchiveExportBodiesForTest(campId, changed, { datasetId = "gs1:other" })
+        local rec = freshRecord(base)
+        installRecord(rec)
+        local st, why = applyBody(bodies[1].body)
+        assertTrue(st == "rejected", "C: dataset change rejected")
+        assertTrue(why == "dataset_mismatch" or why == "id_conflict",
+            "C: dataset not treated as duplicate: " .. tostring(why))
+        assertEq(rec.campaignArchives[campId].datasetId, "gs1:arch",
+            "C: dataset rejection preserves saved archive")
+    end
+
+    -- Ordinary equal must include bankTab (unlike adoption ArchiveCoreEqual).
+    assertFalse(GS._OrdinaryArchiveEqualForTest({
+        schemaVersion = 1, campaignId = "c", datasetId = "d",
+        requestedItems = {}, recipes = {}, generation = 1, archivedAt = 1,
+        bankTab = 1, eligibility = { baselineEstablished = true },
+    }, {
+        schemaVersion = 1, campaignId = "c", datasetId = "d",
+        requestedItems = {}, recipes = {}, generation = 1, archivedAt = 1,
+        bankTab = 2, eligibility = { baselineEstablished = true },
+    }), "C: OrdinaryArchiveEqual distinguishes bankTab")
+end
+
+-- E: trade handoff identity + production OnEvent obligation lifetime
 do
     if not SF.ConsumablesTradeHandoff or not SF.ConsumablesTradeHandoff.EnqueueConfirmed then
         loadModule("SpectrumFederation/modules/LootHelper/ConsumablesTradeHandoff.lua")
@@ -1942,7 +2207,6 @@ do
         playerGuid = "Player-1-G1",
     })
     assertTrue(batch ~= nil, "E: valid enqueue: " .. tostring(err))
-    -- G1→G2 rebinding rejected.
     _G.UnitGUID = function() return "Player-1-G2" end
     SF.ConsumablesWithdrawRuntime.CurrentContext = function()
         return { guildKey = "club:G2" }
@@ -1955,7 +2219,6 @@ do
     assertEq(batch2, nil, "E: G1→G2 rebinding rejected")
     assertEq(err2, "context_mismatch", "E: context_mismatch on guild change")
 
-    -- Unrelated manual offers must not create unresolved status after complete.
     H.Reset()
     _G.UnitGUID = function() return "Player-1-G1" end
     SF.ConsumablesWithdrawRuntime.CurrentContext = function()
@@ -1965,8 +2228,8 @@ do
         operationId = "op-done", guildKey = "club:G1", playerGuid = "Player-1-G1",
     })
     local delivered, ambiguous, outcome = W.ResolveTradeDelivery(
-        { ["10"] = 2, ["999"] = 5 }, -- 999 is unrelated manual
-        { ["10"] = 2 }, -- only 10 is tracked
+        { ["10"] = 2, ["999"] = 5 },
+        { ["10"] = 2 },
         function() return 0 end,
         true
     )
@@ -1975,115 +2238,421 @@ do
     assertEq(delivered["10"], 2, "E: tracked item delivered")
     H.OnTradeCompleted(delivered, ambiguous)
     assertEq(H.GetState().status, "complete", "E: complete not unresolved")
-    -- Ordinary later trade with only manual items after handoff complete.
     local _, _, outcome2 = W.ResolveTradeDelivery(
         { ["999"] = 1 },
-        {}, -- no pending bag snapshot keys
+        {},
         function() return 0 end,
         true
     )
     assertEq(outcome2, "cancelled", "E: no tracked obligations → cancelled")
+
+    -- Production TRADE_SHOW → ACCEPT → CLOSED path.
+    local bagCounts = { ["10"] = 5 }
+    local tradeOffers = { ["10"] = 5 }
+    _G.GetServerTime = function() return 100000 end
+    _G.C_Container = {
+        GetContainerNumSlots = function() return 4 end,
+        GetContainerItemInfo = function() return nil end,
+    }
+    SF.ConsumablesRouting = { IsCarriedBag = function() return true end }
+    -- Patch PlayerBagCount via bag read path used by handoff.
+    local priorGetItemCount = _G.GetItemCount
+    _G.GetItemCount = function(itemId)
+        return bagCounts[tostring(itemId)] or bagCounts[tonumber(itemId)] or 0
+    end
+    -- Handoff uses container scans; provide counts through GetContainerItemInfo.
+    C_Container.GetContainerItemInfo = function(bag, slot)
+        if bag == 0 and slot == 1 and (bagCounts["10"] or 0) > 0 then
+            return { itemID = 10, stackCount = bagCounts["10"], isLocked = false }
+        end
+        return nil
+    end
+    _G.GetTradePlayerItemInfo = function(slot)
+        local qty = tradeOffers["10"]
+        if slot == 1 and qty and qty > 0 then
+            return "item", nil, qty
+        end
+        return nil
+    end
+    _G.GetTradePlayerItemLink = function(slot)
+        if slot == 1 and tradeOffers["10"] then return "|Hitem:10:|h" end
+        return nil
+    end
+    local savedCreateFrame = _G.CreateFrame
+    local frames = {}
+    _G.CreateFrame = function(_, name)
+        local f = { name = name, scripts = {}, _text = "" }
+        function f:RegisterEvent() end
+        function f:UnregisterEvent() end
+        function f:UnregisterAllEvents() end
+        function f:SetScript(ev, fn) f.scripts[ev] = fn end
+        function f:GetScript(ev) return f.scripts[ev] end
+        function f:SetSize() end
+        function f:SetPoint() end
+        function f:SetHeight() end
+        function f:SetWidth() end
+        function f:SetFrameStrata() end
+        function f:SetFrameLevel() end
+        function f:SetMovable() end
+        function f:EnableMouse() end
+        function f:RegisterForDrag() end
+        function f:Hide() end
+        function f:Show() end
+        function f:IsShown() return false end
+        function f:SetText(t) f._text = tostring(t or "") end
+        function f:GetText() return f._text end
+        function f:SetJustifyH() end
+        function f:SetFontObject() end
+        function f:SetTextColor() end
+        function f:CreateFontString()
+            return {
+                SetPoint = function() end, SetJustifyH = function() end,
+                SetWordWrap = function() end, SetText = function() end,
+                SetFontObject = function() end, SetTextColor = function() end,
+                SetWidth = function() end, Show = function() end, Hide = function() end,
+                GetText = function() return "" end,
+            }
+        end
+        frames[#frames + 1] = f
+        return f
+    end
+
+    local function fire(event, ...)
+        local st = H.GetState()
+        assertTrue(st.frame and st.frame.scripts.OnEvent, "E: production OnEvent registered")
+        st.frame.scripts.OnEvent(st.frame, event, ...)
+    end
+
+    local function runClearThenEnqueue(outcomeMode)
+        H.Reset()
+        -- Force re-attach listeners after Reset keeps listenersAttached.
+        H._state.listenersAttached = false
+        bagCounts["10"] = 5
+        tradeOffers["10"] = 5
+        local oldBatch = H.EnqueueConfirmed({ ["10"] = 5 }, {
+            operationId = "op-old-" .. outcomeMode,
+            guildKey = "club:G1",
+            playerGuid = "Player-1-G1",
+        })
+        assertTrue(oldBatch ~= nil, "E: old batch enqueued")
+        fire("TRADE_SHOW")
+        assertTrue(H.GetState().tradeSessionAuthority ~= nil, "E: authority captured at show")
+        local offeredBeforeClear = tradeOffers["10"]
+        H.ClearPending()
+        assertEq(H.GetState().tradeSessionAuthority, nil, "E: Clear drops trade authority")
+        assertEq(tradeOffers["10"], offeredBeforeClear, "E: Clear leaves player offers untouched")
+        bagCounts["10"] = 7
+        local newBatch = H.EnqueueConfirmed({ ["10"] = 7 }, {
+            operationId = "op-new-" .. outcomeMode,
+            guildKey = "club:G1",
+            playerGuid = "Player-1-G1",
+        })
+        assertTrue(newBatch ~= nil, "E: new same-item batch after Clear")
+        assertEq(#H.GetState().batches, 1, "E: only new batch present")
+        assertEq(H.GetState().batches[1].id, newBatch.id, "E: surviving batch is new")
+        tradeOffers["10"] = 5
+        if outcomeMode == "delivered" then
+            fire("TRADE_ACCEPT_UPDATE", 1, 1)
+            bagCounts["10"] = 2 -- lost 5 from bag relative to show snapshot; authority gone
+            fire("TRADE_CLOSED")
+        else
+            fire("TRADE_ACCEPT_UPDATE", 1, 1)
+            -- Ambiguous: bags unchanged relative to whatever, authority nil → cancel
+            fire("TRADE_CLOSED")
+        end
+        assertEq(#H.GetState().batches, 1, "E: " .. outcomeMode .. " leaves new batch intact")
+        assertEq(H.GetState().batches[1].id, newBatch.id, "E: " .. outcomeMode .. " new id intact")
+        assertTrue(H.GetState().batches[1].ambiguous == nil
+            or next(H.GetState().batches[1].ambiguous) == nil,
+            "E: " .. outcomeMode .. " new batch not paused")
+        -- Duplicate close idempotent.
+        fire("TRADE_CLOSED")
+        assertEq(#H.GetState().batches, 1, "E: duplicate close idempotent")
+    end
+    runClearThenEnqueue("delivered")
+    runClearThenEnqueue("ambiguous")
+
+    -- Expiry during open trade + later enqueue.
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 4
+    tradeOffers["10"] = 4
+    local expBatch = H.EnqueueConfirmed({ ["10"] = 4 }, {
+        operationId = "op-exp",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    fire("TRADE_SHOW")
+    -- AppendTradeBatch stores a copy; expire the live state row, not the return value.
+    do
+        local live = H.GetState().batches
+        for i = 1, #live do
+            if live[i].id == expBatch.id then
+                live[i].expiresAt = 1
+            end
+        end
+    end
+    local late = H.EnqueueConfirmed({ ["10"] = 3 }, {
+        operationId = "op-late",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    assertTrue(late ~= nil, "E: enqueue during open trade after expiry")
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    bagCounts["10"] = 0
+    fire("TRADE_CLOSED")
+    local alive = H.GetState().batches
+    local foundLate = false
+    for i = 1, #alive do
+        if alive[i].id == late.id then foundLate = true end
+        assertTrue(alive[i].id ~= expBatch.id, "E: expired original not resurrected")
+    end
+    assertTrue(foundLate, "E: late enqueue survives expired-trade settlement")
+
+    -- All relevant obligations expired before settlement → no unresolved sticky status.
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 2
+    tradeOffers["10"] = 2
+    local allExp = H.EnqueueConfirmed({ ["10"] = 2 }, {
+        operationId = "op-all-exp",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    fire("TRADE_SHOW")
+    do
+        local live = H.GetState().batches
+        for i = 1, #live do
+            if live[i].id == allExp.id then
+                live[i].expiresAt = 1
+                -- Pre-seed ambiguity that would sticky-unresolved under beforeAmbiguous.
+                live[i].ambiguous = { ["10"] = 2 }
+            end
+        end
+    end
+    fire("TRADE_ACCEPT_UPDATE", 0, 1) -- numeric 0/1 flags
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    bagCounts["10"] = 2
+    fire("TRADE_CLOSED")
+    assertTrue(H.GetState().status ~= "unresolved",
+        "E: all-expired settlement does not sticky unresolved status=" .. tostring(H.GetState().status))
+
+    if savedCreateFrame then
+        _G.CreateFrame = savedCreateFrame
+    end
+
+    -- Explicit empty snapshot (manual removal of offers) with both accepted.
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 3
+    tradeOffers["10"] = 3
+    H.EnqueueConfirmed({ ["10"] = 3 }, {
+        operationId = "op-empty-offer",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    fire("TRADE_SHOW")
+    tradeOffers["10"] = nil -- player cleared offers
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    -- CaptureOfferSnapshot on accept sees empty.
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    fire("TRADE_CLOSED")
+    assertTrue(#H.GetState().batches >= 1, "E: empty offer cancels without consuming")
+
+    if priorGetItemCount then _G.GetItemCount = priorGetItemCount end
 end
 
--- F: focused pooled-row rebind + orphan-only access
+-- F: focused pooled-row rebind + orphan-only access via real __sfTest hooks
 do
-    -- Reuse Manage hooks from prior C block when available.
-    local hooks = SF._GuildSuppliesManageTestHooks
-    if type(hooks) == "table" and hooks.OpenRecipeEditor and hooks.RefreshRecipeEditor then
-        local record = {
-            datasetId = "gs1:focus",
-            _guildKey = "club:focus",
-            currentCampaignId = "camp1",
-            activation = "staged",
-            permission = { editorRankPosition = 3 },
-            accounting = {
-                _consumables = {
-                    bankTab = 1,
-                    generation = 1,
-                    configSeq = 1,
-                    requestedItems = {
-                        ["10"] = { itemId = 10, goal = 5 },
-                        ["20"] = { itemId = 20, goal = 5 },
-                    },
-                    recipes = {
-                        ["100"] = { itemId = 100, reagents = { ["10"] = 3, ["20"] = 9 } },
-                    },
+    local managePage = SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesManage
+    assertTrue(managePage and managePage.__sfTest, "F: Manage page __sfTest hooks required")
+    local hooks = managePage.__sfTest
+    assertTrue(type(hooks.OpenRecipeEditor) == "function", "F: OpenRecipeEditor required")
+    assertTrue(type(hooks.RefreshRecipeEditor) == "function", "F: RefreshRecipeEditor required")
+    assertTrue(type(hooks.CommitRecipeEditorSave) == "function", "F: CommitRecipeEditorSave required")
+    assertTrue(type(hooks.RecipeEditorDraft) == "function", "F: RecipeEditorDraft required")
+    assertTrue(type(hooks.RecipeEditorUi) == "function", "F: RecipeEditorUi required")
+    assertTrue(type(hooks.CloseRecipeEditor) == "function", "F: CloseRecipeEditor required")
+    assertTrue(type(hooks.RecipeRows) == "function", "F: RecipeRows required")
+
+    local record = {
+        datasetId = "gs1:focus",
+        _guildKey = "club:focus",
+        currentCampaignId = "camp1",
+        activation = "staged",
+        permission = { editorRankPosition = 3 },
+        accounting = {
+            _consumables = {
+                bankTab = 1,
+                generation = 1,
+                configSeq = 1,
+                requestedItems = {
+                    ["10"] = { itemId = 10, goal = 5 },
+                    ["20"] = { itemId = 20, goal = 5 },
+                },
+                recipes = {
+                    ["100"] = { itemId = 100, reagents = { ["10"] = 3, ["20"] = 9 } },
                 },
             },
-        }
-        GS.GetCurrentRecord = function() return record end
-        GS.GetCurrentContext = function()
-            return { ready = true, guildKey = "club:focus", actorGuid = "Player-1-A", canEdit = true }
-        end
-        GS.SenderHasEditorAuthority = function() return true end
-        local ctx = { section = { SetMessage = function() end } }
-        hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
-        hooks.RefreshRecipeEditor()
-        local draft = hooks.RecipeEditorDraft()
-        local ui = hooks.RecipeEditorUi and hooks.RecipeEditorUi()
-        if ui and ui.reagentRows and ui.reagentRows[1] and ui.reagentRows[1].Edit then
-            local row10 = nil
-            for i = 1, #ui.reagentRows do
-                if ui.reagentRows[i]._boundItemId == 10 then
-                    row10 = ui.reagentRows[i]
-                    break
-                end
-            end
-            if row10 then
-                row10.Edit._hasFocus = true
-                row10.Edit:SetText("7")
-                -- Remove item 10 from requested; keep 20. Focused 7 must stay orphan.
-                record.accounting._consumables.requestedItems = {
-                    ["20"] = { itemId = 20, goal = 5 },
-                }
-                hooks.RefreshRecipeEditor()
-                assertEq(draft.reagentTexts["10"], "7", "F: focused remove keeps orphan10=7")
-                assertEq(draft.reagentTexts["20"], "9", "F: item20 remains 9")
-                -- Insert lower-sorted item 5; must not inherit focused text.
-                record.accounting._consumables.requestedItems = {
-                    ["5"] = { itemId = 5, goal = 1 },
-                    ["20"] = { itemId = 20, goal = 5 },
-                }
-                hooks.RefreshRecipeEditor()
-                assertEq(draft.reagentTexts["5"] or "0", "0", "F: new lower item starts at 0")
-            end
-        end
-        -- Orphan-only: clear all requested; saved recipe still opens.
-        record.accounting._consumables.requestedItems = {}
-        hooks.CloseRecipeEditor(true)
-        hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
-        assertEq(hooks.RecipeEditorDraft().open, true, "F: orphan-only existing recipe opens")
-        hooks.CloseRecipeEditor(true)
-        -- Creation still blocked without requested items.
-        local blocked = false
-        ctx.section.SetMessage = function(_, _, kind)
-            if kind == "warn" then blocked = true end
-        end
-        hooks.OpenRecipeEditor(ctx, 200, nil)
-        assertTrue(blocked or hooks.RecipeEditorDraft().open ~= true,
-            "F: creation without requested items blocked")
+        },
+    }
+    GS.GetCurrentRecord = function() return record end
+    GS.GetCurrentContext = function()
+        return { ready = true, guildKey = "club:focus", actorGuid = "Player-1-A", canEdit = true }
     end
+    GS.GetCapabilities = function() return { canEdit = true, canRead = true } end
+    GS.SenderHasEditorAuthority = function() return true end
+    GS.RecipeAvailability = function() return true end
+    local messages = {}
+    local ctx = {
+        section = {
+            SetMessage = function(_, text, kind)
+                messages[#messages + 1] = { text = text, kind = kind }
+            end,
+            ClearMessage = function()
+                messages[#messages + 1] = { cleared = true }
+            end,
+        },
+    }
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, _msg, _label, accept)
+            if type(accept) == "function" then accept() end
+        end,
+    }
+
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    local draft = hooks.RecipeEditorDraft()
+    local ui = hooks.RecipeEditorUi()
+    assertTrue(ui and ui.reagentRows and #ui.reagentRows >= 2, "F: reagent rows exist")
+    local row10
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 10 then
+            row10 = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(row10 and row10.Edit, "F: item10 row widget required")
+    row10.Edit._hasFocus = true
+    row10.Edit:SetText("7")
+    -- Remove item 10 from requested; keep 20. Focused 7 must stay orphan.
+    record.accounting._consumables.requestedItems = {
+        ["20"] = { itemId = 20, goal = 5 },
+    }
+    hooks.RefreshRecipeEditor()
+    assertEq(draft.reagentTexts["10"], "7", "F: focused remove keeps orphan10=7")
+    assertEq(draft.reagentTexts["20"], "9", "F: item20 remains 9")
+    -- Inspect rebound widget text for surviving item20.
+    local row20
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 20 and ui.reagentRows[i].Edit then
+            row20 = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(row20 ~= nil, "F: item20 rebound row required")
+    assertEq(row20.Edit:GetText(), "9", "F: rebound widget text for item20 is 9")
+
+    -- Save/capture must read focused orphan through production path.
+    local applied
+    GS.NewConfigOperation = function(_, kind, target, value)
+        applied = { kind = kind, target = target, value = value }
+        return { kind = kind, target = target, value = value }, "accepted"
+    end
+    GS.ApplyStagedConfigOperation = function() return "accepted" end
+    hooks.CommitRecipeEditorSave()
+    assertTrue(applied ~= nil, "F: Save emitted set-recipe")
+    assertEq(applied.value.reagents["10"], 7, "F: Save capture orphan10=7")
+    assertEq(applied.value.reagents["20"], 9, "F: Save capture item20=9")
+
+    -- Independent insertion case with focused rebind.
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    draft = hooks.RecipeEditorDraft()
+    ui = hooks.RecipeEditorUi()
+    row20 = nil
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 20 then
+            row20 = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(row20 and row20.Edit, "F: insertion setup row20")
+    row20.Edit._hasFocus = true
+    row20.Edit:SetText("9")
+    record.accounting._consumables.requestedItems = {
+        ["5"] = { itemId = 5, goal = 1 },
+        ["20"] = { itemId = 20, goal = 5 },
+    }
+    hooks.RefreshRecipeEditor()
+    assertEq(draft.reagentTexts["5"] or "0", "0", "F: new lower item starts at 0")
+    assertEq(draft.reagentTexts["20"], "9", "F: focused item20 stays 9 across insert")
+    local row5
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 5 then
+            row5 = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(row5 and row5.Edit, "F: inserted item5 row required")
+    assertEq(row5.Edit:GetText() or "0", "0", "F: inserted widget text is 0")
+    applied = nil
+    hooks.CommitRecipeEditorSave()
+    assertTrue(applied ~= nil, "F: insertion Save emitted")
+    assertTrue(applied.value.reagents["5"] == nil or applied.value.reagents["5"] == 0,
+        "F: zero/new item omitted or zero on Save")
+    assertEq(applied.value.reagents["20"], 9, "F: insertion Save keeps 20=9")
+
+    -- Orphan-only access through saved-list selection + Delete.
+    record.accounting._consumables.requestedItems = {}
+    hooks.CloseRecipeEditor(true)
+    local rows = hooks.RecipeRows()
+    assertTrue(#rows >= 1, "F: saved recipe list still has orphan recipe")
+    local existing = record.accounting._consumables.recipes["100"]
+    hooks.OpenRecipeEditor(ctx, 100, existing)
+    assertEq(hooks.RecipeEditorDraft().open, true, "F: orphan-only existing recipe opens")
+    ui = hooks.RecipeEditorUi()
+    assertTrue(ui and ui.delete and ui.delete.scripts and ui.delete.scripts.OnClick,
+        "F: delete control required")
+    local deleted
+    GS.NewConfigOperation = function(_, kind, target, value)
+        deleted = { kind = kind, target = target, value = value }
+        return { kind = kind, target = target, value = value }, "accepted"
+    end
+    ui.delete.scripts.OnClick(ui.delete)
+    assertTrue(deleted ~= nil, "F: orphan-only Delete issued set-recipe")
+    assertEq(deleted.value.removed, true, "F: Delete removed=true")
+
+    -- Creation still blocked without requested items.
+    local blocked = false
+    ctx.section.SetMessage = function(_, _, kind)
+        if kind == "warn" or kind == "error" then blocked = true end
+    end
+    hooks.OpenRecipeEditor(ctx, 200, nil)
+    assertTrue(blocked or hooks.RecipeEditorDraft().open ~= true,
+        "F: creation without requested items blocked")
 end
 
--- D: queue completion before allowance; bank unavailable; timer ownership
+-- D: queue completion, close-timer ownership, visit status, allowance split dest
 do
     if not SF.ConsumablesWithdrawRuntime or not SF.ConsumablesWithdrawRuntime.PlaceNext then
         loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
     end
     local WR = SF.ConsumablesWithdrawRuntime
+
+    -- Exhausted queue finalizes before allowance.
     local finalized = false
+    local realFinalize = WR.FinalizeWork
     WR.FinalizeWork = function()
         finalized = true
     end
     WR.work = {
         pendingStep = nil,
         index = 3,
-        queue = { { itemId = 10 }, { itemId = 10 } }, -- index past end after last pickup
+        queue = { { itemId = 10 }, { itemId = 10 } },
         bankClosed = false,
         confirmed = {},
         take = {},
     }
-    -- Exhausted queue must finalize before ContextStillValid/allowance.
     local ctxCalled = false
     WR.ContextStillValid = function()
         ctxCalled = true
@@ -2092,8 +2661,380 @@ do
     WR.PlaceNext()
     assertTrue(finalized, "D: exhausted queue calls FinalizeWork")
     assertFalse(ctxCalled, "D: allowance not checked after queue exhausted")
+    WR.FinalizeWork = realFinalize
     WR.work = nil
-    -- Restore FinalizeWork from module by reloading is heavy; call StopWork path instead.
+
+    -- Accurate timer model + drain (must be invoked).
+    local pendingTimers = {}
+    C_Timer = {
+        After = function(_, fn)
+            if type(fn) == "function" then
+                pendingTimers[#pendingTimers + 1] = { fn = fn, cancellable = false }
+            end
+            return nil
+        end,
+        NewTimer = function(_, fn)
+            local cancelled = false
+            local entry = {
+                fn = fn,
+                cancellable = true,
+                Cancel = function() cancelled = true end,
+                _fire = function()
+                    if not cancelled and type(fn) == "function" then fn() end
+                end,
+                _cancelled = function() return cancelled end,
+            }
+            pendingTimers[#pendingTimers + 1] = entry
+            return entry
+        end,
+        _drain = function()
+            local batch = pendingTimers
+            pendingTimers = {}
+            for i = 1, #batch do
+                local t = batch[i]
+                if t.cancellable then
+                    t._fire()
+                elseif type(t.fn) == "function" then
+                    t.fn()
+                end
+            end
+        end,
+        _live = function()
+            local n = 0
+            for i = 1, #pendingTimers do
+                local t = pendingTimers[i]
+                if not t.cancellable or not t._cancelled() then
+                    n = n + 1
+                end
+            end
+            return n
+        end,
+    }
+
+    local settleCount, receiptCount, handoffCount = 0, 0, 0
+    GS.CommitLocalWithdrawalReceipts = function()
+        receiptCount = receiptCount + 1
+        return "accepted"
+    end
+    SF.ConsumablesTradeHandoff = SF.ConsumablesTradeHandoff or {}
+    SF.ConsumablesTradeHandoff.EnqueueConfirmed = function()
+        handoffCount = handoffCount + 1
+        return { id = "h1" }
+    end
+    SF.ConsumablesTradeHandoff.CanAcceptUnits = function() return true end
+    SF.ConsumablesTradeHandoff.PendingSnapshot = function() return {}, {} end
+    SF.ConsumablesTradeHandoff.GetState = function() return {} end
+
+    _G.GetServerTime = function() return 2000 end
+    _G.GetCursorInfo = function() return nil end
+    _G.GetGuildBankTabInfo = function()
+        return "Tab", "icon", true, true, 0, -1, false
+    end
+    _G.GetGuildBankItemInfo = function() return "tex", 5, false end
+    _G.GetGuildBankItemLink = function() return "|Hitem:10:|h" end
+
+    -- Drive close with incomplete observation → deadline unresolved, once-only commit.
+    local Workflow = SF.ConsumablesWithdrawWorkflow
+    local priorInterp = Workflow.InterpretWithdrawal
+    Workflow.InterpretWithdrawal = function()
+        return 0, "waiting"
+    end
+    Workflow.WithdrawalDisposition = function()
+        return "wait"
+    end
+    WR.BagCount = function() return 0 end
+    local settleReasons = {}
+    WR.work = {
+        settled = false,
+        movementStarted = true,
+        bankClosed = false,
+        pendingStep = {
+            itemId = 10,
+            slot = 1,
+            count = 5,
+            beforeBags = 0,
+            beforeSlot = 5,
+            observeStartedAt = 2000,
+            observeDelay = 0.05,
+        },
+        bankTab = 1,
+        confirmed = {},
+        confirmedTotal = 0,
+        take = { ["10"] = 5 },
+        requested = { ["10"] = 5 },
+        selections = { ["100"] = 1 },
+        operationId = "op-close",
+        visitToken = "visit:close",
+        guildKey = "club:wd",
+        playerGuid = "Player-1-A",
+        onSettle = function(result)
+            settleCount = settleCount + 1
+            settleReasons[#settleReasons + 1] = result.reason
+        end,
+    }
+    WR.OnBankClosed()
+    assertTrue(WR.work == nil or WR.work.pendingStep ~= nil or settleCount >= 0,
+        "D: after close either settled or waiting deadline")
+    -- ObservePending under close must not steal closeSettleTimer via observeTimer.
+    if WR.work then
+        assertTrue(WR.work.closeSettleTimer ~= nil, "D: closeSettleTimer owned distinctly")
+        assertEq(WR.work.observeTimer, nil, "D: observeTimer not holding close deadline")
+        WR.OnBagOrBankUpdate()
+        assertTrue(WR.work.closeSettleTimer ~= nil, "D: bag update preserves closeSettleTimer")
+        assertEq(WR.work.observeTimer, nil, "D: no competing observeTimer after close update")
+    end
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: deadline settles once")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: explicit unresolved on deadline")
+    assertEq(C_Timer._live(), 0, "D: no active owned timers after deadline")
+    -- Duplicate close after settle is a no-op.
+    WR.OnBankClosed()
+    assertEq(settleCount, 1, "D: duplicate close does not re-settle")
+
+    -- Early settlement on close with confirmed movement: once-only receipt/handoff.
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    Workflow.InterpretWithdrawal = function()
+        return 5, nil
+    end
+    Workflow.WithdrawalDisposition = function(actual, intended)
+        if actual >= intended then return "commit" end
+        return "wait"
+    end
+    WR.BagCount = function() return 5 end
+    WR.work = {
+        settled = false,
+        movementStarted = true,
+        bankClosed = false,
+        pendingStep = {
+            itemId = 10,
+            slot = 1,
+            count = 5,
+            beforeBags = 0,
+            beforeSlot = 5,
+            observeStartedAt = 2000,
+            observeDelay = 0.05,
+        },
+        bankTab = 1,
+        confirmed = {},
+        confirmedTotal = 0,
+        take = { ["10"] = 5 },
+        requested = { ["10"] = 5 },
+        selections = { ["100"] = 1 },
+        operationId = "op-early",
+        visitToken = "visit:early",
+        guildKey = "club:wd",
+        playerGuid = "Player-1-A",
+        campaignId = "camp1",
+        datasetId = "gs1:wd",
+        generation = 1,
+        startedAt = 2000,
+        onSettle = function()
+            settleCount = settleCount + 1
+        end,
+    }
+    WR.OnBankClosed()
+    assertEq(settleCount, 1, "D: early reliable evidence settles on close")
+    assertEq(receiptCount, 1, "D: receipt once")
+    assertEq(handoffCount, 1, "D: handoff once")
+    assertEq(C_Timer._live(), 0, "D: timers cleared after early settle")
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: drained leftovers do not double-settle")
+    assertEq(receiptCount, 1, "D: receipt still once after drain")
+
+    Workflow.InterpretWithdrawal = priorInterp
+
+    -- Visit status lifetime via real Runtime open/close handlers.
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local RT = SF.ConsumablesRuntime
+    RT.WatchGuildBankFrame = function() end
+    RT.RefreshReminder = function() end
+    RT.SyncReviewWithGuildBank = function() end
+    RT.ConsumeBannerBankNavigation = function() end
+    RT.HideReviewForBankLifecycle = function() end
+    RT.CancelBannerBankNavigation = function() end
+    RT.RebuildReview = function() end
+    local statusText = ""
+    RT.review = {
+        Status = {
+            SetText = function(_, t) statusText = t or "" end,
+            GetText = function() return statusText end,
+        },
+        IsShown = function() return false end,
+    }
+    RT.bankOpen = false
+    RT._quickWithdrawVisitSeq = 0
+    RT:OnBankOpened()
+    local visit1 = RT._quickWithdrawVisitToken
+    assertTrue(visit1 ~= nil, "D: first open assigns visit token")
+    RT:SetQuickWithdrawStatus("working", { visitToken = visit1 })
+    assertEq(statusText, "working", "D: status accepted for current visit")
+    -- Duplicate open / tab refresh must not rotate visit.
+    RT:OnBankOpened()
+    assertEq(RT._quickWithdrawVisitToken, visit1, "D: duplicate open keeps visit token")
+    -- close → settle while closed → reopen clears inherited status.
+    RT:OnBankClosed()
+    RT:SetQuickWithdrawStatus("settled-closed", { visitToken = visit1 })
+    assertEq(statusText, "settled-closed", "D: settle while closed publishes originating status")
+    RT:OnBankOpened()
+    local visit2 = RT._quickWithdrawVisitToken
+    assertTrue(visit2 ~= visit1, "D: reopen rotates visit token")
+    assertEq(statusText, "", "D: fresh visit clears prior status text")
+    -- close → reopen → old operation settles: must not overwrite.
+    RT:SetQuickWithdrawStatus("visit2-status", { visitToken = visit2 })
+    assertEq(statusText, "visit2-status", "D: current visit status set")
+    RT:SetQuickWithdrawStatus("late-old", { visitToken = visit1 })
+    assertEq(statusText, "visit2-status", "D: old settle rejected after reopen")
+    -- Receipt-failure / unresolved remain scoped to originating token.
+    RT:OnBankClosed()
+    RT:SetQuickWithdrawStatus("unresolved-op", { visitToken = visit2 })
+    assertEq(statusText, "unresolved-op", "D: unresolved while closed for originating visit")
+    RT:OnBankOpened()
+    RT:SetQuickWithdrawStatus("stale-unresolved", { visitToken = visit2 })
+    assertTrue(statusText ~= "stale-unresolved",
+        "D: prior visit unresolved cannot overwrite new visit")
+
+    -- One-source stack → partial merge + empty dest; allowance 1 rejects, 2 permits.
+    -- Trade tests may have replaced WR.CurrentContext with a guildKey-only stub;
+    -- reload production CurrentContext/BeginWithdraw before this regression.
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    WR = SF.ConsumablesWithdrawRuntime
+    pendingTimers = {}
+    C_Timer = {
+        After = function(_, fn)
+            if type(fn) == "function" then
+                pendingTimers[#pendingTimers + 1] = { fn = fn, cancellable = false }
+            end
+            return nil
+        end,
+        NewTimer = function(_, fn)
+            local cancelled = false
+            local entry = {
+                fn = fn,
+                cancellable = true,
+                Cancel = function() cancelled = true end,
+                _fire = function()
+                    if not cancelled and type(fn) == "function" then fn() end
+                end,
+                _cancelled = function() return cancelled end,
+            }
+            pendingTimers[#pendingTimers + 1] = entry
+            return entry
+        end,
+        _drain = function()
+            local batch = pendingTimers
+            pendingTimers = {}
+            for i = 1, #batch do
+                local t = batch[i]
+                if t.cancellable then t._fire()
+                elseif type(t.fn) == "function" then t.fn() end
+            end
+        end,
+    }
+    local cursorItem = nil
+    _G.GetCursorInfo = function()
+        if cursorItem then return "item", cursorItem end
+        return nil
+    end
+    _G.InCombatLockdown = function() return false end
+    _G.PickupGuildBankItem = function() cursorItem = 10 end
+    _G.SplitGuildBankItem = function() cursorItem = 10 end
+    _G.PutItemInBackpack = function() cursorItem = nil end
+    _G.ClearCursor = function() cursorItem = nil end
+    _G.GetItemCount = function() return 15 end
+    _G.GetCurrentGuildBankTab = function() return 1 end
+    C_Container = {
+        GetContainerNumSlots = function(bag)
+            if bag == 0 then return 4 end
+            return 0
+        end,
+        GetContainerNumFreeSlots = function(bag)
+            if bag == 0 then return 3, 0 end
+            return 0, 0
+        end,
+        GetContainerItemInfo = function(bag, slot)
+            if bag == 0 and slot == 1 then
+                return { itemID = 10, stackCount = 15, isLocked = false }
+            end
+            return nil
+        end,
+        PickupContainerItem = function() cursorItem = nil end,
+    }
+    C_Item = {
+        GetItemFamily = function() return 0 end,
+        GetItemMaxStackSizeByID = function() return 20 end,
+    }
+    SF.Consumables = SF.Consumables or {}
+    SF.Consumables.ItemIdFromText = function(link)
+        local id = tostring(link or ""):match("item:(%d+)")
+        return tonumber(id)
+    end
+    SF.ConsumablesRouting = { IsCarriedBag = function() return true end }
+    SF.ConsumablesRuntime = SF.ConsumablesRuntime or {}
+    SF.ConsumablesRuntime.BankIsOpen = function() return true end
+    SF.ConsumablesRuntime.ItemStackLimit = function() return 20 end
+    SF.ConsumablesTradeHandoff = SF.ConsumablesTradeHandoff or {}
+    SF.ConsumablesTradeHandoff.CanAcceptUnits = function() return true end
+    SF.ConsumablesTradeHandoff.PendingSnapshot = function() return {}, {} end
+    SF.ConsumablesTradeHandoff.GetState = function() return {} end
+    local record = {
+        datasetId = "gs1:wd",
+        _guildKey = "club:wd",
+        currentCampaignId = "camp1",
+        accounting = {
+            _consumables = {
+                bankTab = 1,
+                generation = 1,
+                configSeq = 1,
+                recipes = {
+                    ["100"] = { itemId = 100, reagents = { ["10"] = 10 } },
+                },
+            },
+        },
+    }
+    GS.IsLiveActiveForCurrentGuild = function() return true end
+    GS.GetCurrentRecord = function() return record end
+    GS.RecipeAvailability = function() return true end
+    GS.WithdrawalReceiptCapacityOk = function() return true end
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", 10, false end
+        return nil
+    end
+    _G.GetGuildBankItemLink = function(tab, slot)
+        if tab == 1 and slot == 1 then return "|Hitem:10:|h" end
+        return nil
+    end
+    -- Capture the planned queue before PlaceNext mutates/settles it.
+    local capturedQueue = nil
+    local realPlaceNext = WR.PlaceNext
+    WR.PlaceNext = function()
+        if WR.work and WR.work.queue then
+            capturedQueue = WR.work.queue
+        end
+        return realPlaceNext()
+    end
+    _G.GetGuildBankTabInfo = function()
+        return "Tab", "icon", true, true, 0, 1, false -- remainingWithdrawals = 1
+    end
+    capturedQueue = nil
+    local okBlock, errBlock = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okBlock, false, "D: allowance 1 rejects two-pickup split-dest plan")
+    assertEq(errBlock, "allowance", "D: allowance reason got=" .. tostring(errBlock))
+    assertEq(WR.work, nil, "D: no work when allowance blocks before pickup")
+    assertEq(capturedQueue, nil, "D: PlaceNext not reached when allowance blocks")
+    _G.GetGuildBankTabInfo = function()
+        return "Tab", "icon", true, true, 0, 2, false -- remainingWithdrawals = 2
+    end
+    capturedQueue = nil
+    local okAllow, errAllow = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okAllow, true, "D: allowance 2 permits two-pickup plan: " .. tostring(errAllow))
+    assertTrue(capturedQueue ~= nil, "D: queue captured under allowance 2")
+    assertEq(#capturedQueue, 2, "D: two pickups for merge+empty from one source")
+    assertEq(capturedQueue[1].destMerge, true, "D: first chunk merges into partial bag stack")
+    assertEq(capturedQueue[2].destMerge, false, "D: second chunk uses empty destination")
+    WR.PlaceNext = realPlaceNext
+    if WR.work then
+        WR.StopWork("test_cleanup", true)
+    end
 end
 
 if failures > 0 then
