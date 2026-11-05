@@ -6029,6 +6029,25 @@ end
 -- keep private paused state so admission previews cannot clobber a pause.
 local creditProjectionScratchAccepted = setmetatable({}, { __mode = "k" })
 local creditProjectionScratchSpeculative = setmetatable({}, { __mode = "k" })
+-- Accepted published map validity for the current dependency stamp. Distinct
+-- from "creditCorrections is a table": Invalidate / incomplete accepted rebuild
+-- clear this so speculative pauses cannot resurrect stale readable credit (#459).
+local acceptedCreditValidStamp = setmetatable({}, { __mode = "k" })
+
+local function MarkAcceptedCreditInvalid(record)
+    if type(record) ~= "table" then
+        return
+    end
+    acceptedCreditValidStamp[record] = nil
+    record.creditCorrections = nil
+end
+
+local function MarkAcceptedCreditValid(record, stamp)
+    if type(record) ~= "table" then
+        return
+    end
+    acceptedCreditValidStamp[record] = stamp or CreditProjectionDependencyStamp(record)
+end
 
 local function IsSpeculativeCreditProjectionOp(ops, extraOp)
     return type(extraOp) == "table"
@@ -6148,6 +6167,9 @@ ScheduleCreditProjectionContinuation = function(record)
         and cached.resume.speculative then
         return
     end
+    -- Scheduling accepted-history continuation means reconstruction is incomplete:
+    -- clear published validity so Ensure cannot serve a stale map (#459 B3).
+    MarkAcceptedCreditInvalid(record)
     local cont = creditProjectionContinuation[record]
     if type(cont) ~= "table" then
         cont = {}
@@ -6411,6 +6433,9 @@ function GS.InvalidateCreditCorrectionProjection(record)
         end
         creditProjectionCache[record] = nil
         ClearCreditProjectionScratch(record)
+        -- Clear published accepted credit so Invalidate cannot leave a readable
+        -- stale map for Ensure's speculative shortcut or Resolve (#459 B3).
+        MarkAcceptedCreditInvalid(record)
         local cont = creditProjectionContinuation[record]
         if type(cont) == "table" then
             cont.scheduled = false
@@ -6600,6 +6625,10 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 extraOpId = speculative and extraOp.id or nil,
             },
         }
+        -- Incomplete accepted reconstruction is not readable (#459 B3).
+        if not speculative then
+            MarkAcceptedCreditInvalid(record)
+        end
         local workUnits = CreditProjectionWorkNow(0)
         AccumulateCreditProjectionCallbackWork(workUnits)
         if not speculative then
@@ -6758,11 +6787,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- No correction ops: publish empty active set without scanning the ledger
     -- (keeps ordinary progress projection readiness-bounded — #427 / #459).
     if not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline or haveOrderedScratch) and #candidates == 0 then
+        local emptyStamp = CreditProjectionDependencyStamp(record)
         record.creditCorrections = {}
         creditProjectionCache[record] = {
-            stamp = CreditProjectionDependencyStamp(record),
+            stamp = emptyStamp,
             ok = true,
         }
+        MarkAcceptedCreditValid(record, emptyStamp)
         writeScratch(nil)
         if GS._creditProjectionOwnedCallbackBudget then
             EndCreditProjectionCallbackBudget()
@@ -7294,7 +7325,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
         local workUnits = CreditProjectionWorkNow(rowVisits)
         AccumulateCreditProjectionCallbackWork(workUnits)
-        -- Do not publish a partial prune; leave any prior coherent map alone.
+        -- Do not publish a partial prune. Accepted-history pauses clear published
+        -- validity so unfinished reconstruction cannot be read as current (#459 B3).
+        -- Speculative pauses keep any independently valid accepted map intact.
         creditProjectionCache[record] = {
             stamp = stamp,
             ok = false,
@@ -7308,6 +7341,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 extraOpId = speculative and extraOp.id or nil,
             },
         }
+        if not speculative then
+            MarkAcceptedCreditInvalid(record)
+        end
         -- Accepted-history always owns its successor timer while unfinished.
         if not speculative then
             ScheduleCreditProjectionContinuation(record)
@@ -7677,6 +7713,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- would verify — consumers must treat failure as unavailable, not as proof
     -- that no valid set exists.
     if not TotalsAllNonNegative(totals) then
+        MarkAcceptedCreditInvalid(record)
         record.creditCorrections = {}
         creditProjectionCache[record] = {
             stamp = stamp,
@@ -7708,6 +7745,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         stamp = stamp,
         ok = true,
     }
+    MarkAcceptedCreditValid(record, stamp)
     return true, nil, {
         activeIds = activeIds,
         rowVisits = rowVisits,
@@ -7725,18 +7763,29 @@ end
 --- After Apply already published a coherent projection (e.g. extraOp preview)
 -- and the matching op was stored, adopt the current dependency stamp without a
 -- second full rebuild (#459 redrive callback budget).
+-- Only call after a completed coherent publication — never to certify an
+-- unfinished accepted reconstruction (e.g. local ADJUST_QUANTITY).
 function GS.SealCreditCorrectionProjection(record, ok)
     if type(record) ~= "table" then
         return
     end
+    local stamp = CreditProjectionDependencyStamp(record)
     creditProjectionCache[record] = {
-        stamp = CreditProjectionDependencyStamp(record),
+        stamp = stamp,
         ok = ok ~= false,
         err = (ok == false) and "player_negative" or nil,
     }
     -- Sealed generation must not leave prior-stamp owner pauses/candidates that
     -- a queued accepted-history timer could certify as current.
     ClearCreditProjectionScratch(record)
+    if ok ~= false and type(record.creditCorrections) == "table" then
+        MarkAcceptedCreditValid(record, stamp)
+    else
+        MarkAcceptedCreditInvalid(record)
+        if ok == false then
+            record.creditCorrections = {}
+        end
+    end
     local cont = creditProjectionContinuation[record]
     if type(cont) == "table" then
         cont.scheduled = false
@@ -7758,14 +7807,22 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
     local cached = creditProjectionCache[record]
     if cached and cached.stamp == stamp then
         if cached.ok then
-            return true
+            -- Published ok must still have independent accepted validity.
+            if acceptedCreditValidStamp[record] == stamp
+                and type(record.creditCorrections) == "table" then
+                return true
+            end
+            -- Stale ok without a valid map: rebuild.
+            return GS.RebuildCreditCorrectionProjection(record, nil)
         end
         if cached.err == "work_budget" then
-            -- Speculative local/remote preview pauses must not hide the last
-            -- published accepted map or Schedule an accepted-history continuation
-            -- that would wipe private resumable scratch (#459 local save).
+            -- Speculative local/remote preview pauses must not Schedule an
+            -- accepted-history continuation that would wipe private scratch.
+            -- Serve accepted credit only when it still has current-stamp validity
+            -- (#459 B3) — never merely because creditCorrections is a table.
             if type(cached.resume) == "table" and cached.resume.speculative then
-                if type(record.creditCorrections) == "table" then
+                if acceptedCreditValidStamp[record] == stamp
+                    and type(record.creditCorrections) == "table" then
                     return true
                 end
                 return false, "work_budget"

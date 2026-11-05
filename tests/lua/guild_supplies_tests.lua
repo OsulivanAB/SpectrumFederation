@@ -46100,14 +46100,28 @@ do
         "459-GI: warm available")
     local function creditFp()
         local parts = {}
+        local active = 0
         for i = 1, nHeads do
             local ev = GS.FindLedgerEventById(record, "gi-don-" .. tostring(i))
-            parts[#parts + 1] = tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, ev)))
+            local name, guid = GS.ResolveEffectiveCreditIdentity(record, ev)
+            parts[#parts + 1] = tostring(name) .. "|" .. tostring(guid)
+            if type(record.creditCorrections) == "table"
+                and type(record.creditCorrections[ev.id]) == "table" then
+                active = active + 1
+            end
         end
-        return table.concat(parts, ",")
+        local bobBal = GS.PersonalContributorItemTotal
+            and GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 98459)
+            or 0
+        local daveBal = GS.PersonalContributorItemTotal
+            and GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 98459)
+            or 0
+        return table.concat(parts, ",") .. "#a=" .. tostring(active)
+            .. "#bob=" .. tostring(bobBal) .. "#dave=" .. tostring(daveBal)
     end
     local natural = creditFp()
-    assertTrue(natural:find("Bob%-Garona", 1), "459-GI: natural has Bob credit")
+    assertTrue(natural:find("Bob%-Garona|Player%-1%-Bob", 1),
+        "459-GI: natural has Bob name+GUID credit")
 
     local opsOrderBefore = #(record.operations.order or {})
     local ledgerBefore = #(record.accounting._consumableEvents or {})

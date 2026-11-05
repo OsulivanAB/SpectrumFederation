@@ -1760,7 +1760,9 @@ function GS:ApplyStagedConfigOperation(op, context)
         end
     end
     StoreAccepted(ops, stored, tKey)
-    if stored.kind == KIND.CORRECT_CONTRIBUTOR or stored.kind == KIND.ADJUST_QUANTITY then
+    if stored.kind == KIND.CORRECT_CONTRIBUTOR then
+        -- Apply already published a coherent projection with this op as extraOp;
+        -- seal the post-store stamp without a second full rebuild (#459).
         if GS.SealCreditCorrectionProjection then
             GS.SealCreditCorrectionProjection(record, true)
         elseif GS.RebuildCreditCorrectionProjection then
@@ -1768,9 +1770,28 @@ function GS:ApplyStagedConfigOperation(op, context)
         end
         if GS.RedrivePendingContributorCorrections then
             GS.RedrivePendingContributorCorrections(record, {
-                eventId = stored.kind == KIND.CORRECT_CONTRIBUTOR and stored.target or nil,
+                eventId = stored.target,
                 itemId = stored.value and stored.value.itemId,
             })
+        end
+    elseif stored.kind == KIND.ADJUST_QUANTITY then
+        -- Adjustments change durable floors: never Seal(true) an unfinished
+        -- reconstruction. Invalidate published validity and Ensure/redrive so
+        -- readable credit matches current dependencies (#459 B3).
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(record)
+        end
+        if GS.EnsureThenRedriveCreditCorrections then
+            GS.EnsureThenRedriveCreditCorrections(record, {
+                itemId = stored.value and stored.value.itemId,
+            })
+        elseif GS.EnsureCreditCorrectionProjection then
+            GS.EnsureCreditCorrectionProjection(record, nil)
+            if GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
+                    itemId = stored.value and stored.value.itemId,
+                })
+            end
         end
     end
     GS._NotifyLocalDurableChange("config")

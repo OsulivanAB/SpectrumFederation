@@ -376,6 +376,7 @@ SF.SettingsUI = {
     },
 }
 loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
 
 -- Minimal provider registry stub so EnsureGossipProvider can register without the
 -- full engine. 3A multi-client tests exercise ValidateAndApply / AdmitRemote*.
@@ -5609,7 +5610,9 @@ do
 end
 
 do
-    -- B4: accepted-history work_budget→terminal emits one coalesced UI notify.
+    -- B4: listener-driven Logs/Rankings recovery after accepted-history
+    -- work_budget→terminal (discussion_r4481471773). Keep cold unavailable
+    -- cache intact; complete via timers only; no pending promotion.
     local nHeads = 80
     local itemId = 9803
     local record = seedLiveCampaignWithItem(itemId, nHeads + 40)
@@ -5643,6 +5646,8 @@ do
         }
         GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
     end
+    local opsOrderBefore = #(record.operations.order or {})
+    local ledgerBefore = #(record.accounting._consumableEvents or {})
     GS._creditProjectionWorkBudgetOverride = 96
     GS.InvalidateCreditCorrectionProjection(record)
     local notifies = {}
@@ -5652,8 +5657,37 @@ do
         if prevNotify then prevNotify(reason) end
     end
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
-    -- Visible Logs: seed a panel so Refresh can run; capture cached unavailable.
-    logsPage.panel = { IsShown = function() return true end }
+    local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
+    local logsRefresh = 0
+    local rankingsRefresh = 0
+    local hiddenLogsRefresh = 0
+    local shown = true
+    logsPage.panel = {
+        IsShown = function() return shown end,
+        IsVisible = function() return shown end,
+    }
+    rankingsPage.panel = {
+        IsShown = function() return shown end,
+        IsVisible = function() return shown end,
+    }
+    local prevLogsRefresh = logsPage.Refresh
+    logsPage.Refresh = function(self, panel)
+        if not shown then
+            hiddenLogsRefresh = hiddenLogsRefresh + 1
+        end
+        logsRefresh = logsRefresh + 1
+        if prevLogsRefresh then
+            return prevLogsRefresh(self, panel)
+        end
+    end
+    local prevRankingsRefresh = rankingsPage.Refresh
+    rankingsPage.Refresh = function(self, panel)
+        rankingsRefresh = rankingsRefresh + 1
+        if prevRankingsRefresh then
+            return prevRankingsRefresh(self, panel)
+        end
+    end
+    -- Seed cold unavailable into the page cache; keep it intact through drain.
     local rowsCold = logsPage.__sfTest.BuildProjectedRows()
     local sawUnavailable = false
     for i = 1, #rowsCold do
@@ -5664,8 +5698,11 @@ do
     end
     assertTrue(sawUnavailable or not GS.IsCreditCorrectionProjectionAvailable(record),
         "459-B4: cold history unavailable before drain")
+    local cachedCold = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
+    assertTrue(type(cachedCold) == "table", "459-B4: cold cache populated")
     local ok = GS.EnsureCreditCorrectionProjection(record, nil)
     assertTrue(ok == false, "459-B4: first Ensure yields")
+    -- Drain timers only — do not manually clear cache or rebuild rows.
     local ticks = 0
     while #timers > 0 and ticks < 200 do
         runOneDueTimer()
@@ -5685,7 +5722,17 @@ do
     assertEq(readyCount, 1, "459-B4: exactly one terminal UI notify got="
         .. tostring(readyCount) .. " total=" .. tostring(#notifies))
     assertEq(#timers, 0, "459-B4: idle")
-    -- Cached Logs recover without an unrelated event (bust page projection cache).
+    assertEq(#(record.operations.order or {}), opsOrderBefore,
+        "459-B4: no pending promotion / ops mutation")
+    assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
+        "459-B4: no ledger mutation during recovery")
+    -- Listener-driven: durable notify cleared cache and queued Logs/Rankings refresh.
+    assertTrue(logsRefresh >= 1, "459-B4: Logs refreshed via listener got="
+        .. tostring(logsRefresh))
+    assertTrue(rankingsRefresh >= 1, "459-B4: Rankings refreshed via listener got="
+        .. tostring(rankingsRefresh))
+    local cachedAfter = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
+    -- After listener refresh, cache should be rebuilt available (or cleared then rebuilt).
     local rowsWarm = logsPage.__sfTest.BuildProjectedRows()
     local bobRows = 0
     for i = 1, #rowsWarm do
@@ -5697,10 +5744,22 @@ do
             bobRows = bobRows + 1
         end
     end
-    assertTrue(bobRows > 0, "459-B4: Logs show Bob after recovery")
+    assertTrue(bobRows > 0, "459-B4: Logs show Bob after listener recovery")
+    -- Rankings observed through its page Refresh path (not a direct helper call).
+    rankingsPage:Refresh(rankingsPage.panel)
     local rankings = GS.ProjectCampaignRankingsOnRecord(record, record.currentCampaignId)
-    assertTrue(not rankings.creditUnavailable, "459-B4: Rankings available")
+    assertTrue(not rankings.creditUnavailable, "459-B4: Rankings available after refresh")
+    -- Hidden page: notify must not render.
+    shown = false
+    logsRefresh = 0
+    hiddenLogsRefresh = 0
+    GS.NotifyUI("credit-projection-ready")
+    flushTimers()
+    assertEq(hiddenLogsRefresh, 0, "459-B4: no hidden-page rendering")
+    logsPage.Refresh = prevLogsRefresh
+    rankingsPage.Refresh = prevRankingsRefresh
     logsPage.panel = nil
+    rankingsPage.panel = nil
 end
 
 do
@@ -5854,6 +5913,116 @@ do
     assertNil(record.operations.records[cancelOpId],
         "459-C5: cancelled save never accepted")
     GS._creditProjectionWorkBudgetOverride = nil
+
+    -- C5 recipient lifecycle: confirm Carol, yield, then change to Dave via
+    -- text and suggestion callbacks — old Carol intent must not commit.
+    injectProductionDonation(record, {
+        id = "ls-recip-target", itemId = itemId, quantity = 4,
+        timestamp = world.time + 2,
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+    warmGuard = 0
+    while warmOk == false and warmGuard < 200 do
+        if not runOneDueTimer() then break end
+        warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        warmGuard = warmGuard + 1
+    end
+    flushTimers()
+    GS._creditProjectionWorkBudgetOverride = 64
+    rows = logsPage.__sfTest.BuildProjectedRows()
+    row = nil
+    for i = 1, #rows do
+        if rows[i].id == "ls-recip-target" then row = rows[i] break end
+    end
+    assertTrue(row ~= nil, "459-C5: recip target row")
+    logsPage.__sfTest.OpenEditContributorDialog("ls-recip-target", row)
+    session = logsPage.__sfTest.GetEditSession()
+    session.attributed = "Carol-Garona"
+    session.attributedGuid = "Player-1-Carol"
+    session.attributionText = "Carol-Garona"
+    session.attributionResolved = true
+    confirmCb = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        confirmCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    confirmCb()
+    local carolSave = GS.GetLocalContributorCorrectionSave(record)
+    assertTrue(type(carolSave) == "table" and type(carolSave.op) == "table",
+        "459-C5: Carol pending retained")
+    local carolOpId = carolSave.op.id
+    assertEq(carolSave.op.value.attributed, "Carol-Garona",
+        "459-C5: confirmed Carol intent")
+    -- Text path: type Dave while pending.
+    logsPage.__sfTest.SetEditAttributionFromText("Dave-Garona")
+    assertNil(GS.GetLocalContributorCorrectionSave(record),
+        "459-C5: text recipient change cancels Carol retain")
+    local sessText = logsPage.__sfTest.GetEditSession()
+    assertTrue(sessText and sessText.pendingLocal ~= true,
+        "459-C5: text path clears pendingLocal")
+    assertEq(sessText.attributed, "Dave-Garona", "459-C5: visible Dave after text")
+    flushTimers()
+    assertNil(record.operations.records[carolOpId],
+        "459-C5: Carol never accepted after text change")
+
+    -- Suggestion path: confirm Carol again, then pick Dave via onResolved.
+    logsPage.__sfTest.ClearEditSession()
+    flushTimers()
+    GS.InvalidateCreditCorrectionProjection(record)
+    warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+    warmGuard = 0
+    while warmOk == false and warmGuard < 200 do
+        if not runOneDueTimer() then break end
+        warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        warmGuard = warmGuard + 1
+    end
+    flushTimers()
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-C5: suggestion case projection available")
+    GS._creditProjectionWorkBudgetOverride = 64
+    rows = logsPage.__sfTest.BuildProjectedRows()
+    row = nil
+    for i = 1, #rows do
+        if rows[i].id == "ls-recip-target" then row = rows[i] break end
+    end
+    assertTrue(row ~= nil and not row.creditUnavailable,
+        "459-C5: suggestion target row available")
+    logsPage.__sfTest.OpenEditContributorDialog("ls-recip-target", row)
+    session = logsPage.__sfTest.GetEditSession()
+    assertTrue(session ~= nil, "459-C5: suggestion editor opens")
+    session.attributed = "Carol-Garona"
+    session.attributedGuid = "Player-1-Carol"
+    session.attributionText = "Carol-Garona"
+    session.attributionResolved = true
+    confirmCb = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        confirmCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(type(confirmCb) == "function", "459-C5: suggestion confirm captured")
+    confirmCb()
+    carolSave = GS.GetLocalContributorCorrectionSave(record)
+    assertTrue(type(carolSave) == "table", "459-C5: Carol retained for suggestion case")
+    carolOpId = carolSave.op.id
+    logsPage.__sfTest.ResolveEditAttributionSuggestion({
+        value = "Dave-Garona",
+        label = "Dave-Garona",
+        text = "Dave-Garona",
+    })
+    assertNil(GS.GetLocalContributorCorrectionSave(record),
+        "459-C5: suggestion recipient change cancels Carol retain")
+    local sessSug = logsPage.__sfTest.GetEditSession()
+    assertTrue(sessSug and sessSug.pendingLocal ~= true,
+        "459-C5: suggestion path clears pendingLocal")
+    assertEq(sessSug.attributed, "Dave-Garona", "459-C5: visible Dave after suggestion")
+    flushTimers()
+    assertNil(record.operations.records[carolOpId],
+        "459-C5: Carol never accepted after suggestion change")
+    logsPage.__sfTest.ClearEditSession()
+    GS._creditProjectionWorkBudgetOverride = nil
     logsPage.panel = nil
 end
 
@@ -5954,6 +6123,369 @@ do
         record, GS.FindLedgerEventById(record, "unavail-adj"))), "Bob-Garona",
         "459-C6: Unassigned→Bob commit succeeds (nil==nil freshness)")
     logsPage.__sfTest.ClearEditSession()
+
+    -- C6 transitions: available→unavailable before Continue and after confirm,
+    -- starting from a genuine Unassigned adjustment (discussion_r4481473890).
+    local uItem2 = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 98056 }, {
+        itemId = 98056, goal = 20, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(uItem2), "accepted", "459-C6: add transition item")
+    injectProductionDonation(record, {
+        id = "unavail-tx-don", itemId = 98056, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(record, {
+        id = "unavail-tx-adj", itemId = 98056, quantity = 5,
+        attributed = nil, attributedGuid = nil,
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okTx = GS.EnsureCreditCorrectionProjection(record, nil)
+    local gTx = 0
+    while okTx == false and gTx < 50 do
+        if not runOneDueTimer() then break end
+        okTx = GS.EnsureCreditCorrectionProjection(record, nil)
+        gTx = gTx + 1
+    end
+    flushTimers()
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-C6: transition baseline available")
+    rows = logsPage.__sfTest.BuildProjectedRows()
+    local txRow = nil
+    for i = 1, #rows do
+        if rows[i].id == "unavail-tx-adj" then txRow = rows[i] break end
+    end
+    assertTrue(txRow ~= nil, "459-C6: transition Unassigned row exists")
+    assertTrue(not txRow.creditUnavailable, "459-C6: transition row available")
+    assertTrue(txRow.showAction == true or txRow.canEdit == true
+        or txRow.creditUnavailable ~= true,
+        "459-C6: projected row present before action gate")
+
+    local prepCalls = 0
+    local applyCalls = 0
+    local realNew = GS.NewContributorCorrectionOperation
+    local realApply = GS.ApplyStagedConfigOperation
+    GS.NewContributorCorrectionOperation = function(...)
+        prepCalls = prepCalls + 1
+        return realNew(...)
+    end
+    GS.ApplyStagedConfigOperation = function(...)
+        applyCalls = applyCalls + 1
+        return realApply(...)
+    end
+
+    -- Before Continue: open editor on Unassigned, then force unavailable.
+    logsPage.__sfTest.OpenEditContributorDialog("unavail-tx-adj", txRow)
+    sess = logsPage.__sfTest.GetEditSession()
+    assertTrue(sess ~= nil, "459-C6: transition editor opens while available")
+    assertNil(sess.effectiveName, "459-C6: transition starts Unassigned")
+    sess.attributed = "Bob-Garona"
+    sess.attributedGuid = "Player-1-Bob"
+    sess.attributionText = "Bob-Garona"
+    sess.attributionResolved = true
+    -- Break floors so projection becomes unavailable (Alice−20 with no Alice heads).
+    injectProductionAdjustment(record, {
+        id = "unavail-tx-break", itemId = 98056, quantity = -20,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okBreak, errBreak = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okBreak == false, "459-C6: transition rebuild fails")
+    assertEq(errBreak, "player_negative", "459-C6: transition player_negative")
+    local statusMsgs = {}
+    local prevReport
+    -- ConfirmAndSaveEdit → EditSessionStillFresh → credit_unavailable.
+    local beforePrep, beforeApply = prepCalls, applyCalls
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    assertNil(logsPage.__sfTest.GetEditSession(),
+        "459-C6: before-Continue clears session on credit_unavailable")
+    assertNil(logsPage.__sfTest.GetPendingConfirm(),
+        "459-C6: before-Continue leaves no pending confirm")
+    assertEq(prepCalls, beforePrep, "459-C6: before-Continue zero prepare")
+    assertEq(applyCalls, beforeApply, "459-C6: before-Continue zero apply")
+
+    -- Recover for after-confirm case: remove breaker, rebuild, reopen.
+    local listTx = record.accounting._consumableEvents
+    for i = #listTx, 1, -1 do
+        if listTx[i].id == "unavail-tx-break" then
+            table.remove(listTx, i)
+        end
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    okTx = GS.EnsureCreditCorrectionProjection(record, nil)
+    gTx = 0
+    while okTx == false and gTx < 50 do
+        if not runOneDueTimer() then break end
+        okTx = GS.EnsureCreditCorrectionProjection(record, nil)
+        gTx = gTx + 1
+    end
+    flushTimers()
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-C6: recovered for after-confirm")
+    rows = logsPage.__sfTest.BuildProjectedRows()
+    txRow = nil
+    for i = 1, #rows do
+        if rows[i].id == "unavail-tx-adj" then txRow = rows[i] break end
+    end
+    assertTrue(txRow ~= nil, "459-C6: after-confirm row exists")
+    logsPage.__sfTest.ClearEditSession()
+    logsPage.__sfTest.OpenEditContributorDialog("unavail-tx-adj", txRow)
+    sess = logsPage.__sfTest.GetEditSession()
+    assertTrue(sess ~= nil, "459-C6: after-confirm editor opens")
+    sess.attributed = "Carol-Garona"
+    sess.attributedGuid = "Player-1-Carol"
+    sess.attributionText = "Carol-Garona"
+    sess.attributionResolved = true
+    okCb = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        okCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(type(okCb) == "function", "459-C6: confirm dialog opened")
+    assertTrue(logsPage.__sfTest.GetPendingConfirm() ~= nil,
+        "459-C6: pending confirm captured")
+    -- After confirmation opens: become unavailable, then invoke confirm.
+    injectProductionAdjustment(record, {
+        id = "unavail-tx-break2", itemId = 98056, quantity = -20,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    okBreak, errBreak = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okBreak == false and errBreak == "player_negative",
+        "459-C6: after-confirm unavailable")
+    beforePrep, beforeApply = prepCalls, applyCalls
+    okCb()
+    assertEq(prepCalls, beforePrep, "459-C6: after-confirm zero prepare")
+    assertEq(applyCalls, beforeApply, "459-C6: after-confirm zero apply")
+    local storedTx = false
+    for _, op in pairs(record.operations.records or {}) do
+        if type(op) == "table" and op.target == "unavail-tx-adj" then
+            storedTx = true
+        end
+    end
+    assertTrue(not storedTx, "459-C6: after-confirm no correction stored")
+    GS.NewContributorCorrectionOperation = realNew
+    GS.ApplyStagedConfigOperation = realApply
+    logsPage.__sfTest.ClearEditSession()
+end
+
+do
+    -- B3: accepted-projection validity — invalidated map not readable during
+    -- speculative pause; local ADJUST must not Seal unfinished reconstruction.
+    do
+        local nHeads = 80
+        local itemId = 9810
+        local record = seedLiveCampaignWithItem(itemId, nHeads + 40)
+        local ctx = select(1, GS:GetCurrentContext())
+        local t0 = world.time
+        for i = 1, nHeads do
+            local id = "b3-don-" .. i
+            injectProductionDonation(record, {
+                id = id, itemId = itemId, quantity = 1, timestamp = t0 + i,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            })
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "b3-op-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = id,
+                value = {
+                    eventId = id, eventKind = "donation",
+                    attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = t0 + nHeads + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
+        end
+        injectProductionDonation(record, {
+            id = "b3-spec-target", itemId = itemId, quantity = 3, timestamp = t0 + 2 * nHeads,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        GS.InvalidateCreditCorrectionProjection(record)
+        GS._creditProjectionWorkBudgetOverride = 96
+        local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        local g = 0
+        while warmOk == false and g < 200 do
+            if not runOneDueTimer() then break end
+            warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+            g = g + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-B3: warm available")
+        local beforeName = select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "b3-don-1")))
+        assertEq(beforeName, "Bob-Garona", "459-B3: warm Bob credit")
+
+        -- Invalidate (GI-style): published map must clear.
+        GS.InvalidateCreditCorrectionProjection(record)
+        assertNil(record.creditCorrections, "459-B3: Invalidate clears published map")
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record) == false,
+            "459-B3: unavailable immediately after Invalidate")
+
+        -- Start accepted rebuild; pause; then speculative pause at same stamp.
+        local okAcc = GS.EnsureCreditCorrectionProjection(record, nil)
+        assertTrue(okAcc == false, "459-B3: accepted yield")
+        local specOp = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "b3-spec-op",
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "b3-spec-target",
+            value = {
+                eventId = "b3-spec-target", eventKind = "donation",
+                attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = itemId,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = t0 + 3 * nHeads,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local okSpec, errSpec = GS.RebuildCreditCorrectionProjection(record, specOp)
+        assertTrue(okSpec == false and errSpec == "work_budget",
+            "459-B3: speculative yield")
+        -- Ensure must NOT report available with stale Bob credit.
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record) == false,
+            "459-B3: speculative pause does not certify invalidated map")
+        local _, _, _, st = GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "b3-don-1"))
+        assertEq(st, GS.CREDIT_UNAVAILABLE,
+            "459-B3: Resolve unavailable during speculative pause after Invalidate")
+        flushTimers()
+        GS._creditProjectionWorkBudgetOverride = nil
+        local g2 = 0
+        while (not GS.IsCreditCorrectionProjectionAvailable(record)) and g2 < 200 do
+            if not runOneDueTimer() then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            g2 = g2 + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-B3: recovered after drain")
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "b3-don-1"))), "Bob-Garona",
+            "459-B3: recovered Bob credit")
+    end
+
+    -- Local ADJUST_QUANTITY must not Seal unfinished reconstruction as ok.
+    do
+        local nHeads = 80
+        local itemId = 9811
+        local record = seedLiveCampaignWithItem(itemId, nHeads + 40)
+        local ctx = select(1, GS:GetCurrentContext())
+        local t0 = world.time
+        for i = 1, nHeads do
+            local id = "b3a-don-" .. i
+            injectProductionDonation(record, {
+                id = id, itemId = itemId, quantity = 1, timestamp = t0 + i,
+            })
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "b3a-op-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = id,
+                value = {
+                    eventId = id, eventKind = "donation",
+                    attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = t0 + nHeads + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
+        end
+        GS.InvalidateCreditCorrectionProjection(record)
+        GS._creditProjectionWorkBudgetOverride = 96
+        local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        local g = 0
+        while warmOk == false and g < 200 do
+            if not runOneDueTimer() then break end
+            warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+            g = g + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-B3-adj: warm available")
+        local bobBefore = 0
+        for i = 1, nHeads do
+            local name = select(1, GS.ResolveEffectiveCreditIdentity(
+                record, GS.FindLedgerEventById(record, "b3a-don-" .. i)))
+            if name == "Bob-Garona" then bobBefore = bobBefore + 1 end
+        end
+        assertTrue(bobBefore > 0, "459-B3-adj: warm Bob heads")
+        -- Attribute to Bob (who has corrected credit) so prepare floors pass.
+        -- Low budget forces post-store Ensure to yield rather than Seal.
+        GS._creditProjectionWorkBudgetOverride = 96
+        local adjOp, adjSt, adjReason = GS:NewAdjustmentOperation(
+            itemId, -1, "Bob-Garona")
+        assertTrue(adjOp ~= nil, "459-B3-adj: prepare adjust got "
+            .. tostring(adjSt) .. "/" .. tostring(adjReason))
+        local st, reason = GS:ApplyStagedConfigOperation(adjOp)
+        assertEq(st, "accepted", "459-B3-adj: adjust accepted got "
+            .. tostring(st) .. "/" .. tostring(reason))
+        -- Must not falsely certify unfinished reconstruction as available with
+        -- a mismatched credit set.
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record) == false,
+            "459-B3-adj: unfinished adjust leaves credit unavailable")
+        assertEq(select(4, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "b3a-don-1"))),
+            GS.CREDIT_UNAVAILABLE,
+            "459-B3-adj: Resolve unavailable before drain")
+        local g3 = 0
+        while (not GS.IsCreditCorrectionProjectionAvailable(record)) and g3 < 200 do
+            if not runOneDueTimer() then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            g3 = g3 + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-B3-adj: timers complete reconstruction")
+        local natural = {}
+        for i = 1, nHeads do
+            natural[i] = select(1, GS.ResolveEffectiveCreditIdentity(
+                record, GS.FindLedgerEventById(record, "b3a-don-" .. i)))
+        end
+        GS.InvalidateCreditCorrectionProjection(record)
+        local okF = GS.EnsureCreditCorrectionProjection(record, nil)
+        local gf = 0
+        while okF == false and gf < 200 do
+            if not runOneDueTimer() then break end
+            okF = GS.EnsureCreditCorrectionProjection(record, nil)
+            gf = gf + 1
+        end
+        flushTimers()
+        for i = 1, nHeads do
+            assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+                record, GS.FindLedgerEventById(record, "b3a-don-" .. i))),
+                natural[i],
+                "459-B3-adj: natural==fresh after adjust drain i=" .. tostring(i))
+        end
+        GS._creditProjectionWorkBudgetOverride = nil
+        assertEq(#timers, 0, "459-B3-adj: idle")
+    end
 end
 
 do

@@ -659,7 +659,74 @@ local function EditAttributionSuggestions(prefix)
 	return out
 end
 
-local function SetEditAttributionFromText(v)
+--- Cancel an in-flight authorized local save when the visible recipient changes
+-- away from the confirmed intent (#459 C5). Never let pendingLocalOp commit a
+-- different recipient than the editor currently displays.
+local function CancelPendingLocalSaveOnRecipientChange()
+	if type(editSession) ~= "table" or editSession.pendingLocal ~= true then
+		return
+	end
+	local g = GS()
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if g and g.CancelLocalContributorCorrectionSave and type(record) == "table" then
+		g.CancelLocalContributorCorrectionSave(record, "recipient_changed")
+	end
+	editSession.pendingLocalOp = nil
+	editSession.pendingLocal = nil
+end
+
+local SetEditAttributionFromText
+local function ApplyEditAttributionSuggestion(item)
+	if type(editSession) ~= "table" then
+		return
+	end
+	InvalidatePendingConfirm()
+	if not item then
+		CancelPendingLocalSaveOnRecipientChange()
+		editSession.attributionResolved = false
+		return
+	end
+	if item.value == EDIT_UNASSIGNED or item.value == nil then
+		if editSession.allowUnassigned then
+			if editSession.attributed ~= nil or editSession.attributedGuid ~= nil then
+				CancelPendingLocalSaveOnRecipientChange()
+			end
+			editSession.attributed = nil
+			editSession.attributedGuid = nil
+			editSession.attributionText = ""
+			editSession.attributionResolved = true
+		else
+			CancelPendingLocalSaveOnRecipientChange()
+			editSession.attributionResolved = false
+		end
+		return
+	end
+	if type(item.value) == "string" and item.value ~= "" then
+		local cache = EnsureEditRosterCache()
+		local newGuid = cache.guidByLower[string.lower(item.value)]
+		local g = GS()
+		local changed = true
+		if g and g.CreditIdentitiesEqual then
+			changed = not g.CreditIdentitiesEqual(
+				editSession.attributed, editSession.attributedGuid,
+				item.value, newGuid)
+		else
+			changed = editSession.attributed ~= item.value
+				or editSession.attributedGuid ~= newGuid
+		end
+		if changed then
+			CancelPendingLocalSaveOnRecipientChange()
+		end
+		editSession.attributed = item.value
+		editSession.attributedGuid = newGuid
+		editSession.attributionText = item.text or item.label or item.value
+		editSession.attributionResolved = true
+		return
+	end
+	SetEditAttributionFromText(item.text or item.label or "")
+end
+
+SetEditAttributionFromText = function(v)
 	if type(editSession) ~= "table" then
 		return
 	end
@@ -669,6 +736,18 @@ local function SetEditAttributionFromText(v)
 	editSession.attributionText = text
 	local name, guid, ok = ResolveEditAttribution(text, editSession.allowUnassigned)
 	if ok then
+		local priorName = editSession.attributed
+		local priorGuid = editSession.attributedGuid
+		local g = GS()
+		local changed = true
+		if g and g.CreditIdentitiesEqual then
+			changed = not g.CreditIdentitiesEqual(priorName, priorGuid, name, guid)
+		else
+			changed = priorName ~= name or priorGuid ~= guid
+		end
+		if changed then
+			CancelPendingLocalSaveOnRecipientChange()
+		end
 		editSession.attributed = name
 		editSession.attributedGuid = guid
 		editSession.attributionResolved = true
@@ -681,6 +760,9 @@ local function SetEditAttributionFromText(v)
 		and string.lower(text:match("^%s*(.-)%s*$") or "") == string.lower(editSession.attributed) then
 		return
 	end
+	-- Unresolved typed text is also a visible recipient change away from the
+	-- confirmed pending intent.
+	CancelPendingLocalSaveOnRecipientChange()
 	editSession.attributionResolved = false
 end
 
@@ -928,6 +1010,7 @@ OpenEditContributorDialog = function(eventId, rowData)
 		effectiveName, effectiveGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
 	end
 	if creditStatus == (g.CREDIT_UNAVAILABLE or "credit_unavailable") then
+		ClearEditSession()
 		ReportLogsStatus("rejected", "credit_unavailable")
 		return
 	end
@@ -1255,40 +1338,7 @@ local function Definition()
 							return EditAttributionSuggestions(prefix)
 						end,
 						onResolved = function(_, item)
-							if type(editSession) ~= "table" then
-								return
-							end
-							InvalidatePendingConfirm()
-							if not item then
-								editSession.attributionResolved = false
-								return
-							end
-							if item.value == EDIT_UNASSIGNED or item.value == nil then
-								if editSession.allowUnassigned then
-									editSession.attributed = nil
-									editSession.attributedGuid = nil
-									editSession.attributionText = ""
-									editSession.attributionResolved = true
-								else
-									editSession.attributionResolved = false
-								end
-								if Page.Refresh and Page.panel then
-									Page:Refresh(Page.panel)
-								end
-								return
-							end
-							if type(item.value) == "string" and item.value ~= "" then
-								local cache = EnsureEditRosterCache()
-								editSession.attributed = item.value
-								editSession.attributedGuid = cache.guidByLower[string.lower(item.value)]
-								editSession.attributionText = item.text or item.label or item.value
-								editSession.attributionResolved = true
-								if Page.Refresh and Page.panel then
-									Page:Refresh(Page.panel)
-								end
-								return
-							end
-							SetEditAttributionFromText(item.text or item.label or "")
+							ApplyEditAttributionSuggestion(item)
 							if Page.Refresh and Page.panel then
 								Page:Refresh(Page.panel)
 							end
@@ -1590,6 +1640,18 @@ Page.__sfTest = {
 	CommitCapturedEdit = CommitCapturedEdit,
 	ConfirmAndSaveEdit = ConfirmAndSaveEdit,
 	EnsureEditRosterCache = EnsureEditRosterCache,
+	SetEditAttributionFromText = SetEditAttributionFromText,
+	EditAttributionSuggestions = EditAttributionSuggestions,
+	--- Apply an autocomplete suggestion through the real onResolved path (#459 C5).
+	ResolveEditAttributionSuggestion = ApplyEditAttributionSuggestion,
+	--- Peek the page projection cache without rebuilding (#459 B4).
+	PeekCachedProjectedRows = function()
+		return cachedProjectedRows, cachedProjectionKey
+	end,
+	ClearProjectedRowCache = function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
+	end,
 }
 
 EnsureRosterListener()
