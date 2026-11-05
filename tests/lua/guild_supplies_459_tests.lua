@@ -3654,6 +3654,208 @@ do
 end
 
 do
+    -- Substantial retained-history complete-callback bound (#459 /
+    -- discussion_r4476766989): O(1) prune scratch retain must keep each
+    -- production callback within soft+atomic, including save/restore work.
+    -- Fixture mirrors the reproduced slice (4000 Alice +1, Alice −2000,
+    -- Bob/Carol/Dave seeds, 3984 accepted correction heads).
+    local function buildLargeConflictRecord(itemId)
+        local record = seedLiveCampaignWithItem(itemId, 4000)
+        local donors = {
+            { name = "Alice-Garona", guid = "Player-1-Alice" },
+            { name = "Bob-Garona", guid = "Player-1-Bob" },
+            { name = "Carol-Garona", guid = "Player-1-Carol" },
+            { name = "Dave-Garona", guid = "Player-1-Dave" },
+        }
+        local nDon = 4000
+        for i = 1, nDon do
+            injectProductionDonation(record, {
+                id = "copy-don-" .. itemId .. "-" .. i,
+                itemId = itemId, quantity = 1,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                timestamp = 24000 + i,
+            })
+        end
+        injectProductionAdjustment(record, {
+            id = "copy-adj-" .. itemId, itemId = itemId, quantity = -2000,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            timestamp = 28010,
+        })
+        for di = 2, #donors do
+            local d = donors[di]
+            injectProductionDonation(record, {
+                id = "copy-seed-" .. itemId .. "-" .. di,
+                itemId = itemId, quantity = 3,
+                actor = d.name, actorGuid = d.guid,
+                timestamp = 28020 + di,
+            })
+        end
+        local ctx = select(1, GS:GetCurrentContext())
+        local acceptedN = 3984
+        for i = 1, acceptedN do
+            local target = donors[(i % (#donors - 1)) + 2]
+            local donId = "copy-don-" .. itemId .. "-" .. i
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "copy-corr-" .. itemId .. "-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = donId,
+                value = {
+                    eventId = donId, eventKind = "donation",
+                    attributed = target.name, attributedGuid = target.guid,
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = 28100 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            record.operations.records[op.id] = op
+            record.operations.order[#record.operations.order + 1] = op.id
+        end
+        return record, acceptedN
+    end
+    local function creditFingerprint(record, itemId, sampleN)
+        local parts = {}
+        for i = 1, sampleN do
+            local ev = GS.FindLedgerEventById(record, "copy-don-" .. itemId .. "-" .. i)
+            local name = select(1, GS.ResolveEffectiveCreditIdentity(record, ev))
+            parts[#parts + 1] = tostring(name or "?")
+        end
+        -- Also fingerprint a late donation outside the correction set.
+        local late = GS.FindLedgerEventById(record, "copy-don-" .. itemId .. "-3999")
+        parts[#parts + 1] = tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, late)) or "?")
+        return table.concat(parts, ",")
+    end
+    local function settleAutonomous(record, budgetOverride)
+        GS._creditProjectionWorkBudgetOverride = budgetOverride
+        GS.InvalidateCreditCorrectionProjection(record)
+        local soft = tonumber(budgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+        local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+        local slices = {}
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, det = realRebuild(...)
+            local work = tonumber(det and det.workUnits) or 0
+            local copies = tonumber(det and det.structureCopyVisits) or 0
+            local phase = det and det.phase
+            if err == "work_budget" or ok then
+                slices[#slices + 1] = {
+                    ok = ok and true or false,
+                    err = err,
+                    work = work,
+                    copies = copies,
+                    phase = phase,
+                    deferred = det and det.deferred,
+                }
+            end
+            return ok, err, det
+        end
+        local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
+        assertTrue(ok0 == false or ok0 == true,
+            "459: copy-bound Ensure returned")
+        if ok0 == false then
+            assertEq(err0, "work_budget", "459: copy-bound kickoff work_budget")
+        end
+        local g = 0
+        local maxTimers = 8000
+        local timerFail = nil
+        while #timers > 0 and g < maxTimers do
+            if not runOneDueTimer() then
+                timerFail = "459: copy-bound autonomous timer stalled at " .. tostring(g + 1)
+                break
+            end
+            g = g + 1
+        end
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        GS._creditProjectionWorkBudgetOverride = nil
+        assertTrue(timerFail == nil, timerFail or "459: copy-bound timers drained")
+        assertTrue(g > 1, "459: copy-bound drained multiple timers got=" .. tostring(g))
+        assertEq(#timers, 0, "459: copy-bound idles with empty timer queue")
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459: copy-bound projection available after timers only")
+        local okTerm, errTerm = GS.EnsureCreditCorrectionProjection(record, nil)
+        assertTrue(okTerm, "459: copy-bound terminal coherent got " .. tostring(errTerm))
+        local copySum = 0
+        local sawPruneResume = false
+        local boundFail = nil
+        local copyFail = nil
+        for i = 1, #slices do
+            local s = slices[i]
+            if s.work > hard and not boundFail then
+                boundFail = "459: copy-bound callback within soft+atomic i="
+                    .. tostring(i) .. " work=" .. tostring(s.work)
+                    .. " copies=" .. tostring(s.copies)
+                    .. " hard=" .. tostring(hard)
+                    .. " phase=" .. tostring(s.phase)
+            end
+            copySum = copySum + s.copies
+            -- After prune working state is retained, resume slices must not
+            -- re-clone history-sized structures (structureCopyVisits stays 0).
+            if sawPruneResume and s.copies ~= 0 and not copyFail then
+                copyFail = "459: copy-bound prune-resume structureCopyVisits=0 i="
+                    .. tostring(i) .. " copies=" .. tostring(s.copies)
+                    .. " phase=" .. tostring(s.phase)
+            end
+            -- deferProjection saves pruneReady by ref; the next slice must not
+            -- re-clone. post_baseline yields do not set pruneReady.
+            if s.deferred and (s.phase == "pre_prune" or s.phase == "prune"
+                or s.phase == "prune_scan" or s.phase == "empty_fallback") then
+                sawPruneResume = true
+            end
+        end
+        assertTrue(boundFail == nil, boundFail or "459: copy-bound all callbacks within soft+atomic")
+        assertTrue(copyFail == nil, copyFail or "459: copy-bound prune-resume copies stay 0")
+        assertTrue(sawPruneResume, "459: copy-bound observed prune-resume retain path")
+        return slices, copySum, hard, g
+    end
+
+    local itemFull = 9380
+    local rFull, acceptedN = buildLargeConflictRecord(itemFull)
+    assertEq(acceptedN, 3984, "459: copy-bound accepted head count")
+    -- Production budget path (reproduces discussion_r4476766989 scale).
+    local slicesProd, copySumProd, hardProd, timersProd =
+        settleAutonomous(rFull, nil)
+    assertTrue(#slicesProd >= 2,
+        "459: copy-bound production used multiple slices got="
+            .. tostring(#slicesProd))
+    assertTrue(timersProd >= 1, "459: copy-bound drained timers")
+    -- History-sized save/restore would visit ~6 × accepted heads (~24k).
+    -- Retained by-ref scratch plus charged totals clones must stay far below.
+    local historyCopyFloor = acceptedN * 3
+    assertTrue(copySumProd < historyCopyFloor,
+        "459: copy-bound structure copies << history-sized save/restore got="
+            .. tostring(copySumProd) .. " floor=" .. tostring(historyCopyFloor))
+    local fpFull = creditFingerprint(rFull, itemFull, 48)
+
+    -- Alternate soft budget: above baseline+activate cost for this fixture so
+    -- the first slice can reach paced prune without a history-sized atomic
+    -- overshoot, yet still force multi-slice prune (below production 16384).
+    local itemAlt = 9381
+    local rAlt = buildLargeConflictRecord(itemAlt)
+    local altBudget = 12288
+    local slicesAlt, copySumAlt = settleAutonomous(rAlt, altBudget)
+    assertTrue(#slicesAlt >= 2,
+        "459: copy-bound alt budget multi-slice got="
+            .. tostring(#slicesAlt))
+    assertTrue(copySumAlt < historyCopyFloor,
+        "459: copy-bound alt structure copies bounded got="
+            .. tostring(copySumAlt))
+    local fpAlt = creditFingerprint(rAlt, itemAlt, 48)
+    assertEq(fpAlt, fpFull,
+        "459: copy-bound identical final credit across budgets")
+    -- Small-case sync and nested-redrive bounds remain covered by the earlier
+    -- conflict-heavy / small Ensure / redrive blocks in this file.
+end
+
+do
     -- Genuine reconstruction failure: durable Bob −20 with only Alice→Bob +10.
     -- Public consumers must surface credit_unavailable (not zero / durable names).
     local record = seedLiveCampaignWithItem(9350, 50)

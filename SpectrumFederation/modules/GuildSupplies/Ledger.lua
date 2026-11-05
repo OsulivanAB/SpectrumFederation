@@ -5796,6 +5796,7 @@ local function CreditProjectionWorkNow(rowVisits)
         + (tonumber(GS._creditProjectionBucketVisits) or 0)
         + (tonumber(GS._creditProjectionFloorVisits) or 0)
         + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+        + (tonumber(GS._creditProjectionStructureCopyVisits) or 0)
 end
 
 --- Begin a fresh callback budget, or keep nesting under the parent allowance.
@@ -5853,8 +5854,14 @@ local function CloneCreditProjectionTotals(totals)
     if type(totals) ~= "table" then
         return copy
     end
+    local n = 0
     for k, v in pairs(totals) do
         copy[k] = v
+        n = n + 1
+    end
+    if n > 0 then
+        GS._creditProjectionStructureCopyVisits =
+            (tonumber(GS._creditProjectionStructureCopyVisits) or 0) + n
     end
     return copy
 end
@@ -5975,6 +5982,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     GS._creditProjectionBucketVisits = 0
     GS._creditProjectionFloorVisits = 0
     GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
     local ops = record.operations
     local stampEarly = CreditProjectionDependencyStamp(record)
     local priorCache = creditProjectionCache[record]
@@ -6066,14 +6074,31 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         }
     end
     -- Reuse scratch baseline/ordered when resuming the same dependency stamp.
-    -- Prior callbacks already paid baseline/index cost — this slice's budget
-    -- starts at zero visits so prune can make progress under the soft limit.
+    -- When prune working tables are retained, skip baseline cloning entirely.
     local totals, byId, rowVisits, relationshipsReady, ordered, lookupMisses
     local scratch = creditProjectionScratch[record]
-    if type(scratch) == "table" and scratch.stamp == stampEarly
+    local baselineTotals
+    local skipToPrune = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.pruneReady == true
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
+    if skipToPrune then
+        -- Adopt retained private working state below; keep metadata from scratch.
+        baselineTotals = scratch.baselineTotals
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        GS._creditProjectionRowVisits = 0
+    elseif type(scratch) == "table" and scratch.stamp == stampEarly
         and type(scratch.ordered) == "table"
         and type(scratch.baselineTotals) == "table" then
-        -- Always restart activate from the immutable post-baseline totals.
+        -- Resume after post_baseline: one charged working clone from baseline.
+        baselineTotals = scratch.baselineTotals
         totals = CloneCreditProjectionTotals(scratch.baselineTotals)
         byId = scratch.byId
         rowVisits = 0
@@ -6147,12 +6172,17 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return tostring(a.op.id) < tostring(b.op.id)
     end)
     end -- scratch miss: built baseline+ordered
-    local baselineTotals = CloneCreditProjectionTotals(totals)
+    if not baselineTotals then
+        -- Freeze immutable baseline; working totals are a charged clone.
+        baselineTotals = totals
+        totals = CloneCreditProjectionTotals(baselineTotals)
+    end
     -- Soft yield after baseline/indexing before activation when allowance spent.
     do
         local softLimit = CreditProjectionSoftLimit()
         local allowDefer = (C_Timer and C_Timer.After) and true or false
-        if allowDefer and CreditProjectionCallbackWorkTotal(rowVisits or 0) >= softLimit then
+        if allowDefer and CreditProjectionCallbackWorkTotal(
+            CreditProjectionWorkNow(rowVisits or 0)) >= softLimit then
             creditProjectionScratch[record] = {
                 stamp = stampEarly,
                 baselineTotals = baselineTotals,
@@ -6177,7 +6207,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     extraOpId = speculative and extraOp.id or nil,
                 },
             }
-            AccumulateCreditProjectionCallbackWork(rowVisits or 0)
+            local workUnits = CreditProjectionWorkNow(rowVisits or 0)
+            AccumulateCreditProjectionCallbackWork(workUnits)
             if not speculative then
                 ScheduleCreditProjectionContinuation(record)
             end
@@ -6187,7 +6218,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             end
             return false, "work_budget", {
                 rowVisits = rowVisits,
-                workUnits = rowVisits,
+                structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+                workUnits = workUnits,
                 deferred = true,
                 phase = "post_baseline",
                 speculative = speculative and true or false,
@@ -6198,11 +6230,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local activeIds = {}
     local bound = {}
     local scoreBox
-    local deactivatedEventIds = {}
-    if type(resumeDeactivated) == "table" then
-        for ri = 1, #resumeDeactivated do
-            deactivatedEventIds[ri] = resumeDeactivated[ri]
-        end
+    -- Private working tables are retained by reference across slices (O(1)
+    -- save/resume). Do not history-copy bound/map/ids/totals on each yield.
+    local deactivatedEventIds = resumeDeactivated
+    if type(deactivatedEventIds) ~= "table" then
+        deactivatedEventIds = {}
     end
     local stamp = stampEarly
     local softLimit = CreditProjectionSoftLimit()
@@ -6234,26 +6266,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         if type(priorScratch) == "table" and type(priorScratch.baselineTotals) == "table" then
             baseSnap = priorScratch.baselineTotals
         end
-        local boundSnap = {}
-        for i = 1, #bound do
-            local entry = bound[i]
-            if entry then
-                boundSnap[#boundSnap + 1] = {
-                    event = entry.event,
-                    op = entry.op,
-                    newName = entry.newName,
-                    newGuid = entry.newGuid,
-                }
-            end
-        end
-        local mapSnap = {}
-        for eid, head in pairs(activeMap) do
-            mapSnap[eid] = head
-        end
-        local idsSnap = {}
-        for oid, v in pairs(activeIds) do
-            idsSnap[oid] = v
-        end
+        -- O(1) retain owned private working state; no history-sized copies.
         creditProjectionScratch[record] = {
             stamp = stamp,
             baselineTotals = baseSnap,
@@ -6263,18 +6276,20 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             ordered = ordered,
             lookupMisses = lookupMisses,
             pruneReady = true,
-            pruneTotals = CloneCreditProjectionTotals(totals),
-            pruneBound = boundSnap,
-            pruneActiveMap = mapSnap,
-            pruneActiveIds = idsSnap,
-            pruneScore = scoreBox and scoreBox[1] or 0,
+            pruneTotals = totals,
+            pruneBound = bound,
+            pruneActiveMap = activeMap,
+            pruneActiveIds = activeIds,
+            pruneScoreBox = scoreBox,
             deactivatedEventIds = deactivatedEventIds,
         }
     end
     local function deferProjection(phase)
+        -- Retain working state first (O(1)), then charge this callback's work
+        -- including anything performed after the yield decision.
+        savePruneScratch()
         local workUnits = CreditProjectionWorkNow(rowVisits)
         AccumulateCreditProjectionCallbackWork(workUnits)
-        savePruneScratch()
         -- Do not publish a partial prune; leave any prior coherent map alone.
         creditProjectionCache[record] = {
             stamp = stamp,
@@ -6300,6 +6315,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0,
             floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0,
             candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0,
+            structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
             workUnits = workUnits,
             callbackWork = CreditProjectionCallbackWorkTotal(0),
             deactivations = GS._creditProjectionDeactivations,
@@ -6313,42 +6329,27 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return allowDefer
             and CreditProjectionCallbackWorkTotal(localWork) >= softLimit
     end
-    -- Prefer retained post-activate/restore scratch so that work is not repeated
-    -- (and therefore not under-counted by resetting counters).
+    -- Adopt retained private working tables (no copy) when stamp matches.
     local reusedPrune = false
     if type(scratch) == "table" and scratch.stamp == stampEarly
         and scratch.pruneReady == true
         and type(scratch.pruneTotals) == "table"
-        and type(scratch.pruneBound) == "table" then
-        local sameDeact = true
-        local priorDeact = scratch.deactivatedEventIds
-        if type(priorDeact) ~= "table" or #priorDeact ~= #deactivatedEventIds then
-            sameDeact = false
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table" then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
         else
-            for i = 1, #deactivatedEventIds do
-                if priorDeact[i] ~= deactivatedEventIds[i] then
-                    sameDeact = false
-                    break
-                end
-            end
-        end
-        if sameDeact then
-            totals = CloneCreditProjectionTotals(scratch.pruneTotals)
-            bound = {}
-            for i = 1, #scratch.pruneBound do
-                bound[i] = scratch.pruneBound[i]
-            end
-            activeMap = {}
-            for eid, head in pairs(scratch.pruneActiveMap or {}) do
-                activeMap[eid] = head
-            end
-            activeIds = {}
-            for oid, v in pairs(scratch.pruneActiveIds or {}) do
-                activeIds[oid] = v
-            end
             scoreBox = { tonumber(scratch.pruneScore) or TotalsNegScore(totals) }
-            reusedPrune = true
         end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedPrune = true
     end
     if not reusedPrune then
         scoreBox = { TotalsNegScore(totals) }
