@@ -3240,8 +3240,11 @@ do
         "D: prior visit unresolved cannot overwrite new visit")
 
     -- Retained shortage confirmation: early visit-guard isolation + same-visit control.
-    -- Fail-before is executed against the broken Runtime revision (f42d96cb) in an
-    -- isolated reload, then the repaired module is restored for the guard assertion.
+    -- Historical fail-before (Runtime at f42d96cb admits the retained callback into a
+    -- later visit with a still-valid plan) was validated as a one-off against that
+    -- commit in the prior delivery. The ordinary suite must not `git show` historical
+    -- objects — shallow CI / source archives lack them. Keep that result labeled in
+    -- PR/thread evidence; exercise only the current checked-out production modules here.
     local bankStock = 2
     _G.GetGuildBankItemInfo = function(tab, slot)
         if tab == 1 and slot == 1 then return "tex", bankStock, false end
@@ -3268,81 +3271,7 @@ do
         end,
     }
 
-    local function loadRuntimeFromGit(rev)
-        local cmd = string.format(
-            "git -C %q show %s:SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua",
-            ROOT:gsub("/$", ""), rev)
-        local h = io.popen(cmd)
-        assertTrue(h ~= nil, "D: io.popen for Runtime " .. tostring(rev))
-        local src = h:read("*a")
-        h:close()
-        assertTrue(type(src) == "string" and #src > 0,
-            "D: Runtime source from " .. tostring(rev))
-        local chunk, err = loadstring(src, "ConsumablesRuntime@" .. tostring(rev))
-        assertTrue(chunk ~= nil, "D: loadstring Runtime " .. tostring(rev) .. ": " .. tostring(err))
-        chunk("SpectrumFederation", SF)
-        RT = SF.ConsumablesRuntime
-        stubRuntimeLifecycle()
-        statusText = ""
-        RT.review = {
-            Status = {
-                SetText = function(_, t) statusText = t or "" end,
-                GetText = function() return statusText end,
-            },
-            IsShown = function() return false end,
-        }
-        RT.BankIsOpen = function() return true end
-        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
-        WR = SF.ConsumablesWithdrawRuntime
-        WR.BagCount = function(itemId)
-            return bagByItem[tonumber(itemId) or -1] or 0
-        end
-        if WR.work then WR.StopWork("test_cleanup", true) end
-    end
-
-    local function captureShortageAccept(label)
-        RT.bankOpen = false
-        RT._quickWithdrawVisitSeq = 0
-        RT._quickWithdrawVisitToken = nil
-        statusText = ""
-        bankStock = 2
-        WR.craftDrafts = { ["100"] = 2 }
-        acceptCb = nil
-        RT:OnBankOpened()
-        local visitA = RT._quickWithdrawVisitToken
-        assertTrue(visitA ~= nil, label .. ": visit A token")
-        RT:BeginQuickWithdraw()
-        assertTrue(type(acceptCb) == "function", label .. ": ConfirmChoice captured")
-        return visitA, acceptCb
-    end
-
-    -- Executed fail-before: broken Runtime (pre-guard) admits across visits with valid plan.
-    loadRuntimeFromGit("f42d96cb")
-    local visitBrokenA, brokenAccept = captureShortageAccept("D: fail-before broken")
-    RT:OnBankClosed()
-    RT:OnBankOpened()
-    local visitBrokenB = RT._quickWithdrawVisitToken
-    assertTrue(visitBrokenB ~= visitBrokenA, "D: fail-before reopen rotates visit")
-    RT:SetQuickWithdrawStatus("visit-B-active", { visitToken = visitBrokenB })
-    assertEq(statusText, "visit-B-active", "D: fail-before visit B baseline")
-    bankStock = 2 -- plan still valid; defect is missing visit guard
-    pickupCount = 0
-    local admittedBroken = false
-    local realBeginBroken = WR.BeginWithdraw
-    WR.BeginWithdraw = function(sel, opts)
-        local ok, err, detail = realBeginBroken(sel, opts)
-        if ok then admittedBroken = true end
-        return ok, err, detail
-    end
-    brokenAccept()
-    WR.BeginWithdraw = realBeginBroken
-    assertTrue(admittedBroken,
-        "D: fail-before — broken Runtime admits retained callback into visit B")
-    assertTrue(pickupCount >= 1 or WR.work ~= nil,
-        "D: fail-before — broken Runtime starts movement in visit B")
-    if WR.work then WR.StopWork("test_cleanup", true) end
-
-    -- Restored repaired Runtime: same retained-callback scenario must not admit.
+    -- Ensure current tree modules (no historical Git object lookup).
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
     RT = SF.ConsumablesRuntime
     stubRuntimeLifecycle()
@@ -3362,6 +3291,22 @@ do
     end
     if WR.work then WR.StopWork("test_cleanup", true) end
     installCursorStubs()
+
+    local function captureShortageAccept(label)
+        RT.bankOpen = false
+        RT._quickWithdrawVisitSeq = 0
+        RT._quickWithdrawVisitToken = nil
+        statusText = ""
+        bankStock = 2
+        WR.craftDrafts = { ["100"] = 2 }
+        acceptCb = nil
+        RT:OnBankOpened()
+        local visitA = RT._quickWithdrawVisitToken
+        assertTrue(visitA ~= nil, label .. ": visit A token")
+        RT:BeginQuickWithdraw()
+        assertTrue(type(acceptCb) == "function", label .. ": ConfirmChoice captured")
+        return visitA, acceptCb
+    end
 
     local visitShortA, guardedAccept = captureShortageAccept("D: guarded cross-visit")
     RT:OnBankClosed()
