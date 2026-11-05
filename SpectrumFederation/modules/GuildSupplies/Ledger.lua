@@ -5945,6 +5945,23 @@ local function EndCreditProjectionCallbackBudget()
     GS._creditProjectionAccumulating = false
 end
 
+--- Open an outer callback allowance when none is active (#459).
+-- @return boolean owned true when this caller must EndOuter later
+function GS.BeginOuterCreditProjectionCallbackBudget()
+    if GS._creditProjectionAccumulating then
+        return false
+    end
+    BeginCreditProjectionCallbackBudget(false)
+    return true
+end
+
+--- Close an outer allowance only when BeginOuter returned owned=true.
+function GS.EndOuterCreditProjectionCallbackBudget(owned)
+    if owned then
+        EndCreditProjectionCallbackBudget()
+    end
+end
+
 --- One outer callback allowance for accepted-history Ensure then pending redrive.
 -- Production wakes must not open a second full slice after Ensure returns.
 -- Nested callers share the caller's already-consumed allowance; only this

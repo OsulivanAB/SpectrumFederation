@@ -5058,8 +5058,11 @@ do
         local lateEv = GS.FindLedgerEventById(record, lateId)
         assertTrue(lateEv and lateEv.gsProductionCredit == true,
             label .. " late production-credited")
-        assertTrue(arrivalWork <= hard, label .. " arrival work within soft+atomic got="
-            .. tostring(arrivalWork) .. " hard=" .. tostring(hard)
+        local seeded = tonumber(preConsumed) or 0
+        local totalArrival = arrivalWork + seeded
+        assertTrue(totalArrival <= hard, label .. " arrival work within soft+atomic got="
+            .. tostring(totalArrival) .. " (rebuild=" .. tostring(arrivalWork)
+            .. " seeded=" .. tostring(seeded) .. ") hard=" .. tostring(hard)
             .. " visits=" .. tostring(arrivalVisits))
 
         -- Measure each timer callback: sum rebuild workUnits inside that callback.
@@ -5137,6 +5140,222 @@ do
     runArrivalBudgetCase("459: arrival yield", 9411, 80, 96, nil)
     -- Already-consumed outer allowance must remain respected on the wake.
     runArrivalBudgetCase("459: arrival preConsumed", 9412, 80, 256, 200)
+end
+
+do
+    -- Ordinary AdmitRemoteOperation outer lifecycle (#459 / discussion_r4479259160):
+    -- one shared allowance from Apply through post-store; work_budget pending
+    -- schedules authenticated redrive without redelivery.
+    flushTimers()
+    timers = {}
+    GS._creditProjectionWorkBudgetOverride = nil
+    GS._creditProjectionAccumulating = false
+
+    local function runOperationAdmitCase(label, kind, nHeads, budgetOverride, preConsumed)
+        flushTimers()
+        timers = {}
+        GS._creditProjectionWorkBudgetOverride = budgetOverride
+        GS._creditProjectionAccumulating = false
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        local itemId = 9750
+        local record = seedLiveCampaignWithItem(itemId, nHeads + 100)
+        world.time = world.time + 7200
+        settleRoster()
+        flushTimers()
+        local ctx = select(1, GS:GetCurrentContext())
+        local t0 = world.time - (2 * nHeads + 100)
+        local soft = tonumber(budgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+        local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+        local function makeCorrection(id, target, ts, who)
+            return {
+                schemaVersion = GS.OP_SCHEMA_VERSION, id = id, guildKey = ctx.guildKey,
+                datasetId = record.datasetId, campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR, target = target,
+                value = {
+                    eventId = target, eventKind = "donation",
+                    attributed = who .. "-Garona", attributedGuid = "Player-1-" .. who,
+                    baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = ts,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+        end
+        for i = 1, nHeads do
+            local id = "ctx:opadm-don-" .. itemId .. "-" .. i
+            injectProductionDonation(record, {
+                id = id, itemId = itemId, quantity = 1, timestamp = t0 + i,
+            })
+            local op = makeCorrection("opadm-op-" .. itemId .. "-" .. i, id, t0 + nHeads + i, "Bob")
+            GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
+        end
+        injectProductionDonation(record, {
+            id = "ctx:opadm-late-" .. itemId, itemId = itemId, quantity = 5,
+            timestamp = t0 + 2 * nHeads + 1,
+        })
+        GS.InvalidateCreditCorrectionProjection(record)
+        local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        local warmGuard = 0
+        while warmOk == false and warmGuard < 12000 do
+            if not runOneDueTimer() then break end
+            warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+            warmGuard = warmGuard + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " warm projection available")
+        assertEq(#timers, 0, label .. " warm idle")
+
+        local incoming = makeCorrection(
+            "opadm-incoming-" .. itemId .. "-" .. kind .. "-" .. tostring(nHeads),
+            "ctx:opadm-late-" .. itemId, t0 + 2 * nHeads + 2, "Carol")
+        if kind == "adjust" then
+            incoming.kind = GS.KIND.ADJUST_QUANTITY
+            incoming.target = { itemId = itemId }
+            incoming.value = {
+                itemId = itemId, quantity = 1,
+                attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            }
+        end
+
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        local realAdmit = GS.AdmitRemoteOperation
+        local firstWork, accepts = 0, 0
+        local inFirst = true
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, d = realRebuild(...)
+            local units = tonumber(d and d.workUnits) or 0
+            if inFirst then firstWork = firstWork + units end
+            return ok, err, d
+        end
+        GS.AdmitRemoteOperation = function(self, op, opts)
+            local status, reason, details = realAdmit(self, op, opts)
+            if op.id == incoming.id and status == "accepted" then
+                accepts = accepts + 1
+            end
+            return status, reason, details
+        end
+
+        local seeded = tonumber(preConsumed) or 0
+        if seeded > 0 then
+            GS._creditProjectionAccumulating = true
+            GS._creditProjectionCallbackWork = seeded
+            GS._creditProjectionCallbackLimit = soft
+            GS._creditProjectionCallbackHardLimit = hard
+        end
+
+        local status, reason = GS:AdmitRemoteOperation(incoming, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        inFirst = false
+        if seeded > 0 then
+            GS._creditProjectionAccumulating = false
+        end
+        local totalFirst = firstWork + seeded
+        assertTrue(status == "accepted"
+            or (status == "pending" and reason == "work_budget"),
+            label .. " status got " .. tostring(status) .. "/" .. tostring(reason))
+        assertTrue(totalFirst <= hard, label .. " first-call work within soft+atomic got="
+            .. tostring(totalFirst) .. " rebuild=" .. tostring(firstWork)
+            .. " seeded=" .. tostring(seeded) .. " hard=" .. tostring(hard))
+
+        local ticks, maxTimer = 0, 0
+        while #timers > 0 and ticks < 200 do
+            local sliceWork = 0
+            GS.RebuildCreditCorrectionProjection = function(...)
+                local ok, err, d = realRebuild(...)
+                sliceWork = sliceWork + (tonumber(d and d.workUnits) or 0)
+                return ok, err, d
+            end
+            if not runOneDueTimer() then break end
+            if sliceWork > maxTimer then maxTimer = sliceWork end
+            assertTrue(sliceWork <= hard, label .. " timer work within soft+atomic got="
+                .. tostring(sliceWork) .. " at=" .. tostring(ticks + 1))
+            ticks = ticks + 1
+        end
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        GS.AdmitRemoteOperation = realAdmit
+        assertEq(#timers, 0, label .. " idle after drain")
+        assertTrue(record.operations.records[incoming.id] ~= nil,
+            label .. " stored exactly once path")
+        assertTrue(record.operations.pending == nil
+            or record.operations.pending[incoming.id] == nil,
+            label .. " pending cleared")
+        assertEq(accepts, 1, label .. " accepted once")
+        local occurrences = 0
+        for _, id in ipairs(record.operations.order) do
+            if id == incoming.id then occurrences = occurrences + 1 end
+        end
+        assertEq(occurrences, 1, label .. " order entry once")
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " projection available")
+        local bob = 0
+        for i = 1, nHeads do
+            local ev = GS.FindLedgerEventById(record, "ctx:opadm-don-" .. itemId .. "-" .. i)
+            if select(1, GS.ResolveEffectiveCreditIdentity(record, ev)) == "Bob-Garona" then
+                bob = bob + 1
+            end
+        end
+        assertEq(bob, nHeads, label .. " all Bob heads retained got=" .. tostring(bob))
+        local late = GS.FindLedgerEventById(record, "ctx:opadm-late-" .. itemId)
+        local expectLate = (kind == "correction") and "Carol-Garona" or "Alice-Garona"
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, late)),
+            expectLate, label .. " late credit")
+        local bobTotal = select(1, GS.PersonalContributorItemTotal(
+            record, "Bob-Garona", "Player-1-Bob", itemId))
+        assertEq(bobTotal, nHeads, label .. " Bob personal total")
+        local aliceTotal = select(1, GS.PersonalContributorItemTotal(
+            record, "Alice-Garona", "Player-1-Alice", itemId))
+        local carolTotal = select(1, GS.PersonalContributorItemTotal(
+            record, "Carol-Garona", "Player-1-Carol", itemId))
+        assertEq(aliceTotal, (kind == "correction") and 0 or 5, label .. " Alice personal")
+        assertEq(carolTotal, (kind == "correction") and 5 or 0, label .. " Carol personal")
+        if kind == "adjust" then
+            local adjEv = GS.FindLedgerEventById(record, incoming.id)
+            assertTrue(adjEv and adjEv.quantity == 1, label .. " adjust event present")
+            assertTrue(adjEv.gsProductionCredit ~= true,
+                label .. " remote adjust uncredited until marked provenance")
+        end
+        local function fp()
+            local parts = {}
+            for i = 1, nHeads do
+                local ev = GS.FindLedgerEventById(record, "ctx:opadm-don-" .. itemId .. "-" .. i)
+                parts[#parts + 1] = tostring(i) .. "="
+                    .. tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, ev)) or "?")
+            end
+            parts[#parts + 1] = "late="
+                .. tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, late)) or "?")
+            return table.concat(parts, ";")
+        end
+        local fpNatural = fp()
+        GS.InvalidateCreditCorrectionProjection(record)
+        local okFresh = GS.EnsureCreditCorrectionProjection(record, nil)
+        local guard = 0
+        while okFresh == false and guard < 12000 do
+            if not runOneDueTimer() then break end
+            okFresh = GS.EnsureCreditCorrectionProjection(record, nil)
+            guard = guard + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " fresh available")
+        assertEq(fp(), fpNatural, label .. " natural==fresh")
+        assertEq(#timers, 0, label .. " idle after credit reads")
+        GS._creditProjectionWorkBudgetOverride = nil
+        GS._creditProjectionAccumulating = false
+    end
+
+    runOperationAdmitCase("459: op correction 1500", "correction", 1500, nil, nil)
+    runOperationAdmitCase("459: op adjust 1500", "adjust", 1500, nil, nil)
+    runOperationAdmitCase("459: op correction 3400", "correction", 3400, nil, nil)
+    runOperationAdmitCase("459: op adjust 3400", "adjust", 3400, nil, nil)
+    runOperationAdmitCase("459: op correction yield", "correction", 80, 96, nil)
+    runOperationAdmitCase("459: op adjust yield", "adjust", 80, 96, nil)
+    runOperationAdmitCase("459: op correction preConsumed", "correction", 80, 256, 200)
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

@@ -8016,6 +8016,21 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         GS._pendingCampaignBoundaries[stored.id] = nil
     else
+        -- One outer callback allowance for correction/adjustment admission from
+        -- Apply through post-store wakes (#459 / discussion_r4479259160). Nested
+        -- ingress (redrive) inherits an already-active allowance.
+        local ownedCreditBudget = false
+        local creditKind = stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            or stored.kind == GS.KIND.ADJUST_QUANTITY
+        if creditKind and GS.BeginOuterCreditProjectionCallbackBudget then
+            ownedCreditBudget = GS.BeginOuterCreditProjectionCallbackBudget()
+        end
+        local function releaseCreditBudget()
+            if ownedCreditBudget and GS.EndOuterCreditProjectionCallbackBudget then
+                GS.EndOuterCreditProjectionCallbackBudget(true)
+                ownedCreditBudget = false
+            end
+        end
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(record, stored)
             if not ok then
@@ -8032,6 +8047,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         and GS._NotifyLocalDurableChange then
                         GS._NotifyLocalDurableChange("remote-pending")
                     end
+                    releaseCreditBudget()
                     return stPend, reasonPend
                 end
                 -- #459: correction-before-event stays pending; floor failures are
@@ -8045,13 +8061,26 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         stPend, reasonPend = GS._AdmitPendingOrConflict(
                             ops, stored, err, admissionCtx.sender)
                     end
+                    -- work_budget: retain authenticated pending and schedule the
+                    -- existing redrive machinery (no redelivery / getter wake).
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingContributorCorrections then
+                        GS.RedrivePendingContributorCorrections(record, {
+                            eventId = stored.target,
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
+                    end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay
                         and GS._NotifyLocalDurableChange then
                         GS._NotifyLocalDurableChange("remote-pending")
                     end
+                    releaseCreditBudget()
                     return stPend, reasonPend
                 end
+                releaseCreditBudget()
                 return "rejected", err or "apply_failed"
             end
         end
@@ -8059,39 +8088,38 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             GS._StoreAccepted(ops, stored, targetKey)
         end
         if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
-            -- Redrive already rebuilt with this op as extraOp in Apply; seal the
-            -- stamp after store instead of a second full rebuild (#459 budget).
-            if admissionCtx._creditRedrive and GS.SealCreditCorrectionProjection then
+            -- Apply already rebuilt with this op as extraOp; seal the post-store
+            -- stamp instead of a second full rebuild (#459 budget). Nested
+            -- redrive uses the same Seal path. Then wake sibling pendings under
+            -- the shared outer allowance when this is a top-level admit.
+            if GS.SealCreditCorrectionProjection then
                 GS.SealCreditCorrectionProjection(record, true)
-            elseif not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
-                and GS.EnsureThenRedriveCreditCorrections then
-                if GS.InvalidateCreditCorrectionProjection then
-                    GS.InvalidateCreditCorrectionProjection(record)
-                end
-                GS.EnsureThenRedriveCreditCorrections(record, {
+            end
+            if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
+                and GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
                     eventId = stored.target,
                     itemId = stored.value and stored.value.itemId,
+                    _shareCallbackBudget = true,
                 })
-            else
-                if GS.InvalidateCreditCorrectionProjection then
-                    GS.InvalidateCreditCorrectionProjection(record)
-                end
-                if GS.EnsureCreditCorrectionProjection then
-                    GS.EnsureCreditCorrectionProjection(record, nil)
-                end
             end
         elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
-            if GS.InvalidateCreditCorrectionProjection then
-                GS.InvalidateCreditCorrectionProjection(record)
-            end
-            if not admissionCtx.adoptionReplay and GS.EnsureThenRedriveCreditCorrections then
-                GS.EnsureThenRedriveCreditCorrections(record, {
-                    itemId = stored.value and stored.value.itemId,
-                })
+            -- AppendLedgerEvent already Ensure'd under the shared outer allowance.
+            -- StoreAccepted bumps ops generation, so continue Ensure/redrive under
+            -- the same allowance (no second Begin/reset).
+            if not admissionCtx.adoptionReplay then
+                if GS.EnsureThenRedriveCreditCorrections then
+                    GS.EnsureThenRedriveCreditCorrections(record, {
+                        itemId = stored.value and stored.value.itemId,
+                    })
+                elseif GS.EnsureCreditCorrectionProjection then
+                    GS.EnsureCreditCorrectionProjection(record, nil)
+                end
             elseif GS.EnsureCreditCorrectionProjection then
                 GS.EnsureCreditCorrectionProjection(record, nil)
             end
         end
+        releaseCreditBudget()
     end
 
     -- Predecessor-late: ordinary accepts must redrive pending confirmations.
