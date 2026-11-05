@@ -3,9 +3,16 @@ local _, SF = ...
 
 SF.SettingsUI = SF.SettingsUI or {}
 local UI = SF.SettingsUI
+local OpaqueMenu = UI.OpaqueMenu or {}
 
 UI.Dialogs = UI.Dialogs or {}
 local Dialogs = UI.Dialogs
+
+local function ApplyOpaqueDropdownMenuStyle(dropdown)
+    if OpaqueMenu.ApplyDropdownMenuStyle then
+        OpaqueMenu.ApplyDropdownMenuStyle(dropdown)
+    end
+end
 
 local KEY = "SF_SETTINGS_CONFIRM"
 
@@ -203,12 +210,14 @@ local function EnsureTransferPopupContent(content)
 
     content.sourceDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
     content.sourceDropdown:SetDefaultText("Select member")
+    ApplyOpaqueDropdownMenuStyle(content.sourceDropdown)
 
     content.targetLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
     content.targetLabel:SetText("Character 2")
 
     content.targetDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
     content.targetDropdown:SetDefaultText("Select member")
+    ApplyOpaqueDropdownMenuStyle(content.targetDropdown)
 
     content.validationText = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     content.validationText:SetJustifyH("LEFT")
