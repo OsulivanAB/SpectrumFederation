@@ -1296,6 +1296,22 @@ assertEq(
     "explicit empty preparedMembers still displays zero"
 )
 
+-- #449: completion summary counts distinguish Prepared / Unprepared / Inspection Failed.
+local cPrepared, cUnprepared, cFailed = CheckRun.CountClassifiedResults({
+    a = { class = CheckRun.CLASS.PREPARED },
+    b = { class = CheckRun.CLASS.UNPREPARED },
+    c = { class = CheckRun.CLASS.UNPREPARED_AVAILABILITY },
+    d = { class = CheckRun.CLASS.INSPECTION_FAILED },
+})
+assertEq(cPrepared, 1, "completion count includes Prepared")
+assertEq(cUnprepared, 2, "completion count merges Unprepared classes")
+assertEq(cFailed, 1, "completion count includes Inspection Failed")
+assertEq(
+    CheckRun.FormatCompletionSummary("Raid Check", cPrepared, cUnprepared, cFailed),
+    "[Raid Check] Complete: 1 Prepared · 2 Unprepared · 1 Inspection Failed",
+    "completion summary localizes Prepared/Unprepared/Inspection Failed counts"
+)
+
 -- #442: canonicalize presentMembers onto profile IDs before logging.
 local canon15 = CheckRun.CanonicalizePresentMembers(group15, profile22)
 assertEq(#canon15, 16, "15 profile-present members plus one non-profile guest")
