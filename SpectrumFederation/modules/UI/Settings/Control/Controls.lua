@@ -8,6 +8,7 @@ local Controls = UI.Controls
 
 local Store = SF.SettingsStore
 local Style = UI.Style or {}
+local OpaqueMenu = UI.OpaqueMenu or {}
 local R = Style.Row or {}
 
 local LABEL_WIDTH   = R.labelWidth or 220
@@ -15,6 +16,12 @@ local GUTTER        = R.gutter or 16
 local CONTROL_WIDTH = R.controlWidth or 240
 local ADMIN_ONLY_SUFFIX = "|cffff4040(Admin Only)|r"
 local OWNER_ONLY_SUFFIX = "|cffff4040(Owner Only)|r"
+
+local function ApplyOpaqueDropdownMenuStyle(dropdown)
+	if OpaqueMenu.ApplyDropdownMenuStyle then
+		OpaqueMenu.ApplyDropdownMenuStyle(dropdown)
+	end
+end
 
 -- Evaluate a value or thunk to a boolean with default
 -- @param v any Boolean, function returning boolean, or nil
@@ -490,6 +497,7 @@ end
 				local dropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
 				dropdown:SetWidth(def.width or 180)
 				dropdown:SetDefaultText(def.defaultText or "Select...")
+				ApplyOpaqueDropdownMenuStyle(dropdown)
 
 				if previous then
 					dropdown:SetPoint("LEFT", previous, "RIGHT", spacing, 0)
@@ -1203,6 +1211,7 @@ function Controls:AddDropdown(section, opts)
 		local dropdown = CreateFrame("DropdownButton", nil, control, "WowStyle1DropdownTemplate")
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth(opts.width or CONTROL_WIDTH)
+		ApplyOpaqueDropdownMenuStyle(dropdown)
 
 		local function ResolveDefaultText()
 			local d = opts.defaultText
@@ -1482,6 +1491,7 @@ function Controls:AddDropdownWithIconButton(section, opts)
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth((opts.width or CONTROL_WIDTH) - iconSize - gap)
 		dropdown:SetDefaultText(opts.defaultText or "Select...")
+		ApplyOpaqueDropdownMenuStyle(dropdown)
 
 		local iconBtn = CreateIconButton(control, opts.iconAtlas or "common-icon-trash", iconSize)
 		iconBtn:SetPoint("LEFT", dropdown, "RIGHT", gap, 0)
@@ -4332,16 +4342,19 @@ function Controls:AddAutocomplete(section, opts)
 			drop:SetClampedToScreen(true)
 		end
 		drop:Hide()
-		if drop.SetBackdrop then
+		-- Fully opaque WHITE8X8 backing; dialog-box textures stay translucent.
+		if OpaqueMenu.ApplyAutocompleteBackdrop then
+			OpaqueMenu.ApplyAutocompleteBackdrop(drop)
+		elseif drop.SetBackdrop then
 			drop:SetBackdrop({
-				bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+				bgFile = "Interface\\Buttons\\WHITE8X8",
 				edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 				tile = true,
 				tileSize = 8,
 				edgeSize = 12,
 				insets = { left = 3, right = 3, top = 3, bottom = 3 },
 			})
-			drop:SetBackdropColor(0, 0, 0, 0.92)
+			drop:SetBackdropColor(0, 0, 0, 1)
 			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 		end
 
