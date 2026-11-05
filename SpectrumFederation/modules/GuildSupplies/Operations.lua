@@ -847,6 +847,17 @@ local function ValidateKindValue(op)
             or op.value.eventId ~= op.target then
             return false, "invalid_target"
         end
+        -- Authored campaign fields must both be nonempty and mutually consistent.
+        -- Event matching is enforced at ValidateContributorCorrectionPrepare (#459).
+        if type(op.campaignId) ~= "string" or op.campaignId == "" then
+            return false, "invalid_campaign"
+        end
+        if type(op.baseCampaignId) ~= "string" or op.baseCampaignId == "" then
+            return false, "invalid_base_campaign"
+        end
+        if op.campaignId ~= op.baseCampaignId then
+            return false, "invalid_campaign"
+        end
         local eventKind = op.value.eventKind
         if eventKind ~= "donation" and eventKind ~= "adjustment" then
             return false, "invalid_value"

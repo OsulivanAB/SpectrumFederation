@@ -340,6 +340,16 @@ function GS._BumpOpsValidationGen(ops)
     end
 end
 
+--- Drop a cached ops-store validation result without advancing generation (#459).
+-- Used when a trusted credit alias binding is re-confirmed so a prior cached
+-- invalid_operations miss can recover without a manual ops-generation bump.
+function GS._ClearOpsValidationCache(ops)
+    if type(ops) ~= "table" then
+        return
+    end
+    opsStoreValidationCache[ops] = nil
+end
+
 --- Ephemeral ops mutation generation for projection invalidation (#459).
 function GS.GetOpsValidationGen(ops)
     if type(ops) ~= "table" then
@@ -480,6 +490,12 @@ local function ValidateOperationsStore(ops, guildKey, datasetId, record)
     if pendingCount + conflictCount > GS.MAX_PENDING_OPERATIONS then
         CacheOpsValidationResult(ops, gen, guildKey, datasetId, false, "invalid_operations")
         return false, "invalid_operations"
+    end
+
+    -- Reconstruct durable credit aliases from retained correction heads before
+    -- head-key checks so registry eviction cannot make accepted ops invalid (#459).
+    if type(record) == "table" and GS.ReconstructCreditEventAliasesFromOps then
+        GS.ReconstructCreditEventAliasesFromOps(record)
     end
 
     local headsOk, headsErr = ValidateOperationsHeads(ops, record)

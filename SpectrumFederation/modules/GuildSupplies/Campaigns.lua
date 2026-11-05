@@ -1678,7 +1678,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         local markUncredited = (not isWithdrawalRow) and isArchived and GS.IsLiveActive(record)
             and event.gsProductionCredit ~= true
         local creditName, creditGuid, correctionHead, creditStatus = nil, nil, nil, nil
-        if GS.ResolveEffectiveCreditIdentity then
+        -- Withdrawals do not carry contribution credit; skip correction-credit
+        -- resolution so an unavailable projection cannot replace the actor (#459).
+        if not isWithdrawalRow and GS.ResolveEffectiveCreditIdentity then
             creditName, creditGuid, correctionHead, creditStatus =
                 GS.ResolveEffectiveCreditIdentity(record, event)
         end
