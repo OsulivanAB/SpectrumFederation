@@ -1005,15 +1005,26 @@ local function EnsureRecipeEditorUi()
 	frame:SetFrameLevel(200)
 	frame:Hide()
 	if frame.SetBackdrop then
+		-- Same opaque WHITE8X8 foundation as the main Settings window so
+		-- global.settingsWindowOpacity produces matching backdrop alpha.
 		frame:SetBackdrop({
-			bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+			bgFile = "Interface\\Buttons\\WHITE8X8",
 			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 			tile = true,
 			tileSize = 16,
 			edgeSize = 16,
 			insets = { left = 4, right = 4, top = 4, bottom = 4 },
 		})
-		frame:SetBackdropColor(0, 0, 0, 0.92)
+	end
+	-- Share the account-local Settings window opacity (backdrop only).
+	local settingsWindow = SF.SettingsWindow
+	if settingsWindow and settingsWindow.RegisterSettingsWindowOpacityTarget then
+		settingsWindow:RegisterSettingsWindowOpacityTarget(frame)
+	end
+	if settingsWindow and settingsWindow.ApplySettingsWindowOpacity then
+		settingsWindow:ApplySettingsWindowOpacity()
+	elseif frame.SetBackdropColor then
+		frame:SetBackdropColor(0, 0, 0, 0.90)
 	end
 	frame:SetMovable(true)
 	frame:EnableMouse(true)
@@ -1577,6 +1588,10 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 	ui.save:SetScript("OnClick", CommitRecipeEditorSave)
 	ui.delete:SetScript("OnClick", CommitRecipeEditorDelete)
 	ui.frame:Show()
+	-- Re-apply current backdrop opacity on every open (create or reopen).
+	if SF.SettingsWindow and SF.SettingsWindow.ApplySettingsWindowOpacity then
+		SF.SettingsWindow:ApplySettingsWindowOpacity()
+	end
 	-- Skip UI capture: widgets are unbound until Refresh rebinds this session.
 	SyncOrphanReagentsFromSavedAndDraft({ captureUi = false })
 	RefreshRecipeEditor()

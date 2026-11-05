@@ -3016,6 +3016,204 @@ do
     hooks.CloseRecipeEditor(true)
 end
 
+-- Recipe editor shares Settings window opacity (Retail QA: popup vs main window).
+do
+    SpectrumFederationDB = {
+        version = 3,
+        global = { settingsWindowOpacity = 75 },
+        lootHelper = { profiles = {}, activeProfileId = nil },
+    }
+    SpectrumFederationCharDB = {}
+    -- Prior blocks install C_Timer fakes; clear so Apply Debounce runs immediately
+    -- (production sf.reset still reaches ApplyAll without a harness drain).
+    local savedTimer = C_Timer
+    C_Timer = nil
+    loadModule("SpectrumFederation/modules/Settings/Schema.lua")
+    loadModule("SpectrumFederation/modules/Settings/Store.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua")
+    loadModule("SpectrumFederation/modules/Settings/Apply.lua")
+    SF.SettingsStore.db = nil
+    SF.SettingsStore.charDb = nil
+    SF.SettingsStore._callbacks = nil
+    SF.SettingsStore:Init()
+    SF.SettingsApply.initialized = nil
+    SF.SettingsApply._debounce = nil
+    SF.SettingsApply:Init()
+    assertEq(SF.SettingsStore:Get("global.settingsWindowOpacity"), 75,
+        "opacity: store holds nondefault 75")
+
+    local savedCreateFrame = _G.CreateFrame
+    _G.CreateFrame = function(frameType, name, parent, template)
+        local f = {
+            name = name,
+            shown = false,
+            scripts = {},
+            _text = "",
+            alpha = 1,
+            backdrop = nil,
+            backdropColor = nil,
+        }
+        function f:SetSize() end
+        function f:SetPoint() end
+        function f:SetFrameStrata() end
+        function f:SetFrameLevel() end
+        function f:Hide()
+            local wasShown = f.shown
+            f.shown = false
+            if wasShown and f.scripts.OnHide then f.scripts.OnHide(f) end
+        end
+        function f:Show() f.shown = true end
+        function f:IsShown() return f.shown end
+        function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:GetScript(k) return f.scripts[k] end
+        function f:SetMovable() end
+        function f:EnableMouse() end
+        function f:RegisterForDrag() end
+        function f:RegisterEvent() end
+        function f:UnregisterEvent() end
+        function f:UnregisterAllEvents() end
+        function f:SetScrollChild(child) f.scrollChild = child end
+        function f:GetScrollChild() return f.scrollChild end
+        function f:SetBackdrop(info) f.backdrop = info end
+        function f:SetBackdropColor(r, g, b, a)
+            f.backdropColor = { r = r, g = g, b = b, a = a }
+        end
+        function f:SetAlpha(a) f.alpha = a end
+        function f:GetAlpha() return f.alpha end
+        function f:SetText(t)
+            f._text = tostring(t or "")
+            if f.scripts.OnTextChanged then f.scripts.OnTextChanged(f) end
+        end
+        function f:GetText() return f._text end
+        function f:SetShown(v) f.shown = v and true or false end
+        function f:Enable() end
+        function f:Disable() end
+        function f:ClearAllPoints() end
+        function f:SetAutoFocus() end
+        function f:SetNumeric() end
+        function f:SetMaxLetters() end
+        function f:SetHeight() end
+        function f:SetWidth() end
+        function f:SetJustifyH() end
+        f._hasFocus = false
+        function f:HasFocus() return f._hasFocus and true or false end
+        function f:ClearFocus() f._hasFocus = false end
+        function f:SetFocus() f._hasFocus = true end
+        function f:CreateFontString()
+            return {
+                SetPoint = function() end, SetJustifyH = function() end,
+                SetWordWrap = function() end, SetText = function() end,
+                SetFontObject = function() end, SetTextColor = function() end,
+                SetWidth = function() end, Show = function() end, Hide = function() end,
+            }
+        end
+        function f:CreateTexture()
+            return {
+                SetPoint = function() end, SetSize = function() end,
+                SetTexture = function() end, Show = function() end, Hide = function() end,
+                SetAllPoints = function() end,
+            }
+        end
+        return f
+    end
+    SF.SettingsWindow._opacityTargets = {}
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = {}
+    SF.SettingsUI.pages = {}
+    SF.SettingsUI.categories = {}
+    function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsUI.Style = SF.SettingsUI.Style or {}
+    SF.SettingsUI.Controls = SF.SettingsUI.Controls or {}
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+    SF.ItemDisplay = SF.ItemDisplay or {
+        RegisterRefresh = function() end,
+        ResetSession = function() end,
+        QUESTION_MARK = "Interface/Icons/INV_Misc_QuestionMark",
+        Describe = function(_, id) return { name = "Item" .. tostring(id), icon = "x" } end,
+    }
+    _G.UIParent = _G.UIParent or {}
+    _G.UISpecialFrames = {}
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesManage.lua")
+    local managePage = SF.SettingsUI.pagesById.guildSuppliesManage
+    assertTrue(managePage and managePage.__sfTest, "opacity: Manage hooks")
+    local hooks = managePage.__sfTest
+    local record = {
+        datasetId = "gs1:opacity",
+        _guildKey = "club:opacity",
+        currentCampaignId = "camp1",
+        activation = "staged",
+        permission = { editorRankPosition = 3 },
+        accounting = {
+            _consumables = {
+                bankTab = 1, generation = 1, configSeq = 1,
+                requestedItems = { ["10"] = { itemId = 10, goal = 5 } },
+                recipes = { ["100"] = { itemId = 100, reagents = { ["10"] = 1 } } },
+            },
+        },
+    }
+    GS.GetCurrentRecord = function() return record end
+    GS.GetCurrentContext = function()
+        return { ready = true, guildKey = "club:opacity", actorGuid = "Player-1-A", canEdit = true }
+    end
+    GS.GetCapabilities = function() return { canEdit = true, canRead = true } end
+    GS.SenderHasEditorAuthority = function() return true end
+    local ctx = {
+        section = {
+            SetMessage = function() end,
+            ClearMessage = function() end,
+        },
+    }
+    local targetsBefore = #(SF.SettingsWindow._opacityTargets or {})
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    local ui = hooks.RecipeEditorUi()
+    assertTrue(ui and ui.frame, "opacity: editor frame created")
+    assertTrue(ui.frame.backdrop and ui.frame.backdrop.bgFile == "Interface\\Buttons\\WHITE8X8",
+        "opacity: editor uses WHITE8X8 backdrop foundation")
+    assertTrue(ui.frame.backdropColor and math.abs((ui.frame.backdropColor.a or 0) - 0.75) < 1e-6,
+        "opacity: editor opens at saved nondefault 75%")
+    assertEq(ui.frame.alpha, 1, "opacity: editor frame alpha remains 1")
+    assertEq(#SF.SettingsWindow._opacityTargets, targetsBefore + 1,
+        "opacity: editor registered as opacity target once")
+    -- Live settings/apply path updates the existing editor backdrop.
+    SF.SettingsStore:Set("global.settingsWindowOpacity", 100)
+    assertTrue(ui.frame.backdropColor and math.abs((ui.frame.backdropColor.a or 0) - 1.0) < 1e-6,
+        "opacity: production Set updates existing editor to 100%")
+    assertEq(ui.frame.alpha, 1, "opacity: live update does not SetAlpha the frame")
+    -- Close, change setting, reopen uses current value; no callback accumulation.
+    hooks.CloseRecipeEditor(true)
+    assertEq(hooks.RecipeEditorDraft().open, false, "opacity: close discards editor")
+    local targetsAfterClose = #SF.SettingsWindow._opacityTargets
+    SF.SettingsStore:Set("global.settingsWindowOpacity", 70)
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    ui = hooks.RecipeEditorUi()
+    assertTrue(ui.frame.backdropColor and math.abs((ui.frame.backdropColor.a or 0) - 0.70) < 1e-6,
+        "opacity: reopen applies current 70%")
+    assertEq(#SF.SettingsWindow._opacityTargets, targetsAfterClose,
+        "opacity: reopen does not accumulate opacity targets")
+    -- Escape discard still works after opacity wiring.
+    assertTrue(hooks.InvokeRecipeEditorEscape({}), "opacity: Escape hide still works")
+    assertEq(hooks.RecipeEditorDraft().open, false, "opacity: Escape closes editor")
+    assertEq(next(hooks.RecipeEditorDraft().reagentTexts), nil,
+        "opacity: Escape clears draft ownership")
+    -- ResetAll reapplies default to the registered editor frame.
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    ui = hooks.RecipeEditorUi()
+    SF.SettingsStore:ResetAll()
+    assertEq(SF.SettingsStore:Get("global.settingsWindowOpacity"), 90,
+        "opacity: ResetAll restores default")
+    assertTrue(ui.frame.backdropColor and math.abs((ui.frame.backdropColor.a or 0) - 0.90) < 1e-6,
+        "opacity: ResetAll reapplies 90% to recipe editor")
+    hooks.CloseRecipeEditor(true)
+    if savedCreateFrame then
+        _G.CreateFrame = savedCreateFrame
+    end
+    C_Timer = savedTimer
+end
+
 -- D: real bank settle lifecycle, visit settle wiring, shortage visit guard, allowance
 do
     if not SF.ConsumablesWithdrawRuntime or not SF.ConsumablesWithdrawRuntime.PlaceNext then
