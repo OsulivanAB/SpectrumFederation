@@ -122,6 +122,28 @@ do
     assertEq(W.CapacityBlocksPlan(1, 2), true, "bag capacity blocks")
 end
 
+-- Quick Withdraw shortage confirmation helpers (#457 repair)
+do
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    local WR = SF.ConsumablesWithdrawRuntime
+    assertTrue(WR.TakeMapsEqual({ ["10"] = 5, ["20"] = 8 }, { ["10"] = 5, ["20"] = 8 }),
+        "take maps equal")
+    assertEq(WR.TakeMapsEqual({ ["10"] = 5 }, { ["10"] = 8 }), false,
+        "take increase detected")
+    assertEq(WR.TakeMapsEqual({ ["10"] = 5 }, { ["10"] = 3 }), false,
+        "take decrease detected")
+    local authorized = { take = { ["10"] = 8, ["20"] = 2 }, partial = true }
+    local ok = WR.EnforceAcceptedTakeCeiling(authorized, { ["10"] = 5, ["20"] = 2 })
+    assertEq(ok, false, "accepted take blocks increase")
+    authorized = { take = { ["10"] = 4, ["20"] = 2 }, partial = true }
+    ok = WR.EnforceAcceptedTakeCeiling(authorized, { ["10"] = 5, ["20"] = 2 })
+    assertTrue(ok, "accepted take allows same or lower")
+    assertEq(authorized.take["10"], 4, "take unchanged under cap")
+    authorized = { take = { ["30"] = 1 }, partial = true }
+    ok = WR.EnforceAcceptedTakeCeiling(authorized, { ["10"] = 5 })
+    assertEq(ok, false, "new take item blocked")
+end
+
 -- Multi-item bag destination reservation (shared empty-slot pool)
 do
     local bags = {
@@ -149,6 +171,78 @@ do
     assertEq(d1.count, 2, "merge qty")
     assertEq(W.SourcePlanIncomplete(1), true, "source incomplete")
     assertEq(W.SourcePlanIncomplete(0), false, "source complete")
+end
+
+-- Bag family compatibility: specialty empty slots cannot take mismatched reagents.
+do
+    assertTrue(W.SlotAcceptsItemFamily(0, 8), "general bag accepts restricted item")
+    assertTrue(W.SlotAcceptsItemFamily(4, 4), "matching family")
+    assertFalse(W.SlotAcceptsItemFamily(4, 8), "mismatched family")
+
+    local herbBag = {
+        { bag = 4, slots = {
+            { slot = 1, empty = true, family = 4 },
+        } },
+        { bag = 0, slots = {
+            { slot = 1, empty = true, family = 0 },
+        } },
+    }
+    local okHerb, errHerb, planHerb = W.PlanMultiItemBagDestinations(
+        herbBag,
+        { ["100"] = 5 },
+        function() return 20 end,
+        function() return 4 end
+    )
+    assertTrue(okHerb, "herb item into herb+general: " .. tostring(errHerb))
+    assertEq(planHerb.requiredNewStacks, 1, "uses herb slot not general-only miscount")
+
+    local okOre, errOre = W.PlanMultiItemBagDestinations(
+        herbBag,
+        { ["200"] = 5 },
+        function() return 20 end,
+        function() return 8 end
+    )
+    assertFalse(okOre, "ore blocked from herb-only pool")
+    assertEq(errOre, "bag_capacity", "capacity error when no compatible slot")
+
+    local okDest, destErr = W.DestinationStillValid(
+        { empty = true, family = 4 },
+        { count = 5, merge = false, itemFamily = 8 },
+        200,
+        20
+    )
+    assertFalse(okDest, "revalidate rejects family mismatch")
+    assertEq(destErr, "family", "family reason")
+end
+
+-- Allowance counts bank pickups (destination splits), not source stack count alone.
+do
+    local moves, rem = W.PlanSourceMoves({ { slot = 1, count = 10 } }, 10)
+    assertEq(rem, 0, "one source stack")
+    assertEq(#moves, 1, "one source move")
+    local destRows = {
+        { itemId = 10, bag = 0, slot = 1, count = 5, merge = true },
+        { itemId = 10, bag = 0, slot = 2, count = 5, merge = false },
+    }
+    local pickups = 0
+    local remaining = 10
+    for mi = 1, #moves do
+        local move = moves[mi]
+        local left = FloorQty(move.count)
+        local di = 1
+        while left > 0 do
+            local dest = destRows[di]
+            local chunk = math.min(left, FloorQty(dest.count))
+            pickups = pickups + 1
+            left = left - chunk
+            if chunk >= FloorQty(dest.count) then
+                di = di + 1
+            end
+        end
+    end
+    assertEq(pickups, 2, "merge+new destination splits into two bank pickups")
+    assertTrue(W.AllowanceBlocksPlan(1, pickups), "allowance uses pickup count")
+    assertFalse(W.AllowanceBlocksPlan(2, pickups), "two pickups fit allowance of 2")
 end
 
 -- Withdrawal interpret / disposition

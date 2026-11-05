@@ -2046,18 +2046,7 @@ function Runtime:BeginQuickWithdraw()
             selections[tostring(k)] = tonumber(v) or 0
         end
     end
-    local boundSelections = selections
-    local boundDataset = nil
-    local boundCampaign = nil
-    local boundConfigSeq = nil
-    do
-        local ctx = WR.CurrentContext and select(1, WR.CurrentContext())
-        if ctx then
-            boundDataset = ctx.datasetId
-            boundCampaign = ctx.campaignId
-            boundConfigSeq = ctx.configSeq
-        end
-    end
+    local boundSelections = WR.CopyCraftSelections and WR.CopyCraftSelections(selections) or selections
     local function SettleHandler(result)
         self:SetQuickWithdrawStatus(self:FormatQuickWithdrawSettlement(result))
         self:RebuildReview()
@@ -2078,6 +2067,11 @@ function Runtime:BeginQuickWithdraw()
     end
     if err == "shortage" and plan and SF.SettingsUI and SF.SettingsUI.Dialogs then
         local Dialogs = SF.SettingsUI.Dialogs
+        local _, _, preview = WR.PreviewWithdrawPlan and WR.PreviewWithdrawPlan(boundSelections, {})
+        if preview and preview.plan then
+            plan = preview.plan
+        end
+        local ctx = preview and preview.ctx
         local lines = {
             Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
                 "There aren’t enough reagents to fulfill your request."),
@@ -2089,33 +2083,50 @@ function Runtime:BeginQuickWithdraw()
                 name, s.available, s.requested, s.missing)
         end
         local shortageFingerprint = table.concat(lines, "\n")
+        local bound = {
+            guildKey = ctx and ctx.guildKey,
+            datasetId = ctx and ctx.datasetId,
+            campaignId = ctx and ctx.campaignId,
+            bankTab = ctx and ctx.bankTab,
+            generation = ctx and ctx.generation,
+            selections = WR.CopyCraftSelections and WR.CopyCraftSelections(boundSelections) or boundSelections,
+            recipeFingerprints = (preview and preview.recipeFingerprints) or {},
+            requested = (preview and preview.requested and WR.CopyStringKeyQtyMap)
+                and WR.CopyStringKeyQtyMap(preview.requested) or {},
+            take = WR.CopyStringKeyQtyMap and WR.CopyStringKeyQtyMap(plan.take) or plan.take,
+            shortagesFingerprint = shortageFingerprint,
+        }
         if Dialogs.ConfirmChoice then
-            Dialogs:ConfirmChoice({
-                title = Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
-                    "There aren’t enough reagents to fulfill your request."),
-                message = shortageFingerprint,
-                confirmText = Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
-                cancelText = Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
-                onConfirm = function()
-                    -- Re-read stock/context; reject stale shortage confirmation.
-                    local ctx = WR.CurrentContext and select(1, WR.CurrentContext())
-                    if not ctx
-                        or ctx.datasetId ~= boundDataset
-                        or ctx.campaignId ~= boundCampaign
-                        or ctx.configSeq ~= boundConfigSeq then
+            Dialogs:ConfirmChoice(
+                shortageFingerprint,
+                Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
+                Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
+                function()
+                    local valid = WR.QuickWithdrawConfirmationStillValid
+                        and WR.QuickWithdrawConfirmationStillValid(bound)
+                    if not valid then
                         self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
                             "the page is out of date — refresh and try again"))
                         self:RebuildReview()
                         return
                     end
-                    local freshOk, freshErr, freshPlan = StartWithdraw({ allowPartial = true })
+                    local freshOk, freshErr = StartWithdraw({
+                        allowPartial = true,
+                        acceptedTake = bound.take,
+                    })
                     if not freshOk then
                         self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
                             "Withdraw blocked: %s"):format(tostring(freshErr or "unknown")))
                         self:RebuildReview()
                     end
                 end,
-            })
+                function()
+                    -- Edit quantities: preserve craft drafts; no movement.
+                end,
+                function()
+                    -- Escape / Cancel: preserve craft drafts; no movement.
+                end
+            )
         end
         return
     end
@@ -2493,6 +2504,11 @@ function Runtime:BeginDeposit(line, collected)
     end
     if self.depositIntent or self.depositWork then
         Warn("A deposit is already in progress.")
+        return
+    end
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.IsBusy and WR.IsBusy() then
+        Warn("Finish the quick withdraw before depositing raid supplies.")
         return
     end
     local beforeTab = (self:TabItemCounts(tab)[line.itemId]) or 0
