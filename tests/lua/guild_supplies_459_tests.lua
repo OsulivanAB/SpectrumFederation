@@ -2648,17 +2648,21 @@ do
 end
 
 do
-    -- Delayed marked-ledger duplicate: Q's Bob→Alice + Alice−10 vs P's Alice→Bob
-    -- + Bob−20. After marked Alice−10 credits, both heads conflict; empty set
-    -- is valid and must publish (not stale Alice→Bob).
+    -- Delayed marked-ledger duplicate on item X, plus independent item-Y
+    -- deduction-supporting correction that must survive X's empty-set fallback.
+    local ITEM_X, ITEM_Y = 9320, 9325
     local function seedMutualBase()
-        local record = seedLiveCampaignWithItem(9320, 200)
+        local record = seedLiveCampaignWithItem(ITEM_X, 200)
+        local yOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = ITEM_Y }, {
+            itemId = ITEM_Y, goal = 100, removed = false,
+        }))
+        assertEq(GS:ApplyStagedConfigOperation(yOp), "accepted", "459: mutual add item Y")
         injectProductionDonation(record, {
-            id = "mut-don-alice", itemId = 9320, quantity = 10,
+            id = "mut-don-alice", itemId = ITEM_X, quantity = 10,
             actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 10000,
         })
         injectProductionDonation(record, {
-            id = "mut-don-bob", itemId = 9320, quantity = 20,
+            id = "mut-don-bob", itemId = ITEM_X, quantity = 20,
             actor = "Bob-Garona", actorGuid = "Player-1-Bob", timestamp = 10001,
         })
         return record
@@ -2677,7 +2681,7 @@ do
         return body
     end
 
-    -- Peer Q: Bob→Alice then Alice −10.
+    -- Peer Q: Bob→Alice then Alice −10 on X.
     local peerQ = seedMutualBase()
     world.time = 11000
     local qCorr = select(1, GS:NewContributorCorrectionOperation(
@@ -2689,7 +2693,7 @@ do
             and qCut.eligibilityBoundary.tabEligibleFrom)
         or tonumber(qCut and qCut.contextObservedAt) or world.time
     world.time = math.max(world.time, qBound) + 40
-    local qAdj = select(1, GS:NewAdjustmentOperation(9320, -10, "Alice-Garona"))
+    local qAdj = select(1, GS:NewAdjustmentOperation(ITEM_X, -10, "Alice-Garona"))
     assertTrue(qAdj ~= nil, "459: mutual Q prepare Alice−10")
     assertEq(GS:ApplyStagedConfigOperation(qAdj), "accepted", "459: mutual Q apply Alice−10")
     local snapQCorr = select(1, GS._SnapshotPublicOp(qCorr))
@@ -2697,15 +2701,38 @@ do
     local qAdjEv = GS.FindLedgerEventById(peerQ, qAdj.id)
     assertTrue(qAdjEv and qAdjEv.gsProductionCredit == true, "459: mutual Q adj credited")
 
-    -- Peer P: receive unmarked Alice−10 op first, then Alice→Bob + Bob−20.
-    -- Keep P's own cutover until marked-ledger reconcile (avoid dataset mismatch).
+    -- Peer P: independent Y history (Alice→Carol + Carol−10) before X conflict.
     local peerP = seedMutualBase()
+    injectProductionDonation(peerP, {
+        id = "mut-don-y", itemId = ITEM_Y, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 10002,
+    })
+    world.time = 10500
+    local yCorr = select(1, GS:NewContributorCorrectionOperation(
+        "mut-don-y", "Carol-Garona", "Player-1-Carol"))
+    assertTrue(yCorr ~= nil, "459: mutual P prepare Y Alice→Carol")
+    assertEq(GS:ApplyStagedConfigOperation(yCorr), "accepted", "459: mutual P apply Y Alice→Carol")
+    local yCut = peerP.liveCutover
+    local yBound = tonumber(yCut and yCut.eligibilityBoundary
+            and yCut.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(yCut and yCut.contextObservedAt) or world.time
+    world.time = math.max(world.time, yBound) + 40
+    local yAdj = select(1, GS:NewAdjustmentOperation(ITEM_Y, -10, "Carol-Garona"))
+    assertTrue(yAdj ~= nil, "459: mutual P prepare Carol−10")
+    assertEq(GS:ApplyStagedConfigOperation(yAdj), "accepted", "459: mutual P apply Carol−10")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", ITEM_Y), 0,
+        "459: mutual Y Alice 0 after Carol correction")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Carol-Garona", "Player-1-Carol", ITEM_Y), 0,
+        "459: mutual Y Carol 0 after Carol−10")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerP, GS.FindLedgerEventById(peerP, "mut-don-y"))), "Carol-Garona",
+        "459: mutual Y head active before X conflict")
+
     local stQAdjOp = select(1, GS:AdmitRemoteOperation(rebaseMut(snapQAdj, peerP), {
         sender = "Alice-Garona", offlineRecord = peerP, preserveAttribution = true,
     }))
     assertTrue(stQAdjOp == "accepted" or stQAdjOp == "pending" or stQAdjOp == "duplicate",
         "459: mutual P admits unmarked Alice−10 op got " .. tostring(stQAdjOp))
-    -- Unmarked adjustment must not yet move production credit floors.
     local earlyAdj = GS.FindLedgerEventById(peerP, qAdj.id)
     if earlyAdj then
         assertTrue(earlyAdj.gsProductionCredit ~= true,
@@ -2721,20 +2748,18 @@ do
             and pCut.eligibilityBoundary.tabEligibleFrom)
         or tonumber(pCut and pCut.contextObservedAt) or world.time
     world.time = math.max(world.time, pBound) + 40
-    local pAdj = select(1, GS:NewAdjustmentOperation(9320, -20, "Bob-Garona"))
+    local pAdj = select(1, GS:NewAdjustmentOperation(ITEM_X, -20, "Bob-Garona"))
     assertTrue(pAdj ~= nil, "459: mutual P prepare Bob−20")
     assertEq(GS:ApplyStagedConfigOperation(pAdj), "accepted", "459: mutual P apply Bob−20")
-    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", 9320), 0,
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", ITEM_X), 0,
         "459: mutual P Alice 0 before Q correction")
-    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", 9320), 10,
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", ITEM_X), 10,
         "459: mutual P Bob 10 before Q correction")
 
     assertEq(select(1, GS:AdmitRemoteOperation(rebaseMut(snapQCorr, peerP), {
         sender = "Alice-Garona", offlineRecord = peerP, preserveAttribution = true,
     })), "accepted", "459: mutual P admits Bob→Alice correction")
 
-    -- Same-dataset catch-up: share Q's cutover marker only, then deliver the
-    -- matching marked Alice−10 ledger duplicate so provenance credits it.
     assertTrue(type(peerP.liveCutover) == "table", "459: mutual P has liveCutover")
     peerP.liveCutover.cutoverMarker = peerQ.liveCutover.cutoverMarker
     if type(peerQ.liveCutover.eligibilityBoundary) == "table" then
@@ -2766,18 +2791,24 @@ do
     GS.InvalidateCreditCorrectionProjection(peerP)
     local okMut, errMut = GS.RebuildCreditCorrectionProjection(peerP, nil)
     assertTrue(okMut, "459: mutual rebuild succeeds got " .. tostring(errMut))
-    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", 9320), 0,
-        "459: mutual final Alice 0")
-    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", 9320), 0,
-        "459: mutual final Bob 0")
-    -- Both heads inactive (empty active set); durable donations unchanged.
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", ITEM_X), 0,
+        "459: mutual final Alice 0 on X")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", ITEM_X), 0,
+        "459: mutual final Bob 0 on X")
+    -- X heads inactive; independent Y deduction-supporting head preserved.
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         peerP, GS.FindLedgerEventById(peerP, "mut-don-alice"))), "Alice-Garona",
-        "459: mutual Alice donation durable after empty projection")
+        "459: mutual Alice donation durable after X empty")
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         peerP, GS.FindLedgerEventById(peerP, "mut-don-bob"))), "Bob-Garona",
-        "459: mutual Bob donation durable after empty projection")
-    -- Unchanged reads do not thrash rebuilds.
+        "459: mutual Bob donation durable after X empty")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerP, GS.FindLedgerEventById(peerP, "mut-don-y"))), "Carol-Garona",
+        "459: mutual Y Carol head kept after X empty-set")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", ITEM_Y), 0,
+        "459: mutual Y Alice 0 after X conflict")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Carol-Garona", "Player-1-Carol", ITEM_Y), 0,
+        "459: mutual Y Carol 0 — not durable −10")
     GS._creditProjectionRowVisits = 0
     for _ = 1, 5 do
         GS.EnsureCreditCorrectionProjection(peerP, nil)
@@ -2790,6 +2821,8 @@ do
         "459: mutual durable actor preserved")
     assertEq(tonumber(GS.FindLedgerEventById(peerP, "mut-don-alice").quantity), 10,
         "459: mutual durable qty preserved")
+    assertEq(GS.FindLedgerEventById(peerP, "mut-don-y").actor, "Alice-Garona",
+        "459: mutual Y durable actor preserved")
 end
 
 do
@@ -2841,33 +2874,50 @@ do
                 .. " (pre-flush " .. tostring(t0) .. ")")
     end
 
-    -- Missing donation: one wake, then idle until real append.
+    -- Missing donation: one wake, then idle until real AdmitLedgerEvent append.
     local miss = seedLiveCampaignWithItem(9321, 50)
     plantOnePending(miss, "miss-don", "miss-corr", 9321, "pending_event")
     GS.RedrivePendingContributorCorrections(miss, { itemId = 9321, maxAttempts = 8 })
     assertIdleAfterDrain(miss, "missing-event")
     assertTrue(miss.operations.pending["miss-corr"] ~= nil,
         "459: missing-event remains pending while blocked")
-    -- Satisfy via production AdmitLedgerEvent (append/admission wake path).
-    local missDon = injectProductionDonation(miss, {
-        id = "miss-don", itemId = 9321, quantity = 5,
-        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    local cfgMiss = miss.accounting._consumables
+    local missEv = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = "miss-don",
+        txnId = "miss-don",
+        itemId = 9321,
+        quantity = 5,
+        generation = tonumber(cfgMiss.generation) or 1,
+        timestamp = world.time,
+        actor = "Alice-Garona",
+        actorGuid = "Player-1-Alice",
+        writer = "Player-1-Alice",
+        verification = GS.VERIFICATION.OFFICER,
+        verifierGuid = "Player-1-Alice",
+        coreSignature = "miss|don",
+        campaignId = miss.currentCampaignId,
+        datasetId = miss.datasetId,
+        guildGuid = cfgMiss.guild and tostring(cfgMiss.guild.guid),
+        bankTab = tonumber(cfgMiss.bankTab),
+    }
+    local stMiss, rMiss = GS:AdmitLedgerEvent(missEv, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = select(1, GS:GetCurrentContext()).guildKey, rankOrder = 1 },
+        offlineRecord = miss,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        localWrite = false,
     })
-    -- Real append wake wiring:
-    if GS.InvalidateCreditCorrectionProjection then
-        GS.InvalidateCreditCorrectionProjection(miss)
-    end
-    if GS.EnsureCreditCorrectionProjection then
-        GS.EnsureCreditCorrectionProjection(miss, nil)
-    end
-    GS.RedrivePendingContributorCorrections(miss, {
-        eventId = "miss-don", itemId = 9321, maxAttempts = 8,
-    })
+    assertTrue(stMiss == "accepted" or stMiss == "duplicate",
+        "459: missing-event AdmitLedgerEvent got " .. tostring(stMiss) .. "/" .. tostring(rMiss))
     flushTimers()
     assertTrue(miss.operations.records["miss-corr"] ~= nil,
-        "459: missing-event settles after donation arrives")
+        "459: missing-event settles after AdmitLedgerEvent append wake")
     assertNil(miss.operations.pending["miss-corr"],
         "459: missing-event pending cleared once")
+    assertIdleAfterDrain(miss, "missing-event-recovered")
 
     -- Not-credited existing row: donation present but gsProductionCredit false.
     local nocred = seedLiveCampaignWithItem(9322, 50)
@@ -2910,6 +2960,238 @@ do
     flushTimers()
     assertTrue(cap.operations.records["cap-corr"] ~= nil,
         "459: capacity-full settles after capacity restored")
+end
+
+do
+    -- Explicit full wake `{}` from InstallRemoteLiveCutover must dominate a
+    -- prior filtered wave so item-B pending settles without manual Redrive.
+    local record = seedLiveCampaignWithItem(9330, 80)
+    local itemBOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 9331 }, {
+        itemId = 9331, goal = 80, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemBOp), "accepted", "459: full-wake add item B")
+    local cutover = record.liveCutover
+    local boundary = tonumber(cutover.eligibilityBoundary and cutover.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(cutover.contextObservedAt) or world.time
+    -- Item A: credited donation + pending already settled idle filter retained.
+    injectProductionDonation(record, {
+        id = "fw-don-a", itemId = 9330, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = boundary + 10,
+    })
+    local pendingA = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "fw-corr-a",
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "fw-don-a",
+        value = {
+            eventId = "fw-don-a", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9330,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(pendingA, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })), "accepted", "459: full-wake item-A correction accepted")
+    -- Leave a filtered idle continuation as if an A-wave just finished.
+    GS.RedrivePendingContributorCorrections(record, { itemId = 9330, maxAttempts = 8 })
+    flushTimers()
+
+    -- Item B: marked donation not yet production-credited + pending correction.
+    local donB = injectProductionDonation(record, {
+        id = "fw-don-b", itemId = 9331, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = boundary + 50,
+    })
+    donB.approxTxnTime = boundary + 50
+    donB.gsProductionCredit = false
+    donB.gsSourceCutoverMarker = cutover.cutoverMarker
+    local pendingB = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "fw-corr-b",
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "fw-don-b",
+        value = {
+            eventId = "fw-don-b", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9331,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 2,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(pendingB, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })), "pending", "459: full-wake item-B pending before cutover")
+
+    local savedCutover = {}
+    for k, v in pairs(cutover) do
+        savedCutover[k] = v
+    end
+    record.activation = GS.ACTIVATION_STAGED
+    record.liveCutover = nil
+    local stCut = GS.InstallRemoteLiveCutover(record, savedCutover,
+        select(1, GS:GetCurrentContext()).guildKey, {
+            quarantinePending = false,
+            forceActive = true,
+        })
+    assertTrue(stCut == "accepted" or stCut == "duplicate",
+        "459: full-wake InstallRemoteLiveCutover " .. tostring(stCut))
+    flushTimers()
+    assertEq(donB.gsProductionCredit, true, "459: full-wake B donation credited")
+    assertTrue(record.operations.records["fw-corr-b"] ~= nil,
+        "459: full-wake cutover `{}` promotes item-B without manual Redrive")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, donB)), "Bob-Garona",
+        "459: full-wake B credit after cutover")
+    local tAfter = #timers
+    for _ = 1, 5 do flushTimers() end
+    assertEq(#timers, tAfter, "459: full-wake idles after cutover drain")
+end
+
+do
+    -- Conflict-heavy scoring: O(1) bucket deltas, not whole-balance rescans.
+    local record = seedLiveCampaignWithItem(9340, 400)
+    local nDon = 80
+    for i = 1, nDon do
+        injectProductionDonation(record, {
+            id = "score-don-" .. i, itemId = 9340, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 20000 + i,
+        })
+    end
+    injectProductionAdjustment(record, {
+        id = "score-adj", itemId = 9340, quantity = -40,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        timestamp = 20100,
+    })
+    for i = 1, nDon do
+        local target = (i % 2 == 0) and "Bob-Garona" or "Carol-Garona"
+        local guid = (i % 2 == 0) and "Player-1-Bob" or "Player-1-Carol"
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "score-corr-" .. i,
+            guildKey = select(1, GS:GetCurrentContext()).guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "score-don-" .. i,
+            value = {
+                eventId = "score-don-" .. i,
+                eventKind = "donation",
+                attributed = target,
+                attributedGuid = guid,
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = 9340,
+            },
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            timestamp = 20200 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[op.id] = op
+        record.operations.order[#record.operations.order + 1] = op.id
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okScore, errScore, detScore = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okScore, "459: conflict-heavy rebuild ok got " .. tostring(errScore))
+    local bucketVisits = tonumber(detScore and detScore.bucketVisits)
+        or tonumber(GS._creditProjectionBucketVisits) or 0
+    local deacts = tonumber(detScore and detScore.deactivations)
+        or tonumber(GS._creditProjectionDeactivations) or 0
+    -- Old path rescanned every balance bucket per candidate trial each round.
+    -- Bound against that whole-balance product, not trial-step count alone.
+    local approxBuckets = nDon + 8
+    local rescanProduct = nDon * approxBuckets * math.max(deacts, 1)
+    assertTrue(bucketVisits > 0, "459: conflict-heavy measured bucketVisits")
+    assertTrue(deacts > 0, "459: conflict-heavy performed deactivations got="
+        .. tostring(deacts))
+    assertTrue(bucketVisits * 5 < rescanProduct,
+        "459: conflict-heavy bucketVisits ≪ whole-balance rescan product got="
+            .. tostring(bucketVisits) .. " product=" .. tostring(rescanProduct)
+            .. " deacts=" .. tostring(deacts))
+    GS.InvalidateCreditCorrectionProjection(record)
+    local ok2, _, det2 = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(ok2, "459: conflict-heavy ensure after invalidate")
+    local bv2 = tonumber(det2 and det2.bucketVisits) or tonumber(GS._creditProjectionBucketVisits) or 0
+    assertTrue(bv2 * 5 < rescanProduct,
+        "459: conflict-heavy ensure bucketVisits bounded got=" .. tostring(bv2))
+    GS.RedrivePendingContributorCorrections(record, { itemId = 9340, maxAttempts = 8 })
+    flushTimers()
+end
+
+do
+    -- Genuine reconstruction failure: durable Bob −20 with only Alice→Bob +10
+    -- support. Empty local heads still leave Bob negative → blocked Resolve.
+    local record = seedLiveCampaignWithItem(9350, 50)
+    injectProductionDonation(record, {
+        id = "fail-don", itemId = 9350, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "fail-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "459: fail prepare Alice→Bob")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "459: fail apply Alice→Bob")
+    -- Inject an overspending Bob adjustment that bypasses local floor authorship
+    -- so the durable baseline itself is negative once the head is dropped.
+    injectProductionAdjustment(record, {
+        id = "fail-adj", itemId = 9350, quantity = -20,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okFail, errFail = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okFail == false, "459: fail rebuild returns false")
+    assertEq(errFail, "player_negative", "459: fail reason player_negative")
+    local name, guid, head = GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "fail-don"))
+    assertNil(name, "459: fail Resolve name unavailable (not durable Alice)")
+    assertNil(guid, "459: fail Resolve guid unavailable")
+    assertNil(head, "459: fail Resolve head unavailable")
+    -- Ordinary personal totals must not silently serve durable Bob −20.
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9350), 0,
+        "459: fail Bob total blocked (not durable −20)")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9350), 0,
+        "459: fail Alice total blocked while projection failed")
+    GS._creditProjectionRowVisits = 0
+    for _ = 1, 5 do
+        local okCached = GS.EnsureCreditCorrectionProjection(record, nil)
+        assertTrue(okCached == false, "459: fail cached Ensure stays false")
+        GS.ResolveEffectiveCreditIdentity(record, GS.FindLedgerEventById(record, "fail-don"))
+    end
+    assertTrue((tonumber(GS._creditProjectionRowVisits) or 0) == 0,
+        "459: fail unchanged reads skip rebuild visits="
+            .. tostring(GS._creditProjectionRowVisits))
+    -- Recovery: remove the overspend so empty/active sets can verify again.
+    local list = record.accounting._consumableEvents
+    for i = #list, 1, -1 do
+        if list[i] and list[i].id == "fail-adj" then
+            table.remove(list, i)
+            break
+        end
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okRec, errRec = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(okRec, "459: fail recovers after dependency change got " .. tostring(errRec))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "fail-don"))), "Bob-Garona",
+        "459: fail recovery restores Bob credit")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

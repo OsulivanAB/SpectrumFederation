@@ -2416,18 +2416,33 @@ local function CreditRedriveMatch(record, body, opts)
     return matchItem
 end
 
+--- True when opts is an explicit full dependency wake (no item/event filter).
+-- Distinct from nil timer-resume continuation (#459 cutover `{}` wake).
+local function IsFullCreditRedriveWake(opts)
+    return type(opts) == "table" and opts.eventId == nil and opts.itemId == nil
+end
+
 --- Merge an incoming redrive wake into continuation filters (#459).
--- Broader filters clear any mid-wave snapshot so newly eligible work is included.
--- A non-nil opts wake during an active/saved snapshot marks followUpWake so a
--- drained wave schedules one more pass for newly eligible work — without
--- spinning forever on unchanged blocked pending.
+-- nil opts = timer resume (keep filters). Explicit `{}` / unfiltered table = full
+-- wake that clears item/event filters and dominates later narrow wakes until a
+-- full snapshot drains. Broader filters clear any mid-wave snapshot.
 -- @return table cont, boolean broadened
 local function MergeCreditRedriveWake(record, opts)
     local cont = creditRedriveContinuation[record]
     if type(cont) ~= "table" then
-        cont = { opts = opts or {}, scheduled = false, followUpWake = false }
+        cont = {
+            opts = opts or {},
+            scheduled = false,
+            followUpWake = false,
+            fullWake = IsFullCreditRedriveWake(opts),
+        }
+        if cont.fullWake then
+            cont.opts = {
+                maxAttempts = opts and opts.maxAttempts or nil,
+            }
+        end
         creditRedriveContinuation[record] = cont
-        return cont, false
+        return cont, cont.fullWake
     end
     local prev = cont.opts or {}
     local merged = {}
@@ -2437,24 +2452,37 @@ local function MergeCreditRedriveWake(record, opts)
     local broadened = false
     local externalWake = type(opts) == "table"
     if externalWake then
-        if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+        if IsFullCreditRedriveWake(opts) then
+            -- Explicit full wake dominates narrower retained filters.
+            if merged.eventId ~= nil or merged.itemId ~= nil or not cont.fullWake then
+                broadened = true
+            end
             merged.eventId = nil
-            broadened = true
-        elseif opts.eventId and not prev.eventId and not prev.itemId then
-            merged.eventId = opts.eventId
-        elseif opts.eventId and prev.itemId and not prev.eventId then
-            merged.eventId = opts.eventId
-        end
-        if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
             merged.itemId = nil
+            cont.fullWake = true
+        elseif cont.fullWake then
+            -- Outstanding full wake must not be narrowed by a later item wake.
             merged.eventId = nil
-            broadened = true
-        elseif opts.itemId and not (prev.eventId or prev.itemId) then
-            merged.itemId = opts.itemId
-        elseif opts.itemId then
-            -- Narrow item filter while a broader (nil) filter is active keeps broad.
-            if prev.itemId or prev.eventId then
+            merged.itemId = nil
+        else
+            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+                merged.eventId = nil
+                broadened = true
+            elseif opts.eventId and not prev.eventId and not prev.itemId then
+                merged.eventId = opts.eventId
+            elseif opts.eventId and prev.itemId and not prev.eventId then
+                merged.eventId = opts.eventId
+            end
+            if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+                merged.itemId = nil
+                merged.eventId = nil
+                broadened = true
+            elseif opts.itemId and not (prev.eventId or prev.itemId) then
                 merged.itemId = opts.itemId
+            elseif opts.itemId then
+                if prev.itemId or prev.eventId then
+                    merged.itemId = opts.itemId
+                end
             end
         end
         if opts.maxAttempts then
@@ -2462,20 +2490,13 @@ local function MergeCreditRedriveWake(record, opts)
         end
     end
     cont.opts = merged
-    -- Broader wake must rebuild the snapshot; mid-wave index is invalid.
     if broadened then
         cont.snapshot = nil
         cont.index = nil
     end
-    -- Any real dependency wake while a snapshot exists (or is draining) needs
-    -- a follow-up wave after the current drain — even when filters did not
-    -- broaden (new pending ids would otherwise be skipped).
     if externalWake and (type(cont.snapshot) == "table" or creditRedriveDepth > 0
         or cont.scheduled) then
         cont.followUpWake = true
-        if not broadened then
-            -- Keep draining the current snapshot; follow-up rebuilds after.
-        end
     end
     return cont, broadened
 end
@@ -2600,16 +2621,23 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         ScheduleCreditRedriveContinuation(record, nil)
     else
         -- Wave complete: become idle unless a real dependency wake arrived
-        -- during this drain (followUpWake). Do not reschedule merely because
-        -- blocked pending entries still match filters.
+        -- during this drain (followUpWake). Full-wake filter clearance sticks
+        -- so a later cutover `{}` is not required to fight stale item filters.
         local followUp = cont.followUpWake == true
+        local wasFull = cont.fullWake == true
+        local retainedOpts = waveOpts
+        if wasFull and not followUp then
+            retainedOpts = { maxAttempts = waveOpts and waveOpts.maxAttempts or nil }
+        end
         creditRedriveContinuation[record] = {
-            opts = waveOpts,
+            opts = retainedOpts,
             scheduled = false,
             followUpWake = false,
+            -- Keep fullWake through a follow-up so narrow wakes cannot re-narrow.
+            fullWake = followUp and wasFull or false,
         }
         if followUp then
-            ScheduleCreditRedriveContinuation(record, nil)
+            ScheduleCreditRedriveContinuation(record, wasFull and {} or nil)
         end
     end
     return promoted, attempts
@@ -5102,13 +5130,18 @@ function GS.CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
 end
 
 --- Effective credited identity for one ledger event (#459).
+-- When projection reconstruction is failed/blocked, returns nil (unavailable)
+-- instead of silently falling back to durable identities that may be negative.
 -- @return name|nil, guid|nil, correctionHead|nil
 function GS.ResolveEffectiveCreditIdentity(record, event)
     if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
         return nil, nil, nil
     end
     if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
-        GS.EnsureCreditCorrectionProjection(record, nil)
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return nil, nil, nil
+        end
     end
     local map = type(record) == "table" and record.creditCorrections or nil
     local head = nil
@@ -5401,11 +5434,28 @@ local function CreditFloorBucketKey(record, name, guid, itemId, campaignId, rela
     return IdentityBucketKey(n, g, itemId, campaignId)
 end
 
-local function TotalsAdd(totals, key, qty)
+local function NegContribution(value)
+    value = tonumber(value) or 0
+    if value < 0 then
+        return value
+    end
+    return 0
+end
+
+--- Add qty to a floor bucket. Optional scoreBox={score} updates TotalsNegScore in O(1).
+local function TotalsAdd(totals, key, qty, scoreBox)
     if not key or not qty or qty == 0 then
         return
     end
-    totals[key] = (totals[key] or 0) + qty
+    local old = totals[key] or 0
+    local new = old + qty
+    totals[key] = new
+    if type(scoreBox) == "table" then
+        scoreBox[1] = (tonumber(scoreBox[1]) or 0)
+            + (NegContribution(new) - NegContribution(old))
+        GS._creditProjectionBucketVisits =
+            (tonumber(GS._creditProjectionBucketVisits) or 0) + 1
+    end
 end
 
 local function TotalsAllNonNegative(totals)
@@ -5418,14 +5468,39 @@ local function TotalsAllNonNegative(totals)
 end
 
 --- Sum of negative totals (0 when all nonnegative). Higher is better when pruning.
+-- Prefer maintaining score via TotalsAdd(..., scoreBox) during conflict trials.
 local function TotalsNegScore(totals)
     local score = 0
     for _, total in pairs(totals) do
+        GS._creditProjectionBucketVisits =
+            (tonumber(GS._creditProjectionBucketVisits) or 0) + 1
         if total < 0 then
             score = score + total
         end
     end
     return score
+end
+
+--- Item ids that currently have any negative personal floor bucket.
+-- Keys are "g:guid\0itemId\0campaign" or "n:name\0itemId\0campaign".
+-- Lua 5.1 patterns cannot match embedded NULs — use plain find/sub.
+local function ItemIdsWithNegativeTotals(totals)
+    local bad = {}
+    for key, total in pairs(totals) do
+        if total < 0 and type(key) == "string" then
+            local first = key:find("\0", 1, true)
+            if first then
+                local second = key:find("\0", first + 1, true)
+                if second then
+                    local itemId = tonumber(key:sub(first + 1, second - 1))
+                    if itemId then
+                        bad[itemId] = true
+                    end
+                end
+            end
+        end
+    end
+    return bad
 end
 
 --- Index a ledger event under id and txnId only (#459).
@@ -5534,7 +5609,8 @@ local function BuildDurableCreditFloorBaseline(record)
 end
 
 --- Apply or reverse one donation/adjustment correction delta on floor totals.
-local function ApplyCorrectionFloorDelta(record, totals, event, newName, newGuid, relationshipsReady, sign)
+-- Optional scoreBox={score} keeps TotalsNegScore in O(1) per touched bucket.
+local function ApplyCorrectionFloorDelta(record, totals, event, newName, newGuid, relationshipsReady, sign, scoreBox)
     sign = sign or 1
     if type(event) ~= "table" then
         return
@@ -5554,18 +5630,21 @@ local function ApplyCorrectionFloorDelta(record, totals, event, newName, newGuid
     local isAdjustment = IsAdjustmentLedgerEvent(event)
     if isDonation and qty > 0 then
         TotalsAdd(totals, CreditFloorBucketKey(
-            record, oldName, oldGuid, itemId, campaignId, relationshipsReady), -sign * qty)
+            record, oldName, oldGuid, itemId, campaignId, relationshipsReady),
+            -sign * qty, scoreBox)
         TotalsAdd(totals, CreditFloorBucketKey(
-            record, newName, newGuid, itemId, campaignId, relationshipsReady), sign * qty)
+            record, newName, newGuid, itemId, campaignId, relationshipsReady),
+            sign * qty, scoreBox)
     elseif isAdjustment and (oldName or oldGuid or newName or newGuid) then
-        -- Adjustments move credit the same way: remove from durable, add to new.
         if oldName or oldGuid then
             TotalsAdd(totals, CreditFloorBucketKey(
-                record, oldName, oldGuid, itemId, campaignId, relationshipsReady), -sign * qty)
+                record, oldName, oldGuid, itemId, campaignId, relationshipsReady),
+                -sign * qty, scoreBox)
         end
         if newName or newGuid then
             TotalsAdd(totals, CreditFloorBucketKey(
-                record, newName, newGuid, itemId, campaignId, relationshipsReady), sign * qty)
+                record, newName, newGuid, itemId, campaignId, relationshipsReady),
+                sign * qty, scoreBox)
         end
     end
 end
@@ -5616,16 +5695,16 @@ end
 --   1) LWW winner per canonical event
 --   2) Activate *all* production-credited winners that bind
 --   3) While floors fail, deactivate the head whose removal maximizes
---      TotalsNegScore; ties drop older. Jointly required heads stay.
---   4) If no single removal improves but the empty set is nonnegative,
---      deactivate all remaining heads (bounded mutual-conflict recovery —
---      not an unbounded subset search).
+--      TotalsNegScore (O(1) bucket deltas); ties drop older.
+--   4) If prune stalls, empty only item groups that still have negative
+--      floors — independent items keep deduction-supporting heads.
 --   5) Never leave a stale active map; never mark a negative projection ok.
---      Failed reconstructions cache under the dependency stamp.
+--      Failed reconstructions cache under the stamp; Resolve returns nil
+--      (unavailable) rather than durable fallback.
 -- Floor checks use one durable ledger baseline plus O(1) deltas per head.
 -- Alias targets resolve through the baseline id/txn + one linear registry pass.
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
--- @return boolean ok, string|nil err, table|nil details { activeIds, rowVisits, deactivations }
+-- @return boolean ok, string|nil err, table|nil details
 function GS.RebuildCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
@@ -5633,6 +5712,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     GS._creditProjectionRowVisits = 0
     GS._creditProjectionLookupMisses = 0
     GS._creditProjectionDeactivations = 0
+    GS._creditProjectionBucketVisits = 0
     local ops = record.operations
     local candidates = {}
     local function considerOp(op)
@@ -5678,6 +5758,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return true, nil, {
             activeIds = {},
             rowVisits = 0,
+            bucketVisits = 0,
             deactivations = 0,
             lookupMisses = 0,
         }
@@ -5749,6 +5830,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local activeMap = {}
     local activeIds = {}
     local bound = {}
+    local scoreBox = { TotalsNegScore(totals) }
     -- Activate every bindable production-credited winner, then prune by impact.
     for i = 1, #ordered do
         local entry = ordered[i]
@@ -5768,27 +5850,25 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     newGuid = newGuid,
                 }
                 ApplyCorrectionFloorDelta(
-                    record, totals, event, newName, newGuid, relationshipsReady, 1)
+                    record, totals, event, newName, newGuid, relationshipsReady, 1, scoreBox)
             end
         end
     end
-    -- Conflict rule: drop the head whose removal most improves personal floors
-    -- (TotalsNegScore). Require strict score improvement. When scores tie,
-    -- deactivate the older head (prefer keeping newer). Jointly required heads
-    -- stay because dropping either does not improve the score.
+    -- Conflict rule: drop the head whose removal most improves personal floors.
+    -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
     while not TotalsAllNonNegative(totals) do
-        local currentScore = TotalsNegScore(totals)
+        local currentScore = scoreBox[1]
         local bestIdx, bestScore, bestTs, bestId = nil, nil, nil, nil
         for i = 1, #bound do
             local entry = bound[i]
             if entry and activeMap[entry.event.id] then
                 ApplyCorrectionFloorDelta(
                     record, totals, entry.event, entry.newName, entry.newGuid,
-                    relationshipsReady, -1)
-                local score = TotalsNegScore(totals)
+                    relationshipsReady, -1, scoreBox)
+                local score = scoreBox[1]
                 ApplyCorrectionFloorDelta(
                     record, totals, entry.event, entry.newName, entry.newGuid,
-                    relationshipsReady, 1)
+                    relationshipsReady, 1, scoreBox)
                 if score > currentScore then
                     local ts = tonumber(entry.op.timestamp) or 0
                     local id = tostring(entry.op.id)
@@ -5814,34 +5894,40 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         local entry = bound[bestIdx]
         ApplyCorrectionFloorDelta(
             record, totals, entry.event, entry.newName, entry.newGuid,
-            relationshipsReady, -1)
+            relationshipsReady, -1, scoreBox)
         activeMap[entry.event.id] = nil
         activeIds[entry.op.id] = nil
         bound[bestIdx] = nil
         GS._creditProjectionDeactivations =
             (tonumber(GS._creditProjectionDeactivations) or 0) + 1
     end
-    -- When no single removal improves the score but the empty set is valid
-    -- (cross-entry mutual conflict after delayed marked adjustments), drop all
-    -- remaining heads in one bounded step — not an unbounded subset search.
+    -- Local empty-set fallback: when single-head prune stalls, drop remaining
+    -- heads only for item groups that still have negative floors. Independent
+    -- deduction-supporting corrections on other items are preserved.
     if not TotalsAllNonNegative(totals) then
+        local badItems = ItemIdsWithNegativeTotals(totals)
         for i = 1, #bound do
             local entry = bound[i]
             if entry and activeMap[entry.event.id] then
-                ApplyCorrectionFloorDelta(
-                    record, totals, entry.event, entry.newName, entry.newGuid,
-                    relationshipsReady, -1)
-                activeMap[entry.event.id] = nil
-                activeIds[entry.op.id] = nil
-                GS._creditProjectionDeactivations =
-                    (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+                local itemId = tonumber(entry.event.itemId)
+                if itemId and badItems[itemId] then
+                    ApplyCorrectionFloorDelta(
+                        record, totals, entry.event, entry.newName, entry.newGuid,
+                        relationshipsReady, -1, scoreBox)
+                    activeMap[entry.event.id] = nil
+                    activeIds[entry.op.id] = nil
+                    bound[i] = nil
+                    GS._creditProjectionDeactivations =
+                        (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+                end
             end
         end
     end
     local stamp = CreditProjectionDependencyStamp(record)
+    local bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0
     -- Final invariant: never leave a stale active map and never mark a negative
-    -- projection verified. Publish durable-only (empty) when that is nonnegative;
-    -- otherwise clear heads, cache the failure under the stamp, and stop.
+    -- projection verified. On failure, clear heads and cache under the stamp;
+    -- ResolveEffectiveCreditIdentity treats that as unavailable (not durable).
     if not TotalsAllNonNegative(totals) then
         record.creditCorrections = {}
         creditProjectionCache[record] = {
@@ -5852,6 +5938,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return false, "player_negative", {
             activeIds = {},
             rowVisits = rowVisits,
+            bucketVisits = bucketVisits,
             deactivations = GS._creditProjectionDeactivations,
             lookupMisses = lookupMisses,
         }
@@ -5871,6 +5958,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     return true, nil, {
         activeIds = activeIds,
         rowVisits = rowVisits,
+        bucketVisits = bucketVisits,
         deactivations = GS._creditProjectionDeactivations,
         lookupMisses = lookupMisses,
     }
