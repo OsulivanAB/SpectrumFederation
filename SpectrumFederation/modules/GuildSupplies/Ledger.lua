@@ -6223,6 +6223,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         WriteCreditProjectionScratch(record, speculative, extraOp, value)
     end
     local scratch = readScratch()
+    -- Dependency generation gate: never reuse candidates/cursors/phase from a
+    -- prior stamp (Seal/admission can advance the generation while owner scratch
+    -- and timers still linger).
+    if type(scratch) == "table" and scratch.stamp ~= stampEarly then
+        writeScratch(nil)
+        scratch = nil
+    end
     -- Speculative callers must not adopt or mutate accepted-history pauses.
     if type(scratch) == "table" and scratch.stamp == stampEarly then
         if speculative and scratch.ownerSpeculative ~= true then
@@ -6270,7 +6277,17 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         and tonumber(scratch.collectIndex) ~= nil
         and not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline
             or haveOrderedScratch)
+    -- Owner-keyed prune comparison progress (cursor / best-so-far).
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.pruneScan) == "table" then
+        resumeScan = scratch.pruneScan
+    end
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.deactivatedEventIds) == "table" then
+        resumeDeactivated = scratch.deactivatedEventIds
+    end
     -- Skip ops.records walks when ordered/working state is already retained.
+    -- Candidates only from current-stamp scratch (stamp gate above).
     local candidates = scratch and scratch.candidates or nil
     if type(candidates) ~= "table" then
         candidates = {}
@@ -6989,6 +7006,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             pruneActiveIds = activeIds,
             pruneScoreBox = scoreBox,
             deactivatedEventIds = deactivatedEventIds,
+            pruneScan = scanState,
             ownerSpeculative = speculative and true or false,
             ownerOpId = speculative and extraOp and extraOp.id or nil,
         })
@@ -7448,6 +7466,13 @@ function GS.SealCreditCorrectionProjection(record, ok)
         ok = ok ~= false,
         err = (ok == false) and "player_negative" or nil,
     }
+    -- Sealed generation must not leave prior-stamp owner pauses/candidates that
+    -- a queued accepted-history timer could certify as current.
+    ClearCreditProjectionScratch(record)
+    local cont = creditProjectionContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
 end
 
 --- Ensure the credit projection matches current ops/ledger dependency stamps.
