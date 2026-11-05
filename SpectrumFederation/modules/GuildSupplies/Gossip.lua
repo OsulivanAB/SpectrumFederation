@@ -3301,8 +3301,28 @@ local function IsRemoteGuildInfoReason(reason)
     return reason == "remote" or reason:sub(1, 7) == "remote-"
 end
 
+--- Invalidate accepted credit projection + in-flight owner scratch when Guild
+-- Info readiness/identity inputs change, then bounded Ensure/redrive while ready
+-- (#459 / discussion_r4480420558). Does not promote witnesses or mutate GS
+-- ledger/ops by itself.
+local function RefreshCreditProjectionAfterGuildInfo(record, ready)
+    if type(record) ~= "table" then
+        return
+    end
+    -- Invalidate also cancels any in-flight authorized local save retain.
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if ready and GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {})
+    end
+end
+
 local function RunGuildInfoPendingReevaluate(reason, becameReady)
     local record = select(1, GS:GetCurrentRecord())
+    -- Identity/readiness inputs feed credit attribution; refresh projection
+    -- before witness reevaluation so Logs/Rankings never keep a stale stamp.
+    RefreshCreditProjectionAfterGuildInfo(record, true)
     -- Cheap skip when already ready and nothing unfinished remains.
     if not becameReady
         and type(record) == "table"
@@ -3376,12 +3396,18 @@ local function OnGuildInfoDurableChange(reason)
         elseif SF.GuildInfo and SF.GuildInfo.GetRelationshipReadiness then
             ready = SF.GuildInfo:GetRelationshipReadiness() == "ready"
         end
-        local becameReady = ready and guildInfoLastReady ~= true
+        local priorReady = guildInfoLastReady
+        local becameReady = ready and priorReady ~= true
+        local becameNotReady = (not ready) and priorReady == true
         guildInfoLastReady = ready and true or false
 
         -- Incomplete / synchronizing baselines cannot form independent witness
         -- quorum; skip the full pending scan until readiness flips to ready.
+        -- Still invalidate credit projection so name↔GUID floors do not linger.
         if not ready then
+            if becameNotReady or priorReady == nil then
+                RefreshCreditProjectionAfterGuildInfo(record, false)
+            end
             if GS.NotifyUI then
                 GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
             end

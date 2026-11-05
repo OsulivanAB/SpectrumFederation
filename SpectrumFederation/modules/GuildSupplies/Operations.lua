@@ -1731,11 +1731,39 @@ function GS:ApplyStagedConfigOperation(op, context)
         localProductionAuthority = true,
     })
     if not applied then
+        -- Authorized local correction save: retain one immutable op identity and
+        -- private resumable scratch across work_budget slices (#459).
+        if applyErr == "work_budget"
+            and stored.kind == KIND.CORRECT_CONTRIBUTOR
+            and GS.RetainLocalContributorCorrectionSave then
+            GS.RetainLocalContributorCorrectionSave(record, stored, {
+                guildKey = context and context.guildKey or stored.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+            })
+            if GS.ScheduleLocalContributorCorrectionSaveContinuation then
+                GS.ScheduleLocalContributorCorrectionSaveContinuation(record)
+            end
+            return "pending", "work_budget"
+        end
         return "rejected", applyErr or "apply_failed"
+    end
+    -- Soft-clear matching local save retain without discarding the speculative
+    -- scratch Seal/StoreAccepted is about to promote into accepted history.
+    do
+        local entry = GS.GetLocalContributorCorrectionSave
+            and GS.GetLocalContributorCorrectionSave(record)
+        if type(entry) == "table" and type(entry.op) == "table"
+            and entry.op.id == stored.id
+            and GS._ClearLocalContributorCorrectionSaveRetain then
+            GS._ClearLocalContributorCorrectionSaveRetain(record)
+        end
     end
     StoreAccepted(ops, stored, tKey)
     if stored.kind == KIND.CORRECT_CONTRIBUTOR or stored.kind == KIND.ADJUST_QUANTITY then
-        if GS.RebuildCreditCorrectionProjection then
+        if GS.SealCreditCorrectionProjection then
+            GS.SealCreditCorrectionProjection(record, true)
+        elseif GS.RebuildCreditCorrectionProjection then
             GS.RebuildCreditCorrectionProjection(record, nil)
         end
         if GS.RedrivePendingContributorCorrections then

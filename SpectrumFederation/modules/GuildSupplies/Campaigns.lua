@@ -1431,6 +1431,11 @@ local function FormatCampaignHistoryText(record, event, itemName, markUncredited
                 corrWhen = formatted
             end
         end
+        local whenSuffix = ""
+        if corrWhen then
+            whenSuffix = Loc("GUILD_SUPPLIES_HISTORY_CREDIT_CORRECTED_AT", " at %s")
+                :format(corrWhen)
+        end
         local audit = Loc("GUILD_SUPPLIES_HISTORY_CREDIT_CORRECTED",
             "Contribution credit corrected: original %s; %s → %s by %s%s.")
             :format(
@@ -1438,7 +1443,7 @@ local function FormatCampaignHistoryText(record, event, itemName, markUncredited
                 previous,
                 newCredit,
                 officer,
-                corrWhen and (" at " .. corrWhen) or "")
+                whenSuffix)
         body = body .. " " .. audit
     end
     if markUncredited then
@@ -1898,6 +1903,8 @@ function GS.FormatReasonText(reason)
             "that player's contribution cannot become negative"),
         credit_unavailable = Loc("GUILD_SUPPLIES_REASON_CREDIT_UNAVAILABLE",
             "contribution credit is temporarily unavailable while corrections reconcile"),
+        work_budget = Loc("GUILD_SUPPLIES_REASON_WORK_BUDGET",
+            "contribution credit is still reconciling — the save will finish shortly"),
         adjustment_floor = Loc("GUILD_SUPPLIES_REASON_ADJUSTMENT_FLOOR",
             "that adjustment would make totals negative"),
         item_over_goal = Loc("GUILD_SUPPLIES_REASON_ITEM_OVER_GOAL",

@@ -6405,7 +6405,9 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
     end
     if class == "pending" then
         if GS._AdmitPendingOrConflict then
-            return GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
+            return GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "stale_base",
+                admissionCtx and admissionCtx.sender)
         end
         return "pending", classReason or "stale_base"
     end
@@ -6428,7 +6430,9 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
             meta = { boundaries = { [stored.id] = boundary } }
         end
         if GS._AdmitPendingOrConflict then
-            local st, reason = GS._AdmitPendingOrConflict(ops, stored, classReason or "divergent_edit")
+            local st, reason = GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "divergent_edit",
+                admissionCtx and admissionCtx.sender)
             if st == "rejected" then
                 return st, reason
             end
@@ -7853,7 +7857,10 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         local stPend, reasonPend = "pending", classReason or "stale_base"
         if GS._AdmitPendingOrConflict then
-            stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
+            -- Preserve authenticated transport sender for deferred re-admission
+            -- (missing_policy_predecessor / stale_base). Never trust body.actor.
+            stPend, reasonPend = GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "stale_base", admissionCtx.sender)
         end
         -- Successful durable missing-predecessor / pending evidence must notify
         -- provider maintenance so peers can discover it without a later edit.
@@ -8040,7 +8047,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         or err == "invalid_quantity") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
-                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
                     end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay
@@ -8158,6 +8166,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     })
                 end
             end
+        end
+        -- Durable pending corrections that waited on this policy (C before P)
+        -- wake through authenticated redrive — no redelivery / manual getter.
+        if GS.RedrivePendingContributorCorrections then
+            GS.RedrivePendingContributorCorrections(record, {})
         end
     end
     local guildKey = member.guildKey or (record and record._guildKey)

@@ -6163,6 +6163,10 @@ ScheduleCreditProjectionContinuation = function(record)
             return
         end
         state.scheduled = false
+        local prior = creditProjectionCache[record]
+        local fromAcceptedBudget = type(prior) == "table"
+            and prior.err == "work_budget"
+            and not (type(prior.resume) == "table" and prior.resume.speculative)
         BeginCreditProjectionCallbackBudget(false)
         local ok, err = false, nil
         if GS.RebuildCreditCorrectionProjection then
@@ -6177,13 +6181,234 @@ ScheduleCreditProjectionContinuation = function(record)
             })
         end
         EndCreditProjectionCallbackBudget()
+        -- One coalesced UI-only notify for accepted-history work_budget→terminal
+        -- after publication/budget cleanup (#459 / discussion_r4480421491).
+        -- No per-slice notifies; do not invalidate the just-completed projection.
+        if fromAcceptedBudget and (ok or err ~= "work_budget") then
+            if GS.NotifyUI then
+                GS.NotifyUI("credit-projection-ready")
+            end
+        end
     end
     C_Timer.After(0, run)
+end
+
+---------------------------------------------------------------------------
+-- Authorized local correction save resume (#459 / discussion_r4480434323)
+--
+-- Owner: one private pending entry per record (immutable op body + captured
+--        recipient/head/context). Never ops.pending / AdmitRemote.
+-- Lifetime: first local work_budget → accept | cancel | context invalidation.
+-- Cancellation: ClearEditSession / OpenEdit replacement / GI invalidation /
+--               Continue detecting stale authority, guild, dataset, campaign,
+--               expected head, or captured recipient. No later mutation.
+-- Preserve approved accounting/floor policy; complete via LOCAL commit path.
+---------------------------------------------------------------------------
+local localCorrectionSavePending = setmetatable({}, { __mode = "k" })
+local localCorrectionSaveContinuation = setmetatable({}, { __mode = "k" })
+
+local ScheduleLocalContributorCorrectionSaveContinuation
+
+function GS.CancelLocalContributorCorrectionSave(record, _reason)
+    if type(record) ~= "table" then
+        return
+    end
+    local entry = localCorrectionSavePending[record]
+    localCorrectionSavePending[record] = nil
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+    if type(entry) == "table" and type(entry.op) == "table" then
+        DiscardSpeculativeCreditProjectionResume(record, entry.op)
+    end
+end
+
+--- Drop the retain slot after a successful local accept without discarding the
+-- speculative scratch that Seal/StoreAccepted is about to promote.
+function GS._ClearLocalContributorCorrectionSaveRetain(record)
+    if type(record) ~= "table" then
+        return
+    end
+    localCorrectionSavePending[record] = nil
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+end
+
+function GS.GetLocalContributorCorrectionSave(record)
+    local entry = type(record) == "table" and localCorrectionSavePending[record]
+    if type(entry) ~= "table" or type(entry.op) ~= "table" then
+        return nil
+    end
+    return entry
+end
+
+local function RetainLocalContributorCorrectionSave(record, op, meta)
+    if type(record) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
+        return false
+    end
+    local prior = localCorrectionSavePending[record]
+    if type(prior) == "table" and type(prior.op) == "table" and prior.op.id ~= op.id then
+        DiscardSpeculativeCreditProjectionResume(record, prior.op)
+    end
+    localCorrectionSavePending[record] = {
+        op = op,
+        guildKey = meta and meta.guildKey or op.guildKey,
+        datasetId = meta and meta.datasetId or op.datasetId,
+        campaignId = meta and meta.campaignId or op.campaignId,
+        eventId = op.target,
+        baseTargetRevision = op.baseTargetRevision,
+        baseAttributed = op.value and op.value.baseAttributed,
+        baseAttributedGuid = op.value and op.value.baseAttributedGuid,
+        attributed = op.value and op.value.attributed,
+        attributedGuid = op.value and op.value.attributedGuid,
+    }
+    return true
+end
+
+local function LocalContributorCorrectionSaveStillValid(record, entry)
+    if type(record) ~= "table" or type(entry) ~= "table" or type(entry.op) ~= "table" then
+        return false, "invalid_operation"
+    end
+    local op = entry.op
+    local caps = GS.GetCapabilities and GS:GetCapabilities() or nil
+    if not (caps and caps.canEdit) then
+        return false, (caps and caps.reason) or "unauthorized"
+    end
+    local ctx = GS.GetCurrentContext and GS:GetCurrentContext() or nil
+    if type(ctx) ~= "table" or ctx.guildKey ~= entry.guildKey then
+        return false, "stale_guild"
+    end
+    local live, liveReason = GS.GetCurrentRecord and GS:GetCurrentRecord() or nil, nil
+    if live ~= record then
+        return false, liveReason or "not_configured"
+    end
+    if record.datasetId ~= entry.datasetId then
+        return false, "dataset_mismatch"
+    end
+    if record.currentCampaignId ~= entry.campaignId then
+        return false, "stale_campaign"
+    end
+    if op.datasetId ~= record.datasetId or op.campaignId ~= record.currentCampaignId then
+        return false, "stale_campaign"
+    end
+    local event = GS.FindLedgerEventById and GS.FindLedgerEventById(record, entry.eventId)
+    if not event then
+        return false, "missing_event"
+    end
+    local curName, curGuid, _, creditStatus = nil, nil, nil, nil
+    if GS.ResolveEffectiveCreditIdentity then
+        curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    end
+    if creditStatus == GS.CREDIT_UNAVAILABLE then
+        return false, GS.CREDIT_UNAVAILABLE
+    end
+    if GS.CreditIdentities and GS.CreditIdentities.equal then
+        if not GS.CreditIdentities.equal(
+            curName, curGuid, entry.baseAttributed, entry.baseAttributedGuid) then
+            return false, "stale_credit"
+        end
+    end
+    local tKey = GS.CorrectionTargetKey and GS.CorrectionTargetKey(record, entry.eventId)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(
+            GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR, entry.eventId))
+    local headId = tKey and record.operations and record.operations.heads
+        and record.operations.heads[tKey]
+    local expected = entry.baseTargetRevision
+    local noPriorHead = expected == nil or expected == record.datasetId
+    if noPriorHead then
+        if headId ~= nil then
+            return false, "stale_credit"
+        end
+    elseif expected ~= headId then
+        return false, "stale_credit"
+    end
+    return true, nil, op
+end
+
+function GS.ContinueLocalContributorCorrectionSave(record)
+    local entry = type(record) == "table" and localCorrectionSavePending[record]
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+    if type(entry) ~= "table" then
+        return false, "missing"
+    end
+    local okValid, validErr, op = LocalContributorCorrectionSaveStillValid(record, entry)
+    if not okValid then
+        GS.CancelLocalContributorCorrectionSave(record, validErr or "stale_credit")
+        return false, validErr or "stale_credit"
+    end
+    if type(GS.ApplyStagedConfigOperation) ~= "function" then
+        GS.CancelLocalContributorCorrectionSave(record, "unsupported_kind")
+        return false, "unsupported_kind"
+    end
+    local status, reason = GS:ApplyStagedConfigOperation(op)
+    if status == "pending" and reason == "work_budget" then
+        ScheduleLocalContributorCorrectionSaveContinuation(record)
+        return false, "work_budget"
+    end
+    if status == "accepted" or status == "duplicate" then
+        localCorrectionSavePending[record] = nil
+        return true, status
+    end
+    GS.CancelLocalContributorCorrectionSave(record, reason or status or "rejected")
+    return false, reason or status or "rejected"
+end
+
+ScheduleLocalContributorCorrectionSaveContinuation = function(record)
+    if type(record) ~= "table" then
+        return
+    end
+    if not (C_Timer and C_Timer.After) then
+        return
+    end
+    if type(localCorrectionSavePending[record]) ~= "table" then
+        return
+    end
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {}
+        localCorrectionSaveContinuation[record] = cont
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    C_Timer.After(0, function()
+        local state = localCorrectionSaveContinuation[record]
+        if type(state) ~= "table" or state.scheduled ~= true then
+            -- Cancelled while queued.
+            if type(state) == "table" then
+                state.scheduled = false
+            end
+            return
+        end
+        state.scheduled = false
+        if GS.ContinueLocalContributorCorrectionSave then
+            GS.ContinueLocalContributorCorrectionSave(record)
+        end
+    end)
+end
+
+function GS.RetainLocalContributorCorrectionSave(record, op, meta)
+    return RetainLocalContributorCorrectionSave(record, op, meta)
+end
+
+function GS.ScheduleLocalContributorCorrectionSaveContinuation(record)
+    return ScheduleLocalContributorCorrectionSaveContinuation(record)
 end
 
 --- Invalidate cached credit projection after dependency mutations (#459).
 function GS.InvalidateCreditCorrectionProjection(record)
     if type(record) == "table" then
+        -- Drop in-flight authorized local save with the projection it depends on.
+        if GS.CancelLocalContributorCorrectionSave then
+            GS.CancelLocalContributorCorrectionSave(record, "invalidate")
+        end
         creditProjectionCache[record] = nil
         ClearCreditProjectionScratch(record)
         local cont = creditProjectionContinuation[record]
@@ -7536,6 +7761,15 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
             return true
         end
         if cached.err == "work_budget" then
+            -- Speculative local/remote preview pauses must not hide the last
+            -- published accepted map or Schedule an accepted-history continuation
+            -- that would wipe private resumable scratch (#459 local save).
+            if type(cached.resume) == "table" and cached.resume.speculative then
+                if type(record.creditCorrections) == "table" then
+                    return true
+                end
+                return false, "work_budget"
+            end
             ScheduleCreditProjectionContinuation(record)
             return false, "work_budget"
         end
@@ -7584,6 +7818,16 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     if opts.localPrepare then
         if type(record.currentCampaignId) ~= "string"
             or event.campaignId ~= record.currentCampaignId then
+            return false, "stale_campaign"
+        end
+    else
+        -- Remote/adoption: correction authorship campaign must match the target
+        -- event's campaign (current-campaign ops must not rewrite archived rows).
+        -- Legitimate historical corrections authored for that campaign still pass.
+        local authored = op.campaignId or op.baseCampaignId
+        if type(authored) == "string" and authored ~= ""
+            and type(event.campaignId) == "string" and event.campaignId ~= ""
+            and authored ~= event.campaignId then
             return false, "stale_campaign"
         end
     end
@@ -7735,10 +7979,14 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
     -- Preview rebuild including this op; local prepare must activate.
     local rebuilt, rebuildErr, rebuildDetails = GS.RebuildCreditCorrectionProjection(record, op)
     if not rebuilt then
-        -- Local rejected/paused preview must not stay queued for background
-        -- publication via resume.extraOp (#459 / discussion_r4476590692).
+        -- Local work_budget keeps private speculative scratch for the authorized
+        -- resumable local save path (#459 / discussion_r4480434323). Other local
+        -- failures still discard so timers cannot publish an unaccepted preview.
         -- Remote redrive keeps speculative resume so the next Admit can continue.
         if rebuildErr == "work_budget" and isLocal then
+            return false, "work_budget"
+        end
+        if isLocal then
             DiscardSpeculativeCreditProjectionResume(record, op)
         end
         return false, rebuildErr or "invalid_value"

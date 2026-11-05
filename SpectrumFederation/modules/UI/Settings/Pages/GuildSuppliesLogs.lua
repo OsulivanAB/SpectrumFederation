@@ -414,6 +414,7 @@ local function BuildProjectedRows()
 			and event.id ~= ""
 			and productionOk
 			and campaignOk
+			and event.creditUnavailable ~= true
 		local effectiveName = event.effectiveAttributed
 		local effectiveGuid = event.effectiveAttributedGuid
 		if kind == "donation" and effectiveName == nil and effectiveGuid == nil
@@ -493,6 +494,15 @@ end
 
 local function ClearEditSession()
 	InvalidatePendingConfirm()
+	-- Cancellation contract (#459): page/session replacement drops any in-flight
+	-- authorized local save so timers cannot mutate after the editor left.
+	do
+		local g = GS()
+		local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+		if g and g.CancelLocalContributorCorrectionSave and type(record) == "table" then
+			g.CancelLocalContributorCorrectionSave(record, "session_cleared")
+		end
+	end
 	editSession = nil
 end
 
@@ -561,8 +571,12 @@ local function ResolveEditAttribution(text, allowUnassigned)
 	if exact then
 		return exact, cache.guidByLower[lower], true, nil
 	end
-	-- Realm-disambiguated exact match when the typed text omits realm but the
-	-- roster has a unique short-name hit.
+	-- Short-name fallback only when the typed text omits a realm. A failed
+	-- exact realm-qualified lookup must not resolve a different realm.
+	local hasRealm = trimmed:find("-", 1, true) ~= nil
+	if hasRealm then
+		return nil, nil, false, "invalid_attribution"
+	end
 	local short = trimmed:match("^([^%-]+)") or trimmed
 	local shortLower = string.lower(short)
 	local unique = nil
@@ -720,10 +734,14 @@ local function EditSessionStillFresh(session)
 	if not event then
 		return false, "missing_event"
 	end
-	local curName, curGuid = nil, nil
+	local curName, curGuid, _, creditStatus = nil, nil, nil, nil
 	if g.ResolveEffectiveCreditIdentity then
-		curName, curGuid = g.ResolveEffectiveCreditIdentity(record, event)
+		curName, curGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
 	end
+	if creditStatus == (g.CREDIT_UNAVAILABLE or "credit_unavailable") then
+		return false, "credit_unavailable"
+	end
+	-- Genuine Unassigned (nil==nil) stays fresh; unavailable must not look Unassigned.
 	if g.CreditIdentitiesEqual
 		and not g.CreditIdentitiesEqual(
 			curName, curGuid, session.effectiveName, session.effectiveGuid) then
@@ -804,12 +822,18 @@ local function CommitCapturedEdit(payload)
 		ReportLogsStatus("rejected", "unsupported_kind")
 		return
 	end
-	local op, status, prepReason = g:NewContributorCorrectionOperation(
-		payload.eventId, payload.attributed, payload.attributedGuid)
-	if not op then
-		ClearEditSession()
-		ReportLogsStatus(status or "rejected", prepReason or "invalid_value")
-		return
+	-- Retain ONE immutable authorized local save identity across work_budget
+	-- slices (#459 / discussion_r4480434323). Do not mint a new operation id.
+	local op = session.pendingLocalOp
+	if type(op) ~= "table" then
+		local status, prepReason
+		op, status, prepReason = g:NewContributorCorrectionOperation(
+			payload.eventId, payload.attributed, payload.attributedGuid)
+		if not op then
+			ClearEditSession()
+			ReportLogsStatus(status or "rejected", prepReason or "invalid_value")
+			return
+		end
 	end
 	-- Reconfirm open-time revision still matches prepare-time head.
 	if op.baseTargetRevision ~= payload.baseTargetRevision then
@@ -818,7 +842,17 @@ local function CommitCapturedEdit(payload)
 		return
 	end
 	local applyStatus, applyReason = g:ApplyStagedConfigOperation(op)
-	ClearEditSession()
+	if applyStatus == "pending" and applyReason == "work_budget" then
+		-- Keep truthful pending UI; timers complete through the local resume path.
+		session.pendingLocalOp = op
+		session.pendingLocal = true
+		InvalidatePendingConfirm()
+		ReportLogsStatus(applyStatus, applyReason)
+		return
+	end
+	-- Soft-clear session without cancelling an already-accepted local save.
+	InvalidatePendingConfirm()
+	editSession = nil
 	ReportLogsStatus(applyStatus, applyReason)
 end
 
@@ -889,9 +923,13 @@ OpenEditContributorDialog = function(eventId, rowData)
 		end
 	end
 	local allowUnassigned = kind == "adjustment"
-	local effectiveName, effectiveGuid = nil, nil
+	local effectiveName, effectiveGuid, _, creditStatus = nil, nil, nil, nil
 	if g.ResolveEffectiveCreditIdentity then
-		effectiveName, effectiveGuid = g.ResolveEffectiveCreditIdentity(record, event)
+		effectiveName, effectiveGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
+	end
+	if creditStatus == (g.CREDIT_UNAVAILABLE or "credit_unavailable") then
+		ReportLogsStatus("rejected", "credit_unavailable")
+		return
 	end
 	local tKey = g.CorrectionTargetKey and g.CorrectionTargetKey(record, event.id)
 		or (g.ComputeTargetKey
@@ -903,8 +941,8 @@ OpenEditContributorDialog = function(eventId, rowData)
 	local prefill = effectiveName
 	local prefillGuid = effectiveGuid
 	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
-	-- Opening another entry invalidates any in-flight confirmation.
-	InvalidatePendingConfirm()
+	-- Opening another entry invalidates confirmation and any resumable local save.
+	ClearEditSession()
 	editSession = {
 		eventId = event.id,
 		kind = kind,
@@ -1419,6 +1457,27 @@ local function EnsureDurableListener()
 	supplies.RegisterUIListener(function()
 		cachedProjectedRows = nil
 		cachedProjectionKey = nil
+		-- Reconcile resumable local save UI with GS retain / accepted storage.
+		if type(editSession) == "table" and editSession.pendingLocal
+			and type(editSession.pendingLocalOp) == "table" then
+			local g = GS()
+			local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+			local opId = editSession.pendingLocalOp.id
+			local retained = g and g.GetLocalContributorCorrectionSave
+				and g.GetLocalContributorCorrectionSave(record)
+			local accepted = type(record) == "table"
+				and record.operations and record.operations.records
+				and record.operations.records[opId]
+			if accepted then
+				InvalidatePendingConfirm()
+				editSession = nil
+				ReportLogsStatus("accepted")
+			elseif retained == nil then
+				InvalidatePendingConfirm()
+				editSession = nil
+				ReportLogsStatus("rejected", "stale_credit")
+			end
+		end
 		QueueRefresh()
 	end)
 	durableListenerRegistered = true
@@ -1447,6 +1506,8 @@ function Page:Build(panel)
 		end)
 		panel:HookScript("OnHide", function()
 			CancelValuationCatchup()
+			-- Page leave cancels any in-flight authorized local save (#459).
+			ClearEditSession()
 		end)
 	end
 	MaybeStartValuationCatchup(panel)

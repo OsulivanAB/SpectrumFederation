@@ -46018,6 +46018,190 @@ do
     assertEq(installed.currentCampaignId, camp2, "447-adopt-5: current is camp2")
 end
 
+---------------------------------------------------------------------------
+-- #459 / PR #460: Guild Info → Guild Supplies credit projection bridge
+---------------------------------------------------------------------------
+
+do
+    -- Real GI provider/bridge: readiness/identity changes invalidate accepted
+    -- projection + owner scratch, then bounded Ensure/redrive. No witness
+    -- promotion and no GS ledger/ops mutation from the bridge itself.
+    ensureNonOfficerRoster()
+    local record = seedStagedCampaignWithItem(98459, 200)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted",
+        "459-GI: assign Dave←Eve")
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "459-GI: bridge registered")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    assertTrue(giRec ~= nil, "459-GI: gi record")
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = true
+    assertEq(GI:GetRelationshipReadiness(), "ready", "459-GI: ready baseline")
+
+    local cfg = record.accounting._consumables
+    local gen = tonumber(cfg.generation) or 1
+    local events = record.accounting._consumableEvents
+    local nHeads = 60
+    for i = 1, nHeads do
+        local id = "gi-don-" .. tostring(i)
+        events[#events + 1] = {
+            type = "donation",
+            id = id,
+            txnId = id,
+            itemId = 98459,
+            quantity = 1,
+            actor = "Eve-Garona",
+            actorGuid = "Player-1-Eve",
+            donorGuid = "Player-1-Eve",
+            generation = gen,
+            timestamp = (world.time or 0) + i,
+            source = "guildbank",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+        }
+        local ctx = select(1, GS:GetCurrentContext())
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "gi-op-" .. tostring(i),
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = id,
+            value = {
+                eventId = id, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Eve-Garona", baseAttributedGuid = "Player-1-Eve",
+                itemId = 98459,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = (world.time or 0) + nHeads + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
+    end
+    -- Non-vacuous binding: Eve rolls under Dave via GI; floors use that identity.
+    GS.InvalidateCreditCorrectionProjection(record)
+    local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+    local warmGuard = 0
+    while warmOk == false and warmGuard < 200 do
+        if not runOneDueTimer() then break end
+        warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        warmGuard = warmGuard + 1
+    end
+    flushTimers()
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-GI: warm available")
+    local function creditFp()
+        local parts = {}
+        for i = 1, nHeads do
+            local ev = GS.FindLedgerEventById(record, "gi-don-" .. tostring(i))
+            parts[#parts + 1] = tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, ev)))
+        end
+        return table.concat(parts, ",")
+    end
+    local natural = creditFp()
+    assertTrue(natural:find("Bob%-Garona", 1), "459-GI: natural has Bob credit")
+
+    local opsOrderBefore = #(record.operations.order or {})
+    local ledgerBefore = #(record.accounting._consumableEvents or {})
+    local witnessBefore = 0
+    if type(record.observations) == "table" then
+        for _ in pairs(record.observations) do
+            witnessBefore = witnessBefore + 1
+        end
+    end
+
+    -- Into not-ready: bridge invalidates; no GS ledger/ops/witness mutation.
+    local ensureCalls = 0
+    local realEnsure = GS.EnsureCreditCorrectionProjection
+    GS.EnsureCreditCorrectionProjection = function(...)
+        ensureCalls = ensureCalls + 1
+        return realEnsure(...)
+    end
+    giRec.baseline.complete = false
+    GI.NotifyUI("baseline-incomplete")
+    drainExportMaint(16)
+    -- not-ready path invalidates without Ensure/redrive.
+    assertEq(ensureCalls, 0, "459-GI: no Ensure on out-of-readiness")
+    assertEq(#(record.operations.order or {}), opsOrderBefore,
+        "459-GI: no ops mutation on not-ready")
+    assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
+        "459-GI: no ledger mutation on not-ready")
+
+    -- Back to ready: Invalidate + Ensure/redrive via bridge.
+    ensureCalls = 0
+    giRec.baseline.complete = true
+    GI.NotifyUI("baseline-complete")
+    assertTrue(ensureCalls >= 1, "459-GI: Ensure on ready transition got="
+        .. tostring(ensureCalls))
+    local readyGuard = 0
+    while (not GS.IsCreditCorrectionProjectionAvailable(record)) and readyGuard < 200 do
+        if not runOneDueTimer() then
+            realEnsure(record, nil)
+        end
+        readyGuard = readyGuard + 1
+    end
+    flushTimers()
+    GS.EnsureCreditCorrectionProjection = realEnsure
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-GI: available after ready")
+    local fresh = creditFp()
+    assertEq(fresh, natural, "459-GI: natural==fresh after ready transition")
+    assertEq(#(record.operations.order or {}), opsOrderBefore,
+        "459-GI: no ops mutation on ready")
+    assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
+        "459-GI: no ledger mutation on ready")
+    local witnessAfter = 0
+    if type(record.observations) == "table" then
+        for _ in pairs(record.observations) do
+            witnessAfter = witnessAfter + 1
+        end
+    end
+    assertEq(witnessAfter, witnessBefore, "459-GI: no witness promotion")
+
+    -- Readiness flip between paced slices: invalidate mid-drain, then recover.
+    GS._creditProjectionWorkBudgetOverride = 48
+    GS.InvalidateCreditCorrectionProjection(record)
+    local midOk = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(midOk == false, "459-GI: paced yield before flip")
+    assertTrue(#timers >= 1, "459-GI: continuation queued")
+    ensureCalls = 0
+    GS.EnsureCreditCorrectionProjection = function(...)
+        ensureCalls = ensureCalls + 1
+        return realEnsure(...)
+    end
+    giRec.baseline.complete = false
+    GI.NotifyUI("mid-slice-incomplete")
+    assertEq(ensureCalls, 0, "459-GI: mid-slice not-ready does not Ensure")
+    -- Drop queued continuation; ready transition must redrive freshly.
+    timers = {}
+    giRec.baseline.complete = true
+    GI.NotifyUI("mid-slice-complete")
+    assertTrue(ensureCalls >= 1, "459-GI: mid-slice ready Ensure got="
+        .. tostring(ensureCalls))
+    local midGuard = 0
+    while (not GS.IsCreditCorrectionProjectionAvailable(record)) and midGuard < 200 do
+        if not runOneDueTimer() then
+            realEnsure(record, nil)
+        end
+        midGuard = midGuard + 1
+    end
+    flushTimers()
+    GS.EnsureCreditCorrectionProjection = realEnsure
+    GS._creditProjectionWorkBudgetOverride = nil
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459-GI: recovered after mid-slice readiness flip")
+    assertEq(creditFp(), natural, "459-GI: natural==fresh after mid-slice flip")
+    assertEq(#timers, 0, "459-GI: idle")
+end
+
 SF.TSM = nil
 world.impersonationActive = false
 setPlayer("Alice-Garona", "Player-1-Alice", 1)
