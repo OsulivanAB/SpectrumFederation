@@ -5982,11 +5982,67 @@ local function AccumulateCreditProjectionCallbackWork(workUnits)
 end
 
 -- Ephemeral paced-rebuild scratch (not durable / not another ledger authority).
-local creditProjectionScratch = setmetatable({}, { __mode = "k" })
+-- Scratch is ownership-keyed: accepted-history and each speculative extraOp
+-- keep private paused state so admission previews cannot clobber a pause.
+local creditProjectionScratchAccepted = setmetatable({}, { __mode = "k" })
+local creditProjectionScratchSpeculative = setmetatable({}, { __mode = "k" })
+
+local function IsSpeculativeCreditProjectionOp(ops, extraOp)
+    return type(extraOp) == "table"
+        and not (type(ops) == "table" and type(ops.records) == "table"
+            and ops.records[extraOp.id])
+end
+
+local function ReadCreditProjectionScratch(record, speculative, extraOp)
+    if type(record) ~= "table" then
+        return nil
+    end
+    if speculative and type(extraOp) == "table" and type(extraOp.id) == "string" then
+        local bag = creditProjectionScratchSpeculative[record]
+        if type(bag) == "table" then
+            return bag[extraOp.id]
+        end
+        return nil
+    end
+    return creditProjectionScratchAccepted[record]
+end
+
+local function WriteCreditProjectionScratch(record, speculative, extraOp, value)
+    if type(record) ~= "table" then
+        return
+    end
+    if speculative and type(extraOp) == "table" and type(extraOp.id) == "string" then
+        local bag = creditProjectionScratchSpeculative[record]
+        if type(bag) ~= "table" then
+            bag = {}
+            creditProjectionScratchSpeculative[record] = bag
+        end
+        bag[extraOp.id] = value
+        return
+    end
+    creditProjectionScratchAccepted[record] = value
+end
 
 local function ClearCreditProjectionScratch(record)
     if type(record) == "table" then
-        creditProjectionScratch[record] = nil
+        creditProjectionScratchAccepted[record] = nil
+        creditProjectionScratchSpeculative[record] = nil
+    end
+end
+
+local function ClearSpeculativeCreditProjectionScratch(record, op)
+    if type(record) ~= "table" then
+        return
+    end
+    local bag = creditProjectionScratchSpeculative[record]
+    if type(bag) ~= "table" then
+        return
+    end
+    local opId = type(op) == "table" and op.id or nil
+    if type(opId) == "string" then
+        bag[opId] = nil
+    else
+        creditProjectionScratchSpeculative[record] = nil
     end
 end
 
@@ -6013,25 +6069,23 @@ local function DiscardSpeculativeCreditProjectionResume(record, op)
         return
     end
     local cached = creditProjectionCache[record]
-    if type(cached) ~= "table" or type(cached.resume) ~= "table" then
-        return
+    if type(cached) == "table" and type(cached.resume) == "table" then
+        local resume = cached.resume
+        if resume.speculative then
+            local opId = type(op) == "table" and op.id or nil
+            if not (type(resume.extraOpId) == "string"
+                and type(opId) == "string"
+                and resume.extraOpId ~= opId) then
+                creditProjectionCache[record] = nil
+                local cont = creditProjectionContinuation[record]
+                if type(cont) == "table" then
+                    cont.scheduled = false
+                end
+            end
+        end
     end
-    local resume = cached.resume
-    if not resume.speculative then
-        return
-    end
-    local opId = type(op) == "table" and op.id or nil
-    if type(resume.extraOpId) == "string"
-        and type(opId) == "string"
-        and resume.extraOpId ~= opId then
-        return
-    end
-    creditProjectionCache[record] = nil
-    ClearCreditProjectionScratch(record)
-    local cont = creditProjectionContinuation[record]
-    if type(cont) == "table" then
-        cont.scheduled = false
-    end
+    -- Never clear accepted-history scratch when discarding a speculative preview.
+    ClearSpeculativeCreditProjectionScratch(record, op)
 end
 
 local ScheduleCreditProjectionContinuation
@@ -6161,7 +6215,22 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     else
         GS._creditProjectionOwnedCallbackBudget = false
     end
-    local scratch = creditProjectionScratch[record]
+    local speculative = IsSpeculativeCreditProjectionOp(ops, extraOp)
+    local function readScratch()
+        return ReadCreditProjectionScratch(record, speculative, extraOp)
+    end
+    local function writeScratch(value)
+        WriteCreditProjectionScratch(record, speculative, extraOp, value)
+    end
+    local scratch = readScratch()
+    -- Speculative callers must not adopt or mutate accepted-history pauses.
+    if type(scratch) == "table" and scratch.stamp == stampEarly then
+        if speculative and scratch.ownerSpeculative ~= true then
+            scratch = nil
+        elseif (not speculative) and scratch.ownerSpeculative == true then
+            scratch = nil
+        end
+    end
     local skipToPrune = type(scratch) == "table" and scratch.stamp == stampEarly
         and scratch.pruneReady == true
         and type(scratch.pruneTotals) == "table"
@@ -6182,6 +6251,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         and type(scratch.pruneBound) == "table"
         and type(scratch.pruneActiveMap) == "table"
         and type(scratch.pruneActiveIds) == "table"
+    local skipToFallback = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.fallbackReady == true
+        and type(scratch.ordered) == "table"
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
     local skipToBaseline = type(scratch) == "table" and scratch.stamp == stampEarly
         and scratch.baselineReady == false
         and type(scratch.baselineTotals) == "table"
@@ -6189,6 +6265,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local haveOrderedScratch = type(scratch) == "table" and scratch.stamp == stampEarly
         and type(scratch.ordered) == "table"
         and type(scratch.baselineTotals) == "table"
+    local skipToCollect = type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.candidates) == "table"
+        and tonumber(scratch.collectIndex) ~= nil
+        and not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline
+            or haveOrderedScratch)
     -- Skip ops.records walks when ordered/working state is already retained.
     local candidates = scratch and scratch.candidates or nil
     if type(candidates) ~= "table" then
@@ -6211,25 +6292,178 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
         candidates[#candidates + 1] = op
     end
-    if not (skipToPrune or skipToActivate or skipToRestore or skipToBaseline or haveOrderedScratch or #candidates > 0) then
+    local function deferCandidates(collectIndex, collectIds, collectOrderIndex, collectIdsReady)
+        writeScratch({
+            stamp = stampEarly,
+            candidates = candidates,
+            collectIndex = collectIndex,
+            collectIds = collectIds,
+            collectOrderIndex = collectOrderIndex,
+            collectIdsReady = collectIdsReady and true or false,
+            ownerSpeculative = speculative and true or false,
+            ownerOpId = speculative and extraOp.id or nil,
+        })
+        creditProjectionCache[record] = {
+            stamp = stampEarly,
+            ok = false,
+            err = "work_budget",
+            resume = {
+                deactivatedEventIds = {},
+                phase = "collect",
+                speculative = speculative and true or false,
+                extraOp = speculative and extraOp or nil,
+                extraOpId = speculative and extraOp.id or nil,
+            },
+        }
+        local workUnits = CreditProjectionWorkNow(0)
+        AccumulateCreditProjectionCallbackWork(workUnits)
+        if not speculative then
+            ScheduleCreditProjectionContinuation(record)
+        end
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
+        return false, "work_budget", {
+            traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+            workUnits = workUnits,
+            deferred = true,
+            phase = "collect",
+            speculative = speculative and true or false,
+            callbackWork = CreditProjectionCallbackWorkTotal(0),
+        }
+    end
+    if not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline
+        or haveOrderedScratch or (#candidates > 0 and not skipToCollect)) then
         candidates = {}
-        if type(ops) == "table" and type(ops.records) == "table" then
-            for _, op in pairs(ops.records) do
-                considerOp(op)
+        local softLimitEarly = CreditProjectionSoftLimit()
+        local hardLimitEarly = CreditProjectionHardLimit()
+        local allowDeferEarly = (C_Timer and C_Timer.After) and true or false
+        -- Stable paced collection via ops.order when present; else id snapshot.
+        local collectIds = scratch and scratch.collectIds or nil
+        local collectIndex = 1
+        local collectOrderIndex = 1
+        local collectIdsReady = false
+        if skipToCollect then
+            collectIds = scratch.collectIds
+            collectIndex = tonumber(scratch.collectIndex) or 1
+            collectOrderIndex = tonumber(scratch.collectOrderIndex) or 1
+            collectIdsReady = scratch.collectIdsReady == true
+            candidates = scratch.candidates or {}
+        end
+        if type(collectIds) ~= "table" then
+            collectIds = {}
+        end
+        if not collectIdsReady then
+            if type(ops) == "table" and type(ops.order) == "table" then
+                for oi = collectOrderIndex, #ops.order do
+                    GS._creditProjectionTraversalVisits =
+                        (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                    collectIds[#collectIds + 1] = ops.order[oi]
+                    local now = CreditProjectionWorkNow(0)
+                    if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                        or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                        return deferCandidates(1, collectIds, oi + 1, false)
+                    end
+                end
+                collectIdsReady = true
+            elseif type(ops) == "table" and type(ops.records) == "table" then
+                -- Unordered snapshot: finish id list without mid-pairs yield
+                -- (pairs order is not stable); pace considerOp via collectIndex.
+                if #collectIds == 0 then
+                    for id, _ in pairs(ops.records) do
+                        GS._creditProjectionTraversalVisits =
+                            (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                        collectIds[#collectIds + 1] = id
+                    end
+                end
+                collectIdsReady = true
+            else
+                collectIdsReady = true
+            end
+        end
+        local records = type(ops) == "table" and ops.records or nil
+        for ci = collectIndex, #collectIds do
+            local id = collectIds[ci]
+            local op = type(records) == "table" and records[id] or nil
+            considerOp(op)
+            local now = CreditProjectionWorkNow(0)
+            if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                return deferCandidates(ci + 1, collectIds, collectOrderIndex, true)
             end
         end
         if type(extraOp) == "table" then
-            local seen = false
-            for i = 1, #candidates do
-                GS._creditProjectionTraversalVisits =
-                    (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
-                if candidates[i].id == extraOp.id then
-                    seen = true
-                    break
+            -- Pace dedup under the shared remainder; a full unpaced scan of
+            -- thousands of candidates can exceed soft+atomic in one step.
+            local seen = scratch and scratch.extraOpSeen == true
+            local extraScanIndex = 1
+            if skipToCollect and tonumber(scratch and scratch.extraScanIndex) then
+                extraScanIndex = tonumber(scratch.extraScanIndex)
+                seen = scratch.extraOpSeen == true
+            end
+            if not seen then
+                for i = extraScanIndex, #candidates do
+                    GS._creditProjectionTraversalVisits =
+                        (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                    if candidates[i].id == extraOp.id then
+                        seen = true
+                        break
+                    end
+                    local now = CreditProjectionWorkNow(0)
+                    if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                        or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                        writeScratch({
+                            stamp = stampEarly,
+                            candidates = candidates,
+                            collectIndex = #collectIds + 1,
+                            collectIds = collectIds,
+                            collectOrderIndex = collectOrderIndex,
+                            collectIdsReady = true,
+                            extraScanIndex = i + 1,
+                            extraOpSeen = false,
+                            ownerSpeculative = speculative and true or false,
+                            ownerOpId = speculative and extraOp.id or nil,
+                        })
+                        creditProjectionCache[record] = {
+                            stamp = stampEarly,
+                            ok = false,
+                            err = "work_budget",
+                            resume = {
+                                deactivatedEventIds = {},
+                                phase = "collect",
+                                speculative = speculative and true or false,
+                                extraOp = speculative and extraOp or nil,
+                                extraOpId = speculative and extraOp.id or nil,
+                            },
+                        }
+                        local workUnits = CreditProjectionWorkNow(0)
+                        AccumulateCreditProjectionCallbackWork(workUnits)
+                        if not speculative then
+                            ScheduleCreditProjectionContinuation(record)
+                        end
+                        if GS._creditProjectionOwnedCallbackBudget then
+                            EndCreditProjectionCallbackBudget()
+                            GS._creditProjectionOwnedCallbackBudget = false
+                        end
+                        return false, "work_budget", {
+                            traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                            workUnits = workUnits,
+                            deferred = true,
+                            phase = "collect",
+                            speculative = speculative and true or false,
+                            callbackWork = CreditProjectionCallbackWorkTotal(0),
+                        }
+                    end
                 end
             end
             if not seen then
                 considerOp(extraOp)
+            end
+            local now = CreditProjectionWorkNow(0)
+            if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                return deferCandidates(#collectIds + 1, collectIds, collectOrderIndex, true)
             end
         end
     elseif type(extraOp) == "table" and not (skipToPrune or skipToActivate)
@@ -6238,13 +6472,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     -- No correction ops: publish empty active set without scanning the ledger
     -- (keeps ordinary progress projection readiness-bounded — #427 / #459).
-    if not (skipToPrune or skipToActivate or skipToRestore or skipToBaseline or haveOrderedScratch) and #candidates == 0 then
+    if not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline or haveOrderedScratch) and #candidates == 0 then
         record.creditCorrections = {}
         creditProjectionCache[record] = {
             stamp = CreditProjectionDependencyStamp(record),
             ok = true,
         }
-        ClearCreditProjectionScratch(record)
+        writeScratch(nil)
         if GS._creditProjectionOwnedCallbackBudget then
             EndCreditProjectionCallbackBudget()
             GS._creditProjectionOwnedCallbackBudget = false
@@ -6261,15 +6495,14 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     do
         local softLimit = CreditProjectionSoftLimit()
         local allowDefer = (C_Timer and C_Timer.After) and true or false
-        if allowDefer and not (skipToPrune or skipToActivate or skipToRestore or skipToBaseline or haveOrderedScratch)
+        if allowDefer and not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline or haveOrderedScratch)
             and CreditProjectionCallbackWorkTotal(CreditProjectionWorkNow(0)) >= softLimit then
-            creditProjectionScratch[record] = {
+            writeScratch({
                 stamp = stampEarly,
                 candidates = candidates,
-            }
-            local speculative = type(extraOp) == "table"
-                and not (type(ops) == "table" and type(ops.records) == "table"
-                    and ops.records[extraOp.id])
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp.id or nil,
+            })
             creditProjectionCache[record] = {
                 stamp = stampEarly,
                 ok = false,
@@ -6336,6 +6569,15 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         totals = scratch.pruneTotals
         resumeRestoreIndex = tonumber(scratch.restoreIndex) or 1
         GS._creditProjectionRowVisits = 0
+    elseif skipToFallback then
+        baselineTotals = scratch.baselineTotals
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        GS._creditProjectionRowVisits = 0
     elseif haveOrderedScratch then
         -- Resume after post_baseline: one charged working clone from baseline.
         baselineTotals = scratch.baselineTotals
@@ -6351,9 +6593,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         and tonumber(scratch.winnersIndex)
         and type(scratch.baselineTotals) == "table"
         and type(scratch.ordered) ~= "table" then
-        -- Resume paced winner indexing; baseline already retained.
+        -- Resume paced winner indexing; keep baseline immutable.
         baselineTotals = scratch.baselineTotals
-        totals = scratch.baselineTotals
+        totals = CloneCreditProjectionTotals(baselineTotals)
         byId = scratch.byId
         rowVisits = tonumber(scratch.rowVisits) or 0
         relationshipsReady = scratch.relationshipsReady
@@ -6385,10 +6627,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             if type(baselineSnap) ~= "table" then
                 baselineSnap = {}
             end
-            local speculative = type(extraOp) == "table"
-                and not (type(ops) == "table" and type(ops.records) == "table"
-                    and ops.records[extraOp.id])
-            creditProjectionScratch[record] = {
+            writeScratch({
                 stamp = stampEarly,
                 candidates = scratch and scratch.candidates or candidates,
                 baselineReady = false,
@@ -6399,7 +6638,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 baselineVisits = baselineSnap.baselineVisits,
                 baselineRelationshipsReady = baselineSnap.baselineRelationshipsReady,
                 baselineResolveCache = baselineSnap.baselineResolveCache,
-            }
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
             creditProjectionCache[record] = {
                 stamp = stampEarly,
                 ok = false,
@@ -6433,11 +6674,12 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 speculative = speculative and true or false,
             }
         end
-        totals = baselineSnap.baselineTotals
+        -- Keep baseline immutable; working totals are a charged clone.
+        baselineTotals = baselineSnap.baselineTotals
+        totals = CloneCreditProjectionTotals(baselineTotals)
         byId = baselineSnap.baselineById
         rowVisits = tonumber(baselineSnap.baselineVisits) or tonumber(baselineVisits) or 0
         relationshipsReady = baselineSnap.baselineRelationshipsReady
-        baselineTotals = totals
         GS._creditProjectionRowVisits = rowVisits
         -- Yield after baseline before winner indexing when allowance spent.
         do
@@ -6445,10 +6687,10 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             local allowDefer = (C_Timer and C_Timer.After) and true or false
             if allowDefer and CreditProjectionCallbackWorkTotal(
                 CreditProjectionWorkNow(rowVisits or 0)) >= softLimit then
-                creditProjectionScratch[record] = {
+                writeScratch({
                     stamp = stampEarly,
                     candidates = scratch and scratch.candidates or candidates,
-                    baselineTotals = totals,
+                    baselineTotals = baselineTotals,
                     byId = byId,
                     rowVisits = rowVisits,
                     relationshipsReady = relationshipsReady,
@@ -6457,11 +6699,10 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     lookupMisses = scratch and scratch.lookupMisses or 0,
                     winnersIndex = 1,
                     winners = {},
-                }
+                    ownerSpeculative = speculative and true or false,
+                    ownerOpId = speculative and extraOp and extraOp.id or nil,
+                })
                 -- If ordered already absent, resume via winnersIndex path below.
-                local speculative = type(extraOp) == "table"
-                    and not (type(ops) == "table" and type(ops.records) == "table"
-                        and ops.records[extraOp.id])
                 creditProjectionCache[record] = {
                     stamp = stampEarly,
                     ok = false,
@@ -6559,7 +6800,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         local now = CreditProjectionWorkNow(rowVisits or 0)
         if allowDefer and (CreditProjectionCallbackWorkTotal(now) >= softLimit
             or CreditProjectionCallbackWorkTotal(now) >= hardLimit) then
-            creditProjectionScratch[record] = {
+            writeScratch({
                 stamp = stampEarly,
                 candidates = candidates,
                 baselineTotals = baselineTotals or totals,
@@ -6569,10 +6810,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 winners = winners,
                 winnersIndex = i + 1,
                 lookupMisses = lookupMisses,
-            }
-            local speculative = type(extraOp) == "table"
-                and not (type(ops) == "table" and type(ops.records) == "table"
-                    and ops.records[extraOp.id])
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
             creditProjectionCache[record] = {
                 stamp = stampEarly,
                 ok = false,
@@ -6629,12 +6869,15 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         totals = CloneCreditProjectionTotals(baselineTotals)
     end
     -- Soft yield after baseline/indexing before activation when allowance spent.
+    -- Never run this when resuming activate/prune — it would wipe working state.
     do
         local softLimit = CreditProjectionSoftLimit()
         local allowDefer = (C_Timer and C_Timer.After) and true or false
-        if allowDefer and CreditProjectionCallbackWorkTotal(
+        if allowDefer
+            and not (skipToActivate or skipToPrune or skipToRestore or skipToFallback)
+            and CreditProjectionCallbackWorkTotal(
             CreditProjectionWorkNow(rowVisits or 0)) >= softLimit then
-            creditProjectionScratch[record] = {
+            writeScratch({
                 stamp = stampEarly,
                 baselineTotals = baselineTotals,
                 byId = byId,
@@ -6642,10 +6885,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 relationshipsReady = relationshipsReady,
                 ordered = ordered,
                 lookupMisses = lookupMisses,
-            }
-            local speculative = type(extraOp) == "table"
-                and not (type(ops) == "table" and type(ops.records) == "table"
-                    and ops.records[extraOp.id])
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
             creditProjectionCache[record] = {
                 stamp = stampEarly,
                 ok = false,
@@ -6691,9 +6933,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local softLimit = CreditProjectionSoftLimit()
     local hardLimit = CreditProjectionHardLimit()
     local allowDefer = (C_Timer and C_Timer.After) and true or false
-    local speculative = type(extraOp) == "table"
-        and not (type(ops) == "table" and type(ops.records) == "table"
-            and ops.records[extraOp.id])
+    -- `speculative` was resolved at rebuild entry for scratch ownership.
     local function finishOwnedBudget()
         if GS._creditProjectionOwnedCallbackBudget then
             EndCreditProjectionCallbackBudget()
@@ -6714,17 +6954,19 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     local function savePruneScratch(opts)
         opts = opts or {}
-        local priorScratch = creditProjectionScratch[record]
+        local priorScratch = readScratch()
         local baseSnap = baselineTotals
         if type(priorScratch) == "table" and type(priorScratch.baselineTotals) == "table" then
             baseSnap = priorScratch.baselineTotals
         end
         local activateIdx = opts.activateIndex
         local restoreIdx = opts.restoreIndex
+        local fallbackIdx = opts.fallbackIndex
         local activating = activateIdx ~= nil
         local restoring = restoreIdx ~= nil
+        local fallingBack = fallbackIdx ~= nil
         -- O(1) retain owned private working state; no history-sized copies.
-        creditProjectionScratch[record] = {
+        writeScratch({
             stamp = stamp,
             baselineTotals = baseSnap,
             byId = byId,
@@ -6733,26 +6975,33 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             ordered = ordered,
             lookupMisses = lookupMisses,
             candidates = priorScratch and priorScratch.candidates or nil,
-            pruneReady = not activating and not restoring,
+            pruneReady = not activating and not restoring and not fallingBack,
             activateReady = activating and true or false,
             activateIndex = activateIdx,
             restoreReady = restoring and true or false,
             restoreIndex = restoreIdx,
+            fallbackReady = fallingBack and true or false,
+            fallbackIndex = fallbackIdx,
+            fallbackBadItems = opts.fallbackBadItems,
             pruneTotals = totals,
             pruneBound = bound,
             pruneActiveMap = activeMap,
             pruneActiveIds = activeIds,
             pruneScoreBox = scoreBox,
             deactivatedEventIds = deactivatedEventIds,
-        }
+            ownerSpeculative = speculative and true or false,
+            ownerOpId = speculative and extraOp and extraOp.id or nil,
+        })
     end
-    local function deferProjection(phase, activateIndex, restoreIndex)
+    local function deferProjection(phase, activateIndex, restoreIndex, fallbackIndex, fallbackBadItems)
         -- Retain working state first (O(1)), then charge this callback's work
         -- including anything performed after the yield decision.
-        if activateIndex ~= nil or restoreIndex ~= nil then
+        if activateIndex ~= nil or restoreIndex ~= nil or fallbackIndex ~= nil then
             savePruneScratch({
                 activateIndex = activateIndex,
                 restoreIndex = restoreIndex,
+                fallbackIndex = fallbackIndex,
+                fallbackBadItems = fallbackBadItems,
             })
         else
             savePruneScratch()
@@ -6803,6 +7052,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local reusedPrune = false
     local reusedActivate = false
     local reusedRestore = false
+    local reusedFallback = false
     if skipToPrune then
         totals = scratch.pruneTotals
         bound = scratch.pruneBound
@@ -6845,8 +7095,22 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             deactivatedEventIds = scratch.deactivatedEventIds
         end
         reusedRestore = true
+    elseif skipToFallback then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
+        else
+            scoreBox = { TotalsNegScore(totals) }
+        end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedFallback = true
     end
-    if not reusedPrune then
+    if not reusedPrune and not reusedFallback then
         if not reusedActivate and not reusedRestore then
             scoreBox = { TotalsNegScore(totals) }
         end
@@ -6933,14 +7197,14 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
     end
     -- Soft yield before prune when baseline/activate already spent the allowance.
-    if shouldYield(CreditProjectionWorkNow(rowVisits))
+    if (not reusedFallback) and shouldYield(CreditProjectionWorkNow(rowVisits))
         and not TotalsAllNonNegative(totals) then
         return deferProjection("pre_prune")
     end
     -- Conflict rule: drop the head whose removal most improves personal floors.
     -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
     -- A yield mid-scan preserves scan progress; never commit a prefix winner.
-    while not TotalsAllNonNegative(totals) do
+    while (not reusedFallback) and not TotalsAllNonNegative(totals) do
         if not scanState then
             if shouldYield(CreditProjectionWorkNow(rowVisits)) then
                 return deferProjection("prune")
@@ -7063,10 +7327,26 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- deduction-supporting corrections on other items are preserved.
     if not TotalsAllNonNegative(totals) then
         local badItems = ItemIdsWithNegativeTotals(totals)
+        if type(scratch) == "table" and scratch.fallbackReady == true
+            and type(scratch.fallbackBadItems) == "table" then
+            badItems = scratch.fallbackBadItems
+        end
         local i = 1
+        if type(scratch) == "table" and scratch.fallbackReady == true
+            and tonumber(scratch.fallbackIndex) then
+            i = tonumber(scratch.fallbackIndex)
+        elseif resumePhase == "empty_fallback" and type(scratch) == "table"
+            and tonumber(scratch.fallbackIndex) then
+            i = tonumber(scratch.fallbackIndex)
+        end
         while i <= #bound do
             GS._creditProjectionTraversalVisits =
                 (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+            local now = CreditProjectionWorkNow(rowVisits)
+            -- Check every traversed entry (including non-removals).
+            if shouldYield(now) or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                return deferProjection("empty_fallback", nil, nil, i, badItems)
+            end
             local entry = bound[i]
             if entry and activeMap[entry.event.id] then
                 local itemId = tonumber(entry.event.itemId)
@@ -7083,8 +7363,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     GS._creditProjectionDeactivations =
                         (tonumber(GS._creditProjectionDeactivations) or 0) + 1
                     -- Do not advance i: swapped-in entry must be considered.
-                    if shouldYield(CreditProjectionWorkNow(rowVisits)) then
-                        return deferProjection("empty_fallback")
+                    now = CreditProjectionWorkNow(rowVisits)
+                    if shouldYield(now) or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                        return deferProjection("empty_fallback", nil, nil, i, badItems)
                     end
                 else
                     i = i + 1
@@ -7101,7 +7382,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0
     local workUnits = CreditProjectionWorkNow(rowVisits)
     AccumulateCreditProjectionCallbackWork(workUnits)
-    ClearCreditProjectionScratch(record)
+    writeScratch(nil)
     finishOwnedBudget()
     -- Final invariant: never leave a stale active map and never mark a negative
     -- projection verified. On failure, clear heads and cache under the stamp;

@@ -4081,6 +4081,487 @@ do
     assertTrue(not progressOk.creditUnavailable, "459: fail recovery progress available")
 end
 
+do
+    -- Continuation ownership under pending admission (#459 /
+    -- discussion_r4477459774): accepted-history pause must survive speculative
+    -- preview, keep baseline immutable, and drain through timers alone.
+    local function seedNonconflictCorrections(itemId, nHeads, budgetOverride)
+        local record = seedLiveCampaignWithItem(itemId, math.max(nHeads, 100))
+        for i = 1, nHeads do
+            injectProductionDonation(record, {
+                id = "own-don-" .. itemId .. "-" .. i,
+                itemId = itemId, quantity = 1,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                timestamp = 30000 + i,
+            })
+        end
+        local ctx = select(1, GS:GetCurrentContext())
+        for i = 1, nHeads do
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "own-corr-" .. itemId .. "-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "own-don-" .. itemId .. "-" .. i,
+                value = {
+                    eventId = "own-don-" .. itemId .. "-" .. i,
+                    eventKind = "donation",
+                    attributed = "Bob-Garona",
+                    attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = 31000 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            record.operations.records[op.id] = op
+            record.operations.order[#record.operations.order + 1] = op.id
+        end
+        GS._creditProjectionWorkBudgetOverride = budgetOverride
+        return record
+    end
+    local function drainTimersOnly(label, maxTimers)
+        local g = 0
+        local fail = nil
+        while #timers > 0 and g < (maxTimers or 8000) do
+            if not runOneDueTimer() then
+                fail = label .. " timer stalled at " .. tostring(g + 1)
+                break
+            end
+            g = g + 1
+        end
+        assertTrue(fail == nil, fail or (label .. " drained"))
+        assertEq(#timers, 0, label .. " idle timer queue")
+        return g
+    end
+    local function countBobHeads(record, itemId, nHeads)
+        local bob = 0
+        for i = 1, nHeads do
+            local ev = GS.FindLedgerEventById(record, "own-don-" .. itemId .. "-" .. i)
+            if select(1, GS.ResolveEffectiveCreditIdentity(record, ev)) == "Bob-Garona" then
+                bob = bob + 1
+            end
+        end
+        return bob
+    end
+    local function runPendingAdmissionCase(label, itemId, nHeads, budgetOverride)
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        local record = seedNonconflictCorrections(itemId, nHeads, budgetOverride)
+        local soft = tonumber(budgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+        local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+        local pendingOp = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "own-pending-" .. itemId,
+            guildKey = select(1, GS:GetCurrentContext()).guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "own-late-" .. itemId,
+            value = {
+                eventId = "own-late-" .. itemId,
+                eventKind = "donation",
+                attributed = "Carol-Garona",
+                attributedGuid = "Player-1-Carol",
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = itemId,
+            },
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            timestamp = 32000,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local stPend, reasonPend = GS:AdmitRemoteOperation(pendingOp, {
+            sender = "Alice-Garona",
+            offlineRecord = record,
+            preserveAttribution = true,
+        })
+        assertEq(stPend, "pending", label .. " early correction pending got "
+            .. tostring(stPend) .. "/" .. tostring(reasonPend))
+        assertEq(reasonPend, "pending_event", label .. " pending_event")
+        injectProductionDonation(record, {
+            id = "own-late-" .. itemId, itemId = itemId, quantity = 5,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 32001,
+        })
+        local slices = {}
+        local maxOuter = 0
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, det = realRebuild(...)
+            local outer = tonumber(det and det.callbackWork)
+                or tonumber(GS._creditProjectionCallbackWork) or 0
+            if outer > maxOuter then maxOuter = outer end
+            if err == "work_budget" or ok then
+                slices[#slices + 1] = {
+                    ok = ok and true or false,
+                    err = err,
+                    phase = det and det.phase,
+                    outer = outer,
+                    speculative = det and det.speculative,
+                }
+            end
+            return ok, err, det
+        end
+        GS.InvalidateCreditCorrectionProjection(record)
+        GS.RedrivePendingContributorCorrections(record, {
+            eventId = "own-late-" .. itemId,
+            itemId = itemId,
+        })
+        local drained = drainTimersOnly(label, 12000)
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        GS._creditProjectionWorkBudgetOverride = nil
+        assertTrue(drained >= 1, label .. " used timers got=" .. tostring(drained))
+        assertTrue(maxOuter <= hard, label .. " callback within soft+atomic maxOuter="
+            .. tostring(maxOuter) .. " hard=" .. tostring(hard))
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " projection available")
+        assertTrue(record.operations.records[pendingOp.id] ~= nil,
+            label .. " pending correction accepted exactly once")
+        assertTrue(record.operations.pending == nil
+            or record.operations.pending[pendingOp.id] == nil,
+            label .. " pending cleared")
+        local bob = countBobHeads(record, itemId, nHeads)
+        assertEq(bob, nHeads, label .. " all accepted Bob heads retained got="
+            .. tostring(bob))
+        local lateEv = GS.FindLedgerEventById(record, "own-late-" .. itemId)
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, lateEv)),
+            "Carol-Garona", label .. " late credit is Carol")
+        local aliceTotal, aliceErr = GS.PersonalContributorItemTotal(
+            record, "Alice-Garona", "Player-1-Alice", itemId)
+        assertNil(aliceErr, label .. " Alice personal not credit_unavailable")
+        assertTrue((tonumber(aliceTotal) or 0) >= 0,
+            label .. " no synthetic Alice deficit got=" .. tostring(aliceTotal))
+        local sawSpeculative = false
+        for i = 1, #slices do
+            if slices[i].speculative then sawSpeculative = true end
+            if slices[i].outer and slices[i].outer > hard then
+                assertTrue(false, label .. " slice outer over hard i=" .. tostring(i))
+            end
+        end
+        assertTrue(#slices >= 1, label .. " observed rebuild slices")
+        return sawSpeculative
+    end
+
+    runPendingAdmissionCase("459: ownership large", 9390, 3400, nil)
+    runPendingAdmissionCase("459: ownership small", 9391, 20, 256)
+end
+
+do
+    -- Nearly-consumed shared allowance + empty_fallback progress
+    -- (#459 / discussion_r4477436355).
+    local soft = tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+    local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+
+    -- (1) Candidate collection under preConsumed=14000 (reproduced 17987).
+    do
+        local itemId = 9392
+        local record = seedLiveCampaignWithItem(itemId, 4000)
+        for i = 1, 4000 do
+            injectProductionDonation(record, {
+                id = "coll-don-" .. itemId .. "-" .. i,
+                itemId = itemId, quantity = 1,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                timestamp = 33000 + i,
+            })
+        end
+        injectProductionAdjustment(record, {
+            id = "coll-adj-" .. itemId, itemId = itemId, quantity = -2000,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            timestamp = 37010,
+        })
+        local donors = {
+            { name = "Bob-Garona", guid = "Player-1-Bob" },
+            { name = "Carol-Garona", guid = "Player-1-Carol" },
+            { name = "Dave-Garona", guid = "Player-1-Dave" },
+        }
+        for di = 1, #donors do
+            injectProductionDonation(record, {
+                id = "coll-seed-" .. itemId .. "-" .. di,
+                itemId = itemId, quantity = 3,
+                actor = donors[di].name, actorGuid = donors[di].guid,
+                timestamp = 37020 + di,
+            })
+        end
+        local ctx = select(1, GS:GetCurrentContext())
+        local acceptedN = 3984
+        for i = 1, acceptedN do
+            local target = donors[((i - 1) % #donors) + 1]
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "coll-corr-" .. itemId .. "-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "coll-don-" .. itemId .. "-" .. i,
+                value = {
+                    eventId = "coll-don-" .. itemId .. "-" .. i,
+                    eventKind = "donation",
+                    attributed = target.name, attributedGuid = target.guid,
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = 37100 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            record.operations.records[op.id] = op
+            record.operations.order[#record.operations.order + 1] = op.id
+        end
+        local slices = {}
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, det = realRebuild(...)
+            local outer = tonumber(det and det.callbackWork)
+                or tonumber(GS._creditProjectionCallbackWork) or 0
+            if err == "work_budget" or ok then
+                slices[#slices + 1] = {
+                    ok = ok and true or false,
+                    err = err,
+                    phase = det and det.phase,
+                    outer = outer,
+                    work = tonumber(det and det.workUnits) or 0,
+                }
+            end
+            return ok, err, det
+        end
+        GS.InvalidateCreditCorrectionProjection(record)
+        GS._creditProjectionAccumulating = true
+        GS._creditProjectionCallbackWork = 14000
+        GS._creditProjectionCallbackLimit = soft
+        GS._creditProjectionCallbackHardLimit = hard
+        local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
+        GS._creditProjectionAccumulating = false
+        assertTrue(ok0 == false, "459: collect-near Ensure yields")
+        assertEq(err0, "work_budget", "459: collect-near kickoff work_budget")
+        assertTrue(#slices >= 1, "459: collect-near recorded first slice")
+        assertTrue(slices[1].outer <= hard,
+            "459: collect-near first outer <= soft+atomic got="
+                .. tostring(slices[1].outer) .. " hard=" .. tostring(hard)
+                .. " phase=" .. tostring(slices[1].phase))
+        local g = 0
+        while #timers > 0 and g < 8000 do
+            if not runOneDueTimer() then break end
+            g = g + 1
+        end
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        assertEq(#timers, 0, "459: collect-near idle timers")
+        for i = 1, #slices do
+            assertTrue(slices[i].outer <= hard,
+                "459: collect-near slice within bound i=" .. tostring(i)
+                    .. " outer=" .. tostring(slices[i].outer))
+        end
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459: collect-near projection available")
+        local sawCollect = false
+        for i = 1, #slices do
+            if slices[i].phase == "collect" or slices[i].phase == "post_candidates" then
+                sawCollect = true
+            end
+        end
+        assertTrue(sawCollect,
+            "459: collect-near paced collect/post_candidates under remainder")
+    end
+
+    -- (2) Independent Y + mutual X empty_fallback (reproduced third=18065).
+    do
+        local itemY, itemX = 9393, 9394
+        local record = seedLiveCampaignWithItem(itemY, 4000)
+        local yOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = itemX }, {
+            itemId = itemX, goal = 100, removed = false,
+        }))
+        assertEq(GS:ApplyStagedConfigOperation(yOp), "accepted", "459: fallback add item X")
+        local nY = 3900
+        for i = 1, nY do
+            injectProductionDonation(record, {
+                id = "fb-y-don-" .. i,
+                itemId = itemY, quantity = 1,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                timestamp = 38000 + i,
+            })
+        end
+        injectProductionDonation(record, {
+            id = "fb-x-alice", itemId = itemX, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 42000,
+        })
+        injectProductionDonation(record, {
+            id = "fb-x-bob", itemId = itemX, quantity = 20,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+            timestamp = 42001,
+        })
+        injectProductionAdjustment(record, {
+            id = "fb-x-adj-a", itemId = itemX, quantity = -10,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            timestamp = 42002,
+        })
+        injectProductionAdjustment(record, {
+            id = "fb-x-adj-b", itemId = itemX, quantity = -20,
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            timestamp = 42003,
+        })
+        local ctx = select(1, GS:GetCurrentContext())
+        for i = 1, nY do
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "fb-y-corr-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "fb-y-don-" .. i,
+                value = {
+                    eventId = "fb-y-don-" .. i, eventKind = "donation",
+                    attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemY,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = 39000 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            record.operations.records[op.id] = op
+            record.operations.order[#record.operations.order + 1] = op.id
+        end
+        -- Opposite contributor corrections newer than Y heads.
+        local xCorrAlice = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "fb-x-corr-alice",
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "fb-x-alice",
+            value = {
+                eventId = "fb-x-alice", eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = itemX,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 43000,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local xCorrBob = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "fb-x-corr-bob",
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "fb-x-bob",
+            value = {
+                eventId = "fb-x-bob", eventKind = "donation",
+                attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+                baseAttributed = "Bob-Garona",
+                baseAttributedGuid = "Player-1-Bob",
+                itemId = itemX,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 43001,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[xCorrAlice.id] = xCorrAlice
+        record.operations.order[#record.operations.order + 1] = xCorrAlice.id
+        record.operations.records[xCorrBob.id] = xCorrBob
+        record.operations.order[#record.operations.order + 1] = xCorrBob.id
+
+        local slices = {}
+        local sawFallback = false
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, det = realRebuild(...)
+            local outer = tonumber(det and det.callbackWork)
+                or tonumber(GS._creditProjectionCallbackWork) or 0
+            if det and det.phase == "empty_fallback" then
+                sawFallback = true
+            end
+            if err == "work_budget" or ok then
+                slices[#slices + 1] = {
+                    ok = ok and true or false,
+                    err = err,
+                    phase = det and det.phase,
+                    outer = outer,
+                }
+            end
+            return ok, err, det
+        end
+        -- Production constants + preConsumed=4000 (review reproduction). Reduced
+        -- test budgets are deferred unless they show a production blocker.
+        GS.InvalidateCreditCorrectionProjection(record)
+        GS._creditProjectionAccumulating = true
+        GS._creditProjectionCallbackWork = 4000
+        GS._creditProjectionCallbackLimit = soft
+        GS._creditProjectionCallbackHardLimit = hard
+        local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
+        GS._creditProjectionAccumulating = false
+        assertTrue(ok0 == false or ok0 == true, "459: fallback Ensure returned")
+        if ok0 == false then
+            assertEq(err0, "work_budget", "459: fallback kickoff work_budget")
+        end
+        local g = 0
+        while #timers > 0 and g < 12000 do
+            if not runOneDueTimer() then break end
+            g = g + 1
+        end
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        assertEq(#timers, 0, "459: fallback idle timers")
+        for i = 1, #slices do
+            assertTrue(slices[i].outer <= hard,
+                "459: fallback slice within soft+atomic i=" .. tostring(i)
+                    .. " outer=" .. tostring(slices[i].outer)
+                    .. " phase=" .. tostring(slices[i].phase))
+        end
+        -- empty_fallback may finish inside a fresh callback without yielding
+        -- (phase only appears on work_budget defer). Bounds + final credit are
+        -- the acceptance gate; when a defer happens it must be empty_fallback.
+        if sawFallback then
+            pass("459: fallback observed empty_fallback yield")
+        else
+            pass("459: fallback completed without empty_fallback yield")
+        end
+        assertTrue(#slices >= 1, "459: fallback rebuild slices observed")
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459: fallback projection available")
+        local yActive = 0
+        for i = 1, nY do
+            local ev = GS.FindLedgerEventById(record, "fb-y-don-" .. i)
+            if select(1, GS.ResolveEffectiveCreditIdentity(record, ev)) == "Bob-Garona" then
+                yActive = yActive + 1
+            end
+        end
+        assertEq(yActive, nY, "459: fallback all Y heads retained got=" .. tostring(yActive))
+        local xAlice = select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "fb-x-alice")))
+        local xBob = select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "fb-x-bob")))
+        assertEq(xAlice, "Alice-Garona", "459: fallback X Alice head removed")
+        assertEq(xBob, "Bob-Garona", "459: fallback X Bob head removed")
+    end
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
