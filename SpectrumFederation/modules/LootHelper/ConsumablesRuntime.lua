@@ -2122,6 +2122,10 @@ function Runtime:BeginQuickWithdraw()
         end
         local shortageFingerprint = table.concat(lines, "\n")
         local takeMap = (plan and plan.take) or {}
+        -- Bind the confirmation to the bank visit that opened it. A retained
+        -- popup callback after close/reopen must not validate or admit into a
+        -- later visit, and must not overwrite that visit's status.
+        local originVisitToken = self._quickWithdrawVisitToken
         local bound = {
             guildKey = ctx and ctx.guildKey,
             datasetId = ctx and ctx.datasetId,
@@ -2134,6 +2138,7 @@ function Runtime:BeginQuickWithdraw()
                 and WR.CopyStringKeyQtyMap(preview.requested) or {},
             take = WR.CopyStringKeyQtyMap and WR.CopyStringKeyQtyMap(takeMap) or takeMap,
             shortagesFingerprint = shortageFingerprint,
+            visitToken = originVisitToken,
         }
         if Dialogs.ConfirmChoice then
             Dialogs:ConfirmChoice(
@@ -2141,11 +2146,21 @@ function Runtime:BeginQuickWithdraw()
                 Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
                 Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
                 function()
+                    local token = bound.visitToken
+                    if token == nil
+                        or self._quickWithdrawVisitToken == nil
+                        or tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
+                        -- Different (or ended) visit: reject before validation /
+                        -- admission. Any scoped write would no-op on the new visit.
+                        return
+                    end
                     local valid = WR.QuickWithdrawConfirmationStillValid
                         and WR.QuickWithdrawConfirmationStillValid(bound)
                     if not valid then
                         self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
-                            "the page is out of date — refresh and try again"))
+                            "the page is out of date — refresh and try again"), {
+                            visitToken = token,
+                        })
                         self:RebuildReview()
                         return
                     end
@@ -2155,7 +2170,9 @@ function Runtime:BeginQuickWithdraw()
                     })
                     if not freshOk then
                         self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
-                            "Withdraw blocked: %s"):format(tostring(freshErr or "unknown")))
+                            "Withdraw blocked: %s"):format(tostring(freshErr or "unknown")), {
+                            visitToken = token,
+                        })
                         self:RebuildReview()
                     end
                 end,
@@ -2170,7 +2187,9 @@ function Runtime:BeginQuickWithdraw()
         return
     end
     self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
-        "Withdraw blocked: %s"):format(tostring(err or "unknown")))
+        "Withdraw blocked: %s"):format(tostring(err or "unknown")), {
+        visitToken = self._quickWithdrawVisitToken,
+    })
 end
 
 function Runtime:Commit(profile, token, events)
