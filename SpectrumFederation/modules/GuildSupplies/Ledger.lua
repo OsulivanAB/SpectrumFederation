@@ -3721,10 +3721,13 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             or (admissionCtx.sender and tostring(admissionCtx.sender))
         -- Informational trust: same-guild authenticated relay is allowed; actor
         -- mismatch is relabeled RELAY inside AdmitWithdrawalEvent (not ORIGIN).
+        -- Pass adoptionReplay so temporary offline adoption writes do not
+        -- notify/update the live export index before atomic publish.
         return GS.AdmitWithdrawalEvent(record, event, {
             senderGuid = senderGuid,
             memberAuthenticated = member ~= nil,
             allowRelayOfOrigin = true,
+            adoptionReplay = admissionCtx.adoptionReplay == true,
         })
     end
 

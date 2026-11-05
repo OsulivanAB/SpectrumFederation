@@ -259,8 +259,19 @@ function W.DestinationStillValid(slotState, dest, itemId, stackLimit)
     if not itemId then return false, "invalid" end
     local need = FloorQty(dest.count)
     if need < 1 then return false, "invalid" end
-    local itemFamily = tonumber(dest.itemFamily) or tonumber(slotState.expectedItemFamily) or 0
-    local slotFamily = tonumber(slotState.family) or 0
+    -- Preserve nil (unknown) through revalidation. Numeric 0 remains valid
+    -- general-purpose; do not coerce unknown → 0 unrestricted.
+    local itemFamily = dest.itemFamily
+    if itemFamily == nil then
+        itemFamily = slotState.expectedItemFamily
+    end
+    if itemFamily ~= nil then
+        itemFamily = tonumber(itemFamily)
+    end
+    local slotFamily = slotState.family
+    if slotFamily ~= nil then
+        slotFamily = tonumber(slotFamily)
+    end
     if not W.SlotAcceptsItemFamily(slotFamily, itemFamily) then
         return false, "family"
     end
@@ -296,11 +307,16 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, it
             for s = 1, #slots do
                 local row = slots[s]
                 if type(row) == "table" then
+                    -- Preserve nil unknown family; numeric 0 stays general.
+                    local slotFamily = row.family
+                    if slotFamily ~= nil then
+                        slotFamily = tonumber(slotFamily)
+                    end
                     if row.empty then
                         copySlots[s] = {
                             slot = row.slot or s,
                             empty = true,
-                            family = tonumber(row.family) or 0,
+                            family = slotFamily,
                         }
                     else
                         copySlots[s] = {
@@ -308,7 +324,7 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, it
                             itemId = tonumber(row.itemId),
                             count = FloorQty(row.count),
                             locked = row.locked and true or false,
-                            family = tonumber(row.family) or 0,
+                            family = slotFamily,
                         }
                     end
                 end

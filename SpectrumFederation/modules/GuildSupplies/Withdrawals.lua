@@ -418,8 +418,11 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
         end
     end
     if accepted > 0 then
-        if GS.RefreshLedgerEventExport then
-            -- per-event refresh above; no batch hook required
+        -- RefreshLedgerEventExport upserts bodies but does not rebuild the
+        -- dataset descriptor's acceptedLedgerCount. Always drive the durable
+        -- notify path so exported counts stay coherent with accepted history.
+        if GS._NotifyLocalDurableChange then
+            GS._NotifyLocalDurableChange("ledger")
         elseif GS.NotifyLocalDurableChange then
             GS.NotifyLocalDurableChange("ledger")
         end
@@ -540,6 +543,23 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
     end
     Debug("Info", "admitted withdrawal %s qty=%s item=%s",
         tostring(canon.id), tostring(canon.quantity), tostring(canon.itemId))
+    -- Publish into the live export index when this is the durable current
+    -- record. Do not equate mere offlineRecord presence with adoption —
+    -- ordinary provider admission also supplies the current record that way.
+    -- Suppress only for adoptionReplay or temporary non-current records.
+    if not opts.adoptionReplay then
+        local current = GS.GetCurrentRecord and select(1, GS:GetCurrentRecord())
+        if current and record == current then
+            if GS.RefreshLedgerEventExport then
+                pcall(GS.RefreshLedgerEventExport, record, canon)
+            end
+            if GS._NotifyLocalDurableChange then
+                GS._NotifyLocalDurableChange("ledger")
+            elseif GS.NotifyLocalDurableChange then
+                GS.NotifyLocalDurableChange("ledger")
+            end
+        end
+    end
     return "accepted", nil
 end
 

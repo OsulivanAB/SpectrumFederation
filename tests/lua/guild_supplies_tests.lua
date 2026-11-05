@@ -46026,6 +46026,252 @@ do
     assertEq(installed.currentCampaignId, camp2, "447-adopt-5: current is camp2")
 end
 
+---------------------------------------------------------------------------
+-- #457 receipt publication: warm remote Admit + local Commit must export
+-- bodies and keep descriptor acceptedLedgerCount current (current + archived).
+---------------------------------------------------------------------------
+do
+    -- Main harness historically omitted Withdrawals.lua; load it for #457 paths.
+    loadModule("SpectrumFederation/modules/GuildSupplies/Withdrawals.lua")
+    assertTrue(GS.AdmitWithdrawalEvent ~= nil, "457-pub: AdmitWithdrawalEvent loaded")
+    assertTrue(GS.WITHDRAWAL_PROVENANCE ~= nil, "457-pub: WITHDRAWAL_PROVENANCE loaded")
+    assertTrue(GS.CommitLocalWithdrawalReceipts ~= nil, "457-pub: CommitLocal loaded")
+
+    local function descAcceptedLedgerCount(record)
+        local prov = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(prov and prov.api and prov.api.GetRecordBody, "457-pub: GetRecordBody")
+        local descId = "gs:desc:" .. record.datasetId
+        local row = prov.api.GetRecordBody(descId)
+        assertTrue(type(row) == "table" and type(row.body) == "table",
+            "457-pub: descriptor body present")
+        return tonumber(row.body.acceptedLedgerCount) or 0
+    end
+
+    local function makeWithdrawalEvent(record, opts)
+        opts = opts or {}
+        local cfg = record.accounting._consumables
+        local id = opts.id or ("gsw1:pub:" .. tostring(opts.tag or "x") .. ":10:1")
+        return {
+            type = "withdrawal",
+            id = id,
+            datasetId = record.datasetId,
+            campaignId = opts.campaignId or record.currentCampaignId,
+            generation = opts.generation or tonumber(cfg.generation) or 1,
+            itemId = opts.itemId or 10,
+            quantity = opts.quantity or 3,
+            actor = opts.actor or "Bob-Garona",
+            actorGuid = opts.actorGuid or "Player-1-Bob",
+            bankTab = tonumber(cfg.bankTab) or 2,
+            timestamp = opts.timestamp or ((world.time or 1000) + 1),
+            provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+            operationId = opts.operationId or ("op-pub-" .. tostring(opts.tag or "x")),
+            guildKey = record._guildKey or "club:42",
+            gsProductionCredit = false,
+        }
+    end
+
+    local function deliverWithdrawalViaProvider(record, event, sender)
+        sender = sender or "Bob-Garona"
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api, "457-pub: provider entry")
+        local exportId = "gs:le:" .. event.id
+        local body = {
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            event = event,
+        }
+        local gossipRec = {
+            id = exportId,
+            versionFp = GS.ContentFingerprint and GS.ContentFingerprint(body) or "fp",
+            body = body,
+        }
+        -- Actual registered path: ApplyRecordToProvider → ValidateAndApply → Admit.
+        return GG.ApplyRecordToProvider(entry, gossipRec, { sender = sender }), exportId
+    end
+
+    -- Warm current-campaign remote admission.
+    local record = seedStagedCampaignWithItem(45701, 10)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertTrue(GS:EnsureGossipProvider(), "457-pub: ensure provider")
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    local baseline = descAcceptedLedgerCount(record)
+    local durableBefore = GS.CountAcceptedLedgerEvents(record)
+
+    local event = makeWithdrawalEvent(record, { tag = "warm-cur" })
+    local st, exportId = deliverWithdrawalViaProvider(record, event, "Bob-Garona")
+    assertEq(st, "accepted", "457-pub: warm remote admit accepted")
+    -- No reload: body must be servable immediately after admission notify.
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local bodyRow = prov.api.GetRecordBody(exportId)
+    local bodyOk = type(bodyRow) == "table" and type(bodyRow.body) == "table"
+    assertTrue(bodyOk, "457-pub: GetRecordBody returns warm remote receipt")
+    if bodyOk then
+        assertEq(bodyRow.body.kind, "gs-ledger-event", "457-pub: ledger kind")
+        assertEq(bodyRow.body.event and bodyRow.body.event.id, event.id,
+            "457-pub: event id preserved")
+        local fp = prov.api.GetRecordVersionFp(exportId)
+        assertTrue(type(fp) == "string" and fp ~= "", "457-pub: versionFp present")
+    end
+    local afterRemote = descAcceptedLedgerCount(record)
+    assertEq(afterRemote, baseline + 1,
+        "457-pub: descriptor acceptedLedgerCount +1 after warm remote got="
+            .. tostring(afterRemote) .. " baseline=" .. tostring(baseline))
+    assertEq(GS.CountAcceptedLedgerEvents(record), durableBefore + 1,
+        "457-pub: durable history +1")
+
+    -- Duplicate delivery must not append or inflate counts.
+    local stDup = select(1, deliverWithdrawalViaProvider(record, event, "Carol-Garona"))
+    assertEq(stDup, "duplicate", "457-pub: duplicate relay is duplicate")
+    assertEq(descAcceptedLedgerCount(record), afterRemote,
+        "457-pub: duplicate does not inflate acceptedLedgerCount")
+    assertEq(GS.CountAcceptedLedgerEvents(record), durableBefore + 1,
+        "457-pub: duplicate does not append again")
+
+    -- Conflicting body same id rejected.
+    local conflict = makeWithdrawalEvent(record, {
+        tag = "warm-cur", id = event.id, quantity = 99, operationId = "op-conflict",
+    })
+    local stConflict = select(1, deliverWithdrawalViaProvider(record, conflict, "Bob-Garona"))
+    assertEq(stConflict, "rejected", "457-pub: conflicting body rejected")
+    assertEq(descAcceptedLedgerCount(record), afterRemote,
+        "457-pub: conflict does not change acceptedLedgerCount")
+
+    -- Local CommitLocalWithdrawalReceipts publication.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local beforeLocal = descAcceptedLedgerCount(record)
+    local beforeLocalDurable = GS.CountAcceptedLedgerEvents(record)
+    local stLocal, nLocal = GS:CommitLocalWithdrawalReceipts({ ["20"] = 2 }, {
+        operationId = "op-local-pub",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        generation = tonumber(record.accounting._consumables.generation),
+        guildKey = record._guildKey or "club:42",
+        bankTab = tonumber(record.accounting._consumables.bankTab) or 2,
+        timestamp = (world.time or 1000) + 50,
+    })
+    assertEq(stLocal, "accepted", "457-pub: local commit accepted: " .. tostring(nLocal))
+    assertTrue((tonumber(nLocal) or 0) >= 1, "457-pub: local accepted >= 1")
+    local localEvents = record.accounting._consumableEvents
+    local localId = nil
+    for i = #localEvents, 1, -1 do
+        local ev = localEvents[i]
+        if type(ev) == "table" and ev.type == "withdrawal"
+            and ev.operationId == "op-local-pub" then
+            localId = ev.id
+            break
+        end
+    end
+    assertTrue(type(localId) == "string", "457-pub: local receipt id found")
+    local localExportId = localId and ("gs:le:" .. localId) or "gs:le:missing"
+    local localBody = prov.api.GetRecordBody(localExportId)
+    local localBodyOk = type(localBody) == "table" and type(localBody.body) == "table"
+    assertTrue(localBodyOk, "457-pub: local commit GetRecordBody exportable")
+    local afterLocal = descAcceptedLedgerCount(record)
+    assertEq(afterLocal, beforeLocal + (tonumber(nLocal) or 1),
+        "457-pub: local commit updates acceptedLedgerCount got="
+            .. tostring(afterLocal) .. " before=" .. tostring(beforeLocal))
+    assertEq(GS.CountAcceptedLedgerEvents(record),
+        beforeLocalDurable + (tonumber(nLocal) or 1),
+        "457-pub: local durable history matches")
+
+    -- Archived destination: prior generation under archived campaign.
+    local liveCamp = record.currentCampaignId
+    local liveGen = tonumber(record.accounting._consumables.generation) or 1
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.campaignArchives and record.campaignArchives[liveCamp],
+        "457-pub: prior campaign archived")
+    local arch = record.campaignArchives[liveCamp]
+    local archGen = tonumber(arch.generation) or liveGen
+    GS.NotifyLocalDurableChange("campaign")
+    drainExportMaint(64)
+    local beforeArch = descAcceptedLedgerCount(record)
+    local archEvent = makeWithdrawalEvent(record, {
+        tag = "arch",
+        id = "gsw1:pub:arch:10:1",
+        campaignId = liveCamp,
+        generation = archGen,
+        actor = "Carol-Garona",
+        actorGuid = "Player-1-Carol",
+        operationId = "op-pub-arch",
+    })
+    local stArch, archExportId = deliverWithdrawalViaProvider(record, archEvent, "Carol-Garona")
+    assertEq(stArch, "accepted", "457-pub: archived destination admit accepted")
+    drainExportMaint(64) -- archive growth may pace via ledgerBuildNeeded
+    local archBody = prov.api.GetRecordBody(archExportId)
+    local archBodyOk = type(archBody) == "table" and type(archBody.body) == "table"
+    assertTrue(archBodyOk, "457-pub: archived receipt GetRecordBody after publish")
+    local afterArch = descAcceptedLedgerCount(record)
+    assertEq(afterArch, beforeArch + 1,
+        "457-pub: archived admit updates acceptedLedgerCount got="
+            .. tostring(afterArch) .. " before=" .. tostring(beforeArch))
+
+    -- Adoption isolation: temporary offline record must not notify live export.
+    local liveCount = descAcceptedLedgerCount(record)
+    local liveNotify = world.notifyChanged or 0
+    local temp = {
+        datasetId = "gs1:adoption-temp",
+        _guildKey = record._guildKey or "club:42",
+        currentCampaignId = "camp-temp",
+        campaigns = { ["camp-temp"] = { id = "camp-temp" } },
+        campaignArchives = {},
+        accounting = {
+            _mutationSeq = 0,
+            _consumables = {
+                generation = 1,
+                eventSeq = 0,
+                bankTab = 2,
+            },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+    }
+    local tempEvent = makeWithdrawalEvent(temp, {
+        tag = "adopt-iso",
+        id = "gsw1:pub:adopt-iso:10:1",
+        campaignId = "camp-temp",
+        generation = 1,
+    })
+    local stIso = select(1, GS.AdmitWithdrawalEvent(temp, tempEvent, {
+        senderGuid = "Player-1-Bob",
+        memberAuthenticated = true,
+        adoptionReplay = true,
+    }))
+    assertEq(stIso, "accepted", "457-pub: adoptionReplay admit onto temp record")
+    assertEq(descAcceptedLedgerCount(record), liveCount,
+        "457-pub: adoptionReplay did not change live acceptedLedgerCount")
+    assertEq(prov.api.GetRecordBody("gs:le:" .. tempEvent.id), nil,
+        "457-pub: adoption temp receipt not in live GetRecordBody")
+    -- Mere offlineRecord=current (ordinary provider shape) must still publish.
+    local viaOffline = makeWithdrawalEvent(record, {
+        tag = "offline-cur",
+        id = "gsw1:pub:offline-cur:10:1",
+        campaignId = record.currentCampaignId,
+        generation = tonumber(record.accounting._consumables.generation),
+        actor = "Dave-Garona",
+        actorGuid = "Player-1-Dave",
+        operationId = "op-offline-cur",
+    })
+    local beforeOffline = descAcceptedLedgerCount(record)
+    local stOff = select(1, GS:AdmitLedgerEvent(viaOffline, {
+        sender = "Dave-Garona",
+        member = {
+            guid = "Player-1-Dave", name = "Dave-Garona",
+            guildKey = record._guildKey or "club:42", rankOrder = 4,
+        },
+        offlineRecord = record, -- ordinary provider supplies current this way
+    }))
+    assertEq(stOff, "accepted", "457-pub: offlineRecord=current still admits")
+    drainExportMaint(16)
+    assertTrue(type(prov.api.GetRecordBody("gs:le:" .. viaOffline.id)) == "table",
+        "457-pub: ordinary offlineRecord=current publishes body")
+    assertEq(descAcceptedLedgerCount(record), beforeOffline + 1,
+        "457-pub: ordinary offlineRecord=current updates acceptedLedgerCount")
+    assertTrue((world.notifyChanged or 0) >= liveNotify,
+        "457-pub: live notify path remains available")
+end
+
 SF.TSM = nil
 world.impersonationActive = false
 setPlayer("Alice-Garona", "Player-1-Alice", 1)

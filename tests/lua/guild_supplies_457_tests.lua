@@ -154,11 +154,11 @@ end
 do
     local bags = {
         { bag = 0, slots = {
-            { slot = 1, empty = true },
-            { slot = 2, empty = true },
+            { slot = 1, empty = true, family = 0 },
+            { slot = 2, empty = true, family = 0 },
         } },
         { bag = 5, slots = {
-            { slot = 1, itemId = 10, count = 18, locked = false },
+            { slot = 1, itemId = 10, count = 18, locked = false, family = 0 },
         } },
     }
     local ok, err, plan = W.PlanMultiItemBagDestinations(bags, { ["10"] = 5, ["20"] = 20 }, function()
@@ -1504,6 +1504,122 @@ do
     ))
     assertFalse(okForeign, "B3: foreign occupancy still rejected")
     WR.StopWork("test_cleanup", true)
+
+    -- Unknown bag family on the required equipped destination prevents first pickup.
+    -- GetContainerNumFreeSlots returning nil family must not coerce to general (0).
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", 5, false end
+        return nil
+    end
+    _G.GetGuildBankItemLink = function(tab, slot)
+        if tab == 1 and slot == 1 then return "|Hitem:10:|h" end
+        return nil
+    end
+    record.accounting._consumables.recipes["100"] = { itemId = 100, reagents = { ["10"] = 5 } }
+    local pickupCount = 0
+    _G.PickupGuildBankItem = function()
+        pickupCount = pickupCount + 1
+        cursorItem = 10
+    end
+    _G.SplitGuildBankItem = function()
+        pickupCount = pickupCount + 1
+        cursorItem = 10
+    end
+    C_Container.GetContainerNumFreeSlots = function(bag)
+        if bag == 0 then return 4, nil end -- nil family = unknown
+        return 0, nil
+    end
+    C_Item.GetItemFamily = function() return 0 end
+    local okUnkBag, errUnkBag = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okUnkBag, false, "fam: unknown bag family blocks BeginWithdraw")
+    assertEq(errUnkBag, "bag_capacity", "fam: bag_capacity when destination family unknown")
+    assertEq(pickupCount, 0, "fam: no bank pickup when bag family unknown")
+    assertEq(WR.work, nil, "fam: no work attached on unknown bag family")
+
+    -- Known general family (0) still works.
+    C_Container.GetContainerNumFreeSlots = function(bag)
+        if bag == 0 then return 4, 0 end
+        return 0, 0
+    end
+    pickupCount = 0
+    local okGen, errGen = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okGen, true, "fam: known general family starts: " .. tostring(errGen))
+    assertTrue(pickupCount >= 1 or (WR.work and #(WR.work.queue or {}) >= 1),
+        "fam: general family queues bank pickup")
+    WR.StopWork("test_cleanup", true)
+
+    -- Known specialty families still allocate (herb item → herb bag).
+    C_Container.GetContainerNumSlots = function(bag)
+        if bag == 0 then return 1 end
+        if bag == 4 then return 1 end
+        return 0
+    end
+    C_Container.GetContainerNumFreeSlots = function(bag)
+        if bag == 0 then return 1, 0 end
+        if bag == 4 then return 1, 4 end
+        return 0, 0
+    end
+    C_Container.GetContainerItemInfo = function() return nil end
+    C_Item.GetItemFamily = function(itemId)
+        if tonumber(itemId) == 10 then return 4 end
+        return 0
+    end
+    pickupCount = 0
+    local okSpec, errSpec = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okSpec, true, "fam: specialty family starts: " .. tostring(errSpec))
+    assertTrue(WR.work and WR.work.queue and WR.work.queue[1], "fam: specialty queue")
+    assertEq(WR.work.queue[1].destBag, 4, "fam: specialty item prefers herb bag")
+    WR.StopWork("test_cleanup", true)
+
+    -- Live revalidation: item family becoming unavailable rejects next pickup.
+    C_Container.GetContainerNumSlots = function(bag)
+        if bag == 0 then return 4 end
+        return 0
+    end
+    C_Container.GetContainerNumFreeSlots = function(bag)
+        if bag == 0 then return 4, 0 end
+        return 0, 0
+    end
+    C_Item.GetItemFamily = function() return 0 end
+    local okRev, errRev = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okRev, true, "fam: revalidate setup starts: " .. tostring(errRev))
+    local step = WR.work.queue[1]
+    assertTrue(step ~= nil, "fam: revalidate step present")
+    -- Snapshot planned with known family; live ItemFamily now returns nil.
+    C_Item.GetItemFamily = function() return nil end
+    local okLive, whyLive = WR.RevalidateStepDestination(step)
+    assertEq(okLive, false, "fam: live revalidate rejects unknown item family")
+    assertEq(whyLive, "family", "fam: revalidate reason is family")
+    WR.StopWork("test_cleanup", true)
+
+    -- DestinationStillValid preserves nil without coercing to 0.
+    local okNilSlot = select(1, W.DestinationStillValid(
+        { empty = true, family = nil },
+        { count = 1, merge = false, itemFamily = 0 },
+        10, 20
+    ))
+    assertFalse(okNilSlot, "fam: DestinationStillValid rejects nil slot family")
+    local okNilItem = select(1, W.DestinationStillValid(
+        { empty = true, family = 0 },
+        { count = 1, merge = false, itemFamily = nil },
+        10, 20
+    ))
+    assertFalse(okNilItem, "fam: DestinationStillValid rejects nil item family")
+    local okZero = select(1, W.DestinationStillValid(
+        { empty = true, family = 0 },
+        { count = 1, merge = false, itemFamily = 0 },
+        10, 20
+    ))
+    assertTrue(okZero, "fam: numeric family 0 remains valid")
+
+    -- Snapshot copy preserves nil through PlanMultiItemBagDestinations.
+    local okNilPlan = select(1, W.PlanMultiItemBagDestinations(
+        { { bag = 0, slots = { { slot = 1, empty = true, family = nil } } } },
+        { ["10"] = 1 },
+        function() return 20 end,
+        function() return 0 end
+    ))
+    assertFalse(okNilPlan, "fam: plan rejects nil slot family from snapshot")
 end
 
 -- R9: ClearProcessedDrafts preserves unrelated recipe inputs; remaining uses request
