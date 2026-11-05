@@ -3003,24 +3003,40 @@ do
     assertEq(WR.work, nil, "D: work cleared after confirmed close settle")
     assertEq(C_Timer._live(), 0, "D: timers cleared after confirmed settle")
     -- Stale deadline callback cannot commit or settle again.
+    -- _fire honors Cancel (cancellation check); also invoke the captured
+    -- production closure directly so its once-only guards are exercised.
+    assertTrue(type(staleDeadline.fn) == "function",
+        "D: close deadline captures production callback fn")
     staleDeadline:_fire()
-    assertEq(settleCount, 1, "D: stale deadline cannot settle again")
-    assertEq(receiptCount, 1, "D: stale deadline cannot commit receipt again")
-    assertEq(handoffCount, 1, "D: stale deadline cannot handoff again")
+    assertEq(settleCount, 1, "D: canceled staleDeadline:_fire does not settle again")
+    assertEq(receiptCount, 1, "D: canceled _fire cannot commit receipt again")
+    assertEq(handoffCount, 1, "D: canceled _fire cannot handoff again")
+    staleDeadline.fn()
+    assertEq(settleCount, 1, "D: direct stale deadline fn cannot settle again")
+    assertEq(receiptCount, 1, "D: direct stale deadline fn cannot commit receipt again")
+    assertEq(handoffCount, 1, "D: direct stale deadline fn cannot handoff again")
+    assertEq(WR.work, nil, "D: work stays detached after stale fn invoke")
+    assertEq(C_Timer._live(), 0, "D: no owned timer active after stale fn invoke")
     C_Timer._drain()
     assertEq(settleCount, 1, "D: drained leftovers do not double-settle")
     assertEq(receiptCount, 1, "D: receipt still once after drain")
 
-    -- Visit settle wiring via production settlement callback shape (SettleHandler).
+    -- Visit settle wiring through real Runtime:BeginQuickWithdraw (actual onSettle).
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
     local RT = SF.ConsumablesRuntime
-    RT.WatchGuildBankFrame = function() end
-    RT.RefreshReminder = function() end
-    RT.SyncReviewWithGuildBank = function() end
-    RT.ConsumeBannerBankNavigation = function() end
-    RT.HideReviewForBankLifecycle = function() end
-    RT.CancelBannerBankNavigation = function() end
-    RT.RebuildReview = function() end
+    local function stubRuntimeLifecycle()
+        RT.WatchGuildBankFrame = function() end
+        RT.RefreshReminder = function() end
+        RT.SyncReviewWithGuildBank = function() end
+        RT.ConsumeBannerBankNavigation = function() end
+        RT.HideReviewForBankLifecycle = function() end
+        RT.CancelBannerBankNavigation = function() end
+        RT.RebuildReview = function() end
+        RT.BankIsOpen = function() return RT.bankOpen == true end
+        RT.ItemStackLimit = function() return 20 end
+        RT.ItemName = function(_, id) return "Item" .. tostring(id) end
+    end
+    stubRuntimeLifecycle()
     local statusText = ""
     RT.review = {
         Status = {
@@ -3029,100 +3045,35 @@ do
         },
         IsShown = function() return false end,
     }
-    RT.BankIsOpen = function() return RT.bankOpen == true end
     RT.bankOpen = false
     RT._quickWithdrawVisitSeq = 0
     RT._quickWithdrawVisitToken = nil
 
-    local function productionSettleHandler(result)
-        result = type(result) == "table" and result or {}
-        settleCount = settleCount + 1
-        settleReasons[#settleReasons + 1] = result.reason
-        RT:SetQuickWithdrawStatus(RT:FormatQuickWithdrawSettlement(result), {
-            visitToken = result.visitToken,
-            operationId = result.operationId,
-        })
-        RT:RebuildReview()
+    local visitRecord = {
+        datasetId = "gs1:wd",
+        _guildKey = "club:wd",
+        currentCampaignId = "camp1",
+        accounting = {
+            _consumables = {
+                bankTab = 1,
+                generation = 1,
+                configSeq = 1,
+                recipes = {
+                    ["100"] = { itemId = 100, reagents = { ["10"] = 5 } },
+                },
+            },
+        },
+    }
+    GS.IsLiveActiveForCurrentGuild = function() return true end
+    GS.GetCurrentRecord = function() return visitRecord end
+    GS.RecipeAvailability = function() return true end
+    GS.WithdrawalReceiptCapacityOk = function() return true end
+    _G.GetItemCount = function(itemId)
+        return bagByItem[tonumber(itemId) or -1] or 0
     end
-
-    -- close → settle while closed → reopen
-    RT:OnBankOpened()
-    local visit1 = RT._quickWithdrawVisitToken
-    assertTrue(visit1 ~= nil, "D: first open assigns visit token")
-    -- Duplicate open / tab refresh must not rotate visit.
-    RT:OnBankOpened()
-    assertEq(RT._quickWithdrawVisitToken, visit1, "D: duplicate open keeps visit token")
-    C_Timer._clear()
-    WR.work = makePendingWork({
-        visitToken = visit1,
-        operationId = "op-visit-closed",
-        onSettle = productionSettleHandler,
-    })
-    -- Runtime close forwards to WR.OnBankClosed and keeps visit token while closed.
-    RT:OnBankClosed()
-    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
-        "D: close→settle path retains pending under deadline")
-    bagByItem[10] = 5
-    bankBySlot[1] = 0
-    WR.OnBagOrBankUpdate()
-    assertEq(settleCount, 1, "D: production settle while closed fires once")
-    assertTrue(statusText:find("Withdraw settled", 1, true) ~= nil,
-        "D: settle while closed publishes originating status via SettleHandler")
-    local closedStatus = statusText
-    RT:OnBankOpened()
-    local visit2 = RT._quickWithdrawVisitToken
-    assertTrue(visit2 ~= visit1, "D: reopen rotates visit token")
-    assertEq(statusText, "", "D: fresh visit clears prior status text")
-
-    -- close → reopen → old operation settles: must not overwrite visit-B status.
-    C_Timer._clear()
-    RT:OnBankClosed()
-    RT:OnBankOpened()
-    local visitA = RT._quickWithdrawVisitToken
-    WR.work = makePendingWork({
-        visitToken = visitA,
-        operationId = "op-late-settle",
-        onSettle = productionSettleHandler,
-    })
-    RT:OnBankClosed()
-    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
-        "D: late-settle scenario pending after close")
-    RT:OnBankOpened()
-    local visitB = RT._quickWithdrawVisitToken
-    assertTrue(visitB ~= visitA, "D: reopen for late-settle rotates token")
-    RT:SetQuickWithdrawStatus("visit2-status", { visitToken = visitB })
-    assertEq(statusText, "visit2-status", "D: current visit status set")
-    bagByItem[10] = 5
-    bankBySlot[1] = 0
-    local settleBeforeLate = settleCount
-    WR.OnBagOrBankUpdate()
-    assertEq(settleCount, settleBeforeLate + 1, "D: late settle callback still runs")
-    assertEq(statusText, "visit2-status",
-        "D: old operation settle rejected after reopen (production wiring)")
-
-    -- Direct setter checks retained as token policy coverage alongside wiring above.
-    RT:OnBankClosed()
-    RT:SetQuickWithdrawStatus("unresolved-op", { visitToken = visitB })
-    assertEq(statusText, "unresolved-op", "D: unresolved while closed for originating visit")
-    RT:OnBankOpened()
-    RT:SetQuickWithdrawStatus("stale-unresolved", { visitToken = visitB })
-    assertTrue(statusText ~= "stale-unresolved",
-        "D: prior visit unresolved cannot overwrite new visit")
-
-    -- Retained shortage confirmation: fail-before (unguarded) then production guard.
-    _G.GetItemCount = function() return 0 end
     _G.GetCurrentGuildBankTab = function() return 1 end
     _G.GetGuildBankTabInfo = function()
         return "Tab", "icon", true, true, 0, -1, false
-    end
-    local bankStock = 2
-    _G.GetGuildBankItemInfo = function(tab, slot)
-        if tab == 1 and slot == 1 then return "tex", bankStock, false end
-        return nil
-    end
-    _G.GetGuildBankItemLink = function(tab, slot)
-        if tab == 1 and slot == 1 then return "|Hitem:10:|h" end
-        return nil
     end
     C_Container = {
         GetContainerNumSlots = function(bag)
@@ -3146,32 +3097,167 @@ do
         return tonumber(id)
     end
     SF.ConsumablesRouting = { IsCarriedBag = function() return true end }
-    RT.BankIsOpen = function() return true end
-    RT.ItemStackLimit = function() return 20 end
-    RT.ItemName = function(_, id) return "Item" .. tostring(id) end
-    local record = {
-        datasetId = "gs1:wd",
-        _guildKey = "club:wd",
-        currentCampaignId = "camp1",
-        accounting = {
-            _consumables = {
-                bankTab = 1,
-                generation = 1,
-                configSeq = 1,
-                recipes = {
-                    ["100"] = { itemId = 100, reagents = { ["10"] = 5 } },
-                },
-            },
-        },
-    }
-    GS.IsLiveActiveForCurrentGuild = function() return true end
-    GS.GetCurrentRecord = function() return record end
-    GS.RecipeAvailability = function() return true end
-    GS.WithdrawalReceiptCapacityOk = function() return true end
-    -- Reload WR against current Host() after Runtime load.
+    -- Reload WR so Host() resolves the Runtime just loaded.
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
     WR = SF.ConsumablesWithdrawRuntime
-    WR.craftDrafts = { ["100"] = 2 }
+    WR.BagCount = function(itemId)
+        return bagByItem[tonumber(itemId) or -1] or 0
+    end
+
+    local function installCursorStubs()
+        local cursorItem = nil
+        _G.GetCursorInfo = function()
+            if cursorItem then return "item", cursorItem end
+            return nil
+        end
+        _G.PickupGuildBankItem = function()
+            pickupCount = pickupCount + 1
+            cursorItem = 10
+        end
+        _G.SplitGuildBankItem = function()
+            pickupCount = pickupCount + 1
+            cursorItem = 10
+        end
+        _G.PutItemInBackpack = function() cursorItem = nil end
+        _G.ClearCursor = function() cursorItem = nil end
+        C_Container.PickupContainerItem = function() cursorItem = nil end
+    end
+
+    -- Counting spy that forwards to the actual production onSettle callback.
+    local function withSettleSpy(fn)
+        local realBegin = WR.BeginWithdraw
+        WR.BeginWithdraw = function(sel, opts)
+            opts = opts or {}
+            local actualSettle = opts.onSettle
+            assertTrue(type(actualSettle) == "function",
+                "D: BeginQuickWithdraw must attach production onSettle")
+            opts.onSettle = function(result)
+                settleCount = settleCount + 1
+                settleReasons[#settleReasons + 1] = result and result.reason
+                return actualSettle(result)
+            end
+            return realBegin(sel, opts)
+        end
+        local ok, err = pcall(fn)
+        WR.BeginWithdraw = realBegin
+        assertTrue(ok, "D: BeginQuickWithdraw settle spy body: " .. tostring(err))
+    end
+
+    local function startViaBeginQuickWithdraw(label)
+        if WR.work then WR.StopWork("test_cleanup", true) end
+        C_Timer._clear()
+        -- Do not drain observe timers before close: leave the pending observation.
+        settleCount, receiptCount, handoffCount = 0, 0, 0
+        settleReasons = {}
+        pickupCount = 0
+        bagByItem[10] = 0
+        bankBySlot[1] = 5
+        bankAvailable = true
+        WR.craftDrafts = { ["100"] = 1 }
+        installCursorStubs()
+        local visitAtStart = RT._quickWithdrawVisitToken
+        withSettleSpy(function()
+            RT:BeginQuickWithdraw()
+        end)
+        assertTrue(WR.work ~= nil, label .. ": BeginQuickWithdraw attached work")
+        assertEq(WR.work.visitToken, visitAtStart,
+            label .. ": operation uses production visit token")
+        assertTrue(type(WR.work.onSettle) == "function",
+            label .. ": production onSettle retained on work")
+        assertTrue(WR.work.pendingStep ~= nil,
+            label .. ": PlaceNext left pendingStep for observation")
+        assertTrue(pickupCount >= 1, label .. ": bank pickup occurred")
+        return WR.work
+    end
+
+    -- close → settle while closed → reopen
+    RT.bankOpen = false
+    RT._quickWithdrawVisitSeq = 0
+    RT._quickWithdrawVisitToken = nil
+    statusText = ""
+    RT:OnBankOpened()
+    local visit1 = RT._quickWithdrawVisitToken
+    assertTrue(visit1 ~= nil, "D: first open assigns visit token")
+    -- Duplicate open / tab refresh must not rotate visit.
+    RT:OnBankOpened()
+    assertEq(RT._quickWithdrawVisitToken, visit1, "D: duplicate open keeps visit token")
+    startViaBeginQuickWithdraw("D: close→settle")
+    assertEq(WR.work.visitToken, visit1, "D: close→settle work bound to visit1")
+    RT:OnBankClosed()
+    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
+        "D: close→settle path retains pending under deadline")
+    assertTrue(WR.work.closeSettleTimer ~= nil, "D: close deadline active after BeginQuickWithdraw close")
+    bagByItem[10] = 5
+    bankBySlot[1] = 0
+    WR.OnBagOrBankUpdate()
+    assertEq(settleCount, 1, "D: production settle while closed fires once")
+    assertEq(receiptCount, 1, "D: receipt once via BeginQuickWithdraw settle")
+    assertEq(handoffCount, 1, "D: handoff once via BeginQuickWithdraw settle")
+    assertTrue(statusText:find("Withdraw settled", 1, true) ~= nil,
+        "D: settle while closed publishes originating status via production SettleHandler")
+    assertEq(WR.work, nil, "D: work detached after settle while closed")
+    assertEq(C_Timer._live(), 0, "D: no owned timers after settle while closed")
+    RT:OnBankOpened()
+    local visit2 = RT._quickWithdrawVisitToken
+    assertTrue(visit2 ~= visit1, "D: reopen rotates visit token")
+    assertEq(statusText, "", "D: fresh visit clears prior status text")
+
+    -- close → reopen → old operation settles: must not overwrite visit-B status.
+    RT:OnBankClosed()
+    RT:OnBankOpened()
+    local visitA = RT._quickWithdrawVisitToken
+    startViaBeginQuickWithdraw("D: late-settle")
+    assertEq(WR.work.visitToken, visitA, "D: late-settle work bound to visitA")
+    RT:OnBankClosed()
+    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
+        "D: late-settle scenario pending after close")
+    RT:OnBankOpened()
+    local visitB = RT._quickWithdrawVisitToken
+    assertTrue(visitB ~= visitA, "D: reopen for late-settle rotates token")
+    RT:SetQuickWithdrawStatus("visit2-status", { visitToken = visitB })
+    assertEq(statusText, "visit2-status", "D: current visit status set")
+    bagByItem[10] = 5
+    bankBySlot[1] = 0
+    local settleBeforeLate = settleCount
+    local receiptBeforeLate = receiptCount
+    local handoffBeforeLate = handoffCount
+    WR.OnBagOrBankUpdate()
+    assertEq(settleCount, settleBeforeLate + 1, "D: late settle callback still runs")
+    assertEq(receiptCount, receiptBeforeLate + 1, "D: late settle receipt once")
+    assertEq(handoffCount, handoffBeforeLate + 1, "D: late settle handoff once")
+    assertEq(statusText, "visit2-status",
+        "D: old operation settle rejected after reopen (production BeginQuickWithdraw wiring)")
+    assertEq(WR.work, nil, "D: late settle detaches work")
+    assertEq(C_Timer._live(), 0, "D: no owned timers after late settle")
+
+    -- Direct setter checks retained as token policy coverage alongside wiring above.
+    RT:OnBankClosed()
+    RT:SetQuickWithdrawStatus("unresolved-op", { visitToken = visitB })
+    assertEq(statusText, "unresolved-op", "D: unresolved while closed for originating visit")
+    RT:OnBankOpened()
+    RT:SetQuickWithdrawStatus("stale-unresolved", { visitToken = visitB })
+    assertTrue(statusText ~= "stale-unresolved",
+        "D: prior visit unresolved cannot overwrite new visit")
+
+    -- Retained shortage confirmation: early visit-guard isolation + same-visit control.
+    -- Fail-before is executed against the broken Runtime revision (f42d96cb) in an
+    -- isolated reload, then the repaired module is restored for the guard assertion.
+    local bankStock = 2
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", bankStock, false end
+        return nil
+    end
+    _G.GetGuildBankItemLink = function(tab, slot)
+        if tab == 1 and slot == 1 then return "|Hitem:10:|h" end
+        return nil
+    end
+    -- BagCount for withdraw preview/scan uses GetItemCount / WR.BagCount; keep empty bags.
+    bagByItem[10] = 0
+    WR.BagCount = function(itemId)
+        return bagByItem[tonumber(itemId) or -1] or 0
+    end
+    _G.GetItemCount = function() return 0 end
+    installCursorStubs()
     if WR.work then WR.StopWork("test_cleanup", true) end
 
     local acceptCb
@@ -3182,87 +3268,165 @@ do
         end,
     }
 
-    RT.bankOpen = false
-    RT._quickWithdrawVisitSeq = 0
-    RT._quickWithdrawVisitToken = nil
-    statusText = ""
-    RT:OnBankOpened()
-    local visitShortA = RT._quickWithdrawVisitToken
-    assertTrue(visitShortA ~= nil, "D: shortage visit A token")
-    acceptCb = nil
-    RT:BeginQuickWithdraw()
-    assertTrue(type(acceptCb) == "function", "D: shortage ConfirmChoice captured")
+    local function loadRuntimeFromGit(rev)
+        local cmd = string.format(
+            "git -C %q show %s:SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua",
+            ROOT:gsub("/$", ""), rev)
+        local h = io.popen(cmd)
+        assertTrue(h ~= nil, "D: io.popen for Runtime " .. tostring(rev))
+        local src = h:read("*a")
+        h:close()
+        assertTrue(type(src) == "string" and #src > 0,
+            "D: Runtime source from " .. tostring(rev))
+        local chunk, err = loadstring(src, "ConsumablesRuntime@" .. tostring(rev))
+        assertTrue(chunk ~= nil, "D: loadstring Runtime " .. tostring(rev) .. ": " .. tostring(err))
+        chunk("SpectrumFederation", SF)
+        RT = SF.ConsumablesRuntime
+        stubRuntimeLifecycle()
+        statusText = ""
+        RT.review = {
+            Status = {
+                SetText = function(_, t) statusText = t or "" end,
+                GetText = function() return statusText end,
+            },
+            IsShown = function() return false end,
+        }
+        RT.BankIsOpen = function() return true end
+        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+        WR = SF.ConsumablesWithdrawRuntime
+        WR.BagCount = function(itemId)
+            return bagByItem[tonumber(itemId) or -1] or 0
+        end
+        if WR.work then WR.StopWork("test_cleanup", true) end
+    end
 
-    -- Fail-before: unguarded retained callback (pre-fix body) after visit B.
-    -- Change stock so StillValid fails via take-map mismatch (not craft drafts alone).
-    bankStock = 1
+    local function captureShortageAccept(label)
+        RT.bankOpen = false
+        RT._quickWithdrawVisitSeq = 0
+        RT._quickWithdrawVisitToken = nil
+        statusText = ""
+        bankStock = 2
+        WR.craftDrafts = { ["100"] = 2 }
+        acceptCb = nil
+        RT:OnBankOpened()
+        local visitA = RT._quickWithdrawVisitToken
+        assertTrue(visitA ~= nil, label .. ": visit A token")
+        RT:BeginQuickWithdraw()
+        assertTrue(type(acceptCb) == "function", label .. ": ConfirmChoice captured")
+        return visitA, acceptCb
+    end
+
+    -- Executed fail-before: broken Runtime (pre-guard) admits across visits with valid plan.
+    loadRuntimeFromGit("f42d96cb")
+    local visitBrokenA, brokenAccept = captureShortageAccept("D: fail-before broken")
+    RT:OnBankClosed()
+    RT:OnBankOpened()
+    local visitBrokenB = RT._quickWithdrawVisitToken
+    assertTrue(visitBrokenB ~= visitBrokenA, "D: fail-before reopen rotates visit")
+    RT:SetQuickWithdrawStatus("visit-B-active", { visitToken = visitBrokenB })
+    assertEq(statusText, "visit-B-active", "D: fail-before visit B baseline")
+    bankStock = 2 -- plan still valid; defect is missing visit guard
+    pickupCount = 0
+    local admittedBroken = false
+    local realBeginBroken = WR.BeginWithdraw
+    WR.BeginWithdraw = function(sel, opts)
+        local ok, err, detail = realBeginBroken(sel, opts)
+        if ok then admittedBroken = true end
+        return ok, err, detail
+    end
+    brokenAccept()
+    WR.BeginWithdraw = realBeginBroken
+    assertTrue(admittedBroken,
+        "D: fail-before — broken Runtime admits retained callback into visit B")
+    assertTrue(pickupCount >= 1 or WR.work ~= nil,
+        "D: fail-before — broken Runtime starts movement in visit B")
+    if WR.work then WR.StopWork("test_cleanup", true) end
+
+    -- Restored repaired Runtime: same retained-callback scenario must not admit.
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    RT = SF.ConsumablesRuntime
+    stubRuntimeLifecycle()
+    statusText = ""
+    RT.review = {
+        Status = {
+            SetText = function(_, t) statusText = t or "" end,
+            GetText = function() return statusText end,
+        },
+        IsShown = function() return false end,
+    }
+    RT.BankIsOpen = function() return true end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    WR = SF.ConsumablesWithdrawRuntime
+    WR.BagCount = function(itemId)
+        return bagByItem[tonumber(itemId) or -1] or 0
+    end
+    if WR.work then WR.StopWork("test_cleanup", true) end
+    installCursorStubs()
+
+    local visitShortA, guardedAccept = captureShortageAccept("D: guarded cross-visit")
     RT:OnBankClosed()
     RT:OnBankOpened()
     local visitShortB = RT._quickWithdrawVisitToken
-    assertTrue(visitShortB ~= visitShortA, "D: shortage reopen rotates visit")
+    assertTrue(visitShortB ~= visitShortA, "D: guarded reopen rotates visit")
     RT:SetQuickWithdrawStatus("visit-B-active", { visitToken = visitShortB })
-    assertEq(statusText, "visit-B-active", "D: visit B status baseline")
-    local boundFromA = {
-        guildKey = "club:wd",
-        datasetId = "gs1:wd",
-        campaignId = "camp1",
-        bankTab = 1,
-        generation = 1,
-        selections = { ["100"] = 2 },
-        recipeFingerprints = {},
-        requested = { ["10"] = 10 },
-        take = { ["10"] = 2 },
-        -- Intentionally omit visitToken — the pre-fix gap.
-    }
-    -- Seed fingerprints/requested from a fresh preview so only take mismatches.
+    assertEq(statusText, "visit-B-active", "D: guarded visit B status baseline")
+    bankStock = 2 -- original stock/take plan still valid; isolates early visit guard
     do
-        bankStock = 2
-        local okP, errP, preview = WR.PreviewWithdrawPlan({ ["100"] = 2 }, {})
-        assertEq(okP, false, "D: shortage preview for fail-before seed")
-        assertEq(errP, "shortage", "D: shortage seed reason")
-        boundFromA.recipeFingerprints = preview.recipeFingerprints
-        boundFromA.requested = preview.requested
-        boundFromA.take = preview.plan.take
-        boundFromA.guildKey = preview.ctx.guildKey
-        boundFromA.datasetId = preview.ctx.datasetId
-        boundFromA.campaignId = preview.ctx.campaignId
-        boundFromA.bankTab = preview.ctx.bankTab
-        boundFromA.generation = preview.ctx.generation
+        local okStill = WR.QuickWithdrawConfirmationStillValid
+        -- StillValid uses current visit context + bound selections; plan stock matches.
+        -- Cross-visit rejection must happen before this would matter for admission.
+        assertTrue(okStill ~= nil, "D: StillValid present for isolation note")
     end
-    bankStock = 1 -- take-map change invalidates bound.take=2
-    local unguardedWrote = false
-    local unguardedAdmitted = false
-    do
-        local valid = WR.QuickWithdrawConfirmationStillValid(boundFromA)
-        assertFalse(valid, "D: fail-before seed is stale after stock/take change")
-        -- Pre-fix: tokenless status write + no visit rejection.
-        RT:SetQuickWithdrawStatus("stale-from-old-visit")
-        unguardedWrote = (statusText == "stale-from-old-visit")
-        if valid then
-            local ok = WR.BeginWithdraw(boundFromA.selections, {
-                allowPartial = true,
-                acceptedTake = boundFromA.take,
-            })
-            unguardedAdmitted = ok and WR.work ~= nil
-            if WR.work then WR.StopWork("test_cleanup", true) end
-        end
-    end
-    assertTrue(unguardedWrote,
-        "D: fail-before — unguarded stale write overwrites visit B status")
-    assertFalse(unguardedAdmitted, "D: fail-before stale path did not admit")
-    -- Restore visit B baseline for the guarded callback.
-    RT:SetQuickWithdrawStatus("visit-B-active", { visitToken = visitShortB })
-    assertEq(statusText, "visit-B-active", "D: restore visit B status before guarded callback")
     pickupCount = 0
     local workBefore = WR.work
-    acceptCb()
-    assertEq(WR.work, workBefore, "D: guarded cross-visit callback does not admit withdrawal")
-    assertEq(pickupCount, 0, "D: guarded cross-visit callback does no bank pickup")
+    local admittedGuarded = false
+    local realBeginGuard = WR.BeginWithdraw
+    WR.BeginWithdraw = function(sel, opts)
+        local ok, err, detail = realBeginGuard(sel, opts)
+        if ok then admittedGuarded = true end
+        return ok, err, detail
+    end
+    guardedAccept()
+    WR.BeginWithdraw = realBeginGuard
+    assertFalse(admittedGuarded,
+        "D: guarded cross-visit with valid plan does not admit withdrawal")
+    assertEq(WR.work, workBefore, "D: guarded cross-visit does not attach work")
+    assertEq(pickupCount, 0, "D: guarded cross-visit does no bank pickup")
     assertEq(statusText, "visit-B-active",
-        "D: guarded cross-visit callback does not overwrite visit B status")
+        "D: guarded cross-visit does not overwrite visit B status")
 
-    -- Same-visit acceptance control: reopen visit matching the captured popup.
-    -- Restore stock so bound plan remains valid, re-open confirmation on this visit.
+    -- Optional separate stale-feedback coverage (changed take-map): StillValid fails;
+    -- not a substitute for the early no-admission guard above.
+    do
+        bankStock = 1
+        local okP, errP, preview = WR.PreviewWithdrawPlan({ ["100"] = 2 }, {})
+        assertEq(okP, false, "D: stale-feedback shortage preview")
+        assertEq(errP, "shortage", "D: stale-feedback shortage reason")
+        bankStock = 2
+        local _, _, previewBound = WR.PreviewWithdrawPlan({ ["100"] = 2 }, {})
+        local bound = {
+            guildKey = previewBound.ctx.guildKey,
+            datasetId = previewBound.ctx.datasetId,
+            campaignId = previewBound.ctx.campaignId,
+            bankTab = previewBound.ctx.bankTab,
+            generation = previewBound.ctx.generation,
+            selections = { ["100"] = 2 },
+            recipeFingerprints = previewBound.recipeFingerprints,
+            requested = previewBound.requested,
+            take = previewBound.plan.take,
+            visitToken = visitShortB,
+        }
+        bankStock = 1
+        local valid = WR.QuickWithdrawConfirmationStillValid(bound)
+        assertFalse(valid, "D: changed stock/take invalidates confirmation")
+        local beforeStale = statusText
+        RT:SetQuickWithdrawStatus("stale-scoped", { visitToken = visitShortA })
+        assertEq(statusText, beforeStale,
+            "D: scoped stale write from prior visit cannot overwrite visit B")
+        bankStock = 2
+    end
+
+    -- Same-visit acceptance control.
     bankStock = 2
     RT:OnBankClosed()
     RT:OnBankOpened()
@@ -3272,24 +3436,7 @@ do
     RT:BeginQuickWithdraw()
     assertTrue(type(acceptCb) == "function", "D: same-visit ConfirmChoice captured")
     assertEq(RT._quickWithdrawVisitToken, visitSame, "D: same-visit token stable")
-    local cursorItem = nil
-    _G.GetCursorInfo = function()
-        if cursorItem then return "item", cursorItem end
-        return nil
-    end
-    _G.PickupGuildBankItem = function()
-        pickupCount = pickupCount + 1
-        cursorItem = 10
-    end
-    _G.SplitGuildBankItem = function()
-        pickupCount = pickupCount + 1
-        cursorItem = 10
-    end
-    _G.PutItemInBackpack = function() cursorItem = nil end
-    _G.ClearCursor = function() cursorItem = nil end
-    if C_Container then
-        C_Container.PickupContainerItem = function() cursorItem = nil end
-    end
+    installCursorStubs()
     local admitted = false
     local realBegin = WR.BeginWithdraw
     WR.BeginWithdraw = function(sel, opts)
@@ -3304,7 +3451,6 @@ do
     assertTrue(pickupCount >= 1 or WR.work ~= nil,
         "D: same-visit acceptance starts movement")
     if WR.work then WR.StopWork("test_cleanup", true) end
-
     -- One-source stack → partial merge + empty dest; allowance 1 rejects, 2 permits.
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
     WR = SF.ConsumablesWithdrawRuntime
