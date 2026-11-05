@@ -16,6 +16,7 @@ SF.Debug = {
     Info = function() end,
     Warn = function() end,
     Error = function() end,
+    Verbose = function() end,
 }
 SF.LocaleText = function(_, default) return default end
 SF.Consumables = SF.Consumables or {
@@ -3433,10 +3434,16 @@ do
         return opId
     end
 
+    local function clearUnresolvedNoticeState()
+        RT._unresolvedWithdrawPresented = nil -- legacy map removed; keep nil for clarity
+        RT._unresolvedWithdrawRecent = nil
+        RT._unresolvedWithdrawPending = nil
+    end
+
     -- 1) Close → delayed unresolved after lifecycle hide.
     presentedDialogs = {}
     helperLifecycleHidden = false
-    RT._unresolvedWithdrawPresented = nil
+    clearUnresolvedNoticeState()
     RT.bankOpen = false
     RT._quickWithdrawVisitSeq = 0
     RT._quickWithdrawVisitToken = nil
@@ -3477,7 +3484,7 @@ do
     -- 2) Synchronous close ordering: settle inside WR.OnBankClosed before bankOpen=false/hide.
     presentedDialogs = {}
     helperLifecycleHidden = false
-    RT._unresolvedWithdrawPresented = nil
+    clearUnresolvedNoticeState()
     RT:OnBankOpened()
     local syncOpId = startVisibilityWithdraw("D: unresolved-sync")
     bagByItem[10] = 0
@@ -3518,7 +3525,7 @@ do
     -- 3) Close → reopen → old unresolved while newer-visit feedback exists.
     presentedDialogs = {}
     helperLifecycleHidden = false
-    RT._unresolvedWithdrawPresented = nil
+    clearUnresolvedNoticeState()
     bankAvailable = true
     RT:OnBankOpened()
     local lateOpId = startVisibilityWithdraw("D: unresolved-late")
@@ -3559,6 +3566,165 @@ do
     })
     assertEq(#presentedDialogs, 1, "D: late unresolved deduped")
     assertEq(WR.craftDrafts["200"], 3, "D: dialog dedupe path does not clear drafts")
+
+    -- 4) Refused StaticPopup_Show leaves unseen notice; bank-open flush delivers it.
+    -- Exercise production Dialogs:Confirm with StaticPopup_Show faked at the UI boundary.
+    OKAY = OKAY or "OK"
+    CANCEL = CANCEL or "Cancel"
+    YES = YES or "Yes"
+    NO = NO or "No"
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    local popupAllow = false
+    local popupShows = {}
+    function StaticPopup_Show(key, message, _, _data)
+        popupShows[#popupShows + 1] = {
+            key = tostring(key or ""),
+            message = tostring(message or ""),
+        }
+        if not popupAllow then
+            return nil
+        end
+        return { key = key, message = message }
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+    assertTrue(type(SF.SettingsUI.Dialogs.Confirm) == "function",
+        "D: production Dialogs.Confirm loaded")
+
+    clearUnresolvedNoticeState()
+    popupShows = {}
+    popupAllow = false
+    helperLifecycleHidden = false
+    bankAvailable = true
+    RT.bankOpen = false
+    RT._quickWithdrawVisitSeq = 0
+    RT._quickWithdrawVisitToken = nil
+    statusText = ""
+    RT:OnBankOpened()
+    local refuseVisit = RT._quickWithdrawVisitToken
+    local refuseOpId = startVisibilityWithdraw("D: unresolved-refuse")
+    bagByItem[10] = 0
+    bankBySlot[1] = 5
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    RT:OnBankClosed()
+    assertTrue(helperLifecycleHidden, "D: unresolved-refuse hide on close")
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: unresolved-refuse settles once via production SettleHandler")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: unresolved-refuse reason")
+    assertEq(receiptCount, 0, "D: unresolved-refuse no receipt")
+    assertEq(handoffCount, 0, "D: unresolved-refuse no handoff")
+    assertEq(#popupShows, 1, "D: refused path attempted StaticPopup_Show once")
+    assertTrue(type(RT._unresolvedWithdrawPending) == "table"
+        and #RT._unresolvedWithdrawPending == 1,
+        "D: refused display retains one pending unseen notice")
+    assertEq(RT._unresolvedWithdrawPending[1].opKey, tostring(refuseOpId),
+        "D: pending notice preserves originating operationId")
+    assertEq(RT._unresolvedWithdrawPending[1].visitToken, refuseVisit,
+        "D: pending notice preserves originating visitToken")
+    assertTrue(type(RT._unresolvedWithdrawRecent) ~= "table"
+        or #RT._unresolvedWithdrawRecent == 0,
+        "D: refused display is not counted as delivered")
+    -- Replay settle callback must not duplicate pending or movement effects.
+    local refuseText = RT._unresolvedWithdrawPending[1].text
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = refuseOpId,
+        visitToken = refuseVisit,
+        unresolved = { itemId = 10 },
+        requested = { ["10"] = 5 },
+        authorized = { ["10"] = 5 },
+        confirmed = {},
+        remaining = { ["10"] = 5 },
+    }, refuseText)
+    assertEq(#RT._unresolvedWithdrawPending, 1,
+        "D: replayed refused op keeps a single pending notice")
+    assertEq(#popupShows, 2, "D: replayed refused op retries popup without inventing a second notice")
+    assertEq(receiptCount, 0, "D: refused replay adds no receipt")
+    assertEq(handoffCount, 0, "D: refused replay adds no handoff")
+
+    -- Later bank open with popup permitted: prior-op labeling, visit state preserved.
+    popupAllow = true
+    local popupBeforeFlush = #popupShows
+    WR.craftDrafts = { ["200"] = 7 }
+    RT:OnBankOpened()
+    local afterRefuseVisit = RT._quickWithdrawVisitToken
+    assertTrue(afterRefuseVisit ~= refuseVisit, "D: refuse→retry reopen rotates visit")
+    -- OnBankOpened clears status then FlushPending presents; set visit status after
+    -- reopen baseline to prove flush did not leave movement side effects, then
+    -- confirm drafts survived the flush path.
+    assertEq(WR.craftDrafts["200"], 7,
+        "D: bank-open flush preserves newer-visit drafts")
+    RT:SetQuickWithdrawStatus("post-refuse-visit-status", { visitToken = afterRefuseVisit })
+    assertEq(statusText, "post-refuse-visit-status",
+        "D: newer visit can publish its own status after prior-notice flush")
+    assertEq(#popupShows, popupBeforeFlush + 1,
+        "D: bank-open flush delivers previously refused notice")
+    local delivered = popupShows[#popupShows]
+    assertTrue(delivered.message:find("not this bank visit", 1, true) ~= nil
+        or delivered.message:find("earlier withdrawal", 1, true) ~= nil
+        or delivered.message:find("Earlier withdrawal", 1, true) ~= nil,
+        "D: flush during newer visit uses prior-operation labeling")
+    assertTrue(delivered.message:find("requested", 1, true) ~= nil
+        or delivered.message:find("authorized", 1, true) ~= nil
+        or delivered.message:find("remaining", 1, true) ~= nil
+        or delivered.message:find("unresolved", 1, true) ~= nil
+        or (type(refuseText) == "string" and refuseText ~= ""
+            and delivered.message:find(refuseText, 1, true) ~= nil),
+        "D: flush message retains settlement totals/uncertainty text")
+    assertTrue(type(RT._unresolvedWithdrawPending) ~= "table"
+        or #RT._unresolvedWithdrawPending == 0,
+        "D: successful flush clears pending notice")
+    assertTrue(type(RT._unresolvedWithdrawRecent) == "table"
+        and #RT._unresolvedWithdrawRecent == 1
+        and RT._unresolvedWithdrawRecent[1] == tostring(refuseOpId),
+        "D: successful flush records bounded recent delivery")
+    -- Successful delivery + replayed callback: no duplicate notification/movement.
+    local showsAfterDelivery = #popupShows
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = refuseOpId,
+        visitToken = refuseVisit,
+        unresolved = { itemId = 10 },
+    }, refuseText)
+    assertEq(#popupShows, showsAfterDelivery,
+        "D: delivered refuse→retry op does not re-present")
+    assertEq(receiptCount, 0, "D: post-delivery replay adds no receipt")
+    assertEq(handoffCount, 0, "D: post-delivery replay adds no handoff")
+    assertEq(WR.craftDrafts["200"], 7, "D: post-delivery replay leaves drafts intact")
+    assertEq(statusText, "post-refuse-visit-status",
+        "D: post-delivery replay leaves newer-visit status intact")
+
+    -- Bounded recent/pending across repeated operations without manual resets.
+    popupAllow = true
+    for i = 1, 20 do
+        local shown = RT:PresentUnresolvedQuickWithdrawSettlement({
+            operationId = "bound-ok-" .. tostring(i),
+            visitToken = afterRefuseVisit,
+            unresolved = { itemId = 10 },
+            requested = { ["10"] = i },
+            authorized = { ["10"] = i },
+            confirmed = {},
+            remaining = { ["10"] = i },
+        }, "bounded ok " .. tostring(i))
+        assertTrue(shown == true, "D: bound-ok-" .. i .. " presents while popup allowed")
+    end
+    assertEq(#RT._unresolvedWithdrawRecent, 8,
+        "D: successfully presented ops stay within recent bound")
+    assertTrue(type(RT._unresolvedWithdrawPending) ~= "table"
+        or #RT._unresolvedWithdrawPending == 0,
+        "D: successful presents leave pending empty")
+    popupAllow = false
+    for i = 1, 10 do
+        local shown = RT:PresentUnresolvedQuickWithdrawSettlement({
+            operationId = "bound-fail-" .. tostring(i),
+            visitToken = afterRefuseVisit,
+            unresolved = { itemId = 10 },
+        }, "bounded fail " .. tostring(i))
+        assertTrue(shown == false, "D: bound-fail-" .. i .. " refuses display")
+    end
+    assertEq(#RT._unresolvedWithdrawPending, 4,
+        "D: refused notices stay within pending bound without manual reset")
+    assertEq(#RT._unresolvedWithdrawRecent, 8,
+        "D: pending growth does not expand recent beyond its bound")
+
     RT.HideReviewForBankLifecycle = realHideReview
 
     -- Retained shortage confirmation: early visit-guard isolation + same-visit control.

@@ -1821,44 +1821,149 @@ function Runtime:FormatQuickWithdrawSettlement(result)
     return table.concat(parts, " ")
 end
 
+-- Session-only unresolved-notice state. Pending holds unseen failures until an
+-- existing UI lifecycle can retry; recent is a bounded ring of delivered ops.
+local UNRESOLVED_WITHDRAW_PENDING_MAX = 4
+local UNRESOLVED_WITHDRAW_RECENT_MAX = 8
+
+local function UnresolvedWithdrawRecentHas(self, opKey)
+    local recent = self._unresolvedWithdrawRecent
+    if type(recent) ~= "table" or opKey == nil then return false end
+    for i = 1, #recent do
+        if recent[i] == opKey then return true end
+    end
+    return false
+end
+
+local function UnresolvedWithdrawRememberRecent(self, opKey)
+    if opKey == nil then return end
+    local recent = self._unresolvedWithdrawRecent
+    if type(recent) ~= "table" then
+        recent = {}
+        self._unresolvedWithdrawRecent = recent
+    end
+    for i = #recent, 1, -1 do
+        if recent[i] == opKey then
+            table.remove(recent, i)
+        end
+    end
+    recent[#recent + 1] = opKey
+    while #recent > UNRESOLVED_WITHDRAW_RECENT_MAX do
+        table.remove(recent, 1)
+    end
+end
+
+local function UnresolvedWithdrawPendingIndex(self, opKey)
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" or opKey == nil then return nil end
+    for i = 1, #pending do
+        local row = pending[i]
+        if type(row) == "table" and row.opKey == opKey then
+            return i
+        end
+    end
+    return nil
+end
+
+local function UnresolvedWithdrawRetainPending(self, notice)
+    if type(notice) ~= "table" then return end
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" then
+        pending = {}
+        self._unresolvedWithdrawPending = pending
+    end
+    local existing = UnresolvedWithdrawPendingIndex(self, notice.opKey)
+    if existing then
+        pending[existing] = notice
+        return
+    end
+    pending[#pending + 1] = notice
+    while #pending > UNRESOLVED_WITHDRAW_PENDING_MAX do
+        table.remove(pending, 1)
+    end
+end
+
+local function UnresolvedWithdrawClearPending(self, opKey)
+    local idx = UnresolvedWithdrawPendingIndex(self, opKey)
+    if idx then
+        table.remove(self._unresolvedWithdrawPending, idx)
+    end
+end
+
+local function UnresolvedWithdrawBuildMessage(self, notice)
+    local text = type(notice.text) == "string" and notice.text or ""
+    local current = self._quickWithdrawVisitToken
+    local origin = notice.visitToken
+    if origin ~= nil and current ~= nil and tostring(origin) ~= tostring(current) then
+        return Loc("GUILD_SUPPLIES_WITHDRAW_PRIOR_OP_UNRESOLVED_FMT",
+            "An earlier withdrawal finished with unresolved movement (not this bank visit):\n%s")
+            :format(text)
+    end
+    return text
+end
+
 --- Present unresolved bank-close settlement on a visible dialog surface.
 -- Helper status text alone is not delivery: OnBankClosed can settle while the
 -- review is still briefly shown, then hide/clear it before the player reads it.
 -- Acknowledgement only — no movement, receipt, or handoff side effects.
+-- A refused popup does not count as delivery: the notice is retained (bounded)
+-- and retried from an existing UI lifecycle (bank open).
 function Runtime:PresentUnresolvedQuickWithdrawSettlement(result, text)
     result = type(result) == "table" and result or {}
     local opKey = result.operationId ~= nil and tostring(result.operationId) or nil
-    self._unresolvedWithdrawPresented = self._unresolvedWithdrawPresented or {}
-    if opKey and self._unresolvedWithdrawPresented[opKey] then
+    if opKey and UnresolvedWithdrawRecentHas(self, opKey) then
         return false
     end
     text = type(text) == "string" and text or self:FormatQuickWithdrawSettlement(result)
-    local current = self._quickWithdrawVisitToken
-    local origin = result.visitToken
-    local message = text
-    if origin ~= nil and current ~= nil and tostring(origin) ~= tostring(current) then
-        message = Loc("GUILD_SUPPLIES_WITHDRAW_PRIOR_OP_UNRESOLVED_FMT",
-            "An earlier withdrawal finished with unresolved movement (not this bank visit):\n%s")
-            :format(text)
-    end
+    local notice = {
+        opKey = opKey,
+        operationId = result.operationId,
+        visitToken = result.visitToken,
+        text = text,
+    }
+    local message = UnresolvedWithdrawBuildMessage(self, notice)
     local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
     if not (Dialogs and Dialogs.Confirm) then
+        UnresolvedWithdrawRetainPending(self, notice)
         return false
-    end
-    -- Bound session-only dedupe so stale/replayed settle callbacks cannot spam.
-    if opKey then
-        self._unresolvedWithdrawPresented[opKey] = true
     end
     local shown = Dialogs:Confirm(
         message,
         Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED_ACK", "OK"),
         nil
     )
-    if not shown and opKey then
-        self._unresolvedWithdrawPresented[opKey] = nil
-        return false
+    if shown then
+        UnresolvedWithdrawClearPending(self, opKey)
+        UnresolvedWithdrawRememberRecent(self, opKey)
+        return true
     end
-    return true
+    -- Native StaticPopup_Show can return nil; keep unseen notice recoverable.
+    UnresolvedWithdrawRetainPending(self, notice)
+    return false
+end
+
+--- Retry unseen unresolved notices at an existing UI opportunity (bank open).
+-- Rebuilds prior-visit labeling from current visit token; does not overwrite
+-- current-visit status, drafts, or tokens. No timers or polling.
+function Runtime:FlushPendingUnresolvedWithdrawNotices()
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" or #pending < 1 then
+        return
+    end
+    -- Snapshot keys: successful shows mutate the pending array.
+    local snapshot = {}
+    for i = 1, #pending do
+        snapshot[i] = pending[i]
+    end
+    for i = 1, #snapshot do
+        local notice = snapshot[i]
+        if type(notice) == "table" then
+            self:PresentUnresolvedQuickWithdrawSettlement({
+                operationId = notice.operationId,
+                visitToken = notice.visitToken,
+            }, notice.text)
+        end
+    end
 end
 
 function Runtime:SetQuickWithdrawStatus(text, opts)
@@ -2776,6 +2881,10 @@ function Runtime:OnBankOpened()
     self:WatchGuildBankFrame()
     self:RefreshReminder()
     self:SyncReviewWithGuildBank()
+    -- Retry unseen unresolved notices after visit token/status reset so a
+    -- refused earlier popup can surface with prior-operation labeling without
+    -- overwriting this visit's drafts or status.
+    self:FlushPendingUnresolvedWithdrawNotices()
 end
 
 function Runtime:OnBankClosed()
