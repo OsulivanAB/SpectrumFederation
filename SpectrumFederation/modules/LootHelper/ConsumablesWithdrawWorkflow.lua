@@ -212,15 +212,31 @@ function W.SourcePlanIncomplete(remainingUnfilled)
 end
 
 --- Blizzard bag/item family compatibility (bit flags). Nil/0 = unrestricted.
+local function BandFlags(a, b)
+    a = tonumber(a) or 0
+    b = tonumber(b) or 0
+    if bit and bit.band then
+        return bit.band(a, b)
+    end
+    local result = 0
+    local bitval = 1
+    while a > 0 or b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bitval
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bitval = bitval * 2
+    end
+    return result
+end
+
 function W.SlotAcceptsItemFamily(slotFamily, itemFamily)
     slotFamily = tonumber(slotFamily) or 0
     itemFamily = tonumber(itemFamily) or 0
     if itemFamily == 0 then return true end
     if slotFamily == 0 then return true end
-    if bit and bit.band then
-        return bit.band(slotFamily, itemFamily) ~= 0
-    end
-    return false
+    return BandFlags(slotFamily, itemFamily) ~= 0
 end
 
 --- Live or snapshot slot still matches a planned destination row.

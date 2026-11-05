@@ -259,6 +259,10 @@ local function BagSlotFamily(bag)
     if C_Container and C_Container.GetBagSlotFlag then
         return tonumber(C_Container.GetBagSlotFlag(bag)) or 0
     end
+    if C_Container and C_Container.GetContainerNumFreeSlots then
+        local _, bagFamily = C_Container.GetContainerNumFreeSlots(bag)
+        return tonumber(bagFamily) or 0
+    end
     return 0
 end
 
@@ -279,14 +283,7 @@ function WR.ReadCarriedSlot(bag, slot)
     end
     local info = C_Container.GetContainerItemInfo(bag, slot)
     if not info then
-        local family = BagSlotFamily(bag)
-        if C_Container.GetBagFreeSlotInfo then
-            local ok, slotFamily = C_Container.GetBagFreeSlotInfo(bag, slot)
-            if ok and slotFamily then
-                family = tonumber(slotFamily) or family
-            end
-        end
-        return { empty = true, family = family }
+        return { empty = true, family = BagSlotFamily(bag) }
     end
     return {
         itemId = tonumber(info.itemID),
@@ -336,14 +333,11 @@ function WR.BuildCarriedBagSnapshot()
             for slot = 1, slots do
                 local info = C_Container.GetContainerItemInfo(bag, slot)
                 if not info then
-                    local family = BagSlotFamily(bag)
-                    if C_Container.GetBagFreeSlotInfo then
-                        local ok, slotFamily = C_Container.GetBagFreeSlotInfo(bag, slot)
-                        if ok and slotFamily then
-                            family = tonumber(slotFamily) or family
-                        end
-                    end
-                    bagRow.slots[#bagRow.slots + 1] = { slot = slot, empty = true, family = family }
+                    bagRow.slots[#bagRow.slots + 1] = {
+                        slot = slot,
+                        empty = true,
+                        family = BagSlotFamily(bag),
+                    }
                 else
                     bagRow.slots[#bagRow.slots + 1] = {
                         slot = slot,

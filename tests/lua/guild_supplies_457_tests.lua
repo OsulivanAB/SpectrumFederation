@@ -42,6 +42,12 @@ local function assertEq(a, b, msg)
             tostring(msg), tostring(a), tostring(b)))
     end
 end
+local function assertFalse(cond, msg)
+    if cond then
+        failures = failures + 1
+        io.stderr:write("FAIL: " .. tostring(msg) .. "\n")
+    end
+end
 
 -- Load domain modules in TOC order (subset).
 loadModule("SpectrumFederation/modules/GuildSupplies/State.lua")
@@ -197,12 +203,12 @@ do
     assertEq(planHerb.requiredNewStacks, 1, "uses herb slot not general-only miscount")
 
     local okOre, errOre = W.PlanMultiItemBagDestinations(
-        herbBag,
+        { { bag = 4, slots = { { slot = 1, empty = true, family = 4 } } } },
         { ["200"] = 5 },
         function() return 20 end,
         function() return 8 end
     )
-    assertFalse(okOre, "ore blocked from herb-only pool")
+    assertFalse(okOre, "ore blocked when only herb bag slots exist")
     assertEq(errOre, "bag_capacity", "capacity error when no compatible slot")
 
     local okDest, destErr = W.DestinationStillValid(
@@ -228,14 +234,14 @@ do
     local remaining = 10
     for mi = 1, #moves do
         local move = moves[mi]
-        local left = FloorQty(move.count)
+        local left = math.floor(tonumber(move.count) or 0)
         local di = 1
         while left > 0 do
             local dest = destRows[di]
-            local chunk = math.min(left, FloorQty(dest.count))
+            local chunk = math.min(left, math.floor(tonumber(dest.count) or 0))
             pickups = pickups + 1
             left = left - chunk
-            if chunk >= FloorQty(dest.count) then
+            if chunk >= math.floor(tonumber(dest.count) or 0) then
                 di = di + 1
             end
         end
