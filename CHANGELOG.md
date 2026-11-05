@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.9] - 2026-11-05
+
+### Changed
+- Fully opaque dropdown and autocomplete menu backgrounds
+
 ## [1.5.18-beta.8] - 2026-11-05
 
 ### Changed
