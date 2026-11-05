@@ -2,53 +2,30 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.18-beta.9] - 2026-11-05
+## [1.5.18-beta.10] - 2026-11-05
+
+### Added
+- Add officer Edit contributor for Raid Supplies Logs credit corrections (#459)
 
 ### Changed
-- Fully opaque dropdown and autocomplete menu backgrounds
+- Page required credit-event aliases across Guild Gossip wire limits for dataset adoption (#459)
 
-## [1.5.18-beta.8] - 2026-11-05
-
-### Changed
-- Raid Supplies bank panel Quick Withdraw layout and opacity
-
-## [1.5.18-beta.7] - 2026-11-05
-
-### Changed
-- Quick Withdraw recipes, receipts, and bank/trade lifecycle
-
-## [1.5.18-beta.6] - 2026-11-05
-
-### Fixed
-- Fix Raid Check completion visibility for initiating admin (#449)
-
-## [1.5.18-beta.5] - 2026-11-04
-
-### Changed
-- Raid Supply UI adjustments (#453)
-
-### Fixed
-- Fix Mouse Tracer Edge Softness hitch and soft-edge rendering (#454)
-
-## [1.5.18-beta.4] - 2026-11-04
-
-### Fixed
-- Fix Mouse Tracer Edge Softness hitch and soft-edge rendering (#454)
-
-## [1.5.18-beta.3] - 2026-11-04
-
-### Fixed
-- Fix Rankings first-row currency value clipping at scroll top
-
-## [1.5.18-beta.2] - 2026-11-04
-
-### Changed
-- Raid Supplies Rankings: simplify layout and coin amounts (#450)
-
-## [1.5.18-beta.1] - 2026-11-04
+## [1.5.18] - 2026-11-05
 
 ### Added
 - Add officer-only Raid Supplies Rankings (#447)
+
+### Changed
+- Fully opaque dropdown and autocomplete menu backgrounds
+- Raid Supplies bank panel Quick Withdraw layout and opacity
+- Quick Withdraw recipes, receipts, and bank/trade lifecycle
+- Raid Supply UI adjustments (#453)
+- Raid Supplies Rankings: simplify layout and coin amounts (#450)
+
+### Fixed
+- Fix Mouse Tracer Edge Softness hitch and soft-edge rendering (#454)
+- Fix Rankings first-row currency value clipping at scroll top
+- Fix Raid Check completion visibility for initiating admin (#449)
 
 ## [1.5.17] - 2026-11-03
 
