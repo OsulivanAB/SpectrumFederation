@@ -8298,6 +8298,320 @@ do
     assertTrue(type(adoptedDon) == "table", "459-A-adopt: alias resolves after adopt")
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(adopted, adoptedDon)), "Carol-Garona",
         "459-A-adopt: adopter credit Carol")
+    assertEq(tonumber(descBody.creditEventAliasCount), 1,
+        "459-A-adopt: alias count advertised")
+    assertEq(tonumber(descBody.creditEventAliasPageCount) or 0, 0,
+        "459-A-adopt: single binding stays inline (no pages)")
+end
+
+do
+    -- A-wire: required multi-alias history must page under the real Guild Gossip
+    -- wrapper-inclusive limit and survive export → filter → Buffer → Commit.
+    local function wireRawBytes(id, body)
+        local fp = (GS.ContentFingerprint and GS.ContentFingerprint(body))
+            or string.rep("f", GS.MAX_OPERATION_ID or 192)
+        local raw = C_EncodingUtil.SerializeCBOR({
+            id = id, versionFp = fp, body = body,
+        })
+        return type(raw) == "string" and #raw or 0
+    end
+    local function filterWireBudget(bodies)
+        local out, dropped = {}, 0
+        local budget = GS.MAX_WIRE_RECORD_BYTES or 2048
+        for i = 1, #bodies do
+            local id, body = bodies[i].id, bodies[i].body
+            if wireRawBytes(id, body) <= budget then
+                out[#out + 1] = bodies[i]
+            else
+                dropped = dropped + 1
+            end
+        end
+        return out, dropped
+    end
+
+    local record = seedLiveCampaignWithItem(9920, 200)
+    local ctx = select(1, GS:GetCurrentContext())
+    local N = 65
+    local donors = { "Alice-Garona", "Bob-Garona", "Carol-Garona" }
+    local guids = {
+        ["Alice-Garona"] = "Player-1-Alice",
+        ["Bob-Garona"] = "Player-1-Bob",
+        ["Carol-Garona"] = "Player-1-Carol",
+    }
+    -- Direct durable injection (same shape as G1 capacity fixtures) so required
+    -- alias collection and export sizing do not depend on wall-clock skew while
+    -- still producing real accepted correction bodies for adoption replay.
+    record.operations.records = record.operations.records or {}
+    record.operations.order = record.operations.order or {}
+    record.operations.heads = record.operations.heads or {}
+    for i = 1, N do
+        local canon = string.format("ctx:aw-canon-%04d", i)
+        local alias = string.format("ctx:aw-alias-%04d", i)
+        local actor = donors[((i - 1) % #donors) + 1]
+        local don = injectProductionDonation(record, {
+            id = canon, itemId = 9920, quantity = 1,
+            actor = actor, actorGuid = guids[actor],
+            timestamp = world.time + i,
+        })
+        don.txnId = canon
+        assertTrue(GS._AddTxnAlias(record, canon, alias, don),
+            "459-A-wire: alias " .. tostring(i))
+        local credited = donors[(i % #donors) + 1]
+        local opId = string.format("aw-corr-%04d", i)
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = credited, attributedGuid = guids[credited],
+                baseAttributed = actor, baseAttributedGuid = guids[actor],
+                itemId = 9920,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[opId] = op
+        record.operations.order[#record.operations.order + 1] = opId
+        record.operations.heads["credit:" .. canon] = opId
+    end
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(record.operations)
+    end
+    local required = GS.CollectRequiredCreditEventAliases(record)
+    local reqN = 0
+    for _ in pairs(required or {}) do reqN = reqN + 1 end
+    assertTrue(reqN >= N, "459-A-wire: required aliases n=" .. tostring(reqN))
+
+    -- Prove the monolithic desc would exceed the GG raw-record cap.
+    local bloatedDesc = {
+        kind = "dataset-desc",
+        schemaVersion = GS.PROVIDER_SCHEMA,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        creditEventAliases = required,
+        creditEventAliasCount = reqN,
+        creditEventAliasPageCount = 0,
+        acceptedOpCount = 0, transferOpCount = 0, campaignCount = 0, archiveCount = 0,
+        acceptedLedgerCount = 0, donationEvidenceCount = 0, valuationCount = 0,
+        hasBankTab = true,
+    }
+    local bloatedBytes = wireRawBytes("gs:desc:" .. record.datasetId, bloatedDesc)
+    assertTrue(bloatedBytes > (GS.MAX_WIRE_RECORD_BYTES or 2048),
+        "459-A-wire: monolithic aliases exceed wire budget bytes=" .. tostring(bloatedBytes))
+
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(256)
+    local exportBodies = collectAllExportBodies()
+    local descBody, pages = nil, {}
+    local overBudget = 0
+    for i = 1, #exportBodies do
+        local id, body = exportBodies[i].id, exportBodies[i].body
+        local nbytes = wireRawBytes(id, body)
+        if nbytes > (GS.MAX_WIRE_RECORD_BYTES or 2048) then
+            overBudget = overBudget + 1
+        end
+        if body and body.kind == "dataset-desc" then
+            descBody = body
+        elseif body and body.kind == "gs-credit-aliases-page" then
+            pages[#pages + 1] = { id = id, body = body, page = tonumber(body.page) or 0 }
+        end
+    end
+    assertEq(overBudget, 0, "459-A-wire: no exported body exceeds wire budget")
+    assertTrue(type(descBody) == "table", "459-A-wire: dataset-desc present")
+    assertEq(tonumber(descBody.creditEventAliasCount), reqN,
+        "459-A-wire: desc advertises required count")
+    assertTrue((tonumber(descBody.creditEventAliasPageCount) or 0) >= 1,
+        "459-A-wire: desc uses pages pageCount="
+            .. tostring(descBody.creditEventAliasPageCount))
+    local inlineN = 0
+    for _ in pairs(descBody.creditEventAliases or {}) do inlineN = inlineN + 1 end
+    assertEq(inlineN, 0, "459-A-wire: paged desc strips inline map")
+    assertEq(#pages, tonumber(descBody.creditEventAliasPageCount),
+        "459-A-wire: page bodies match pageCount")
+
+    -- Transport boundary: GG would drop oversize records; paged export must
+    -- survive an explicit wrapper-size filter unchanged.
+    local filtered, dropped = filterWireBudget(exportBodies)
+    assertEq(dropped, 0, "459-A-wire: filter drops none got=" .. tostring(dropped))
+    assertEq(#filtered, #exportBodies, "459-A-wire: filter preserves all bodies")
+
+    -- Missing page → incomplete.
+    do
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local sourceDataset = record.datasetId
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "459-A-wire-miss: begin")
+        local skipPage = pages[1] and pages[1].page
+        for i = 1, #filtered do
+            local b = filtered[i]
+            if not (b.body.kind == "gs-credit-aliases-page" and tonumber(b.body.page) == skipPage) then
+                GS:BufferAdoptionRecord(b.id, b.body)
+            end
+        end
+        local readyMiss = GS:GetPendingAdoption() and GS:GetPendingAdoption().ready
+        assertTrue(not readyMiss, "459-A-wire-miss: missing page blocks ready")
+        local okMiss, reasonMiss = GS:IsAdoptionTransferComplete()
+        assertTrue(not okMiss, "459-A-wire-miss: incomplete")
+        assertEq(reasonMiss, "incomplete_transfer",
+            "459-A-wire-miss: reason got " .. tostring(reasonMiss))
+        GS:CancelDatasetAdoption()
+    end
+
+    -- Duplicate exact page + reordered pages still complete.
+    do
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local sourceDataset = record.datasetId
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "459-A-wire-reord: begin")
+        -- Deliver alias pages first (reverse), then the rest; redeliver page 1.
+        table.sort(pages, function(a, b) return a.page > b.page end)
+        for i = 1, #pages do
+            local st = select(1, GS:BufferAdoptionRecord(pages[i].id, pages[i].body))
+            assertTrue(st == "accepted" or st == "duplicate",
+                "459-A-wire-reord: page " .. tostring(pages[i].page))
+        end
+        if pages[#pages] then
+            local stDup = select(1, GS:BufferAdoptionRecord(pages[#pages].id, pages[#pages].body))
+            assertEq(stDup, "duplicate", "459-A-wire-reord: exact redelivery duplicate")
+        end
+        for i = 1, #filtered do
+            local b = filtered[i]
+            if b.body.kind ~= "gs-credit-aliases-page" then
+                GS:BufferAdoptionRecord(b.id, b.body)
+            end
+        end
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            "459-A-wire-reord: ready after reorder+dup")
+        GS:CancelDatasetAdoption()
+    end
+
+    -- Conflicting alias on a page → reject / incomplete.
+    do
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local sourceDataset = record.datasetId
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "459-A-wire-confl: begin")
+        for i = 1, #pages do
+            if pages[i].page == 1 then
+                local victim = nil
+                for a in pairs(pages[i].body.aliases or {}) do
+                    victim = a
+                    break
+                end
+                assertTrue(victim ~= nil, "459-A-wire-confl: victim alias")
+                local badPage = {
+                    kind = "gs-credit-aliases-page",
+                    datasetId = sourceDataset,
+                    page = 1,
+                    pageCount = tonumber(descBody.creditEventAliasPageCount),
+                    aliases = { [victim] = "ctx:aw-CONFLICT-CANON" },
+                }
+                local stGood = select(1, GS:BufferAdoptionRecord(pages[i].id, pages[i].body))
+                assertTrue(stGood == "accepted" or stGood == "duplicate",
+                    "459-A-wire-confl: good page accepted")
+                local stBad, rBad = GS:BufferAdoptionRecord(pages[i].id, badPage)
+                assertEq(stBad, "rejected",
+                    "459-A-wire-confl: conflicting page body rejected got "
+                        .. tostring(stBad) .. "/" .. tostring(rBad))
+                assertEq(rBad, "id_conflict",
+                    "459-A-wire-confl: id_conflict got " .. tostring(rBad))
+                break
+            end
+        end
+        GS:CancelDatasetAdoption()
+    end
+
+    -- Full fresh adoption through filtered transport + cold validate.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local sourceDataset = record.datasetId
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "459-A-wire: begin adopt")
+    for i = 1, #filtered do
+        GS:BufferAdoptionRecord(filtered[i].id, filtered[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "459-A-wire: transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while stAdopt == "pending" and gAdopt < 256 do
+        runOneDueTimer()
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(stAdopt, "accepted",
+        "459-A-wire: commit got " .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "459-A-wire: adopted record")
+    local adoptedMap = adopted.accounting._consumables.creditEventAliases
+    local installed = 0
+    for a, c in pairs(adoptedMap or {}) do
+        if required[a] == c then
+            installed = installed + 1
+        end
+    end
+    assertEq(installed, reqN, "459-A-wire: all required bindings installed got="
+        .. tostring(installed))
+    -- Spot-check alias-targeted credit after adopt.
+    local sample = GS.FindLedgerEventById(adopted, "ctx:aw-alias-0001")
+    assertTrue(type(sample) == "table", "459-A-wire: sample alias resolves")
+    local sampleCredit = select(1, GS.ResolveEffectiveCreditIdentity(adopted, sample))
+    assertTrue(type(sampleCredit) == "string" and sampleCredit ~= "",
+        "459-A-wire: sample credit " .. tostring(sampleCredit))
+    -- Evict projection caches / cold validate after reload-shaped bump.
+    GS._creditProjectionAccumulating = false
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(adopted.operations)
+    end
+    local adoptedCtx = select(1, GS:GetCurrentContext())
+    local coldOk, coldErr = GS._ValidateGuildRecordStructure(adoptedCtx.guildKey, adopted)
+    assertTrue(coldOk, "459-A-wire: cold validate after adopt got " .. tostring(coldErr))
 end
 
 do

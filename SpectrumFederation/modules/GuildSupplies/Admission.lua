@@ -42,6 +42,9 @@ GS.MAX_WIRE_RECORD_BYTES = 2048
 GS.MAX_ARCHIVE_PAGE_ITEMS = 64
 GS.MAX_ARCHIVE_PAGE_COUNT = 512
 GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
+-- Required credit-event alias pages for adoption (#459 A). Worst case one
+-- binding per page under the 2048-byte wrapper-inclusive wire budget.
+GS.MAX_CREDIT_ALIAS_PAGE_COUNT = 512
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -1976,6 +1979,55 @@ local function PreferArchiveHistoricalContext(existing, assembled)
 end
 
 
+--- Merge inline descriptor aliases with buffered gs-credit-aliases-page bodies.
+-- @return table|nil map, string|nil err
+local function AssembleCreditAliasesFromAdoption(adop, desc)
+    local map = {}
+    local function absorb(incoming)
+        if incoming == nil then
+            return true
+        end
+        if type(incoming) ~= "table" then
+            return false, "invalid_credit_event_aliases"
+        end
+        for alias, canon in pairs(incoming) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return false, "invalid_credit_event_aliases"
+            end
+            local prior = map[alias]
+            if type(prior) == "string" and prior ~= "" and prior ~= canon then
+                return false, "alias_conflict"
+            end
+            map[alias] = canon
+        end
+        return true
+    end
+    local ok, err = absorb(desc and desc.creditEventAliases)
+    if not ok then
+        return nil, err
+    end
+    local info = adop and adop._creditAliasIndex
+    local expectPages = tonumber(desc and desc.creditEventAliasPageCount) or 0
+    if expectPages > 0 then
+        if type(info) ~= "table" or type(info.pages) ~= "table" then
+            return nil, "incomplete_transfer"
+        end
+        for page = 1, expectPages do
+            local pageBody = info.pages[page]
+            if type(pageBody) ~= "table" then
+                return nil, "incomplete_transfer"
+            end
+            ok, err = absorb(pageBody.aliases)
+            if not ok then
+                return nil, err
+            end
+        end
+    end
+    return map, nil
+end
+
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
     local adop = GS._adoption
@@ -2111,6 +2163,53 @@ function GS:IsAdoptionTransferComplete()
                     if type(info.pages[page]) ~= "table" then
                         return false, "incomplete_transfer"
                     end
+                end
+            end
+        end
+    end
+    -- Required credit-event alias transfer (#459 A): when the source advertises
+    -- a count, inline and/or paged bindings must assemble to exactly that set.
+    local hasAliasManifest = desc.creditEventAliasCount ~= nil
+    if hasAliasManifest then
+        local expectAliasCount = tonumber(desc.creditEventAliasCount)
+        local expectAliasPages = tonumber(desc.creditEventAliasPageCount) or 0
+        if expectAliasCount == nil
+            or expectAliasCount ~= math.floor(expectAliasCount)
+            or expectAliasCount < 0
+            or expectAliasPages ~= math.floor(expectAliasPages)
+            or expectAliasPages < 0 then
+            return false, "incomplete_transfer"
+        end
+        if adop.pinnedCreditEventAliasCount ~= nil
+            and adop.pinnedCreditEventAliasCount ~= expectAliasCount then
+            return false, "source_changed"
+        end
+        if adop.pinnedCreditEventAliasPageCount ~= nil
+            and adop.pinnedCreditEventAliasPageCount ~= expectAliasPages then
+            return false, "source_changed"
+        end
+        local assembled, assembleErr = AssembleCreditAliasesFromAdoption(adop, desc)
+        if not assembled then
+            return false, assembleErr or "incomplete_transfer"
+        end
+        local n = 0
+        for _ in pairs(assembled) do
+            n = n + 1
+        end
+        if n ~= expectAliasCount then
+            return false, "incomplete_transfer"
+        end
+        if expectAliasPages > 0 then
+            local info = adop._creditAliasIndex
+            if type(info) ~= "table" or type(info.pages) ~= "table" then
+                return false, "incomplete_transfer"
+            end
+            if info.pageCount and info.pageCount ~= expectAliasPages then
+                return false, "incomplete_transfer"
+            end
+            for page = 1, expectAliasPages do
+                if type(info.pages[page]) ~= "table" then
+                    return false, "incomplete_transfer"
                 end
             end
         end
@@ -2305,6 +2404,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _confirmEnvelopes = {},
         _confirmByTarget = {},
         _archiveIndex = {},
+        _creditAliasIndex = { pages = {}, pageCount = nil },
         -- Incremental receive-stage completeness (avoids full-history recounts).
         _bufCounts = {
             acceptedOps = 0,
@@ -2337,6 +2437,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedAcceptedLedgerCount = nil,
         pinnedDonationEvidenceCount = nil,
         pinnedValuationCount = nil,
+        pinnedCreditEventAliasCount = nil,
+        pinnedCreditEventAliasPageCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2826,6 +2928,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local ledger = tonumber(descBody.acceptedLedgerCount)
         local donEv = tonumber(descBody.donationEvidenceCount)
         local valuations = tonumber(descBody.valuationCount)
+        local aliasCount = tonumber(descBody.creditEventAliasCount)
+        local aliasPages = tonumber(descBody.creditEventAliasPageCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2894,6 +2998,28 @@ function GS:BufferAdoptionRecord(recordId, body)
                 adop.pinnedValuationCount = valuations
             end
         elseif valuations == nil or valuations ~= adop.pinnedValuationCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        -- Credit-alias manifest pins (#459 A). Omission after pin is source_changed;
+        -- older descriptors that never advertised stay unpinned.
+        if adop.pinnedCreditEventAliasCount == nil then
+            if aliasCount ~= nil then
+                adop.pinnedCreditEventAliasCount = aliasCount
+            end
+        elseif aliasCount == nil or aliasCount ~= adop.pinnedCreditEventAliasCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedCreditEventAliasPageCount == nil then
+            if aliasPages ~= nil then
+                adop.pinnedCreditEventAliasPageCount = aliasPages
+            end
+        elseif aliasPages == nil or aliasPages ~= adop.pinnedCreditEventAliasPageCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -3071,6 +3197,51 @@ function GS:BufferAdoptionRecord(recordId, body)
         info.recipePages[page] = body
         info.recipePageCount = info.recipePageCount or pc
         adop._archiveIndex[body.campaignId] = info
+    elseif body.kind == "gs-credit-aliases-page" then
+        local maxPages = GS.MAX_CREDIT_ALIAS_PAGE_COUNT or 512
+        if type(body.datasetId) ~= "string" or body.datasetId ~= adop.sourceDatasetId then
+            return "rejected", "invalid_operation"
+        end
+        if type(body.aliases) ~= "table" then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        for alias, canon in pairs(body.aliases) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return "rejected", "invalid_credit_event_aliases"
+            end
+        end
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxPages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._creditAliasIndex = adop._creditAliasIndex or { pages = {}, pageCount = nil }
+        local info = adop._creditAliasIndex
+        if info.pageCount and info.pageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        -- Conflict against a descriptor that already pinned a different pageCount.
+        if adop.pinnedCreditEventAliasPageCount ~= nil
+            and adop.pinnedCreditEventAliasPageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.pages[page]) == "table" then
+            if DeepEqual(info.pages[page], body) then
+                -- Fall through to same-id duplicate handling below.
+            else
+                return "rejected", "id_conflict"
+            end
+        end
+        info.pages[page] = body
+        info.pageCount = info.pageCount or pc
     end
 
     -- Reject malformed / unmintable gs-valuation before buffering/counting.
@@ -3201,11 +3372,12 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
     }
 end
 
---- Install validated credit-event alias bindings from an adoption descriptor onto
--- a fresh bootstrap record before op replay. Rejects conflicting redirections and
--- oversized payloads; does not rewrite immutable op bodies (#459 A).
+--- Install validated credit-event alias bindings from an adoption descriptor
+-- (plus any gs-credit-aliases-page bodies) onto a fresh bootstrap record before
+-- op replay. Rejects conflicting redirections and oversized payloads; does not
+-- rewrite immutable op bodies (#459 A).
 -- @return boolean ok, string|nil err
-local function InstallCreditEventAliasesFromDesc(temp, desc)
+local function InstallCreditEventAliasesFromDesc(temp, desc, adop)
     if type(temp) ~= "table" or type(temp.accounting) ~= "table" then
         return false, "invalid_record"
     end
@@ -3216,24 +3388,19 @@ local function InstallCreditEventAliasesFromDesc(temp, desc)
     if type(cfg.creditEventAliases) ~= "table" then
         cfg.creditEventAliases = {}
     end
-    local map = cfg.creditEventAliases
-    local incoming = desc and desc.creditEventAliases
-    if incoming == nil then
-        -- Older descriptors omit the field; leave empty (winner heads may still
-        -- reconstruct; losers require the transfer).
+    -- Older descriptors omit the alias manifest entirely.
+    if desc and desc.creditEventAliasCount == nil and desc.creditEventAliases == nil
+        and (tonumber(desc.creditEventAliasPageCount) or 0) < 1 then
         return true
     end
-    if type(incoming) ~= "table" then
-        return false, "invalid_credit_event_aliases"
+    local incoming, assembleErr = AssembleCreditAliasesFromAdoption(adop, desc)
+    if not incoming then
+        return false, assembleErr or "incomplete_transfer"
     end
+    local map = cfg.creditEventAliases
     local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
     local n = 0
     for alias, canon in pairs(incoming) do
-        if type(alias) ~= "string" or alias == ""
-            or type(canon) ~= "string" or canon == ""
-            or alias == canon then
-            return false, "invalid_credit_event_aliases"
-        end
         n = n + 1
         if n > maxN then
             return false, "full"
@@ -3244,7 +3411,7 @@ local function InstallCreditEventAliasesFromDesc(temp, desc)
         end
         map[alias] = canon
     end
-    local declared = tonumber(desc.creditEventAliasCount)
+    local declared = tonumber(desc and desc.creditEventAliasCount)
     if declared ~= nil and declared ~= n then
         return false, "incomplete_transfer"
     end
@@ -5793,7 +5960,7 @@ function GS:CommitDatasetAdoption()
     -- Transfer required credit-event alias bindings before op replay so
     -- alias-targeted winners/losers resolve on a fresh dataset (#459 A).
     do
-        local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc)
+        local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc, adop)
         if not aliasOk then
             return "rejected", aliasErr or "invalid_credit_event_aliases"
         end
