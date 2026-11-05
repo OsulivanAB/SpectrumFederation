@@ -22609,14 +22609,17 @@ do
 end
 
 do
-    -- 3B43) Adoption pending capacity fits independent ops + ledger maxima.
+    -- 3B43) Adoption pending capacity fits independent ops + ledger maxima,
+    -- including both withdrawal receipt classes and justified archive structure.
     assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS
         >= (GS.MAX_ACCEPTED_OPERATIONS or 4096)
             + (GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
             + (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
             + (GS.MAX_LEDGER_EVENTS or 4096)
             + (GS.MAX_ARCHIVED_EVENTS or 4096),
-        "3B43: adoption buffer covers ops+ledger+valuations got="
+        "3B43: adoption buffer covers ops+ledger+receipts+valuations got="
             .. tostring(GS.MAX_ADOPTION_PENDING_RECORDS))
     assertTrue(GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS >= GS.MAX_ADOPTION_PENDING_RECORDS,
         "3B43: aggregate admissions include the valuation buffer")
@@ -22631,7 +22634,11 @@ do
     GS.MAX_ARCHIVED_EVENTS = 40
     GS.MAX_ADOPTION_PENDING_RECORDS = 40 + 40 + 40
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + ((GS.MAX_CAMPAIGNS or 64) * 24) + 512
+        + (GS.MAX_CAMPAIGNS or 64)
+        + (GS.MAX_CAMPAIGNS or 64)
+        + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
+        + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
+        + 512
     local aliceRecord = seedStagedCampaignWithItem(9055, 50)
     -- Fill accepted ops near the lowered cap with bank-tab no-ops alternating.
     local acceptedNow = #(aliceRecord.operations.order or {})

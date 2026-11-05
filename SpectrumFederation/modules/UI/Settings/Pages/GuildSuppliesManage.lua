@@ -1020,14 +1020,32 @@ local function EnsureRecipeEditorUi()
 	frame:RegisterForDrag("LeftButton")
 	frame:SetScript("OnDragStart", frame.StartMoving)
 	frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
+	-- Escape via UISpecialFrames must still run the discard lifecycle. OnHide
+	-- discards only when the editor is still marked open (CloseRecipeEditor
+	-- clears open before Hide to avoid double work).
+	frame:SetScript("OnHide", function()
+		if recipeEditorDraft.open then
+			CloseRecipeEditor(true)
+		end
+	end)
+	if type(UISpecialFrames) ~= "table" then
+		UISpecialFrames = {}
+	end
+	local registered = false
+	for i = 1, #UISpecialFrames do
+		if UISpecialFrames[i] == "SFGuildSuppliesRecipeEditor" then
+			registered = true
+			break
+		end
+	end
+	if not registered then
+		UISpecialFrames[#UISpecialFrames + 1] = "SFGuildSuppliesRecipeEditor"
+	end
 
 	local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
 	close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
 	close:SetScript("OnClick", function()
-		CaptureRecipeEditorDraftFromUi()
-		recipeEditorDraft.open = false
-		recipeEditorDraft.reagentTexts = {}
-		frame:Hide()
+		CloseRecipeEditor(true)
 	end)
 
 	local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
@@ -1270,6 +1288,10 @@ local function RefreshRecipeEditor()
 				if boundId then
 					recipeEditorDraft.reagentTexts[tostring(boundId)] = self:GetText() or ""
 				end
+			end)
+			-- Focused reagent inputs must not consume Escape by only clearing focus.
+			row.Edit:SetScript("OnEscapePressed", function()
+				CloseRecipeEditor(true)
 			end)
 			ui.reagentEdits[itemId] = row.Edit
 			local qtyText = recipeEditorDraft.reagentTexts[tostring(itemId)]
@@ -2372,6 +2394,35 @@ Page.__sfTest = {
 	end,
 	RecipeEditorUi = function()
 		return recipeEditorUi
+	end,
+	-- Production Escape routes: UISpecialFrames hide and EditBox OnEscapePressed.
+	InvokeRecipeEditorEscape = function(opts)
+		opts = type(opts) == "table" and opts or {}
+		local ui = recipeEditorUi
+		if not ui or not ui.frame then
+			return false
+		end
+		if opts.withFocus then
+			local edit = nil
+			if ui.reagentEdits then
+				for _, box in pairs(ui.reagentEdits) do
+					edit = box
+					break
+				end
+			end
+			if edit and edit.GetScript then
+				local handler = edit:GetScript("OnEscapePressed")
+				if type(handler) == "function" then
+					handler(edit)
+					return true
+				end
+			end
+		end
+		-- UISpecialFrames dismisses by hiding the named frame.
+		if ui.frame.Hide then
+			ui.frame:Hide()
+		end
+		return true
 	end,
 }
 

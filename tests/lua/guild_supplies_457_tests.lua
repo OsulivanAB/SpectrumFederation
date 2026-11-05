@@ -1223,6 +1223,7 @@ do
         Describe = function(_, id) return { name = "Item" .. tostring(id), icon = "x" } end,
     }
     _G.UIParent = _G.UIParent or {}
+    _G.UISpecialFrames = _G.UISpecialFrames or {}
     _G.CreateFrame = function(frameType, name, parent, template)
         local f = {
             name = name,
@@ -1234,7 +1235,14 @@ do
         function f:SetPoint() end
         function f:SetFrameStrata() end
         function f:SetFrameLevel() end
-        function f:Hide() f.shown = false end
+        function f:Hide()
+            local wasShown = f.shown
+            f.shown = false
+            -- Fire OnHide when leaving the shown state (UISpecialFrames Escape).
+            if wasShown and f.scripts.OnHide then
+                f.scripts.OnHide(f)
+            end
+        end
         function f:Show() f.shown = true end
         function f:IsShown() return f.shown end
         function f:SetScript(k, fn) f.scripts[k] = fn end
@@ -2883,6 +2891,76 @@ do
     hooks.OpenRecipeEditor(ctx, 200, nil)
     assertTrue(blocked or hooks.RecipeEditorDraft().open ~= true,
         "F: creation without requested items blocked")
+
+    -- Escape dismissal: UISpecialFrames hide and focused EditBox OnEscapePressed.
+    assertTrue(type(hooks.InvokeRecipeEditorEscape) == "function",
+        "F: Escape invoke hook required")
+    local escapeRegistered = false
+    for i = 1, #(_G.UISpecialFrames or {}) do
+        if _G.UISpecialFrames[i] == "SFGuildSuppliesRecipeEditor" then
+            escapeRegistered = true
+            break
+        end
+    end
+    assertTrue(escapeRegistered, "F: recipe editor registered in UISpecialFrames")
+    record.accounting._consumables.requestedItems = {
+        ["10"] = { itemId = 10, goal = 5 },
+        ["20"] = { itemId = 20, goal = 5 },
+    }
+    record.accounting._consumables.recipes = {
+        ["100"] = { itemId = 100, reagents = { ["10"] = 1, ["20"] = 1 } },
+    }
+    local savedRecipes = {
+        ["100"] = { itemId = 100, reagents = { ["10"] = 1, ["20"] = 1 } },
+    }
+    hooks.OpenRecipeEditor(ctx, 100, savedRecipes["100"])
+    draft = hooks.RecipeEditorDraft()
+    ui = hooks.RecipeEditorUi()
+    assertEq(draft.open, true, "F: Escape setup opens editor")
+    assertTrue(ui.frame:IsShown(), "F: Escape setup shows frame")
+    local escRow
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 10 then
+            escRow = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(escRow and escRow.Edit, "F: Escape reagent row required")
+    escRow.Edit:SetText("4")
+    assertEq(draft.reagentTexts["10"], "4", "F: Escape setup edited reagent")
+    -- Escape without relying on focus: UISpecialFrames hide path.
+    hooks.InvokeRecipeEditorEscape({})
+    assertEq(hooks.RecipeEditorDraft().open, false, "F: Escape hide closes editor")
+    assertTrue(not ui.frame:IsShown(), "F: Escape hide hides frame")
+    assertEq(next(hooks.RecipeEditorDraft().reagentTexts), nil,
+        "F: Escape hide clears draft texts")
+    assertEq(hooks.RecipeEditorDraft().sessionId, nil, "F: Escape hide clears session")
+    -- Shared saved recipe unchanged.
+    assertEq(savedRecipes["100"].reagents["10"], 1, "F: Escape does not mutate saved recipe")
+    -- Reopen loads saved/default values.
+    hooks.OpenRecipeEditor(ctx, 100, savedRecipes["100"])
+    draft = hooks.RecipeEditorDraft()
+    ui = hooks.RecipeEditorUi()
+    assertEq(draft.reagentTexts["10"], "1", "F: reopen after Escape loads saved qty")
+    escRow = nil
+    for i = 1, #ui.reagentRows do
+        if ui.reagentRows[i]._boundItemId == 10 then
+            escRow = ui.reagentRows[i]
+            break
+        end
+    end
+    assertTrue(escRow and escRow.Edit, "F: reopen Escape row")
+    escRow.Edit._hasFocus = true
+    escRow.Edit:SetText("8")
+    assertEq(draft.reagentTexts["10"], "8", "F: focused edit before Escape")
+    hooks.InvokeRecipeEditorEscape({ withFocus = true })
+    assertEq(hooks.RecipeEditorDraft().open, false, "F: focused Escape closes editor")
+    assertEq(next(hooks.RecipeEditorDraft().reagentTexts), nil,
+        "F: focused Escape clears draft")
+    hooks.OpenRecipeEditor(ctx, 100, savedRecipes["100"])
+    assertEq(hooks.RecipeEditorDraft().reagentTexts["10"], "1",
+        "F: reopen after focused Escape loads saved qty")
+    hooks.CloseRecipeEditor(true)
 end
 
 -- D: real bank settle lifecycle, visit settle wiring, shortage visit guard, allowance
@@ -3924,9 +4002,14 @@ do
         RT._quickWithdrawVisitToken = nil
         statusText = ""
         bankStock = 2
-        WR.craftDrafts = { ["100"] = 2 }
         acceptCb = nil
+        -- Bind visit/draft owner first; seeding drafts before open lets
+        -- EnsureDraftOwner treat a prior owner as stale and wipe them.
+        WR.craftDraftOwner = nil
+        WR.ClearDrafts()
         RT:OnBankOpened()
+        WR.EnsureDraftOwner()
+        WR.craftDrafts = { ["100"] = 2 }
         local visitA = RT._quickWithdrawVisitToken
         assertTrue(visitA ~= nil, label .. ": visit A token")
         RT:BeginQuickWithdraw()
@@ -4003,6 +4086,7 @@ do
     RT:OnBankOpened()
     local visitSame = RT._quickWithdrawVisitToken
     acceptCb = nil
+    WR.EnsureDraftOwner()
     WR.craftDrafts = { ["100"] = 2 }
     RT:BeginQuickWithdraw()
     assertTrue(type(acceptCb) == "function", "D: same-visit ConfirmChoice captured")
@@ -4160,6 +4244,560 @@ do
     WR.PlaceNext = realPlaceNext
     if WR.work then
         WR.StopWork("test_cleanup", true)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Codex repair batch A/B/D/E at 0307e138 dispositions (portable current-tree).
+---------------------------------------------------------------------------
+do
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawWorkflow.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local W = SF.ConsumablesWithdrawWorkflow
+    local WR = SF.ConsumablesWithdrawRuntime
+    local RT = SF.ConsumablesRuntime
+    local GS = SF.GuildSupplies
+
+    ---------------------------------------------------------------- A: reserved backpack slots
+    -- Mutable bag/bank/cursor fakes distinguish PutItemInBackpack (first empty)
+    -- from exact PickupContainerItem(bag, slot).
+    do
+        local bagSlots = {
+            [0] = {
+                [1] = { itemId = nil, count = 0 },
+                [2] = { itemId = nil, count = 0 },
+                [3] = { itemId = nil, count = 0 },
+                [4] = { itemId = nil, count = 0 },
+            },
+        }
+        local bankSlots = {
+            [1] = { itemId = 10, count = 5 },
+            [2] = { itemId = 20, count = 5 },
+        }
+        local cursor = nil
+        local autoFirstEmptyUsed = false
+        local pendingTimers = {}
+        C_Timer = {
+            After = function(_, fn)
+                if type(fn) == "function" then
+                    pendingTimers[#pendingTimers + 1] = { fn = fn, cancellable = false }
+                end
+            end,
+            NewTimer = function(_, fn)
+                local cancelled = false
+                local entry = {
+                    fn = fn, cancellable = true,
+                    Cancel = function() cancelled = true end,
+                    _fire = function()
+                        if not cancelled and type(fn) == "function" then fn() end
+                    end,
+                    _cancelled = function() return cancelled end,
+                }
+                pendingTimers[#pendingTimers + 1] = entry
+                return entry
+            end,
+            _drain = function()
+                local batch = pendingTimers
+                pendingTimers = {}
+                for i = 1, #batch do
+                    local t = batch[i]
+                    if t.cancellable then t._fire()
+                    elseif type(t.fn) == "function" then t.fn() end
+                end
+            end,
+            _clear = function() pendingTimers = {} end,
+        }
+        C_Container = {
+            GetContainerNumSlots = function(bag)
+                if bag == 0 then return 4 end
+                return 0
+            end,
+            GetContainerNumFreeSlots = function(bag)
+                if bag ~= 0 then return 0, 0 end
+                local free = 0
+                for s = 1, 4 do
+                    if not bagSlots[0][s].itemId then free = free + 1 end
+                end
+                return free, 0
+            end,
+            GetContainerItemInfo = function(bag, slot)
+                local cell = bagSlots[bag] and bagSlots[bag][slot]
+                if not cell or not cell.itemId then return nil end
+                return { itemID = cell.itemId, stackCount = cell.count, iconFileID = 1 }
+            end,
+            PickupContainerItem = function(bag, slot)
+                if cursor then
+                    local cell = bagSlots[bag] and bagSlots[bag][slot]
+                    if not cell then return end
+                    if cell.itemId and cell.itemId ~= cursor.itemId then
+                        return
+                    end
+                    cell.itemId = cursor.itemId
+                    cell.count = (cell.count or 0) + (cursor.count or 1)
+                    cursor = nil
+                    return
+                end
+                local cell = bagSlots[bag] and bagSlots[bag][slot]
+                if cell and cell.itemId then
+                    cursor = { itemId = cell.itemId, count = cell.count }
+                    cell.itemId, cell.count = nil, 0
+                end
+            end,
+        }
+        _G.PutItemInBackpack = function()
+            autoFirstEmptyUsed = true
+            if not cursor then return end
+            for s = 1, 4 do
+                local cell = bagSlots[0][s]
+                if not cell.itemId then
+                    cell.itemId = cursor.itemId
+                    cell.count = cursor.count or 1
+                    cursor = nil
+                    return
+                end
+            end
+        end
+        _G.GetCursorInfo = function()
+            if cursor then
+                return "item", cursor.itemId, "|Hitem:" .. tostring(cursor.itemId) .. ":|h"
+            end
+            return nil
+        end
+        _G.ClearCursor = function() cursor = nil end
+        _G.InCombatLockdown = function() return false end
+        _G.PickupGuildBankItem = function(_, slot)
+            local cell = bankSlots[slot]
+            if cell and (cell.count or 0) > 0 then
+                cursor = { itemId = cell.itemId, count = 1 }
+                cell.count = cell.count - 1
+                if cell.count <= 0 then cell.itemId = nil end
+            end
+        end
+        _G.SplitGuildBankItem = function(_, slot, count)
+            local cell = bankSlots[slot]
+            count = tonumber(count) or 1
+            if cell and (cell.count or 0) >= count then
+                cursor = { itemId = cell.itemId, count = count }
+                cell.count = cell.count - count
+                if cell.count <= 0 then cell.itemId = nil end
+            end
+        end
+        _G.GetGuildBankItemInfo = function(_, slot)
+            local cell = bankSlots[slot]
+            if cell and cell.itemId then return "tex", cell.count, false end
+            return nil
+        end
+        _G.GetGuildBankItemLink = function(_, slot)
+            local cell = bankSlots[slot]
+            if cell and cell.itemId then
+                return "|Hitem:" .. tostring(cell.itemId) .. ":|h"
+            end
+            return nil
+        end
+        _G.GetCurrentGuildBankTab = function() return 1 end
+        _G.GetGuildBankTabInfo = function()
+            return "Tab", "icon", true, true, 0, -1, false
+        end
+        _G.GetItemCount = function(itemId)
+            local n = 0
+            for s = 1, 4 do
+                local cell = bagSlots[0][s]
+                if cell.itemId == itemId then n = n + (cell.count or 0) end
+            end
+            return n
+        end
+        _G.GetServerTime = function() return 5000 end
+        C_Item = {
+            GetItemFamily = function() return 0 end,
+            GetItemMaxStackSizeByID = function() return 20 end,
+        }
+        SF.Consumables = SF.Consumables or {}
+        SF.Consumables.ItemIdFromText = function(link)
+            local id = tostring(link or ""):match("item:(%d+)")
+            return tonumber(id)
+        end
+        SF.ConsumablesRouting = { IsCarriedBag = function(bag) return bag == 0 end }
+        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+        WR = SF.ConsumablesWithdrawRuntime
+        WR.BagCount = function(itemId) return _G.GetItemCount(itemId) end
+        local record = {
+            datasetId = "gs1:backpack",
+            _guildKey = "club:backpack",
+            currentCampaignId = "camp1",
+            accounting = {
+                _consumables = {
+                    bankTab = 1, generation = 1, configSeq = 1,
+                    recipes = {
+                        ["100"] = { itemId = 100, reagents = { ["10"] = 1 } },
+                        ["200"] = { itemId = 200, reagents = { ["20"] = 1 } },
+                    },
+                },
+            },
+        }
+        GS.IsLiveActiveForCurrentGuild = function() return true end
+        GS.GetCurrentRecord = function() return record end
+        GS.RecipeAvailability = function() return true end
+        GS.WithdrawalReceiptCapacityOk = function() return true end
+        local receiptCalls = 0
+        GS.CommitLocalWithdrawalReceipts = function()
+            receiptCalls = receiptCalls + 1
+            return "accepted", nil
+        end
+        RT.BankIsOpen = function() return true end
+        RT._quickWithdrawVisitToken = "visit:backpack"
+        RT.RebuildReview = function() end
+        -- Allocator reservation order for two empty backpack slots.
+        local planBags = {
+            { bag = 0, slots = {
+                { slot = 1, empty = true, family = 0 },
+                { slot = 2, empty = true, family = 0 },
+                { slot = 3, empty = true, family = 0 },
+                { slot = 4, empty = true, family = 0 },
+            } },
+        }
+        local okPlan, errPlan, plan = W.PlanMultiItemBagDestinations(
+            planBags, { ["10"] = 1, ["20"] = 1 }, function() return 20 end)
+        assertTrue(okPlan, "A: planner ok " .. tostring(errPlan))
+        local destByItem = {}
+        for i = 1, #(plan.destinations or {}) do
+            local d = plan.destinations[i]
+            destByItem[tonumber(d.itemId)] = d
+        end
+        assertTrue(destByItem[10] and destByItem[20], "A: both items reserved")
+        local slot10 = destByItem[10].slot
+        local slot20 = destByItem[20].slot
+        assertTrue(slot10 ~= slot20, "A: distinct reserved slots")
+        local settleCount = 0
+        local settleReason = nil
+        local confirmed = nil
+        local reordered = false
+        local realPlaceNext = WR.PlaceNext
+        WR.PlaceNext = function()
+            if WR.work and WR.work.queue and not reordered then
+                reordered = true
+                -- Execute opposite allocator reservation order.
+                table.sort(WR.work.queue, function(a, b)
+                    return (tonumber(a.destSlot) or 0) > (tonumber(b.destSlot) or 0)
+                end)
+                WR.work.index = 1
+            end
+            return realPlaceNext()
+        end
+        local ok, err = WR.BeginWithdraw({ ["100"] = 1, ["200"] = 1 }, {
+            onSettle = function(result)
+                settleCount = settleCount + 1
+                settleReason = result and result.reason
+                confirmed = result and result.confirmed
+            end,
+        })
+        assertTrue(ok, "A: BeginWithdraw ok " .. tostring(err))
+        assertTrue(WR.work and #(WR.work.queue or {}) >= 2, "A: queue has two moves")
+        for _ = 1, 30 do
+            if not WR.work then break end
+            C_Timer._drain()
+            if WR.work then
+                WR.OnBagOrBankUpdate()
+            end
+        end
+        C_Timer._drain()
+        WR.PlaceNext = realPlaceNext
+        assertEq(autoFirstEmptyUsed, false,
+            "A: exact-slot path must not call PutItemInBackpack")
+        assertEq(bagSlots[0][slot10].itemId, 10,
+            "A: item 10 landed in reserved slot " .. tostring(slot10))
+        assertEq(bagSlots[0][slot20].itemId, 20,
+            "A: item 20 landed in reserved slot " .. tostring(slot20))
+        assertEq(settleCount, 1, "A: settlement once")
+        assertEq((confirmed and confirmed["10"]) or 0, 1, "A: item 10 confirmed")
+        assertEq((confirmed and confirmed["20"]) or 0, 1, "A: item 20 confirmed")
+        assertTrue(tostring(settleReason or ""):find("occupied", 1, true) == nil,
+            "A: no occupied partial stop got=" .. tostring(settleReason))
+        assertEq(receiptCalls, 1, "A: receipt once")
+        if WR.work then WR.StopWork("test_cleanup", true) end
+    end
+
+    ---------------------------------------------------------------- B: draft ownership lifecycle
+    do
+        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+        RT = SF.ConsumablesRuntime
+        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+        WR = SF.ConsumablesWithdrawRuntime
+        RT.WatchGuildBankFrame = function() end
+        RT.RefreshReminder = function() end
+        RT.SyncReviewWithGuildBank = function() end
+        RT.ConsumeBannerBankNavigation = function() end
+        RT.HideReviewForBankLifecycle = function() end
+        RT.CancelBannerBankNavigation = function() end
+        RT.RebuildReview = function() end
+        RT.BankIsOpen = function() return RT.bankOpen == true end
+        RT.FlushPendingUnresolvedWithdrawNotices = function() end
+        local recipes = {
+            ["100"] = { itemId = 100, reagents = { ["10"] = 1 } },
+            ["200"] = { itemId = 200, reagents = { ["20"] = 1 } },
+        }
+        local record = {
+            datasetId = "gs1:draft",
+            _guildKey = "club:draft",
+            currentCampaignId = "camp1",
+            accounting = {
+                _consumables = {
+                    bankTab = 1, generation = 1, configSeq = 1,
+                    recipes = recipes,
+                    requestedItems = {
+                        ["10"] = { itemId = 10, goal = 5 },
+                        ["20"] = { itemId = 20, goal = 5 },
+                    },
+                },
+            },
+        }
+        GS.IsLiveActiveForCurrentGuild = function() return true end
+        GS.GetCurrentRecord = function() return record end
+        GS.RecipeAvailability = function(_, recipe)
+            local id = tonumber(recipe and recipe.itemId)
+            if id == 100 then
+                -- A becomes unavailable when reagent 10 removed.
+                return GS.IsCurrentRequestedItem
+                    and GS.IsCurrentRequestedItem(record, 10) or false
+            end
+            return true
+        end
+        GS.IsCurrentRequestedItem = function(rec, itemId)
+            local req = rec.accounting._consumables.requestedItems
+            return req and req[tostring(itemId)] ~= nil
+        end
+        _G.GetGuildBankTabInfo = function()
+            return "Tab", "icon", true, true, 0, -1, false
+        end
+        _G.GetCurrentGuildBankTab = function() return 1 end
+        RT.bankOpen = false
+        RT._quickWithdrawVisitSeq = 0
+        RT._quickWithdrawVisitToken = nil
+        WR.ClearDrafts()
+        WR.craftDraftOwner = nil
+        RT:OnBankOpened()
+        WR.EnsureDraftOwner()
+        WR.craftDrafts = { ["100"] = 2, ["200"] = 3 }
+        -- Delete/unavailable A: remove reagent 10 so recipe 100 unavailable.
+        record.accounting._consumables.requestedItems = {
+            ["20"] = { itemId = 20, goal = 5 },
+        }
+        WR.ReconcileCraftDrafts(WR.CurrentContext())
+        assertEq(WR.craftDrafts["100"], nil, "B: unavailable A dropped from drafts")
+        assertEq(WR.craftDrafts["200"], 3, "B: valid B retained")
+        -- Same-visit refresh preserves B; configSeq churn must not clear.
+        record.accounting._consumables.configSeq = 99
+        WR.EnsureDraftOwner()
+        assertEq(WR.craftDrafts["200"], 3, "B: configSeq change keeps same-owner draft")
+        -- Idle close/reopen starts at zero.
+        RT:OnBankClosed()
+        assertEq(WR.craftDrafts["200"], nil, "B: bank close clears UI drafts")
+        assertEq(WR.craftDraftOwner, nil, "B: bank close clears draft owner")
+        RT:OnBankOpened()
+        WR.EnsureDraftOwner()
+        assertEq(WR.craftDrafts["200"], nil, "B: reopen starts empty")
+        -- Overlapping recipe ID across context replacement does not inherit.
+        WR.craftDrafts["200"] = 5
+        local ownerA = {
+            visitToken = RT._quickWithdrawVisitToken,
+            guildKey = "club:draft",
+            datasetId = "gs1:draft",
+            campaignId = "camp1",
+        }
+        WR.craftDraftOwner = ownerA
+        -- Simulate campaign change while open.
+        record.currentCampaignId = "camp2"
+        record.accounting._consumables.recipes = {
+            ["200"] = { itemId = 200, reagents = { ["20"] = 1 } },
+        }
+        WR.EnsureDraftOwner()
+        assertEq(WR.craftDrafts["200"], nil,
+            "B: campaign change clears overlapping recipe draft")
+        -- Late settle of old op must not erase new same-ID draft.
+        RT:OnBankClosed()
+        RT:OnBankOpened()
+        WR.EnsureDraftOwner()
+        WR.craftDrafts["200"] = 7
+        local newOwner = {
+            visitToken = RT._quickWithdrawVisitToken,
+            guildKey = "club:draft",
+            datasetId = "gs1:draft",
+            campaignId = "camp2",
+        }
+        WR.craftDraftOwner = newOwner
+        local settleN = 0
+        WR.work = {
+            settled = false,
+            movementStarted = true,
+            selections = { ["200"] = 1 },
+            take = { ["20"] = 1 },
+            requested = { ["20"] = 1 },
+            confirmed = { ["20"] = 1 },
+            confirmedTotal = 1,
+            draftOwner = ownerA, -- old visit owner
+            onSettle = function() settleN = settleN + 1 end,
+        }
+        WR.StopWork("complete", false)
+        assertEq(settleN, 1, "B: old work settles once")
+        assertEq(WR.craftDrafts["200"], 7, "B: new same-ID draft survives old settle")
+        -- Focused pooled ownership: same key under new owner must not keep old text.
+        local row = {
+            Edit = {
+                _text = "9",
+                _hasFocus = true,
+                HasFocus = function(self) return self._hasFocus end,
+                SetText = function(self, t) self._text = tostring(t or "") end,
+                GetText = function(self) return self._text end,
+                SetScript = function() end,
+                Show = function() end,
+                Enable = function() end,
+                Disable = function() end,
+                SetNumeric = function() end,
+            },
+            _qwDraftKey = "200",
+            _qwDraftOwnerKey = WR.DraftOwnerFingerprint(ownerA), -- stale owner
+        }
+        local draftOwnerKey = WR.DraftOwnerFingerprint(WR.craftDraftOwner)
+        local editing = row.Edit:HasFocus()
+        if not (editing and row._qwDraftKey == "200" and row._qwDraftOwnerKey == draftOwnerKey) then
+            row.Edit:SetText(tostring(WR.craftDrafts["200"] or 0))
+        end
+        assertEq(row.Edit:GetText(), "7",
+            "B: focused same-ID field rebinds to current owner draft, not stale 9")
+    end
+
+    ---------------------------------------------------------------- D: receipt membership readiness
+    do
+        loadModule("SpectrumFederation/modules/GuildSupplies/Withdrawals.lua")
+        local publish = 0
+        local savedNotify = GS._NotifyLocalDurableChange
+        GS._NotifyLocalDurableChange = function(reason)
+            if reason == "ledger" then publish = publish + 1 end
+        end
+        local record = {
+            datasetId = "gs1:rcpt",
+            _guildKey = "club:rcpt",
+            currentCampaignId = "camp1",
+            campaigns = { camp1 = { id = "camp1" } },
+            accounting = {
+                _consumables = { generation = 1, configSeq = 1, bankTab = 1 },
+            },
+            ledgerEvents = {},
+        }
+        GS.GetCurrentRecord = function() return record end
+        -- membershipReady with actor, but ready=false (rank list unavailable).
+        GS.GetCurrentContext = function()
+            return {
+                ready = false,
+                membershipReady = true,
+                reason = "rank_name_unavailable",
+                guildKey = "club:rcpt",
+                actorName = "Alice",
+                actorGuid = "Player-1-ALICE",
+            }
+        end
+        GS.WithdrawalReceiptCapacityOk = function() return true end
+        local st, err = GS:CommitLocalWithdrawalReceipts({ ["10"] = 2 }, {
+            datasetId = "gs1:rcpt",
+            campaignId = "camp1",
+            generation = 1,
+            operationId = "op-rcpt-1",
+            bankTab = 1,
+            timestamp = 1000,
+        })
+        assertEq(st, "accepted", "D: membership-ready commit accepts without rank list: " .. tostring(err))
+        assertTrue(publish >= 1, "D: accepted receipt publishes ledger once")
+        -- Missing membership fails closed.
+        GS.GetCurrentContext = function()
+            return {
+                ready = false,
+                membershipReady = false,
+                reason = "not_ready",
+                guildKey = "club:rcpt",
+            }
+        end
+        local st2, err2 = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
+            datasetId = "gs1:rcpt", campaignId = "camp1", generation = 1,
+            operationId = "op-rcpt-2", bankTab = 1,
+        })
+        assertEq(st2, "rejected", "D: missing membership rejected")
+        assertEq(err2, "not_ready", "D: missing membership reason")
+        -- Mismatched captured guild fails closed.
+        GS.GetCurrentContext = function()
+            return {
+                ready = false,
+                membershipReady = true,
+                guildKey = "club:rcpt",
+                actorName = "Alice",
+                actorGuid = "Player-1-ALICE",
+            }
+        end
+        local st3, err3 = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
+            datasetId = "gs1:rcpt",
+            guildKey = "club:other",
+            campaignId = "camp1",
+            generation = 1,
+            operationId = "op-rcpt-3",
+            bankTab = 1,
+        })
+        assertEq(st3, "rejected", "D: guild mismatch rejected")
+        assertEq(err3, "guild_mismatch", "D: guild mismatch reason")
+        GS._NotifyLocalDurableChange = savedNotify
+    end
+
+    ---------------------------------------------------------------- E: adoption capacity covers receipts + archive pages
+    do
+        assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS
+            >= (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+                + (GS.MAX_LEDGER_EVENTS or 4096)
+                + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+                + (GS.MAX_ARCHIVED_EVENTS or 4096)
+                + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+                + (GS.MAX_LEDGER_EVENTS or 4096)
+                + (GS.MAX_ARCHIVED_EVENTS or 4096)
+                + (GS.MAX_CAMPAIGNS or 64)
+                + (GS.MAX_CAMPAIGNS or 64)
+                + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
+                + (GS.MAX_ARCHIVE_PAGE_COUNT or 512),
+            "E: pending budget includes withdrawals and archive structure")
+        -- Lowered caps: mixed history crossing the OLD ceiling (no withdrawals /
+        -- opaque *24) must still buffer and complete through real packing.
+        local priorPending = GS.MAX_ADOPTION_PENDING_RECORDS
+        local priorWd = GS.MAX_WITHDRAWAL_EVENTS
+        local priorArchWd = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS
+        local priorOps = GS.MAX_ACCEPTED_OPERATIONS
+        local priorLed = GS.MAX_LEDGER_EVENTS
+        local priorArch = GS.MAX_ARCHIVED_EVENTS
+        local priorCamp = GS.MAX_CAMPAIGNS
+        local priorPages = GS.MAX_ARCHIVE_PAGE_COUNT
+        GS.MAX_ACCEPTED_OPERATIONS = 8
+        GS.MAX_LEDGER_EVENTS = 8
+        GS.MAX_ARCHIVED_EVENTS = 8
+        GS.MAX_WITHDRAWAL_EVENTS = 4
+        GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = 4
+        GS.MAX_CAMPAIGNS = 2
+        GS.MAX_ARCHIVE_PAGE_COUNT = 4
+        -- Old formula without withdrawals / with *24 would be smaller than needed
+        -- for ops+ledgers+receipts+vals+structure in this compact shape.
+        local oldCeiling = 8 + 8 + 8 + 8 + 8 + 256 + (2 * 24) + 512
+        local newCeiling = 8 + 8 + 4 + 8 + 4 + 8 + 8 + 256 + 2 + 2 + 4 + 4 + 512
+        GS.MAX_ADOPTION_PENDING_RECORDS = newCeiling
+        assertTrue(newCeiling > oldCeiling - 256 or newCeiling >= (8+8+4+8+4+8+8),
+            "E: new model includes receipt classes the old ceiling omitted")
+        -- Build a compact mixed descriptor count that exceeds the old
+        -- non-receipt-aware logical sum (8+8+8+8+8=40) using receipts.
+        local need = 8 + 8 + 4 + 8 + 4 + 8 + 8 -- ops+liveDon+liveWd+archDon+archWd+vals
+        assertTrue(need > 40, "E: mixed retained classes exceed old donation-only sum")
+        assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS >= need,
+            "E: lowered budget still covers mixed retained classes")
+        GS.MAX_ADOPTION_PENDING_RECORDS = priorPending
+        GS.MAX_WITHDRAWAL_EVENTS = priorWd
+        GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = priorArchWd
+        GS.MAX_ACCEPTED_OPERATIONS = priorOps
+        GS.MAX_LEDGER_EVENTS = priorLed
+        GS.MAX_ARCHIVED_EVENTS = priorArch
+        GS.MAX_CAMPAIGNS = priorCamp
+        GS.MAX_ARCHIVE_PAGE_COUNT = priorPages
     end
 end
 

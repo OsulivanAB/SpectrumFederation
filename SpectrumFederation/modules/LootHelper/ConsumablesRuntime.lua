@@ -2116,6 +2116,15 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
 
     local GS = SF.GuildSupplies
     local recipes = GS and GS.ListCampaignRecipes and GS.ListCampaignRecipes(ctx.record) or {}
+    -- Reconcile UI drafts to the current visit/context and eligible recipes
+    -- before binding rows so deleted/unavailable selections cannot hide.
+    if WR.ReconcileCraftDrafts then
+        WR.ReconcileCraftDrafts(ctx)
+    elseif WR.EnsureDraftOwner then
+        WR.EnsureDraftOwner()
+    end
+    local draftOwnerKey = WR.DraftOwnerFingerprint
+        and WR.DraftOwnerFingerprint(WR.craftDraftOwner) or nil
     local maxRows = 512
     local actionRow = nil
     for i = 1, #recipes do
@@ -2157,16 +2166,25 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
         row.Edit:SetNumeric(true)
         local draftKey = tostring(itemId)
         local editing = row.Edit.HasFocus and row.Edit:HasFocus()
-        if not (editing and row._qwDraftKey == draftKey) then
+        -- Focused text survives only for the same draft key AND draft owner.
+        -- After visit/context replacement, same-ID focus must not keep old text.
+        if not (editing and row._qwDraftKey == draftKey
+            and row._qwDraftOwnerKey == draftOwnerKey) then
             local draft = WR.craftDrafts and WR.craftDrafts[draftKey]
             row.Edit:SetText(tostring(draft or 0))
         end
         row._qwDraftKey = draftKey
+        row._qwDraftOwnerKey = draftOwnerKey
         row._qwAvailable = available
         row.Edit:SetScript("OnTextChanged", function(edit)
             if not row._qwAvailable then return end
             local key = row._qwDraftKey
             if not key then return end
+            local ownerNow = WR.DraftOwnerFingerprint
+                and WR.DraftOwnerFingerprint(WR.craftDraftOwner) or nil
+            if row._qwDraftOwnerKey ~= ownerNow then
+                return
+            end
             local n = tonumber(edit:GetText()) or 0
             if n < 0 then n = 0 end
             WR.craftDrafts = WR.craftDrafts or {}
@@ -2247,10 +2265,17 @@ end
 function Runtime:BeginQuickWithdraw()
     local WR = SF.ConsumablesWithdrawRuntime
     if not WR or not WR.BeginWithdraw then return end
+    local ctx = WR.CurrentContext and select(1, WR.CurrentContext()) or nil
+    if WR.ReconcileCraftDrafts then
+        WR.ReconcileCraftDrafts(ctx)
+    end
     local selections = {}
     if WR.craftDrafts then
         for k, v in pairs(WR.craftDrafts) do
-            selections[tostring(k)] = tonumber(v) or 0
+            local qty = tonumber(v) or 0
+            if qty > 0 then
+                selections[tostring(k)] = qty
+            end
         end
     end
     local boundSelections = WR.CopyCraftSelections and WR.CopyCraftSelections(selections) or selections
@@ -2908,6 +2933,12 @@ function Runtime:OnBankOpened()
         -- Banner-initiated tab selection must run before SyncReviewWithGuildBank
         -- so BankAccess can see the configured tab as usable when appropriate.
         self:ConsumeBannerBankNavigation()
+        -- Bind draft ownership to this visit. Idle close already cleared drafts;
+        -- EnsureDraftOwner also drops stale drafts if identity changed mid-session.
+        local WROpen = SF.ConsumablesWithdrawRuntime
+        if WROpen and WROpen.EnsureDraftOwner then
+            WROpen.EnsureDraftOwner()
+        end
     elseif self.bannerBankNav then
         -- Duplicate open signal while already open: never select twice.
         self:CancelBannerBankNavigation("duplicate_open")
@@ -2937,6 +2968,15 @@ function Runtime:OnBankClosed()
     local WR = SF.ConsumablesWithdrawRuntime
     if WR and WR.OnBankClosed then
         WR.OnBankClosed()
+    end
+    -- Craft drafts are bank-visit scoped (#457). Clear UI drafts at the actual
+    -- close boundary; captured in-flight work.selections remain on the work.
+    -- Do not ClearDrafts from late StopWork — that path is owner-scoped.
+    if WR then
+        if WR.ClearDrafts then
+            WR.ClearDrafts()
+        end
+        WR.craftDraftOwner = nil
     end
     self.bankOpen = false
     -- Quantity overrides end with the visit. Keep the visit token while closed

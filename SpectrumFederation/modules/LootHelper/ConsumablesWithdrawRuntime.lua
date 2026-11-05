@@ -393,21 +393,116 @@ function WR.EstimateBagCapacity(itemId, qty)
     return true, plan.requiredNewStacks, plan.freeCompatibleSlots, qty
 end
 
---- Session craft-count drafts keyed by output item id (cleared on bank close).
+--- Session craft-count drafts keyed by output item id.
+-- Change contract:
+-- Authority: UI drafts belong to the active bank visit + stable
+--   guildKey/datasetId/campaignId (not configSeq).
+-- Guarantee: same-owner edits survive refresh/tab return/pre-movement cancel;
+--   bank close or guild/dataset/campaign change clears UI drafts; deleted or
+--   unavailable recipe keys are dropped before row bind and request collection.
+-- Invalidation: visit rotate, bank close, identity change, recipe delete /
+--   RecipeAvailability false.
+-- Lifecycle: EnsureDraftOwner binds; ClearDrafts on close/identity mismatch;
+--   ClearProcessedDrafts only when the operation's captured owner still owns
+--   the UI draft set. In-flight work.selections stay independent of UI cleanup.
 WR.craftDrafts = WR.craftDrafts or {}
+WR.craftDraftOwner = WR.craftDraftOwner or nil
 WR.work = nil
 
+function WR.DraftOwnerFingerprint(owner)
+    if type(owner) ~= "table" then
+        return nil
+    end
+    return tostring(owner.visitToken or "") .. "|"
+        .. tostring(owner.guildKey or "") .. "|"
+        .. tostring(owner.datasetId or "") .. "|"
+        .. tostring(owner.campaignId or "")
+end
+
+function WR.CurrentDraftOwner()
+    local host = Host()
+    local ctx = WR.CurrentContext()
+    if not host or type(host._quickWithdrawVisitToken) ~= "string" then
+        return nil
+    end
+    if not ctx then
+        return nil
+    end
+    return {
+        visitToken = host._quickWithdrawVisitToken,
+        guildKey = ctx.guildKey,
+        datasetId = ctx.datasetId,
+        campaignId = ctx.campaignId,
+    }
+end
+
 function WR.ClearDrafts()
+    WR.craftDrafts = WR.craftDrafts or {}
     for k in pairs(WR.craftDrafts) do
         WR.craftDrafts[k] = nil
     end
 end
 
---- Clear only craft drafts that this operation actually processed.
--- Unrelated recipe inputs typed while a withdraw was running must survive.
-function WR.ClearProcessedDrafts(selections)
+--- Bind draft ownership to the current visit/context. Clears drafts when the
+-- stable owner identity changes; unrelated configSeq churn does not reset.
+function WR.EnsureDraftOwner()
+    local current = WR.CurrentDraftOwner()
+    if not current then
+        return nil
+    end
+    local existing = WR.craftDraftOwner
+    if existing
+        and WR.DraftOwnerFingerprint(existing) == WR.DraftOwnerFingerprint(current) then
+        return existing
+    end
+    -- Clear only when replacing a previous owner. A nil owner after bank close
+    -- already wiped drafts; do not erase counts seeded for the new visit.
+    if existing then
+        WR.ClearDrafts()
+    end
+    WR.craftDraftOwner = current
+    return current
+end
+
+--- Drop deleted/unavailable recipe selections while leaving definitions visible.
+function WR.ReconcileCraftDrafts(ctx)
+    WR.EnsureDraftOwner()
+    WR.craftDrafts = WR.craftDrafts or {}
+    ctx = type(ctx) == "table" and ctx or select(1, WR.CurrentContext())
+    if type(ctx) ~= "table" then
+        return
+    end
+    local recipes = type(ctx.recipes) == "table" and ctx.recipes or {}
+    local GS = SF.GuildSupplies
+    local record = ctx.record
+    for key in pairs(WR.craftDrafts) do
+        local recipe = recipes[tostring(key)]
+        if type(recipe) ~= "table" then
+            WR.craftDrafts[key] = nil
+        elseif GS and GS.RecipeAvailability and record then
+            if not GS.RecipeAvailability(record, {
+                itemId = tonumber(recipe.itemId) or tonumber(key),
+                reagents = recipe.reagents,
+            }) then
+                WR.craftDrafts[key] = nil
+            end
+        end
+    end
+end
+
+--- Clear only craft drafts that this operation actually processed, and only
+-- when the UI draft set is still owned by that operation's captured owner.
+-- An old settle must not erase a newer visit/context count for the same ID.
+function WR.ClearProcessedDrafts(selections, owner)
     if type(selections) ~= "table" then
         return
+    end
+    if owner ~= nil then
+        local current = WR.craftDraftOwner
+        if not current
+            or WR.DraftOwnerFingerprint(current) ~= WR.DraftOwnerFingerprint(owner) then
+            return
+        end
     end
     WR.craftDrafts = WR.craftDrafts or {}
     for k, v in pairs(selections) do
@@ -790,19 +885,13 @@ local function PlaceCursorToDestination(dest)
     if type(dest) ~= "table" then return false end
     local bag = tonumber(dest.bag)
     local slot = tonumber(dest.slot)
-    if bag == 0 then
-        if dest.merge and C_Container and C_Container.PickupContainerItem and slot then
-            C_Container.PickupContainerItem(0, slot)
-        elseif PutItemInBackpack then
-            PutItemInBackpack()
-        else
-            return false
-        end
-    elseif C_Container and C_Container.PickupContainerItem and bag and slot then
-        C_Container.PickupContainerItem(bag, slot)
-    else
+    -- Honor the planner's reserved bag/slot for empty backpack destinations too.
+    -- PutItemInBackpack() fills the first free slot and can steal another item's
+    -- reservation when queue order differs from allocation order.
+    if not (C_Container and C_Container.PickupContainerItem and bag and slot) then
         return false
     end
+    C_Container.PickupContainerItem(bag, slot)
     return CursorEmpty()
 end
 
@@ -836,7 +925,7 @@ local function StopWork(reason, partial)
     Debug("Info", "withdraw stop reason=%s confirmed=%s",
         tostring(reason), tostring(work and work.confirmedTotal or 0))
     if work and work.movementStarted then
-        WR.ClearProcessedDrafts(work.selections)
+        WR.ClearProcessedDrafts(work.selections, work.draftOwner)
     end
     if work and type(work.onSettle) == "function" then
         local authorized = work.take or {}
@@ -1089,6 +1178,17 @@ function WR.BeginWithdraw(selections, opts)
         end
     end
     local playerGuid = UnitGUID and UnitGUID("player") or nil
+    local draftOwner = nil
+    if WR.craftDraftOwner then
+        draftOwner = {
+            visitToken = WR.craftDraftOwner.visitToken,
+            guildKey = WR.craftDraftOwner.guildKey,
+            datasetId = WR.craftDraftOwner.datasetId,
+            campaignId = WR.craftDraftOwner.campaignId,
+        }
+    else
+        draftOwner = WR.CurrentDraftOwner()
+    end
     AttachWithdrawWork({
         operationId = operationId,
         visitToken = visitToken,
@@ -1102,6 +1202,7 @@ function WR.BeginWithdraw(selections, opts)
         requested = requested,
         take = authorized.take,
         selections = selections,
+        draftOwner = draftOwner,
         recipeFingerprints = recipeFingerprints,
         confirmed = {},
         confirmedTotal = 0,

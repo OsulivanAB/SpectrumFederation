@@ -352,12 +352,20 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
         return "rejected", "invalid_meta"
     end
     local ctx = GS:GetCurrentContext()
-    if not ctx or not ctx.ready then
+    -- Informational origin receipts need authenticated local membership and a
+    -- valid actor identity, not complete editor-rank metadata (ctx.ready).
+    if not ctx or not ctx.membershipReady then
         return "rejected", (ctx and ctx.reason) or "not_ready"
+    end
+    if type(ctx.actorGuid) ~= "string" or ctx.actorGuid == "" then
+        return "rejected", "not_ready"
+    end
+    if type(ctx.actorName) ~= "string" or ctx.actorName == "" then
+        return "rejected", "not_ready"
     end
     -- Bind actor to the actual local player; UI cannot nominate another character.
     meta.actorGuid = ctx.actorGuid
-    meta.actor = ctx.actorName or meta.actor
+    meta.actor = ctx.actorName
     -- Preserve captured operation scope from movement start; do not rewrite with
     -- current record context when meta already carries immutable fields.
     local capturedDataset = BoundedString(meta.datasetId)
@@ -367,7 +375,11 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
     if not capturedDataset then
         meta.datasetId = record.datasetId
     end
-    if not BoundedString(meta.guildKey) then
+    local capturedGuild = BoundedString(meta.guildKey)
+    if capturedGuild and capturedGuild ~= ctx.guildKey then
+        return "rejected", "guild_mismatch"
+    end
+    if not capturedGuild then
         meta.guildKey = ctx.guildKey
     end
     if not BoundedString(meta.campaignId) and type(record.currentCampaignId) == "string" then

@@ -51,19 +51,27 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
--- Logical adoption buffer: accepted ops + live/archived ledger + one valuation
--- per retained ledger row + donation evidence + campaigns/archives + headroom.
--- Ledger and ops are independently capped; the shared buffer must hold both,
--- plus the valuation class, at once.
+-- Logical adoption buffer: accepted ops + live/archived donation ledger +
+-- live/archived withdrawal receipts + donation-only valuations + evidence +
+-- campaign/archive structure the producer actually emits. Receipt retention is
+-- independent of donation history; valuations remain donation-bounded.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
+-- Campaign/archive structure: headers + archive meta + item/eligibility pages +
+-- recipe pages. Item and recipe pages each use MAX_ARCHIVE_PAGE_COUNT in the
+-- producer (Gossip archive export); do not use an opaque per-campaign multiplier.
 GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
     + (GS.MAX_LEDGER_EVENTS or 4096)
+    + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
     + (GS.MAX_ARCHIVED_EVENTS or 4096)
+    + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
     + (GS.MAX_LEDGER_EVENTS or 4096)
     + (GS.MAX_ARCHIVED_EVENTS or 4096)
     + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-    + ((GS.MAX_CAMPAIGNS or 64) * 24)
+    + (GS.MAX_CAMPAIGNS or 64)
+    + (GS.MAX_CAMPAIGNS or 64)
+    + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
+    + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
     + 512
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
 GS.MAX_ADOPTION_ASSEMBLY_OPS = 24
