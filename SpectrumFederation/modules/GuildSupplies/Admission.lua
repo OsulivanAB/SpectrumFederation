@@ -8107,6 +8107,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         -- Ordinary authenticated gossip and adoption both keep prior accepted
         -- evidence under capacity rules (mirrors rename losers on adoption;
         -- corrections also retain on ordinary gossip so audit survives).
+        -- Scope/timestamp validation runs before retention so wrong-campaign or
+        -- future-skew losers cannot bypass acceptance via the obsolete path (#459 G4/G3).
         if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
             and classReason == "stale_credit" then
             local allowRetain = true
@@ -8115,6 +8117,24 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     and admissionCtx.sourceAcceptedSet[stored.id] == true
             end
             if allowRetain then
+                if GS.ValidateContributorCorrectionScope then
+                    local scopeOk, scopeErr = GS.ValidateContributorCorrectionScope(
+                        record, stored, {
+                            allowMissingEvent = true,
+                            remoteAdmit = true,
+                        })
+                    if not scopeOk then
+                        if scopeErr == "pending_event" or scopeErr == "missing_event" then
+                            -- Preserve missing-event pending rather than accepted retention.
+                            if GS._AdmitPendingOrConflict then
+                                return GS._AdmitPendingOrConflict(
+                                    ops, stored, scopeErr, admissionCtx.sender)
+                            end
+                            return "pending", scopeErr
+                        end
+                        return "rejected", scopeErr or classReason or "stale_credit"
+                    end
+                end
                 local newlyRetained = not (ops.records and ops.records[stored.id])
                 if newlyRetained then
                     if GS._AcceptedCount

@@ -1249,11 +1249,21 @@ function GS:ValidateConfigOperation(op, context)
     end
 
     local currentCampaign = record.currentCampaignId
-    if (op.baseCampaignId or nil) ~= (currentCampaign or nil) then
-        return false, "stale_base"
-    end
-    if (op.campaignId or nil) ~= (currentCampaign or nil) then
-        return false, "stale_base"
+    local campaignMatchesCurrent =
+        (op.baseCampaignId or nil) == (currentCampaign or nil)
+        and (op.campaignId or nil) == (currentCampaign or nil)
+    if not campaignMatchesCurrent then
+        -- Prepared-before-rollover / old-campaign catch-up: allow corrections
+        -- whose authored fields still match the target event campaign (#459 G4).
+        if op.kind == KIND.CORRECT_CONTRIBUTOR
+            and GS.ValidateContributorCorrectionScope then
+            local scopeOk, scopeErr = GS.ValidateContributorCorrectionScope(record, op, {})
+            if not scopeOk then
+                return false, scopeErr or "stale_base"
+            end
+        else
+            return false, "stale_base"
+        end
     end
 
     local tKey = TargetKey(op.kind, op.target)

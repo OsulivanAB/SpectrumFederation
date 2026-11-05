@@ -39,9 +39,9 @@ GS.MAX_TXN_CONFLICT_KEYS = 64
 GS.MAX_TXN_CONFLICT_BODIES = 8
 --- Max seconds a correction timestamp may exceed GetServerTime() at admission (#459).
 -- Wall-clock skew is an acceptance check only — never part of saved-body shape validation.
--- Sized above multi-hour catch-up / fixture offsets while still rejecting multi-day
--- far-future LWW lockouts from a modified client.
-GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW = 14400
+-- Small production clock-skew ceiling (not fixture chronology). Catch-up makes authored
+-- timestamps older at the receiver, not hours ahead; synthetic tests must use realistic clocks.
+GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW = 600
 
 GS.LEDGER_EVENT = {
     DONATION = "donation",
@@ -565,36 +565,82 @@ local function CreditProvenanceDependencyStamp(record)
     return tostring(acctMut) .. ":" .. tostring(record and record.datasetId or "")
 end
 
+--- Shared soft-limit check for cold provenance construction under an outer
+-- callback allowance. Uses globals so this early helper can pace before the
+-- later CreditProjectionWorkNow locals are in scope (#459 G2).
+local function CreditProvenanceSharedSoftExceeded()
+    if not GS._creditProjectionAccumulating then
+        return false
+    end
+    local soft = tonumber(GS._creditProjectionCallbackLimit)
+        or (tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384)
+    local base = tonumber(GS._creditProjectionCallbackWork) or 0
+    local localNow = (tonumber(GS._creditProjectionProvenanceVisits) or 0)
+        + (tonumber(GS._creditProjectionRowVisits) or 0)
+        + (tonumber(GS._creditProjectionBucketVisits) or 0)
+        + (tonumber(GS._creditProjectionFloorVisits) or 0)
+        + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+        + (tonumber(GS._creditProjectionStructureCopyVisits) or 0)
+        + (tonumber(GS._creditProjectionTraversalVisits) or 0)
+    return (base + localNow) >= soft
+end
+
 --- Build a trusted ephemeral name↔GUID provenance index once per accounting
 -- stamp. Distinct pairs are indexed once; each row visit is charged to the
--- shared callback counters. Completes synchronously so Bind/Admit cannot strand
--- catch-up as work_budget before any head is considered — Rebuild already paces
--- the equivalent scan inside ContinueDurableCreditFloorBaseline (#459).
--- @return map|nil
+-- shared callback counters. Under an outer allowance, construction is paced and
+-- resumable so cold Bind/Admit cannot overrun soft+atomic; when no shared
+-- budget is open the index still completes synchronously for ordinary reads
+-- (#459 G2 / discussion_r4485438881).
+-- @return map|nil, string|nil err ("work_budget" when paced incomplete)
 local function EnsureCreditProvenanceIndex(record)
     if type(record) ~= "table" or type(record.accounting) ~= "table" then
-        return nil
+        return nil, nil
     end
     local active = creditProvenanceIndexActive[record]
-    if type(active) == "table" and active.complete then
-        return active.map
+    if type(active) == "table" and active.complete and type(active.map) == "table" then
+        return active.map, nil
     end
     local stamp = CreditProvenanceDependencyStamp(record)
     local cached = creditProvenanceIndexCache[record]
     if type(cached) == "table" and cached.stamp == stamp and cached.complete
         and type(cached.map) == "table" then
-        return cached.map
+        return cached.map, nil
     end
     local map = {}
+    local phase = "live"
+    local index = 1
+    if type(cached) == "table" and cached.stamp == stamp and cached.complete == false
+        and type(cached.map) == "table" then
+        map = cached.map
+        phase = cached.phase == "archive" and "archive" or "live"
+        index = math.max(1, tonumber(cached.index) or 1)
+    end
     local lists = {
-        { record.accounting._consumableEvents, MaxLiveLedgerScan() },
-        { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
+        live = { record.accounting._consumableEvents, MaxLiveLedgerScan() },
+        archive = { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
     }
-    for li = 1, #lists do
-        local list, maxLen = lists[li][1], lists[li][2]
+    local function persistIncomplete(nextPhase, nextIndex)
+        creditProvenanceIndexCache[record] = {
+            stamp = stamp,
+            map = map,
+            complete = false,
+            phase = nextPhase,
+            index = nextIndex,
+        }
+    end
+    local order = { "live", "archive" }
+    local startLi = (phase == "archive") and 2 or 1
+    for li = startLi, #order do
+        local key = order[li]
+        local list, maxLen = lists[key][1], lists[key][2]
+        local startAt = (li == startLi) and index or 1
         if type(list) == "table" then
             local limit = math.min(#list, maxLen)
-            for i = 1, limit do
+            for i = startAt, limit do
+                if CreditProvenanceSharedSoftExceeded() then
+                    persistIncomplete(key, i)
+                    return nil, "work_budget"
+                end
                 GS._creditProjectionProvenanceVisits =
                     (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
                 NoteCreditProvenanceFromEvent(map, list[i])
@@ -606,33 +652,37 @@ local function EnsureCreditProvenanceIndex(record)
         map = map,
         complete = true,
     }
-    return map
+    return map, nil
 end
 
 --- True when an already-accepted local ledger row links this durable name to GUID.
 -- Authenticated history is provenance; a bare remote claim is not. Bounded scan.
 -- Prefers a paced ephemeral index so distinct unresolved identities do not each
 -- rescan the full live+archive history (#459 / discussion_r4484522633).
+-- @return boolean established, string|nil err
 local function LedgerEstablishesNameGuid(record, name, guid)
     name = NormName(name)
     guid = ValidGuid(guid)
     if not name or not guid or type(record) ~= "table" or type(record.accounting) ~= "table" then
-        return false
+        return false, nil
     end
     local pair = ProvenancePairKey(name, guid)
     local active = creditProvenanceIndexActive[record]
-    if type(active) == "table" and type(active.map) == "table" then
+    if type(active) == "table" and type(active.map) == "table" and active.complete then
         GS._creditProjectionProvenanceVisits =
             (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
-        return active.map[pair] == true
+        return active.map[pair] == true, nil
     end
-    local map = EnsureCreditProvenanceIndex(record)
+    local map, ensureErr = EnsureCreditProvenanceIndex(record)
+    if ensureErr == "work_budget" then
+        return false, "work_budget"
+    end
     if type(map) == "table" then
         GS._creditProjectionProvenanceVisits =
             (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
-        return map[pair] == true
+        return map[pair] == true, nil
     end
-    return false
+    return false, nil
 end
 
 --- Bind a durable character name to an optional claimed GUID.
@@ -677,8 +727,14 @@ function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
         return name, guid, nil
     end
     -- Unresolved name: require verifiable name↔GUID provenance, not membership.
-    if GuidCurrentNameMatches(record, guid, name)
-        or LedgerEstablishesNameGuid(record, name, guid) then
+    if GuidCurrentNameMatches(record, guid, name) then
+        return name, guid, nil
+    end
+    local established, estErr = LedgerEstablishesNameGuid(record, name, guid)
+    if estErr == "work_budget" then
+        return nil, nil, "work_budget"
+    end
+    if established then
         return name, guid, nil
     end
     -- Unverifiable claimed GUID: omit rather than redirect credit.
@@ -5213,7 +5269,125 @@ local function CountCreditEventAliasKeys(map)
     return n
 end
 
+--- Collect alias→canonical bindings required by retained accepted corrections.
+-- Prefers head keys (credit:<canon>) and registry/map-backed accepted bodies so
+-- reclaim never drops a binding still needed after registry eviction (#459 G1).
+local function CollectRequiredCreditEventAliases(record)
+    local required = {}
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return required
+    end
+    local ops = record.operations
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local map = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    local cfg = record.accounting and record.accounting._consumables
+    local function note(alias, canon)
+        alias = ValidTxnId(alias)
+        canon = ValidTxnId(canon)
+        if alias and canon and alias ~= canon then
+            required[alias] = canon
+        end
+    end
+    local function resolvePrimary(txnId)
+        if type(txnId) ~= "string" or txnId == "" then
+            return nil
+        end
+        if type(FindRegistryByTxn) == "function" and type(cfg) == "table" then
+            local reg = FindRegistryByTxn(cfg, txnId)
+            if type(reg) == "table" then
+                if reg.status == "alias" and type(reg.aliasOf) == "string" and reg.aliasOf ~= "" then
+                    return ValidTxnId(reg.aliasOf) or reg.aliasOf
+                end
+                return ValidTxnId(reg.txnId) or txnId
+            end
+        end
+        if type(map) == "table" and type(map[txnId]) == "string" and map[txnId] ~= "" then
+            return ValidTxnId(map[txnId]) or map[txnId]
+        end
+        return txnId
+    end
+    if type(ops.heads) == "table" and type(ops.records) == "table" then
+        local prefix = "credit:"
+        for targetKey, headId in pairs(ops.heads) do
+            if type(targetKey) == "string" and type(headId) == "string" then
+                local body = ops.records[headId]
+                if type(body) == "table" and body.kind == kindCorrect then
+                    local canon = nil
+                    if targetKey:sub(1, #prefix) == prefix then
+                        canon = targetKey:sub(#prefix + 1)
+                    end
+                    if type(canon) == "string" and canon ~= "" then
+                        note(body.target, canon)
+                        if type(body.value) == "table" then
+                            note(body.value.eventId, canon)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if type(ops.records) == "table" then
+        for _, body in pairs(ops.records) do
+            if type(body) == "table" and body.kind == kindCorrect then
+                local tid = body.target
+                local primary = resolvePrimary(tid)
+                if type(primary) == "string" and type(tid) == "string" and primary ~= tid then
+                    note(tid, primary)
+                end
+                local ve = body.value and body.value.eventId
+                if type(ve) == "string" and ve ~= "" then
+                    local p2 = resolvePrimary(ve)
+                    if type(p2) == "string" and p2 ~= ve then
+                        note(ve, p2)
+                    elseif type(primary) == "string" and ve ~= primary then
+                        note(ve, primary)
+                    end
+                end
+            end
+        end
+    end
+    return required
+end
+
+--- Drop durable alias bindings not required by retained accepted corrections.
+-- Optional protectKeys keeps in-flight writes. Returns number of reclaimed keys.
+local function PruneUnusedCreditEventAliases(record, protectKeys)
+    local map = EnsureCreditEventAliases(record)
+    if not map then
+        return 0
+    end
+    local required = CollectRequiredCreditEventAliases(record)
+    local removed = 0
+    local victims = {}
+    for alias, canon in pairs(map) do
+        if required[alias] == nil
+            and not (type(protectKeys) == "table" and protectKeys[alias]) then
+            victims[#victims + 1] = alias
+        elseif type(required[alias]) == "string" and required[alias] ~= canon
+            and not (type(protectKeys) == "table" and protectKeys[alias]) then
+            -- Stale divergent binding for a still-required alias: refresh below.
+            victims[#victims + 1] = alias
+        end
+    end
+    for i = 1, #victims do
+        map[victims[i]] = nil
+        removed = removed + 1
+    end
+    for alias, canon in pairs(required) do
+        if map[alias] ~= canon then
+            if map[alias] ~= nil
+                or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+                map[alias] = canon
+            end
+        end
+    end
+    return removed
+end
+
 --- Write alias→canonical into the durable map without touching ops generation.
+-- Reclaims unused bindings at capacity before failing so retained corrections
+-- keep durable alias ownership (#459 G1).
 -- @return boolean writtenOrPresent, boolean changed
 local function WriteCreditEventAlias(record, aliasId, canonicalId)
     aliasId = ValidTxnId(aliasId)
@@ -5233,7 +5407,14 @@ local function WriteCreditEventAlias(record, aliasId, canonicalId)
         return true, false
     end
     if prior == nil and CountCreditEventAliasKeys(map) >= (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
-        return false, false
+        PruneUnusedCreditEventAliases(record, { [aliasId] = true })
+        prior = map[aliasId]
+        if prior == canonicalId then
+            return true, false
+        end
+        if prior == nil and CountCreditEventAliasKeys(map) >= (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+            return false, false
+        end
     end
     map[aliasId] = canonicalId
     return true, true
@@ -5267,7 +5448,8 @@ end
 
 --- Rebuild durable alias bindings from retained correction heads when the
 -- txn registry no longer carries X→Y but the canonical donation still exists.
--- Silent map writes only; does not bump ops generation mid-validation (#459).
+-- One shared bounded ledger-id pass; skip heads whose map entry already matches.
+-- Silent map writes only; does not bump ops generation mid-validation (#459 G1).
 function GS.ReconstructCreditEventAliasesFromOps(record)
     if type(record) ~= "table" or type(record.operations) ~= "table" then
         return
@@ -5281,42 +5463,83 @@ function GS.ReconstructCreditEventAliasesFromOps(record)
         return
     end
     local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local needed = {}
+    local prefix = "credit:"
     for targetKey, headId in pairs(ops.heads) do
         if type(targetKey) == "string" and type(headId) == "string" then
             local body = ops.records[headId]
             if type(body) == "table" and body.kind == kindCorrect
                 and type(body.target) == "string" and body.target ~= "" then
                 local canon = nil
-                if GS.ComputeTargetKey then
-                    -- Head keys are credit:<canonicalId>.
-                    local prefix = "credit:"
-                    if targetKey:sub(1, #prefix) == prefix then
-                        canon = targetKey:sub(#prefix + 1)
-                    end
+                if targetKey:sub(1, #prefix) == prefix then
+                    canon = targetKey:sub(#prefix + 1)
                 end
                 if type(canon) == "string" and canon ~= "" and canon ~= body.target then
-                    -- Exact ledger id only — do not recurse through aliases here.
-                    local lists = CreditEventLists(record)
-                    local found = false
-                    for li = 1, #lists do
-                        local list = lists[li]
-                        if type(list) == "table" then
-                            local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
-                                or (GS.MAX_ARCHIVED_EVENTS or 4096))
-                            for i = 1, limit do
-                                local event = list[i]
-                                if type(event) == "table" and event.id == canon then
-                                    found = true
-                                    break
-                                end
-                            end
-                        end
-                        if found then break end
+                    if map[body.target] ~= canon then
+                        needed[canon] = needed[canon] or {}
+                        needed[canon][#needed[canon] + 1] = body.target
                     end
-                    if found and map[body.target] ~= canon then
-                        if map[body.target] ~= nil
+                    local ve = body.value and body.value.eventId
+                    if type(ve) == "string" and ve ~= "" and ve ~= canon
+                        and map[ve] ~= canon then
+                        needed[canon] = needed[canon] or {}
+                        needed[canon][#needed[canon] + 1] = ve
+                    end
+                end
+            end
+        end
+    end
+    local needAny = false
+    for _ in pairs(needed) do
+        needAny = true
+        break
+    end
+    if not needAny then
+        -- Existing map entries already match heads — no ledger walk (#459 G1).
+        GS._creditEventAliasReconstructLedgerVisits = 0
+        return
+    end
+    -- Shared exact-id presence set (one live + one archive bounded pass).
+    local present = {}
+    local ledgerVisits = 0
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
+                or (GS.MAX_ARCHIVED_EVENTS or 4096))
+            for i = 1, limit do
+                ledgerVisits = ledgerVisits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and needed[event.id] then
+                    present[event.id] = true
+                end
+            end
+        end
+    end
+    GS._creditEventAliasReconstructLedgerVisits = ledgerVisits
+    local protect = {}
+    for canon, aliases in pairs(needed) do
+        if present[canon] then
+            for ai = 1, #aliases do
+                protect[aliases[ai]] = true
+            end
+        end
+    end
+    for canon, aliases in pairs(needed) do
+        if present[canon] then
+            for ai = 1, #aliases do
+                local alias = aliases[ai]
+                if map[alias] ~= canon then
+                    if map[alias] ~= nil
+                        or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+                        map[alias] = canon
+                    else
+                        PruneUnusedCreditEventAliases(record, protect)
+                        if map[alias] ~= nil
                             or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
-                            map[body.target] = canon
+                            map[alias] = canon
                         end
                     end
                 end
@@ -6364,6 +6587,19 @@ local function AccumulateCreditProjectionCallbackWork(workUnits)
         (tonumber(GS._creditProjectionCallbackWork) or 0) + (tonumber(workUnits) or 0)
 end
 
+--- Fold a finished rebuild slice into the shared callback total and clear local
+-- visit counters so a later fold/observe cannot double-count (#459 G2).
+local function AccumulateCreditProjectionSliceWork(workUnits)
+    AccumulateCreditProjectionCallbackWork(workUnits)
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
+    GS._creditProjectionTraversalVisits = 0
+    GS._creditProjectionProvenanceVisits = 0
+end
+
 -- Ephemeral paced-rebuild scratch (not durable / not another ledger authority).
 -- Scratch is ownership-keyed: accepted-history and each speculative extraOp
 -- keep private paused state so admission previews cannot clobber a pause.
@@ -6818,6 +7054,20 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
     end
+    local ops = record.operations
+    local stampEarly = CreditProjectionDependencyStamp(record)
+    local priorCache = creditProjectionCache[record]
+    -- Fresh entry (not a work_budget resume): fold cold Bind/Ensure provenance
+    -- into the shared callback total before resetting counters. Resume paths
+    -- already Accumulated their slice — folding again would double-count (#459 G2).
+    local resumingBudget = type(priorCache) == "table" and priorCache.stamp == stampEarly
+        and priorCache.err == "work_budget" and type(priorCache.resume) == "table"
+    if not resumingBudget and GS._creditProjectionAccumulating then
+        local priorProv = tonumber(GS._creditProjectionProvenanceVisits) or 0
+        if priorProv > 0 then
+            AccumulateCreditProjectionCallbackWork(priorProv)
+        end
+    end
     GS._creditProjectionRowVisits = 0
     GS._creditProjectionLookupMisses = 0
     GS._creditProjectionDeactivations = 0
@@ -6829,9 +7079,6 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     GS._creditProjectionProvenanceVisits = 0
     -- Drop a prior active provenance view; baseline republishes when ready (#459).
     creditProvenanceIndexActive[record] = nil
-    local ops = record.operations
-    local stampEarly = CreditProjectionDependencyStamp(record)
-    local priorCache = creditProjectionCache[record]
     local resumeDeactivated = nil
     local resumePhase = nil
     local resumeScan = nil
@@ -6987,7 +7234,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             MarkAcceptedCreditInvalid(record)
         end
         local workUnits = CreditProjectionWorkNow(0)
-        AccumulateCreditProjectionCallbackWork(workUnits)
+        AccumulateCreditProjectionSliceWork(workUnits)
         if not speculative then
             ScheduleCreditProjectionContinuation(record)
         end
@@ -7109,7 +7356,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                             },
                         }
                         local workUnits = CreditProjectionWorkNow(0)
-                        AccumulateCreditProjectionCallbackWork(workUnits)
+                        AccumulateCreditProjectionSliceWork(workUnits)
                         if not speculative then
                             ScheduleCreditProjectionContinuation(record)
                         end
@@ -7189,7 +7436,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 },
             }
             local workUnits = CreditProjectionWorkNow(0)
-            AccumulateCreditProjectionCallbackWork(workUnits)
+            AccumulateCreditProjectionSliceWork(workUnits)
             if not speculative then
                 ScheduleCreditProjectionContinuation(record)
             end
@@ -7330,7 +7577,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             rowVisits = tonumber(baselineSnap.baselineVisits) or tonumber(baselineVisits) or 0
             GS._creditProjectionRowVisits = rowVisits
             local workUnits = CreditProjectionWorkNow(rowVisits)
-            AccumulateCreditProjectionCallbackWork(workUnits)
+            AccumulateCreditProjectionSliceWork(workUnits)
             if not speculative then
                 ScheduleCreditProjectionContinuation(record)
             end
@@ -7404,7 +7651,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     },
                 }
                 local workUnits = CreditProjectionWorkNow(rowVisits or 0)
-                AccumulateCreditProjectionCallbackWork(workUnits)
+                AccumulateCreditProjectionSliceWork(workUnits)
                 if not speculative then
                     ScheduleCreditProjectionContinuation(record)
                 end
@@ -7514,7 +7761,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 },
             }
             local workUnits = now
-            AccumulateCreditProjectionCallbackWork(workUnits)
+            AccumulateCreditProjectionSliceWork(workUnits)
             if not speculative then
                 ScheduleCreditProjectionContinuation(record)
             end
@@ -7589,7 +7836,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 },
             }
             local workUnits = CreditProjectionWorkNow(rowVisits or 0)
-            AccumulateCreditProjectionCallbackWork(workUnits)
+            AccumulateCreditProjectionSliceWork(workUnits)
             if not speculative then
                 ScheduleCreditProjectionContinuation(record)
             end
@@ -7696,7 +7943,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             savePruneScratch()
         end
         local workUnits = CreditProjectionWorkNow(rowVisits)
-        AccumulateCreditProjectionCallbackWork(workUnits)
+        AccumulateCreditProjectionSliceWork(workUnits)
         -- Do not publish a partial prune. Accepted-history pauses clear published
         -- validity so unfinished reconstruction cannot be read as current (#459 B3).
         -- Speculative pauses keep any independently valid accepted map intact.
@@ -7833,6 +8080,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 if event.gsProductionCredit == true then
                     local newName, newGuid, bindErr = BindCorrectionNewIdentity(
                         record, event, op.value.attributed, op.value.attributedGuid)
+                    if bindErr == "work_budget" then
+                        -- Cold paced provenance incomplete: pause activation and
+                        -- resume via the shared continuation (#459 G2).
+                        return deferProjection("activate", i)
+                    end
                     if not bindErr then
                         local head = CorrectionHeadFromOp(op, event, newName, newGuid, nil)
                         activeMap[event.id] = head
@@ -8084,7 +8336,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0
     local structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0
     local workUnits = CreditProjectionWorkNow(rowVisits)
-    AccumulateCreditProjectionCallbackWork(workUnits)
+    AccumulateCreditProjectionSliceWork(workUnits)
     writeScratch(nil)
     finishOwnedBudget()
     -- Final invariant: never leave a stale active map and never mark a negative
@@ -8216,7 +8468,57 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
     return GS.RebuildCreditCorrectionProjection(record, nil)
 end
 
--- opts.localPrepare: require current campaign + production credit + expected match.
+--- Shared acceptance-boundary checks before any path retains a correction as
+-- accepted history (ordinary apply, LWW-loser retention, adoption) (#459 G3/G4).
+-- Does not require local editor freshness, floors, or activation.
+-- opts.allowMissingEvent / opts.remoteAdmit: missing target → pending_event.
+-- @return boolean ok, string|nil err, table|nil event
+function GS.ValidateContributorCorrectionScope(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or (op.value and op.value.eventId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return false, "invalid_target"
+    end
+    -- Acceptance wall-clock skew: reject implausibly future timestamps before
+    -- durable retention/head changes. Not part of saved-body shape validation.
+    do
+        local skew = tonumber(GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW) or 600
+        local now = (GetServerTime and GetServerTime()) or nil
+        local ts = tonumber(op.timestamp)
+        if now and ts and ts == ts and ts >= 0 and skew >= 0 then
+            if ts > now + skew then
+                return false, "invalid_timestamp"
+            end
+        end
+    end
+    local authoredCampaign = op.campaignId
+    local authoredBase = op.baseCampaignId
+    if type(authoredCampaign) ~= "string" or authoredCampaign == ""
+        or type(authoredBase) ~= "string" or authoredBase == "" then
+        return false, "stale_campaign"
+    end
+    if authoredCampaign ~= authoredBase then
+        return false, "stale_campaign"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        if opts.allowMissingEvent or opts.remoteAdmit then
+            return false, "pending_event"
+        end
+        return false, "missing_event"
+    end
+    if type(event.campaignId) ~= "string" or event.campaignId == ""
+        or authoredCampaign ~= event.campaignId then
+        return false, "stale_campaign"
+    end
+    return true, nil, event
+end
+
+-- opts.localPrepare: require production credit + expected match (not current-campaign
+-- rewrite — that stays on New/Build so prepared-before-rollover apply can proceed).
 -- opts.skipExpected: remote LWW apply (still checks floors against current→new).
 -- opts.allowMissingEvent: return pending_event instead of missing_event.
 -- opts.skipFloor: remote apply defers floors to RebuildCreditCorrectionProjection.
@@ -8226,16 +8528,9 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     if type(record) ~= "table" or type(op) ~= "table" or type(op.value) ~= "table" then
         return false, "invalid_value"
     end
-    local eventId = op.target or op.value.eventId
-    if type(eventId) ~= "string" or eventId == "" then
-        return false, "invalid_target"
-    end
-    local event = GS.FindLedgerEventById(record, eventId)
-    if not event then
-        if opts.allowMissingEvent or opts.remoteAdmit then
-            return false, "pending_event"
-        end
-        return false, "missing_event"
+    local scopeOk, scopeErr, event = GS.ValidateContributorCorrectionScope(record, op, opts)
+    if not scopeOk then
+        return false, scopeErr or "invalid_value"
     end
     local eventKind = op.value.eventKind
     local isDonation = IsDonationLedgerEvent(event)
@@ -8252,39 +8547,6 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     -- Corrections never grant production credit to pending/uncredited/staged rows.
     if event.gsProductionCredit ~= true then
         return false, "not_credited"
-    end
-    -- Acceptance wall-clock skew: reject implausibly future timestamps before
-    -- durable retention/head changes. Not part of saved-body shape validation (#459).
-    do
-        local skew = tonumber(GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW) or 600
-        local now = (GetServerTime and GetServerTime()) or nil
-        local ts = tonumber(op.timestamp)
-        if now and ts and ts == ts and ts >= 0 and skew >= 0 then
-            if ts > now + skew then
-                return false, "invalid_timestamp"
-            end
-        end
-    end
-    -- Both authored campaign fields must be nonempty, mutually consistent, and
-    -- matched to the target event's campaign at acceptance (#459).
-    local authoredCampaign = op.campaignId
-    local authoredBase = op.baseCampaignId
-    if type(authoredCampaign) ~= "string" or authoredCampaign == ""
-        or type(authoredBase) ~= "string" or authoredBase == "" then
-        return false, "stale_campaign"
-    end
-    if authoredCampaign ~= authoredBase then
-        return false, "stale_campaign"
-    end
-    if type(event.campaignId) ~= "string" or event.campaignId == ""
-        or authoredCampaign ~= event.campaignId then
-        return false, "stale_campaign"
-    end
-    if opts.localPrepare then
-        if type(record.currentCampaignId) ~= "string"
-            or event.campaignId ~= record.currentCampaignId then
-            return false, "stale_campaign"
-        end
     end
     local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
     -- Remote/skipFloor apply rebuilds projection itself; do not reject while a
@@ -8459,14 +8721,33 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
     if CountCreditCorrections(record) > (GS.MAX_LEDGER_EVENTS or 4096) then
         return false, "full"
     end
-    -- Silent durable alias binding; StoreAccepted bumps ops generation (#459).
+    -- Durable alias binding required for alias-targeted acceptance; refuse when
+    -- the binding cannot be retained under the bounded map (#459 G1).
     if type(event) == "table" and type(event.id) == "string" then
-        if type(eventId) == "string" and eventId ~= event.id then
-            WriteCreditEventAlias(record, eventId, event.id)
+        local function requireAlias(aliasId)
+            if type(aliasId) ~= "string" or aliasId == "" or aliasId == event.id then
+                return true
+            end
+            local wrote = WriteCreditEventAlias(record, aliasId, event.id)
+            if not wrote then
+                return false
+            end
+            return true
+        end
+        if not requireAlias(eventId) then
+            if isLocal then
+                DiscardSpeculativeCreditProjectionResume(record, op)
+            end
+            GS.RebuildCreditCorrectionProjection(record, nil)
+            return false, "full"
         end
         local valueEventId = op.value and op.value.eventId
-        if type(valueEventId) == "string" and valueEventId ~= event.id then
-            WriteCreditEventAlias(record, valueEventId, event.id)
+        if not requireAlias(valueEventId) then
+            if isLocal then
+                DiscardSpeculativeCreditProjectionResume(record, op)
+            end
+            GS.RebuildCreditCorrectionProjection(record, nil)
+            return false, "full"
         end
     end
     return true, "accepted"

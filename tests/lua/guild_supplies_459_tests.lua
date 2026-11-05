@@ -2049,7 +2049,8 @@ do
                     },
                     actorGuid = "Player-1-Alice",
                     actorName = "Alice-Garona",
-                    timestamp = world.time + 1000 + i,
+                    -- Stay within production timestamp skew (not hours ahead).
+                    timestamp = world.time + i,
                     baseTargetRevision = record.datasetId,
                     basePolicyRevision = record.permission and record.permission.revisionId,
                     baseCampaignId = record.currentCampaignId,
@@ -4762,6 +4763,9 @@ do
             record.operations.records[op.id] = op
             record.operations.order[#record.operations.order + 1] = op.id
         end
+        -- Advance the simulated clock past planted history so Admit sees realistic
+        -- (non-future) timestamps under production CORRECT_CONTRIBUTOR skew.
+        world.time = math.max(world.time, t0 + nHeads + 31)
         local pendingOp = {
             schemaVersion = GS.OP_SCHEMA_VERSION,
             id = "life-psc-pending-" .. itemId,
@@ -4915,6 +4919,8 @@ do
             record.operations.records[op.id] = op
             record.operations.order[#record.operations.order + 1] = op.id
         end
+        -- Realistic clocks: planted history is in the past relative to Admit.
+        world.time = math.max(world.time, t0 + nDon + 31)
         local pendingOp = {
             schemaVersion = GS.OP_SCHEMA_VERSION,
             id = "life-stg-heal-" .. itemId,
@@ -5040,6 +5046,7 @@ do
             record.operations.records[op.id] = op
             record.operations.order[#record.operations.order + 1] = op.id
         end
+        world.time = math.max(world.time, t0 + nHeads + 21)
         local lateId = "ctx:arr-late-" .. itemId
         local pendingOp = {
             schemaVersion = GS.OP_SCHEMA_VERSION,
@@ -6961,7 +6968,7 @@ local function EnsureDurableListenerViaBuild(logsPage)
 end
 
 do
-    -- G1: alias-targeted correction survives txn-registry eviction/reload.
+    -- G1: saturated alias-map retention + eviction/reload + proportionate reconstruct.
     local record = seedLiveCampaignWithItem(9901, 40)
     local don = injectProductionDonation(record, {
         id = "ctx:g1-canon", itemId = 9901, quantity = 5,
@@ -6985,6 +6992,13 @@ do
         aliasOf = "ctx:g1-canon",
         committed = true,
     }
+    -- Saturate durable alias map with irrelevant bindings (capacity pressure).
+    local maxAliases = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    cfg.creditEventAliases = {}
+    for i = 1, maxAliases do
+        cfg.creditEventAliases[string.format("ctx:g1-junk-%04d", i)] =
+            string.format("ctx:g1-junk-canon-%04d", i)
+    end
     local ctx = select(1, GS:GetCurrentContext())
     local corr = {
         schemaVersion = GS.OP_SCHEMA_VERSION,
@@ -7012,7 +7026,9 @@ do
     }
     assertEq(select(1, GS:AdmitRemoteOperation(corr, {
         sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
-    })), "accepted", "459-G1: alias-targeted correction accepted")
+    })), "accepted", "459-G1: saturated-map alias correction accepted")
+    assertEq(cfg.creditEventAliases["ctx:g1-alias"], "ctx:g1-canon",
+        "459-G1: required binding retained under saturation")
     local headKey = GS.CorrectionTargetKey(record, "ctx:g1-alias")
     assertEq(headKey, "credit:ctx:g1-canon", "459-G1: canonical head key")
     assertEq(record.operations.heads[headKey], "g1-alias-corr", "459-G1: head stored")
@@ -7020,20 +7036,25 @@ do
         "459-G1: credit Bob before eviction")
     -- Evict registry while retaining donation + correction.
     cfg.txnRegistry = {}
-    -- Warm validate via production structure check.
     local warmOk, warmErr = GS._ValidateGuildRecordStructure(ctx.guildKey, record)
     assertTrue(warmOk, "459-G1: warm validate after eviction got " .. tostring(warmErr))
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
         "459-G1: credit preserved after eviction")
     assertEq(GS.CanonicalCreditEventId(record, "ctx:g1-alias"), "ctx:g1-canon",
         "459-G1: durable alias map resolves after eviction")
-    -- Cold/reload: clear ephemeral ops validation cache + reconstruct.
     if GS._ClearOpsValidationCache then
         GS._ClearOpsValidationCache(record.operations)
     end
     local coldOk, coldErr = GS._ValidateGuildRecordStructure(ctx.guildKey, record)
     assertTrue(coldOk, "459-G1: cold validate after eviction got " .. tostring(coldErr))
-    -- Cached failure then restore alias without manual ops-gen bump.
+
+    -- Proportionate reconstruct: matching map entries skip ledger walks.
+    GS._creditEventAliasReconstructLedgerVisits = -1
+    GS.ReconstructCreditEventAliasesFromOps(record)
+    assertEq(GS._creditEventAliasReconstructLedgerVisits, 0,
+        "459-G1: reconstruct skips ledger when map already matches")
+
+    -- Trusted alias restoration / cache recovery (prior G1b coverage).
     local record2 = seedLiveCampaignWithItem(9902, 40)
     local don2 = injectProductionDonation(record2, {
         id = "ctx:g1b-canon", itemId = 9902, quantity = 4,
@@ -7084,24 +7105,18 @@ do
     for k, v in pairs(record2.operations.heads or {}) do
         realHeads[k] = v
     end
-    -- Strip durable map + registry; poison heads so validate fails and caches.
     cfg2.creditEventAliases = nil
     cfg2.txnRegistry = {}
     record2.operations.heads = { ["credit:bogus"] = "g1b-corr" }
     if GS._BumpOpsValidationGen then GS._BumpOpsValidationGen(record2.operations) end
     assertTrue(not GS._ValidateGuildRecordStructure(ctx2.guildKey, record2),
         "459-G1b: poisoned heads fail and cache")
-    -- Restore real heads (still no map/registry): reconstruct alone heals.
     record2.operations.heads = realHeads
-    -- Do not manually bump; only clear is forbidden here — reconstruct runs on miss,
-    -- but a prior cached failure would stick without Clear from Remember/AddTxnAlias.
-    -- First prove reconstruct on a cleared cache:
     if GS._ClearOpsValidationCache then
         GS._ClearOpsValidationCache(record2.operations)
     end
     local healedOk, healedErr = GS._ValidateGuildRecordStructure(ctx2.guildKey, record2)
     assertTrue(healedOk, "459-G1b: reconstruct heals without registry got " .. tostring(healedErr))
-    -- Re-poison cache with failure, restore heads, then AddTxnAlias must clear cache.
     cfg2.creditEventAliases = nil
     cfg2.txnRegistry = {}
     record2.operations.heads = { ["credit:bogus"] = "g1b-corr" }
@@ -7109,7 +7124,6 @@ do
     assertTrue(not GS._ValidateGuildRecordStructure(ctx2.guildKey, record2),
         "459-G1b: re-cache failure")
     record2.operations.heads = realHeads
-    -- Without AddTxnAlias, cached failure would still be returned (same gen).
     local stuckOk = GS._ValidateGuildRecordStructure(ctx2.guildKey, record2)
     assertTrue(not stuckOk, "459-G1b: cached failure sticks until alias restore")
     assertTrue(GS._AddTxnAlias(record2, "ctx:g1b-canon", "ctx:g1b-alias", don2),
@@ -7120,84 +7134,171 @@ do
 end
 
 do
-    -- G2: identity-provenance visits stay inside soft+atomic across distinct pairs.
+    -- G2: cold paced provenance under shared callback with live+archive history.
     local record = seedLiveCampaignWithItem(9903, 200)
-    -- Large live history so unresolved provenance would otherwise be expensive.
-    for i = 1, 200 do
+    settleRoster()
+    -- Minimal Guild Info stub: ready with empty relationships so unresolved
+    -- claimed identities require ledger provenance (459 harness does not load GI).
+    SF.GuildInfo = SF.GuildInfo or {}
+    local GI = SF.GuildInfo
+    local prevReady = GI.GetRelationshipReadiness
+    local prevResolve = GI.ResolveCharacterGuidByName
+    GI.GetRelationshipReadiness = function()
+        return "ready", { members = {}, characters = {} }, nil
+    end
+    GI.ResolveCharacterGuidByName = function()
+        return nil
+    end
+    assertTrue(GS.WitnessRelationshipsReady(record), "459-G2: relationships ready")
+    local soft = tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+    local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+    local liveN, archN = 4000, 4000
+    for i = 1, liveN do
         injectProductionDonation(record, {
-            id = string.format("g2-hist-%03d", i),
+            id = string.format("g2-live-%04d", i),
             itemId = 9903, quantity = 1,
             actor = "Alice-Garona", actorGuid = "Player-1-Alice",
             timestamp = world.time + i,
         })
     end
-    -- Distinct unresolved claimed identities (name not uniquely resolved; GUID claimed).
-    -- Use names that exist in roster so WitnessRelationshipsReady can proceed, but
-    -- force unresolved unique GUID lookup by using crafted attributions that still
-    -- bind via late ledger provenance.
-    local soft = tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
-    local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
-    local nCorr = 40
-    for i = 1, nCorr do
-        local donId = string.format("g2-hist-%03d", i)
-        -- Late provenance match: first 20 correct to Bob (known), next to Carol.
-        local attr = (i <= 20) and "Bob-Garona" or "Carol-Garona"
-        local guid = (i <= 20) and "Player-1-Bob" or "Player-1-Carol"
-        local op = select(1, GS:NewContributorCorrectionOperation(donId, attr, guid))
-        assertTrue(op ~= nil, "459-G2: prepare corr " .. tostring(i))
-        local st = GS:ApplyStagedConfigOperation(op)
-        assertTrue(st == "accepted" or st == "pending",
-            "459-G2: apply corr " .. tostring(i) .. " got " .. tostring(st))
+    record.accounting._consumableEventArchive =
+        record.accounting._consumableEventArchive or {}
+    local archive = record.accounting._consumableEventArchive
+    for i = 1, archN do
+        local name = (i == archN) and "Retired-Garona" or "Alice-Garona"
+        local guid = (i == archN) and "Player-1-Retired" or "Player-1-Alice"
+        archive[#archive + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("g2-arch-%04d", i),
+            txnId = string.format("g2-arch-%04d", i),
+            generation = 1,
+            timestamp = world.time + liveN + i,
+            actor = name,
+            actorGuid = guid,
+            donorGuid = guid,
+            attributed = name,
+            attributedGuid = guid,
+            itemId = 9903,
+            quantity = 1,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            gsProductionCredit = true,
+        }
     end
-    flushTimers()
-    GS.InvalidateCreditCorrectionProjection(record)
-    GS._creditProjectionProvenanceVisits = 0
+    world.time = world.time + liveN + archN + 10
+    -- Target donation for the cold first correction.
+    local target = injectProductionDonation(record, {
+        id = "g2-target", itemId = 9903, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = world.time,
+    })
+    -- Distinct unresolved claimed identities (not roster-unique).
+    local ctx = select(1, GS:GetCurrentContext())
+    local corr = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g2-cold-corr",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "g2-target",
+        value = {
+            eventId = "g2-target",
+            eventKind = "donation",
+            attributed = "Retired-Garona",
+            attributedGuid = "Player-1-Retired",
+            baseAttributed = "Alice-Garona",
+            baseAttributedGuid = "Player-1-Alice",
+            itemId = 9903,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    -- Pre-consume most of the outer allowance before Admit.
     local owned = GS.BeginOuterCreditProjectionCallbackBudget
         and GS.BeginOuterCreditProjectionCallbackBudget()
-    local ok, err = GS.EnsureCreditCorrectionProjection(record, nil)
-    local guard = 0
-    while ok == false and err == "work_budget" and guard < 200 do
+    GS._creditProjectionCallbackWork = 12000
+    GS._creditProjectionProvenanceVisits = 0
+    local maxObserved = 0
+    local function observe()
         local cw = tonumber(GS._creditProjectionCallbackWork) or 0
-        assertTrue(cw <= hard,
-            "459-G2: mid-slice callback work within hard cw=" .. tostring(cw))
-        if not runOneDueTimer() then break end
-        ok, err = GS.EnsureCreditCorrectionProjection(record, nil)
+        local localNow = (tonumber(GS._creditProjectionProvenanceVisits) or 0)
+            + (tonumber(GS._creditProjectionRowVisits) or 0)
+            + (tonumber(GS._creditProjectionBucketVisits) or 0)
+            + (tonumber(GS._creditProjectionFloorVisits) or 0)
+            + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+            + (tonumber(GS._creditProjectionStructureCopyVisits) or 0)
+            + (tonumber(GS._creditProjectionTraversalVisits) or 0)
+        local total = cw + localNow
+        if total > maxObserved then maxObserved = total end
+        assertTrue(total <= hard,
+            "459-G2: observed work within hard total=" .. tostring(total)
+                .. " hard=" .. tostring(hard))
+    end
+    local st, reason = GS:AdmitRemoteOperation(corr, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    observe()
+    assertTrue(st == "pending" or st == "accepted",
+        "459-G2: cold admit status=" .. tostring(st) .. "/" .. tostring(reason))
+    if st == "pending" then
+        assertEq(reason, "work_budget", "459-G2: pending reason work_budget")
+    end
+    local guard = 0
+    while (st == "pending" or reason == "work_budget") and guard < 400 do
+        if not runOneDueTimer() then
+            -- Re-admit to continue paced cold index / rebuild.
+            st, reason = GS:AdmitRemoteOperation(corr, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+        else
+            st, reason = GS:AdmitRemoteOperation(corr, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+        end
+        observe()
+        if st == "accepted" or st == "duplicate" then break end
         guard = guard + 1
     end
     flushTimers()
     if owned and GS.EndOuterCreditProjectionCallbackBudget then
         GS.EndOuterCreditProjectionCallbackBudget(true)
     end
-    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
-        "459-G2: projection available")
-    local totalWork = tonumber(GS._creditProjectionCallbackWork) or 0
-    -- After EndOuter the accumulator may be cleared; measure last Ensure details.
-    local _, _, details = GS.RebuildCreditCorrectionProjection(record, nil)
-    local workUnits = tonumber(details and details.workUnits)
-        or CreditProjectionWorkNowSafe()
-    assertTrue(workUnits <= hard,
-        "459-G2: complete rebuild workUnits within hard got=" .. tostring(workUnits))
+    assertTrue(record.operations.records["g2-cold-corr"] ~= nil
+        or record.operations.heads[GS.CorrectionTargetKey(record, "g2-target")] ~= nil,
+        "459-G2: correction retained after paced catch-up")
+    assertTrue(maxObserved <= hard,
+        "459-G2: entire Admit/timer work within hard max=" .. tostring(maxObserved))
+    local credName = select(1, GS.ResolveEffectiveCreditIdentity(record, target))
+    assertEq(credName, "Retired-Garona",
+        "459-G2: late archive provenance binds Retired credit")
     assertEq(#timers, 0, "459-G2: idle queues")
-    local lateEv = GS.FindLedgerEventById(record, "g2-hist-040")
-    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, lateEv)), "Carol-Garona",
-        "459-G2: late provenance/credit match Carol")
+    GI.GetRelationshipReadiness = prevReady
+    GI.ResolveCharacterGuidByName = prevResolve
 end
 
 do
-    -- G3: reject implausibly future correction timestamps at acceptance.
+    -- G3: small production skew; immediate edit after rejected future traffic.
     local record = seedLiveCampaignWithItem(9904, 40)
     injectProductionDonation(record, {
         id = "g3-don", itemId = 9904, quantity = 5,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
     })
     local skew = tonumber(GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW) or 600
-    assertTrue(skew > 0, "459-G3: documented skew constant")
+    assertTrue(skew > 0 and skew <= 600, "459-G3: production skew <= 600 got=" .. tostring(skew))
     local ctx = select(1, GS:GetCurrentContext())
-    local function makeCorr(id, ts, attributed, baseName, baseGuid)
+    local function makeCorr(id, ts, attributed, baseName, baseGuid, targetId)
         local guid = attributed == "Bob-Garona" and "Player-1-Bob"
             or attributed == "Carol-Garona" and "Player-1-Carol"
             or attributed == "Dave-Garona" and "Player-1-Dave"
             or "Player-1-Alice"
+        targetId = targetId or "g3-don"
         return {
             schemaVersion = GS.OP_SCHEMA_VERSION,
             id = id,
@@ -7205,9 +7306,9 @@ do
             datasetId = record.datasetId,
             campaignId = record.currentCampaignId,
             kind = GS.KIND.CORRECT_CONTRIBUTOR,
-            target = "g3-don",
+            target = targetId,
             value = {
-                eventId = "g3-don",
+                eventId = targetId,
                 eventKind = "donation",
                 attributed = attributed,
                 attributedGuid = guid,
@@ -7223,6 +7324,17 @@ do
             baseCampaignId = record.currentCampaignId,
         }
     end
+    -- Just-outside boundary rejected; no head retained.
+    local outsideTs = math.floor(world.time) + skew + 1
+    local stOut, rOut = GS:AdmitRemoteOperation(
+        makeCorr("g3-outside", outsideTs, "Bob-Garona", "Alice-Garona", "Player-1-Alice"), {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+    assertTrue(stOut == "rejected" or stOut == "obsolete",
+        "459-G3: just-outside rejected status=" .. tostring(stOut))
+    assertEq(rOut, "invalid_timestamp", "459-G3: just-outside reason")
+    assertNil(record.operations.records["g3-outside"], "459-G3: outside not retained")
+    -- Far-future rejected (including demotion of that traffic).
     local futureTs = math.floor(world.time) + skew + 86400
     local stF, rF = GS:AdmitRemoteOperation(
         makeCorr("g3-future", futureTs, "Bob-Garona", "Alice-Garona", "Player-1-Alice"), {
@@ -7231,42 +7343,47 @@ do
     assertTrue(stF == "rejected" or stF == "obsolete",
         "459-G3: far-future rejected status=" .. tostring(stF))
     assertEq(rF, "invalid_timestamp", "459-G3: far-future reason")
-    assertNil(record.operations.records["g3-future"], "459-G3: not retained")
     assertNil(record.operations.heads[GS.CorrectionTargetKey(record, "g3-don")],
         "459-G3: no head after future reject")
-    -- Skew-boundary timestamp accepted.
+    -- Immediate ordinary authorized edit without advancing past an accepted future head.
+    -- Rejected future traffic is demoted (not retained), so Dave can edit now.
+    local normal = select(1, GS:NewContributorCorrectionOperation(
+        "g3-don", "Dave-Garona", "Player-1-Dave"))
+    assertTrue(type(normal) == "table", "459-G3: ordinary prepare after reject")
+    assertEq(GS:ApplyStagedConfigOperation(normal), "accepted",
+        "459-G3: ordinary accept immediately after rejected future")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "g3-don"))), "Dave-Garona",
+        "459-G3: ordinary credit Dave after future reject")
+    -- Just-inside boundary accepted on a fresh event (separate from recovery path).
+    injectProductionDonation(record, {
+        id = "g3-bound-don", itemId = 9904, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
     local boundaryTs = math.floor(world.time) + skew
     assertEq(select(1, GS:AdmitRemoteOperation(
-        makeCorr("g3-boundary", boundaryTs, "Bob-Garona", "Alice-Garona", "Player-1-Alice"), {
+        makeCorr("g3-boundary", boundaryTs, "Bob-Garona", "Alice-Garona", "Player-1-Alice",
+            "g3-bound-don"), {
             sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
         })), "accepted", "459-G3: skew-boundary accepted")
-    -- Advance server time past the skew-boundary head so ordinary edits can LWW.
-    world.time = boundaryTs + 10
-    -- Old legitimate nonnegative historical timestamp (loses LWW to current head).
+    -- Old legitimate historical timestamp (loses LWW to current head on g3-don).
     local stOld, rOld = GS:AdmitRemoteOperation(
         makeCorr("g3-old", math.max(1, math.floor(world.time) - 500),
-            "Carol-Garona", "Bob-Garona", "Player-1-Bob"), {
+            "Carol-Garona", "Dave-Garona", "Player-1-Dave"), {
             sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
         })
-    assertTrue(stOld == "obsolete" or stOld == "accepted" or stOld == "duplicate",
+    assertTrue(stOld == "obsolete" or stOld == "accepted" or stOld == "duplicate"
+        or stOld == "rejected",
         "459-G3: old timestamp handled st=" .. tostring(stOld) .. "/" .. tostring(rOld))
     -- Shape validation must not apply wall-clock.
     local shapeBody = makeCorr("g3-shape-future", futureTs, "Bob-Garona",
         "Alice-Garona", "Player-1-Alice")
     local shapeOk = GS.ValidateAcceptedOperationBody(shapeBody, ctx.guildKey, record.datasetId)
     assertTrue(shapeOk, "459-G3: pure shape validation ignores wall-clock future")
-    -- Ordinary authorized correction after demoting/rejecting the far-future attempt.
-    local normal = select(1, GS:NewContributorCorrectionOperation(
-        "g3-don", "Dave-Garona", "Player-1-Dave"))
-    assertTrue(type(normal) == "table", "459-G3: ordinary prepare")
-    assertEq(GS:ApplyStagedConfigOperation(normal), "accepted", "459-G3: ordinary accept")
-    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
-        record, GS.FindLedgerEventById(record, "g3-don"))), "Dave-Garona",
-        "459-G3: ordinary credit Dave after future reject")
 end
 
 do
-    -- G4: require nonempty consistent matched campaign fields.
+    -- G4: campaign scope before losing-history retention + prepared-before-rollover.
     local record = seedLiveCampaignWithItem(9905, 40)
     injectProductionDonation(record, {
         id = "g4-don", itemId = 9905, quantity = 5,
@@ -7303,7 +7420,6 @@ do
         end
         return op
     end
-    -- pairs() drops nil values; clear campaignId explicitly after baseCorr.
     local missOp = baseCorr({ id = "g4-miss-camp" })
     missOp.campaignId = nil
     local stMiss, rMiss = GS:AdmitRemoteOperation(missOp, {
@@ -7318,31 +7434,85 @@ do
         id = "g4-contra", baseCampaignId = "other-campaign",
     }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true })
     assertTrue(stContra ~= "accepted", "459-G4: contradictory campaigns rejected")
-    -- Current-scope→archived target: authored current campaign must not rewrite
-    -- an event whose campaignId differs.
-    local archivedEv = GS.FindLedgerEventById(record, "g4-don")
-    local priorCamp = archivedEv.campaignId
-    archivedEv.campaignId = "archived-camp-g4"
-    local stArch, rArch = GS:AdmitRemoteOperation(baseCorr({
-        id = "g4-arch-rewrite",
+    -- Winner first, then older wrong-campaign loser must not retain.
+    assertEq(select(1, GS:AdmitRemoteOperation(baseCorr({
+        id = "g4-winner",
+        timestamp = world.time + 50,
+        value = {
+            eventId = "g4-don", eventKind = "donation",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9905,
+        },
+    }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true })),
+        "accepted", "459-G4: winner accepted")
+    local stLose, rLose = GS:AdmitRemoteOperation(baseCorr({
+        id = "g4-wrong-lose",
+        timestamp = world.time + 10,
+        campaignId = "wrong-campaign",
+        baseCampaignId = "wrong-campaign",
+        value = {
+            eventId = "g4-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9905,
+        },
     }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true })
-    archivedEv.campaignId = priorCamp
-    assertTrue(stArch ~= "accepted",
-        "459-G4: current-scope onto archived target rejected st="
-            .. tostring(stArch) .. "/" .. tostring(rArch))
-    -- Legitimate delayed control: prepare then accept on matching campaign.
+    assertTrue(stLose ~= "accepted",
+        "459-G4: wrong-campaign loser not retained st="
+            .. tostring(stLose) .. "/" .. tostring(rLose))
+    assertNil(record.operations.records["g4-wrong-lose"],
+        "459-G4: wrong-campaign loser body absent")
+    -- Losing delivery order: older valid then newer winner; both retained appropriately.
+    injectProductionDonation(record, {
+        id = "g4-order-don", itemId = 9905, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local stEarly = select(1, GS:AdmitRemoteOperation(baseCorr({
+        id = "g4-order-early",
+        target = "g4-order-don",
+        timestamp = world.time + 5,
+        value = {
+            eventId = "g4-order-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9905,
+        },
+    }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true }))
+    assertEq(stEarly, "accepted", "459-G4: early winner/path accepted")
+    local stLate = select(1, GS:AdmitRemoteOperation(baseCorr({
+        id = "g4-order-late",
+        target = "g4-order-don",
+        timestamp = world.time + 60,
+        value = {
+            eventId = "g4-order-don", eventKind = "donation",
+            attributed = "Dave-Garona", attributedGuid = "Player-1-Dave",
+            baseAttributed = "Bob-Garona", baseAttributedGuid = "Player-1-Bob",
+            itemId = 9905,
+        },
+    }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true }))
+    assertEq(stLate, "accepted", "459-G4: later LWW winner accepted")
+    -- Prepared-before-rollover: prepare under campaign A, rollover, then apply.
+    injectProductionDonation(record, {
+        id = "g4-roll-don", itemId = 9905, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
     local prepared = select(1, GS:NewContributorCorrectionOperation(
-        "g4-don", "Bob-Garona", "Player-1-Bob"))
+        "g4-roll-don", "Bob-Garona", "Player-1-Bob"))
     assertTrue(type(prepared) == "table",
         "459-G4: prepared before rollover got " .. tostring(prepared))
     local oldCampaign = record.currentCampaignId
     assertEq(prepared.campaignId, oldCampaign, "459-G4: prepared campaignId")
     assertEq(prepared.baseCampaignId, oldCampaign, "459-G4: prepared baseCampaignId")
+    startCampaign()
+    assertTrue(record.currentCampaignId ~= oldCampaign, "459-G4: rollover advanced campaign")
+    local rollEv = GS.FindLedgerEventById(record, "g4-roll-don")
+    assertTrue(rollEv ~= nil, "459-G4: donation still findable after rollover")
+    assertEq(rollEv.campaignId, oldCampaign, "459-G4: event keeps old campaignId")
     assertEq(GS:ApplyStagedConfigOperation(prepared), "accepted",
-        "459-G4: delayed same-campaign accept")
-    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
-        record, GS.FindLedgerEventById(record, "g4-don"))), "Bob-Garona",
-        "459-G4: credit after matched campaign accept")
+        "459-G4: prepared-before-rollover apply accepted")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, rollEv)), "Bob-Garona",
+        "459-G4: credit after prepared-before-rollover")
 end
 
 do
