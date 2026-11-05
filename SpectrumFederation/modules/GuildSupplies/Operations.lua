@@ -31,6 +31,8 @@ local KIND = {
     ADJUST_QUANTITY = "adjust-quantity",
     -- #424 guild-owned display names (LWW; not Troubleshooting conflicts)
     RENAME_CAMPAIGN = "rename-campaign",
+    -- #459 officer contributor credit corrections (LWW; ledger evidence untouched)
+    CORRECT_CONTRIBUTOR = "correct-contributor",
 }
 
 GS.KIND = KIND
@@ -373,6 +375,11 @@ local function TargetKey(kind, target)
             return "name:" .. target
         end
         return nil
+    elseif kind == KIND.CORRECT_CONTRIBUTOR then
+        if type(target) == "string" and target ~= "" and #target <= GS.MAX_OPERATION_ID then
+            return "credit:" .. target
+        end
+        return nil
     end
     return nil
 end
@@ -423,6 +430,11 @@ function GS.RenameRevisionWins(incoming, incumbent)
         return it > ht
     end
     return tostring(incoming.id) > tostring(incumbent.id)
+end
+
+--- Last-write-wins for correct-contributor (#459). Same ordering as rename.
+function GS.CreditCorrectionRevisionWins(incoming, incumbent)
+    return GS.RenameRevisionWins(incoming, incumbent)
 end
 
 local function Loc(key, default)
@@ -792,6 +804,51 @@ local function ValidateKindValue(op)
             return false, "invalid_campaign_name"
         end
         return true
+    elseif kind == KIND.CORRECT_CONTRIBUTOR then
+        if type(op.target) ~= "string" or op.target == "" or #op.target > GS.MAX_OPERATION_ID then
+            return false, "invalid_target"
+        end
+        if type(op.value) ~= "table" then
+            return false, "invalid_value"
+        end
+        if type(op.value.eventId) ~= "string" or op.value.eventId == ""
+            or #op.value.eventId > GS.MAX_OPERATION_ID
+            or op.value.eventId ~= op.target then
+            return false, "invalid_target"
+        end
+        local eventKind = op.value.eventKind
+        if eventKind ~= "donation" and eventKind ~= "adjustment" then
+            return false, "invalid_value"
+        end
+        -- New credit: nil attributed = Unassigned (adjustments only).
+        if op.value.attributed ~= nil and op.value.attributed ~= "" then
+            if type(op.value.attributed) ~= "string" or #op.value.attributed > 64 then
+                return false, "invalid_attribution"
+            end
+        elseif eventKind == "donation" then
+            return false, "invalid_attribution"
+        end
+        if op.value.attributedGuid ~= nil then
+            if type(op.value.attributedGuid) ~= "string"
+                or op.value.attributedGuid == ""
+                or #op.value.attributedGuid > 64 then
+                return false, "invalid_guid"
+            end
+        end
+        -- Prepare-time expected effective credit (nil = Unassigned).
+        if op.value.baseAttributed ~= nil and op.value.baseAttributed ~= "" then
+            if type(op.value.baseAttributed) ~= "string" or #op.value.baseAttributed > 64 then
+                return false, "invalid_attribution"
+            end
+        end
+        if op.value.baseAttributedGuid ~= nil then
+            if type(op.value.baseAttributedGuid) ~= "string"
+                or op.value.baseAttributedGuid == ""
+                or #op.value.baseAttributedGuid > 64 then
+                return false, "invalid_guid"
+            end
+        end
+        return true
     end
     return false, "unsupported_kind"
 end
@@ -1006,6 +1063,81 @@ function GS:NewRenameCampaignOperation(campaignId, nameText)
     return op, "accepted", nil
 end
 
+--- Prepare an officer contributor credit correction (#459).
+-- Targets one production-credited donation or adjustment in the current campaign.
+-- Ledger evidence is not rewritten; effective credit is projected from the op head.
+-- @param eventId string durable ledger event id
+-- @param attributed string|nil new credited character (nil = Unassigned, adjustments only)
+-- @param attributedGuid string|nil optional bound GUID
+function GS:NewContributorCorrectionOperation(eventId, attributed, attributedGuid)
+    local ctx = GS:GetCurrentContext()
+    if not ctx or not ctx.ready then
+        return nil, "rejected", (ctx and ctx.reason) or "not_ready"
+    end
+    local ts = ServerTime()
+    if not ts then
+        return nil, "rejected", "server_time_unavailable"
+    end
+    if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+        return nil, "rejected", "invalid_target"
+    end
+    local caps = GS:GetCapabilities()
+    if not caps.canEdit then
+        return nil, "rejected", caps.reason or "unauthorized"
+    end
+    local record, recordReason = GS:GetCurrentRecord()
+    if not record then
+        return nil, "rejected", recordReason or "not_configured"
+    end
+    if not GS.BuildContributorCorrectionValue then
+        return nil, "rejected", "unsupported_kind"
+    end
+    local value, buildErr = GS.BuildContributorCorrectionValue(
+        record, eventId, attributed, attributedGuid, { localPrepare = true })
+    if not value then
+        return nil, "rejected", buildErr or "invalid_value"
+    end
+    -- Unchanged selection is a local no-op (no durable correction).
+    -- Compare as durable identities (GUID-first, name fallback) so asymmetric
+    -- GUID binding after roster lag does not create a no-op correction.
+    if GS.CreditIdentitiesEqual
+        and GS.CreditIdentitiesEqual(
+            value.attributed, value.attributedGuid,
+            value.baseAttributed, value.baseAttributedGuid) then
+        return nil, "rejected", "unchanged_attribution"
+    end
+    local tKey = TargetKey(KIND.CORRECT_CONTRIBUTOR, eventId)
+    if not tKey then
+        return nil, "rejected", "invalid_target"
+    end
+    local id, idErr = GS:_AllocateOperationId(ctx.actorGuid)
+    if not id then
+        return nil, "rejected", idErr or "id_failed"
+    end
+    local op = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = id,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = KIND.CORRECT_CONTRIBUTOR,
+        target = eventId,
+        value = value,
+        actorGuid = ctx.actorGuid,
+        actorName = ctx.actorName,
+        timestamp = ts,
+        baseTargetRevision = CurrentTargetRevision(record, tKey),
+        basePolicyRevision = CurrentPolicyRevision(record),
+        baseCampaignId = record.currentCampaignId,
+        _preparedHandleGeneration = ctx.handleGeneration,
+    }
+    local ok, err = ValidateKindValue(op)
+    if not ok then
+        return nil, "rejected", err or "invalid_value"
+    end
+    return op, "accepted", nil
+end
+
 function GS:ValidateConfigOperation(op, context)
     local ok, err = ValidateConfigShape(op)
     if not ok then
@@ -1059,8 +1191,11 @@ function GS:ValidateConfigOperation(op, context)
     -- Compatible prepared local quantity adjustments must not stay permanently
     -- stale after a sibling adjustment advances adjust:<itemId>. Commit-time
     -- floor validation in ApplyAdjustmentMutation remains authoritative.
-    -- Rename-campaign uses deterministic LWW at apply/admission (#424).
-    if op.kind ~= KIND.ADJUST_QUANTITY and op.kind ~= KIND.RENAME_CAMPAIGN then
+    -- Rename-campaign and correct-contributor use deterministic LWW at
+    -- apply/admission (#424 / #459).
+    if op.kind ~= KIND.ADJUST_QUANTITY
+        and op.kind ~= KIND.RENAME_CAMPAIGN
+        and op.kind ~= KIND.CORRECT_CONTRIBUTOR then
         local currentRev = CurrentTargetRevision(record, tKey)
         if op.baseTargetRevision ~= currentRev then
             return false, "stale_base"
@@ -1074,6 +1209,18 @@ function GS:ValidateConfigOperation(op, context)
         end
         if type(record.campaigns) ~= "table" or type(record.campaigns[targetCamp]) ~= "table" then
             return false, "missing_campaign"
+        end
+    end
+
+    if op.kind == KIND.CORRECT_CONTRIBUTOR then
+        if not GS.ValidateContributorCorrectionPrepare then
+            return false, "unsupported_kind"
+        end
+        local prepOk, prepErr = GS.ValidateContributorCorrectionPrepare(record, op, {
+            localPrepare = true,
+        })
+        if not prepOk then
+            return false, prepErr or "invalid_value"
         end
     end
 
@@ -1365,6 +1512,15 @@ local function ApplyMutations(record, op, opts)
             renamedAt = op.timestamp,
         }
         return true
+    elseif op.kind == KIND.CORRECT_CONTRIBUTOR then
+        if not GS.ApplyContributorCorrectionMutation then
+            return false, "unsupported_kind"
+        end
+        local ok, status = GS.ApplyContributorCorrectionMutation(record, op, opts)
+        if not ok then
+            return false, status or "invalid_value"
+        end
+        return true, status
     end
     return false, "unsupported_kind"
 end
@@ -1900,7 +2056,8 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         return true
     elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM
         or kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS
-        or kind == KIND.ADJUST_QUANTITY or kind == KIND.RENAME_CAMPAIGN then
+        or kind == KIND.ADJUST_QUANTITY or kind == KIND.RENAME_CAMPAIGN
+        or kind == KIND.CORRECT_CONTRIBUTOR then
         local ok, err = ValidateConfigShape(body)
         if not ok then
             return false, err or "invalid_operations"

@@ -10,10 +10,11 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- Wire schema for the Guild Supplies Gossip provider.
 -- 2: valuation-aware wire (#397). 3: Guild Info witness/attribution (#427).
 -- 4: attributed adjustment unitCopper on ledger events (#447 rankings).
--- Older schema-3 peers drop unknown unitCopper when reconstructing stored
--- events and can relay that stripped history; they are incompatible under
--- Guild Gossip's strict equality. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 4
+-- 5: officer contributor credit corrections (#459 correct-contributor ops).
+-- Older schema-4 peers reject/ignore unknown correction ops while still
+-- appearing synchronized under Guild Gossip's strict equality, leaving wrong
+-- credit; they are incompatible. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 5
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -1311,11 +1312,13 @@ local function ClassifyStaleBase(record, op, targetKey)
             end
             return "conflict", "campaign_conflict"
         end
-        -- #424: rename authorship campaignId/baseCampaignId are prepare-time current.
-        -- After rollover a valid rename for an existing (often archived) target must
-        -- still reach LWW rather than permanent stale_campaign rejection. Do not
-        -- relax campaign-head causality for any other kind.
-        if op.kind ~= GS.KIND.RENAME_CAMPAIGN then
+        -- #424 / #459: rename and contributor-correction authorship campaignId /
+        -- baseCampaignId are prepare-time current. After rollover, accepted
+        -- corrections must still replay (and renames must still LWW) rather than
+        -- permanent stale_campaign rejection. Do not relax campaign-head
+        -- causality for any other kind.
+        if op.kind ~= GS.KIND.RENAME_CAMPAIGN
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR then
             -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
             local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
             local headBody = headId and ops.records[headId]
@@ -1342,6 +1345,20 @@ local function ClassifyStaleBase(record, op, targetKey)
     -- #388 adjustments: append-only with commit-time floor checks. Do not open
     -- config-style divergent conflicts; incompatible negatives stay pending.
     if op.kind == GS.KIND.ADJUST_QUANTITY then
+        return "apply", nil
+    end
+
+    -- #459 contributor corrections: LWW per credit:<eventId>; floor failures
+    -- stay pending like adjustments. Never open Troubleshooting conflicts.
+    if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) == "table" and headBody.id ~= op.id then
+            if not (GS.CreditCorrectionRevisionWins
+                and GS.CreditCorrectionRevisionWins(op, headBody)) then
+                return "obsolete", "stale_credit"
+            end
+        end
         return "apply", nil
     end
 
@@ -5694,6 +5711,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.SET_EDITOR_RANK
             -- Names are keyed by target campaign id, not by authorship campaign.
             and op.kind ~= GS.KIND.RENAME_CAMPAIGN
+            -- Credit corrections are keyed by event id, not authorship campaign.
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
     end
 
     local promoteOps = {}
@@ -7859,6 +7878,24 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
             return "accepted", nil
         end
+        -- #459: retain source-accepted LWW-losing corrections without changing
+        -- the effective credit head (mirrors rename-campaign losers).
+        if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and classReason == "stale_credit"
+            and admissionCtx.adoptionReplay
+            and type(admissionCtx.sourceAcceptedSet) == "table"
+            and admissionCtx.sourceAcceptedSet[stored.id] == true then
+            if not ops.records[stored.id] then
+                if GS._AcceptedCount
+                    and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                    return "rejected", "full"
+                end
+                if GS._StoreAccepted then
+                    GS._StoreAccepted(ops, stored, nil)
+                end
+            end
+            return "accepted", nil
+        end
         return "rejected", classReason or "stale_base"
     end
     if class == "conflict" then
@@ -7960,6 +7997,22 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     and (err == "item_negative" or err == "player_negative"
                         or err == "adjustment_floor" or err == "item_over_goal"
                         or err == "invalid_quantity") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    return stPend, reasonPend
+                end
+                -- #459: correction-before-event and temporary personal-floor
+                -- failures stay pending; do not open Troubleshooting conflicts.
+                if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+                    and (err == "pending_event" or err == "player_negative"
+                        or err == "missing_event" or err == "not_credited") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)

@@ -704,6 +704,45 @@ local function ValidateGuildRecordStructure(guildKey, record)
             end
         end
     end
+    -- Optional #459 contributor correction heads: absent on older saves.
+    if record.creditCorrections ~= nil then
+        if type(record.creditCorrections) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local corrCount = 0
+        local maxCorr = GS.MAX_LEDGER_EVENTS or 4096
+        for eventId, entry in pairs(record.creditCorrections) do
+            corrCount = corrCount + 1
+            if corrCount > maxCorr then
+                return false, "full"
+            end
+            if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_record_shape"
+            end
+            if entry.attributed ~= nil then
+                if type(entry.attributed) ~= "string" or entry.attributed == ""
+                    or #entry.attributed > 64 then
+                    return false, "invalid_attribution"
+                end
+            end
+            if entry.attributedGuid ~= nil then
+                if type(entry.attributedGuid) ~= "string" or entry.attributedGuid == ""
+                    or #entry.attributedGuid > 64 then
+                    return false, "invalid_guid"
+                end
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if not IsFiniteNonnegInt(entry.correctedAt) then
+                return false, "invalid_record_shape"
+            end
+        end
+    end
     -- Optional #388 identity links: absent is fine for older staged records.
     if record.identityLinks ~= nil then
         if GS.ValidateIdentityLinks then
