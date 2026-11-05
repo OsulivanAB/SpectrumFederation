@@ -1020,11 +1020,13 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
         if GS.InvalidateCreditCorrectionProjection then
             GS.InvalidateCreditCorrectionProjection(record)
         end
-        if GS.EnsureCreditCorrectionProjection then
+        if GS.EnsureThenRedriveCreditCorrections then
+            GS.EnsureThenRedriveCreditCorrections(record, {})
+        elseif GS.EnsureCreditCorrectionProjection then
             GS.EnsureCreditCorrectionProjection(record, nil)
-        end
-        if GS.RedrivePendingContributorCorrections then
-            GS.RedrivePendingContributorCorrections(record, {})
+            if GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {})
+            end
         end
     end
     return "accepted", nil

@@ -4908,6 +4908,237 @@ do
     runStaleGeneration("459: life stale yield", 9404, 120, 100, 128, 40)
 end
 
+do
+    -- Ordinary authenticated officer_history arrival: one shared callback
+    -- allowance across Ensure + redrive before the first return, then each
+    -- timer callback independently (#459 / discussion_r4479259160).
+    flushTimers()
+    timers = {}
+    GS._creditProjectionWorkBudgetOverride = nil
+    GS._creditProjectionAccumulating = false
+
+    local function runArrivalBudgetCase(label, itemId, nHeads, budgetOverride, preConsumed)
+        flushTimers()
+        timers = {}
+        GS._creditProjectionWorkBudgetOverride = budgetOverride
+        GS._creditProjectionAccumulating = false
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        local record = seedLiveCampaignWithItem(itemId, math.max(nHeads, 100))
+        world.time = world.time + 7200
+        settleRoster()
+        local t0 = world.time
+        local soft = tonumber(budgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+        local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+        local ctx = select(1, GS:GetCurrentContext())
+        for i = 1, nHeads do
+            injectProductionDonation(record, {
+                id = "arr-don-" .. itemId .. "-" .. i, itemId = itemId, quantity = 1,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                timestamp = t0 + i,
+            })
+        end
+        injectProductionAdjustment(record, {
+            id = "arr-adj-" .. itemId, itemId = itemId, quantity = -10,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            timestamp = t0 + nHeads + 1,
+        })
+        for i = 1, nHeads do
+            local op = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = "arr-op-" .. itemId .. "-" .. i,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "arr-don-" .. itemId .. "-" .. i,
+                value = {
+                    eventId = "arr-don-" .. itemId .. "-" .. i, eventKind = "donation",
+                    attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = t0 + nHeads + 10 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            }
+            record.operations.records[op.id] = op
+            record.operations.order[#record.operations.order + 1] = op.id
+        end
+        local lateId = "ctx:arr-late-" .. itemId
+        local pendingOp = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "arr-pending-" .. itemId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = lateId,
+            value = {
+                eventId = lateId, eventKind = "donation",
+                attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = itemId,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = t0 + nHeads + 20,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local stPend, reasonPend = GS:AdmitRemoteOperation(pendingOp, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(stPend, "pending", label .. " pending got "
+            .. tostring(stPend) .. "/" .. tostring(reasonPend))
+        assertEq(reasonPend, "pending_event", label .. " pending_event")
+
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        local arrivalWork, arrivalVisits = 0, 0
+        local maxTimerWork = 0
+        local inArrival = true
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, d = realRebuild(...)
+            local units = tonumber(d and d.workUnits) or 0
+            local visits = tonumber(d and d.traversalVisits) or 0
+            if inArrival then
+                arrivalWork = arrivalWork + units
+                arrivalVisits = arrivalVisits + visits
+            else
+                if units > maxTimerWork then maxTimerWork = units end
+            end
+            return ok, err, d
+        end
+
+        if preConsumed and preConsumed > 0 then
+            GS._creditProjectionAccumulating = true
+            GS._creditProjectionCallbackWork = preConsumed
+            GS._creditProjectionCallbackLimit = soft
+            GS._creditProjectionCallbackHardLimit = hard
+        end
+
+        local cfg = record.accounting._consumables
+        local ev = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = lateId,
+            txnId = lateId,
+            itemId = itemId,
+            quantity = 5,
+            generation = tonumber(cfg.generation) or 1,
+            timestamp = t0 + nHeads + 21,
+            actor = "Alice-Garona",
+            actorGuid = "Player-1-Alice",
+            writer = "Player-1-Alice",
+            verification = GS.VERIFICATION.OFFICER,
+            verifierGuid = "Player-1-Alice",
+            coreSignature = SF.ConsumablesObservation.CoreSignature(
+                "deposit", "Alice-Garona", itemId, 5),
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            guildGuid = cfg.guild and tostring(cfg.guild.guid),
+            bankTab = tonumber(cfg.bankTab),
+            ageHours = 0,
+        }
+        local ds, dr = GS:AdmitLedgerEvent(ev, {
+            sender = "Alice-Garona",
+            offlineRecord = record,
+            preserveAttribution = true,
+            sourceCutoverMarker = record.liveCutover and record.liveCutover.cutoverMarker,
+        })
+        inArrival = false
+        if preConsumed and preConsumed > 0 then
+            GS._creditProjectionAccumulating = false
+        end
+        assertEq(ds, "accepted", label .. " AdmitLedgerEvent status got "
+            .. tostring(ds) .. "/" .. tostring(dr))
+        assertEq(dr, "officer_history", label .. " officer_history")
+        local lateEv = GS.FindLedgerEventById(record, lateId)
+        assertTrue(lateEv and lateEv.gsProductionCredit == true,
+            label .. " late production-credited")
+        assertTrue(arrivalWork <= hard, label .. " arrival work within soft+atomic got="
+            .. tostring(arrivalWork) .. " hard=" .. tostring(hard)
+            .. " visits=" .. tostring(arrivalVisits))
+
+        -- Measure each timer callback: sum rebuild workUnits inside that callback.
+        local g = 0
+        while #timers > 0 and g < 200 do
+            local sliceWork = 0
+            GS.RebuildCreditCorrectionProjection = function(...)
+                local ok, err, d = realRebuild(...)
+                sliceWork = sliceWork + (tonumber(d and d.workUnits) or 0)
+                return ok, err, d
+            end
+            if not runOneDueTimer() then break end
+            if sliceWork > maxTimerWork then maxTimerWork = sliceWork end
+            assertTrue(sliceWork <= hard, label .. " timer slice within soft+atomic got="
+                .. tostring(sliceWork) .. " at=" .. tostring(g + 1))
+            g = g + 1
+        end
+        GS.RebuildCreditCorrectionProjection = realRebuild
+        assertEq(#timers, 0, label .. " idle timer queue")
+        assertTrue(maxTimerWork <= hard, label .. " max timer work within bound got="
+            .. tostring(maxTimerWork))
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " projection available")
+        assertTrue(record.operations.records[pendingOp.id] ~= nil,
+            label .. " Carol op accepted once")
+        assertTrue(record.operations.pending == nil
+            or record.operations.pending[pendingOp.id] == nil,
+            label .. " pending cleared")
+        local bob = 0
+        for i = 1, nHeads do
+            local e = GS.FindLedgerEventById(record, "arr-don-" .. itemId .. "-" .. i)
+            if select(1, GS.ResolveEffectiveCreditIdentity(record, e)) == "Bob-Garona" then
+                bob = bob + 1
+            end
+        end
+        -- Conflict fixture: Alice -10 prunes 5 Bob heads; Carol accepted but not active.
+        if nHeads == 3400 and not budgetOverride then
+            assertEq(bob, 3395, label .. " deterministic Bob heads got=" .. tostring(bob))
+        else
+            assertTrue(bob >= 1, label .. " retained some Bob heads got=" .. tostring(bob))
+        end
+        lateEv = GS.FindLedgerEventById(record, lateId)
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, lateEv)),
+            "Alice-Garona", label .. " late retains Alice (Carol inactive)")
+        local function fp()
+            local parts = {}
+            for i = 1, nHeads do
+                local e = GS.FindLedgerEventById(record, "arr-don-" .. itemId .. "-" .. i)
+                parts[#parts + 1] = tostring(i) .. "="
+                    .. tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, e)) or "?")
+            end
+            local late = GS.FindLedgerEventById(record, lateId)
+            parts[#parts + 1] = "late="
+                .. tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, late)) or "?")
+            return table.concat(parts, ";")
+        end
+        local fpNatural = fp()
+        GS.InvalidateCreditCorrectionProjection(record)
+        local okFresh = GS.EnsureCreditCorrectionProjection(record, nil)
+        local guard = 0
+        while okFresh == false and guard < 12000 do
+            if not runOneDueTimer() then break end
+            okFresh = GS.EnsureCreditCorrectionProjection(record, nil)
+            guard = guard + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            label .. " fresh available")
+        assertEq(fp(), fpNatural, label .. " natural==fresh credit set")
+        GS._creditProjectionWorkBudgetOverride = nil
+        GS._creditProjectionAccumulating = false
+    end
+
+    runArrivalBudgetCase("459: arrival large", 9410, 3400, nil, nil)
+    runArrivalBudgetCase("459: arrival yield", 9411, 80, 96, nil)
+    -- Already-consumed outer allowance must remain respected on the wake.
+    runArrivalBudgetCase("459: arrival preConsumed", 9412, 80, 256, 200)
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

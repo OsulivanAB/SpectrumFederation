@@ -2152,11 +2152,8 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             if GS.InvalidateCreditCorrectionProjection then
                 GS.InvalidateCreditCorrectionProjection(record)
             end
-            if GS.EnsureCreditCorrectionProjection then
-                GS.EnsureCreditCorrectionProjection(record, nil)
-            end
-            if GS.RedrivePendingContributorCorrections then
-                GS.RedrivePendingContributorCorrections(record, {
+            if GS.EnsureThenRedriveCreditCorrections then
+                GS.EnsureThenRedriveCreditCorrections(record, {
                     eventId = existing.id,
                     itemId = existing.itemId,
                 })
@@ -2576,8 +2573,11 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         return 0, 0
     end
     -- Accumulate rebuild work across nested AdmitRemoteOperation callbacks.
-    -- Nested callers (projection continuation) share the remaining allowance.
-    local shareBudget = type(opts) == "table" and opts._shareCallbackBudget == true
+    -- Nested callers (projection continuation / Ensure-then-redrive wake) share
+    -- the remaining allowance and must not reset an already-consumed counter.
+    local nested = GS._creditProjectionAccumulating == true
+    local shareBudget = nested
+        or (type(opts) == "table" and opts._shareCallbackBudget == true)
     if not shareBudget then
         local budget = tonumber(opts and opts.workBudget)
             or tonumber(GS._creditProjectionWorkBudgetOverride)
@@ -2699,7 +2699,10 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             ScheduleCreditRedriveContinuation(record, wasFull and {} or nil)
         end
     end
-    GS._creditProjectionAccumulating = false
+    -- Only the budget owner closes the allowance; nested share leaves it open.
+    if not nested then
+        GS._creditProjectionAccumulating = false
+    end
     return promoted, attempts, tonumber(GS._creditProjectionCallbackWork) or 0
 end
 
@@ -2719,10 +2722,7 @@ local function AppendLedgerEvent(record, event)
             if GS.InvalidateCreditCorrectionProjection then
                 GS.InvalidateCreditCorrectionProjection(record)
             end
-            if GS.EnsureCreditCorrectionProjection then
-                GS.EnsureCreditCorrectionProjection(record, nil)
-            end
-            GS.RedrivePendingContributorCorrections(record, {
+            GS.EnsureThenRedriveCreditCorrections(record, {
                 eventId = event.id,
                 itemId = event.itemId,
             })
@@ -2750,13 +2750,11 @@ local function AppendLedgerEvent(record, event)
     if type(event) == "table" then
         -- Balance/credit changes can activate previously floor-held accepted heads
         -- and redrive trusted pending corrections for related events/items.
+        -- One shared callback allowance across Ensure + redrive (#459).
         if GS.InvalidateCreditCorrectionProjection then
             GS.InvalidateCreditCorrectionProjection(record)
         end
-        if GS.EnsureCreditCorrectionProjection then
-            GS.EnsureCreditCorrectionProjection(record, nil)
-        end
-        GS.RedrivePendingContributorCorrections(record, {
+        GS.EnsureThenRedriveCreditCorrections(record, {
             eventId = event.id,
             itemId = event.itemId,
         })
@@ -5152,20 +5150,12 @@ function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, i
     if GS.InvalidateCreditCorrectionProjection then
         GS.InvalidateCreditCorrectionProjection(record)
     end
-    if GS.EnsureCreditCorrectionProjection then
-        GS.EnsureCreditCorrectionProjection(record, nil)
+    -- One shared allowance; item filter covers primary and alias txn targets.
+    if GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {
+            itemId = itemId,
+        })
     end
-    if not GS.RedrivePendingContributorCorrections then
-        return
-    end
-    GS.RedrivePendingContributorCorrections(record, {
-        eventId = primaryTxnId,
-        itemId = itemId,
-    })
-    GS.RedrivePendingContributorCorrections(record, {
-        eventId = aliasTxnId,
-        itemId = itemId,
-    })
 end
 
 local function DurableCreditIdentity(event)
@@ -5953,6 +5943,42 @@ end
 
 local function EndCreditProjectionCallbackBudget()
     GS._creditProjectionAccumulating = false
+end
+
+--- One outer callback allowance for accepted-history Ensure then pending redrive.
+-- Production wakes must not open a second full slice after Ensure returns.
+-- Nested callers share the caller's already-consumed allowance; only this
+-- boundary closes a budget it opened. Exhausted soft limit merges/schedules
+-- remaining redrive work rather than resetting the counter.
+-- @param record table
+-- @param redriveOpts table|nil filters for RedrivePendingContributorCorrections
+function GS.EnsureThenRedriveCreditCorrections(record, redriveOpts)
+    if type(record) ~= "table" then
+        return
+    end
+    local owned = false
+    if not GS._creditProjectionAccumulating then
+        BeginCreditProjectionCallbackBudget(false)
+        owned = true
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(record, nil)
+    end
+    if GS.RedrivePendingContributorCorrections then
+        local opts = type(redriveOpts) == "table" and redriveOpts or {}
+        if opts._shareCallbackBudget ~= true then
+            local shared = {}
+            for k, v in pairs(opts) do
+                shared[k] = v
+            end
+            shared._shareCallbackBudget = true
+            opts = shared
+        end
+        GS.RedrivePendingContributorCorrections(record, opts)
+    end
+    if owned then
+        EndCreditProjectionCallbackBudget()
+    end
 end
 
 --- Work already charged this callback plus in-progress local rebuild units.

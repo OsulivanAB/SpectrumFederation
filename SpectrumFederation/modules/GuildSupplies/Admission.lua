@@ -8063,6 +8063,15 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             -- stamp after store instead of a second full rebuild (#459 budget).
             if admissionCtx._creditRedrive and GS.SealCreditCorrectionProjection then
                 GS.SealCreditCorrectionProjection(record, true)
+            elseif not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
+                and GS.EnsureThenRedriveCreditCorrections then
+                if GS.InvalidateCreditCorrectionProjection then
+                    GS.InvalidateCreditCorrectionProjection(record)
+                end
+                GS.EnsureThenRedriveCreditCorrections(record, {
+                    eventId = stored.target,
+                    itemId = stored.value and stored.value.itemId,
+                })
             else
                 if GS.InvalidateCreditCorrectionProjection then
                     GS.InvalidateCreditCorrectionProjection(record)
@@ -8071,24 +8080,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     GS.EnsureCreditCorrectionProjection(record, nil)
                 end
             end
-            if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
-                and GS.RedrivePendingContributorCorrections then
-                GS.RedrivePendingContributorCorrections(record, {
-                    eventId = stored.target,
-                    itemId = stored.value and stored.value.itemId,
-                })
-            end
         elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
             if GS.InvalidateCreditCorrectionProjection then
                 GS.InvalidateCreditCorrectionProjection(record)
             end
-            if GS.EnsureCreditCorrectionProjection then
-                GS.EnsureCreditCorrectionProjection(record, nil)
-            end
-            if not admissionCtx.adoptionReplay and GS.RedrivePendingContributorCorrections then
-                GS.RedrivePendingContributorCorrections(record, {
+            if not admissionCtx.adoptionReplay and GS.EnsureThenRedriveCreditCorrections then
+                GS.EnsureThenRedriveCreditCorrections(record, {
                     itemId = stored.value and stored.value.itemId,
                 })
+            elseif GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
             end
         end
     end
