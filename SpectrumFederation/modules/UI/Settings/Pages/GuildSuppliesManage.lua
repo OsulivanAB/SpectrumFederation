@@ -2396,6 +2396,8 @@ Page.__sfTest = {
 		return recipeEditorUi
 	end,
 	-- Production Escape routes: UISpecialFrames hide and EditBox OnEscapePressed.
+	-- withFocus=true invokes only the installed EditBox handler — no Hide fallback
+	-- (a missing OnEscapePressed must fail the focused regression).
 	InvokeRecipeEditorEscape = function(opts)
 		opts = type(opts) == "table" and opts or {}
 		local ui = recipeEditorUi
@@ -2404,21 +2406,26 @@ Page.__sfTest = {
 		end
 		if opts.withFocus then
 			local edit = nil
-			if ui.reagentEdits then
+			if type(opts.itemId) == "number" and ui.reagentEdits then
+				edit = ui.reagentEdits[opts.itemId]
+			end
+			if not edit and ui.reagentEdits then
 				for _, box in pairs(ui.reagentEdits) do
 					edit = box
 					break
 				end
 			end
-			if edit and edit.GetScript then
-				local handler = edit:GetScript("OnEscapePressed")
-				if type(handler) == "function" then
-					handler(edit)
-					return true
-				end
+			if not (edit and edit.GetScript) then
+				return false
 			end
+			local handler = edit:GetScript("OnEscapePressed")
+			if type(handler) ~= "function" then
+				return false
+			end
+			handler(edit)
+			return true
 		end
-		-- UISpecialFrames dismisses by hiding the named frame.
+		-- Ordinary Escape: UISpecialFrames dismisses by hiding the named frame.
 		if ui.frame.Hide then
 			ui.frame:Hide()
 		end

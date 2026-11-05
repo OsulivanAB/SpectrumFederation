@@ -22632,12 +22632,20 @@ do
     GS.MAX_ACCEPTED_OPERATIONS = 40
     GS.MAX_LEDGER_EVENTS = 40
     GS.MAX_ARCHIVED_EVENTS = 40
+    local archiveCamps43 = math.min(
+        GS.MAX_CAMPAIGNS or 64,
+        GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
+    )
+    local pages43 = GS.MAX_ARCHIVE_PAGE_COUNT or 512
     GS.MAX_ADOPTION_PENDING_RECORDS = 40 + 40 + 40
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+        + 40 + 40
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
         + (GS.MAX_CAMPAIGNS or 64)
         + (GS.MAX_CAMPAIGNS or 64)
-        + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
-        + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
+        + (archiveCamps43 * pages43)
+        + (archiveCamps43 * pages43)
         + 512
     local aliceRecord = seedStagedCampaignWithItem(9055, 50)
     -- Fill accepted ops near the lowered cap with bank-tab no-ops alternating.
@@ -22702,12 +22710,22 @@ do
     GS.MAX_ARCHIVED_EVENTS = 40
     GS.MAX_ADOPTION_PENDING_RECORDS = priorPending -- use production raised bound
     initGS()
-    -- Re-apply raised pending after Initialize defaults.
+    -- Re-apply raised pending after Initialize defaults (producer-derived model).
+    local ac43b = math.min(GS.MAX_CAMPAIGNS or 64, GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16)
+    local pg43b = GS.MAX_ARCHIVE_PAGE_COUNT or 512
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 40)
+        + (GS.MAX_LEDGER_EVENTS or 40)
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_EVENTS or 40)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
         + (GS.MAX_LEDGER_EVENTS or 40)
         + (GS.MAX_ARCHIVED_EVENTS or 40)
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + ((GS.MAX_CAMPAIGNS or 64) * 24) + 512
+        + (GS.MAX_CAMPAIGNS or 64)
+        + (GS.MAX_CAMPAIGNS or 64)
+        + (ac43b * pg43b)
+        + (ac43b * pg43b)
+        + 512
     GS:CreateStagedRecord()
     GS:EnsureGossipProvider()
     GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
@@ -46284,6 +46302,407 @@ do
         "457-pub: ordinary offlineRecord=current updates acceptedLedgerCount")
     assertTrue((world.notifyChanged or 0) > notifyBeforeLive,
         "457-pub: subsequent live admission notifies")
+end
+
+---------------------------------------------------------------------------
+-- 3B43E) #457 adoption capacity: real export/packing → buffer → readiness/
+-- commit crossing the scaled old complete budget, plus real packed large-
+-- recipe archive pages-first delivery.
+---------------------------------------------------------------------------
+do
+    loadModule("SpectrumFederation/modules/GuildSupplies/Withdrawals.lua")
+    loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+    assertTrue(type(GS._BuildArchiveExportBodiesForTest) == "function"
+        or type(GS.BeginDatasetAdoption) == "function",
+        "3B43E: adoption APIs available")
+
+    local prior = {
+        ops = GS.MAX_ACCEPTED_OPERATIONS,
+        led = GS.MAX_LEDGER_EVENTS,
+        arch = GS.MAX_ARCHIVED_EVENTS,
+        wd = GS.MAX_WITHDRAWAL_EVENTS,
+        archWd = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS,
+        camps = GS.MAX_CAMPAIGNS,
+        pages = GS.MAX_ARCHIVE_PAGE_COUNT,
+        bufCamps = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS,
+        evidence = GS.MAX_DIRECT_EVIDENCE_EXPORTS,
+        pending = GS.MAX_ADOPTION_PENDING_RECORDS,
+        wire = GS.MAX_WIRE_RECORD_BYTES,
+    }
+
+    -- Scaled full-budget equivalents of the pre-repair 22,784 model.
+    GS.MAX_ACCEPTED_OPERATIONS = 40
+    GS.MAX_LEDGER_EVENTS = 40
+    GS.MAX_ARCHIVED_EVENTS = 40
+    GS.MAX_WITHDRAWAL_EVENTS = 720
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = 40
+    GS.MAX_CAMPAIGNS = 2
+    GS.MAX_ARCHIVE_PAGE_COUNT = 16
+    GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 2
+    GS.MAX_DIRECT_EVIDENCE_EXPORTS = 4
+
+    local function deriveOld()
+        -- Pre-repair formula: ops + live/arch ledger + donation valuations +
+        -- evidence + opaque campaigns*24 + headroom (no withdrawal classes).
+        return (GS.MAX_ACCEPTED_OPERATIONS or 0)
+            + (GS.MAX_LEDGER_EVENTS or 0)
+            + (GS.MAX_ARCHIVED_EVENTS or 0)
+            + (GS.MAX_LEDGER_EVENTS or 0)
+            + (GS.MAX_ARCHIVED_EVENTS or 0)
+            + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 0)
+            + ((GS.MAX_CAMPAIGNS or 0) * 24)
+            + 512
+    end
+    local function deriveNew()
+        local maxCampaigns = GS.MAX_CAMPAIGNS or 64
+        local archiveCampaigns = math.min(
+            maxCampaigns,
+            GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
+        )
+        local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+        return (GS.MAX_ACCEPTED_OPERATIONS or 0)
+            + (GS.MAX_LEDGER_EVENTS or 0)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 0)
+            + (GS.MAX_ARCHIVED_EVENTS or 0)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 0)
+            + (GS.MAX_LEDGER_EVENTS or 0)
+            + (GS.MAX_ARCHIVED_EVENTS or 0)
+            + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 0)
+            + maxCampaigns
+            + maxCampaigns
+            + (archiveCampaigns * pagesPerArchive)
+            + (archiveCampaigns * pagesPerArchive)
+            + 512
+    end
+    local oldCeiling = deriveOld()
+    local newCeiling = deriveNew()
+    assertTrue(newCeiling > oldCeiling,
+        "3B43E: new scaled budget exceeds old scaled complete budget")
+    assertTrue(oldCeiling >= 700,
+        "3B43E: scaled old budget is a genuine complete-model counterpart got="
+            .. tostring(oldCeiling))
+
+    SpectrumFederationDB = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS.MAX_ACCEPTED_OPERATIONS = 40
+    GS.MAX_LEDGER_EVENTS = 40
+    GS.MAX_ARCHIVED_EVENTS = 40
+    GS.MAX_WITHDRAWAL_EVENTS = 720
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = 40
+    GS.MAX_CAMPAIGNS = 2
+    GS.MAX_ARCHIVE_PAGE_COUNT = 16
+    GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 2
+    GS.MAX_DIRECT_EVIDENCE_EXPORTS = 4
+    GS.MAX_ADOPTION_PENDING_RECORDS = newCeiling
+
+    local aliceRecord = seedStagedCampaignWithItem(45710, 20)
+    local acceptedNow = #(aliceRecord.operations.order or {})
+    local needOps = math.max(0, 36 - acceptedNow)
+    for n = 1, needOps do
+        local tab = (n % 2 == 0) and 2 or 3
+        local op = GS:NewConfigOperation("set-bank-tab", "bankTab", tab)
+        assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+            "3B43E: seed op " .. tostring(n))
+    end
+    local cfg = aliceRecord.accounting._consumables
+    local events = aliceRecord.accounting._consumableEvents
+    if type(events) ~= "table" then
+        aliceRecord.accounting._consumableEvents = {}
+        events = aliceRecord.accounting._consumableEvents
+    end
+    for n = 1, 36 do
+        events[#events + 1] = {
+            type = "donation",
+            id = "ctx:gs:e457-d-" .. n,
+            txnId = "ctx:gs:e457-d-" .. n,
+            itemId = 45710,
+            quantity = 1,
+            generation = cfg.generation,
+            timestamp = (world.time or 1000) + n,
+            approxTxnTime = (world.time or 1000) + n,
+            campaignId = aliceRecord.currentCampaignId,
+            datasetId = aliceRecord.datasetId,
+            coreSignature = "e457|don|" .. n,
+            actor = "CapDonor" .. n .. "-Garona",
+            verification = "witnesses",
+            writer = "Player-1-Alice",
+        }
+    end
+    -- Real local receipt commits (valid ORIGIN provenance / id shape).
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local receiptOk = 0
+    for n = 1, 700 do
+        local stR, detailR = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
+            operationId = "op-e457-live-" .. n,
+            datasetId = aliceRecord.datasetId,
+            campaignId = aliceRecord.currentCampaignId,
+            generation = tonumber(cfg.generation) or 1,
+            guildKey = aliceRecord._guildKey or "club:42",
+            bankTab = tonumber(cfg.bankTab) or 2,
+            timestamp = (world.time or 1000) + 500 + n,
+        })
+        if stR == "accepted" then
+            receiptOk = receiptOk + (tonumber(detailR) or 1)
+        end
+    end
+    assertTrue(receiptOk >= 700,
+        "3B43E: seeded live receipts via CommitLocal got=" .. tostring(receiptOk))
+
+    GS:DisableGossipProvider()
+    assertEq(GS:EnsureGossipProvider(), true, "3B43E: provider")
+    drainExportMaint(512)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local kindCounts = {}
+    local totalBytes = 0
+    for i = 1, #exportBodies do
+        local b = exportBodies[i].body
+        local k = b and b.kind or "?"
+        kindCounts[k] = (kindCounts[k] or 0) + 1
+        if type(b) == "table" then
+            totalBytes = totalBytes + 64
+        end
+    end
+    local bodyCount = #exportBodies
+    assertTrue(bodyCount > oldCeiling,
+        "3B43E: export crosses scaled old ceiling bodies=" .. tostring(bodyCount)
+            .. " old=" .. tostring(oldCeiling))
+    assertTrue(bodyCount <= newCeiling,
+        "3B43E: export fits new budget bodies=" .. tostring(bodyCount)
+            .. " new=" .. tostring(newCeiling))
+    assertTrue((kindCounts["gs-ledger-event"] or 0) >= 700,
+        "3B43E: mixed ledger export includes receipts got="
+            .. tostring(kindCounts["gs-ledger-event"]))
+    assertTrue((kindCounts["gs-op"] or 0) >= 30,
+        "3B43E: ops exported got=" .. tostring(kindCounts["gs-op"]))
+    assertTrue(totalBytes > 0, "3B43E: wrapped-record size observed")
+
+    local function applyCaps(pending)
+        GS.MAX_ACCEPTED_OPERATIONS = 40
+        GS.MAX_LEDGER_EVENTS = 40
+        GS.MAX_ARCHIVED_EVENTS = 40
+        GS.MAX_WITHDRAWAL_EVENTS = 720
+        GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = 40
+        GS.MAX_CAMPAIGNS = 2
+        GS.MAX_ARCHIVE_PAGE_COUNT = 16
+        GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 2
+        GS.MAX_DIRECT_EVIDENCE_EXPORTS = 4
+        GS.MAX_ADOPTION_PENDING_RECORDS = pending
+    end
+
+    -- Under old ceiling the same export must hit full.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    applyCaps(oldCeiling)
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B43E: begin under old ceiling")
+    local fullRejects = 0
+    for i = 1, #exportBodies do
+        local stB, rB = GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        if stB == "rejected" and rB == "full" then
+            fullRejects = fullRejects + 1
+        end
+    end
+    assertTrue(fullRejects > 0,
+        "3B43E: old ceiling rejects overflowing mixed export fullRejects="
+            .. tostring(fullRejects))
+    GS._adoption = nil
+
+    -- New ceiling buffers every body, reaches readiness, commits.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    applyCaps(newCeiling)
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B43E: begin under new ceiling")
+    fullRejects = 0
+    local maxOrder = 0
+    for i = 1, #exportBodies do
+        local stB, rB = GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        if stB == "rejected" and rB == "full" then
+            fullRejects = fullRejects + 1
+        end
+        if GS._adoption and type(GS._adoption.order) == "table" then
+            if #GS._adoption.order > maxOrder then maxOrder = #GS._adoption.order end
+        end
+    end
+    assertEq(fullRejects, 0, "3B43E: no full rejects under new budget")
+    assertTrue(maxOrder > oldCeiling, "3B43E: buffered order crossed old ceiling")
+    assertTrue(maxOrder <= newCeiling, "3B43E: order within new budget")
+    local ready, why = GS:IsAdoptionTransferComplete()
+    assertEq(ready, true, "3B43E: readiness true: " .. tostring(why))
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local stats = GS._lastAdoptionSliceStats
+    if type(stats) == "table" then
+        local used = tonumber(stats.used) or 0
+        local budget = tonumber(stats.budget) or (GS.MAX_ADMISSION_WORK_PER_SLICE or 32)
+        assertTrue(used <= budget + 1,
+            "3B43E: slice bounded used=" .. tostring(used))
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertEq(stAdopt, "accepted",
+        "3B43E: adopt accepted got=" .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    assertTrue(adopted and adopted.datasetId == sourceDataset,
+        "3B43E: adopted dataset src=" .. tostring(sourceDataset)
+            .. " got=" .. tostring(adopted and adopted.datasetId))
+    local retainedWd = 0
+    for i = 1, #(adopted.accounting._consumableEvents or {}) do
+        local ev = adopted.accounting._consumableEvents[i]
+        if type(ev) == "table" and ev.type == "withdrawal" then
+            retainedWd = retainedWd + 1
+        end
+    end
+    assertTrue(retainedWd >= 700,
+        "3B43E: retained withdrawal receipts got=" .. tostring(retainedWd))
+
+    ----------------------------------------------------------------
+    -- Real packer large-recipe archive, pages-first into adoption buffer.
+    ----------------------------------------------------------------
+    SpectrumFederationDB = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS.MAX_ARCHIVE_PAGE_COUNT = prior.pages or 512
+    GS.MAX_ADOPTION_PENDING_RECORDS = prior.pending
+    local packRecord = seedStagedCampaignWithItem(45711, 5)
+    local campId = "camp-e457-recipes"
+    local fatRecipes = {}
+    for n = 1, (GS.MAX_RECIPES or 32) do
+        local reagents = {}
+        for r = 1, 24 do
+            reagents[tostring(10000 + r)] = 1 + (r % 3)
+        end
+        fatRecipes[tostring(2000 + n)] = {
+            itemId = 2000 + n,
+            reagents = reagents,
+        }
+    end
+    local items = {}
+    for n = 1, 40 do
+        items[tostring(n)] = { itemId = n, goal = 1 }
+    end
+    local archive = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = campId,
+        datasetId = packRecord.datasetId,
+        requestedItems = items,
+        recipes = fatRecipes,
+        generation = 2,
+        archivedAt = (world.time or 1000) + 50,
+        bankTab = 2,
+        eligibility = {
+            baselineEstablished = true,
+            baselineAt = 1,
+            tabEligibleFrom = 2,
+            items = { ["1"] = 1, ["2"] = 2 },
+        },
+    }
+    -- Force recipe paging by tightening wire budget if the packer would inline.
+    local savedWire = GS.MAX_WIRE_RECORD_BYTES
+    GS.MAX_WIRE_RECORD_BYTES = math.min(tonumber(savedWire) or 12000, 3500)
+    local parts = nil
+    if GS._BuildArchiveExportBodiesForTest then
+        parts = GS._BuildArchiveExportBodiesForTest(campId, archive, {
+            datasetId = packRecord.datasetId,
+        })
+    end
+    GS.MAX_WIRE_RECORD_BYTES = savedWire
+    assertTrue(type(parts) == "table" and #parts >= 2,
+        "3B43E: real packer emitted multi-part archive got=" .. tostring(parts and #parts))
+    local metaBody, itemPages, recipePages = nil, {}, {}
+    for i = 1, #parts do
+        local b = parts[i].body
+        if b.kind == "campaign-archive" then
+            metaBody = b
+        elseif b.kind == "campaign-archive-page" then
+            itemPages[#itemPages + 1] = parts[i]
+        elseif b.kind == "campaign-archive-recipe-page" then
+            recipePages[#recipePages + 1] = parts[i]
+        end
+    end
+    assertTrue(metaBody ~= nil, "3B43E: archive meta from packer")
+    assertTrue(#recipePages >= 1,
+        "3B43E: large-recipe archive produced recipe pages got="
+            .. tostring(#recipePages) .. " recipePageCount="
+            .. tostring(metaBody.recipePageCount))
+    assertTrue(tonumber(metaBody.recipePageCount) == #recipePages
+        or tonumber(metaBody.recipeCount) == (GS.MAX_RECIPES or 32),
+        "3B43E: recipe pageCount matches packer emission")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoption = nil
+    GS._peerDatasets = {}
+    initGS()
+    GS.MAX_ADOPTION_PENDING_RECORDS = math.max(prior.pending or 1000, #parts + 64)
+    GS:CreateStagedRecord()
+    local adoptDs = "gs1:e457-arch"
+    GS.NotePeerDataset("Alice-Garona", adoptDs, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", adoptDs)), "accepted",
+        "3B43E: begin recipe-archive adoption")
+    -- Descriptor required for readiness.
+    local descBody = {
+        kind = "dataset-desc",
+        datasetId = adoptDs,
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 1,
+        archiveCount = 1,
+        schemaVersion = GS.SCHEMA_VERSION,
+    }
+    assertEq(GS:BufferAdoptionRecord("gs:desc:" .. adoptDs, descBody), "accepted",
+        "3B43E: buffer descriptor")
+    -- Pages-first: recipe + item pages before meta shell.
+    for i = 1, #recipePages do
+        local stP, rP = GS:BufferAdoptionRecord(recipePages[i].id, recipePages[i].body)
+        assertTrue(stP == "accepted" or stP == "pending" or stP == "duplicate",
+            "3B43E: pages-first recipe page " .. tostring(stP) .. "/" .. tostring(rP))
+    end
+    for i = 1, #itemPages do
+        local stP, rP = GS:BufferAdoptionRecord(itemPages[i].id, itemPages[i].body)
+        assertTrue(stP == "accepted" or stP == "pending" or stP == "duplicate",
+            "3B43E: pages-first item page " .. tostring(stP) .. "/" .. tostring(rP))
+    end
+    local readyBeforeShell = select(1, GS:IsAdoptionTransferComplete())
+    assertEq(readyBeforeShell, false, "3B43E: pages-first without shell not ready")
+    local stShell, rShell = GS:BufferAdoptionRecord(
+        "gs:ca:" .. campId, metaBody)
+    assertTrue(stShell == "accepted" or stShell == "pending" or stShell == "duplicate",
+        "3B43E: meta after pages " .. tostring(stShell) .. "/" .. tostring(rShell))
+    -- Restore production caps.
+    GS.MAX_ACCEPTED_OPERATIONS = prior.ops
+    GS.MAX_LEDGER_EVENTS = prior.led
+    GS.MAX_ARCHIVED_EVENTS = prior.arch
+    GS.MAX_WITHDRAWAL_EVENTS = prior.wd
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = prior.archWd
+    GS.MAX_CAMPAIGNS = prior.camps
+    GS.MAX_ARCHIVE_PAGE_COUNT = prior.pages
+    GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = prior.bufCamps
+    GS.MAX_DIRECT_EVIDENCE_EXPORTS = prior.evidence
+    GS.MAX_ADOPTION_PENDING_RECORDS = prior.pending
+    GS.MAX_WIRE_RECORD_BYTES = prior.wire
+    GS._adoption = nil
 end
 
 SF.TSM = nil

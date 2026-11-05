@@ -57,22 +57,36 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- independent of donation history; valuations remain donation-bounded.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
--- Campaign/archive structure: headers + archive meta + item/eligibility pages +
--- recipe pages. Item and recipe pages each use MAX_ARCHIVE_PAGE_COUNT in the
--- producer (Gossip archive export); do not use an opaque per-campaign multiplier.
-GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
-    + (GS.MAX_LEDGER_EVENTS or 4096)
-    + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
-    + (GS.MAX_ARCHIVED_EVENTS or 4096)
-    + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
-    + (GS.MAX_LEDGER_EVENTS or 4096)
-    + (GS.MAX_ARCHIVED_EVENTS or 4096)
-    + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-    + (GS.MAX_CAMPAIGNS or 64)
-    + (GS.MAX_CAMPAIGNS or 64)
-    + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
-    + (GS.MAX_ARCHIVE_PAGE_COUNT or 512)
-    + 512
+-- Campaign/archive structure derived from producer + retention constraints:
+-- - Campaign headers (live + archived identities) ≤ MAX_CAMPAIGNS.
+-- - Archive count ≤ MAX_CAMPAIGNS (Campaigns.lua); each archive exports one meta.
+-- - BuildArchiveExportBodies applies MAX_ARCHIVE_PAGE_COUNT per archive for item
+--   and recipe pages. Dataset-wide page capacity uses the transfer-supported
+--   concurrent archive-campaign bound (MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS), which
+--   is the real cross-history constraint for page-heavy archives in adoption —
+--   not a blind MAX_CAMPAIGNS × page-ceiling product, and not a single global
+--   page ceiling that under-counts multi-archive exports.
+do
+    local maxCampaigns = GS.MAX_CAMPAIGNS or 64
+    local archiveCampaigns = math.min(
+        maxCampaigns,
+        GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
+    )
+    local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+        + (GS.MAX_LEDGER_EVENTS or 4096)
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_EVENTS or 4096)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_LEDGER_EVENTS or 4096)
+        + (GS.MAX_ARCHIVED_EVENTS or 4096)
+        + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
+        + maxCampaigns
+        + maxCampaigns
+        + (archiveCampaigns * pagesPerArchive)
+        + (archiveCampaigns * pagesPerArchive)
+        + 512
+end
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
 GS.MAX_ADOPTION_ASSEMBLY_OPS = 24
 GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24)
