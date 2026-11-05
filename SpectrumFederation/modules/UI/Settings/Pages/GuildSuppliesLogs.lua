@@ -38,6 +38,7 @@ local cachedProjectionKey = nil
 local refreshQueued = false
 local rosterFrame = nil
 local passCache = nil
+local OpenEditContributorDialog
 
 local function BeginRenderPass()
 	passCache = {}
@@ -364,6 +365,10 @@ local function BuildProjectedRows()
 				end
 			end
 		end
+		local canEdit = Caps().canEdit == true
+			and type(event.id) == "string"
+			and event.id ~= ""
+			and event.uncredited ~= true
 		rows[#rows + 1] = {
 			contributor = contributorDisplay,
 			contributorKey = contributorName,
@@ -374,9 +379,181 @@ local function BuildProjectedRows()
 			id = event.id,
 			kind = kind,
 			timestamp = event.timestamp,
+			showAction = canEdit,
+			actionLabel = Loc("GUILD_SUPPLIES_LOGS_EDIT_ACTION", "Edit"),
+			onAction = canEdit and OpenEditContributorDialog or nil,
+			_eventKind = kind,
+			_contributorName = contributorName,
+			_quantityText = quantityText,
+			_itemText = itemText,
 		}
 	end
 	return finish(rows)
+end
+
+---------------------------------------------------------------------------
+-- Officer Edit contributor (#459). Session-only dialog state; no chat output.
+---------------------------------------------------------------------------
+
+local editRosterCache = {
+	guildKey = nil,
+	generation = nil,
+	byLower = {},
+}
+
+local function EditRosterGeneration()
+	local GG = SF.GuildGossip
+	if GG and GG.GetGuildGeneration then
+		return tonumber(GG.GetGuildGeneration()) or 0
+	end
+	return 0
+end
+
+local function EnsureEditRosterCache()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local key = (ctx and ctx.guildKey) or "none"
+	local gen = EditRosterGeneration()
+	if editRosterCache.guildKey == key
+		and editRosterCache.generation == gen
+		and type(editRosterCache.byLower) == "table" then
+		return editRosterCache
+	end
+	local byLower = {}
+	if type(GetNumGuildMembers) == "function" and type(GetGuildRosterInfo) == "function" then
+		local total = tonumber(GetNumGuildMembers()) or 0
+		if total < 0 then
+			total = 0
+		end
+		for i = 1, total do
+			local rosterName = GetGuildRosterInfo(i)
+			local norm = rosterName
+			if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+				norm = SF.NameUtil.NormalizeNameRealm(rosterName) or rosterName
+			end
+			if type(norm) == "string" and norm ~= "" then
+				local lower = string.lower(norm)
+				if not byLower[lower] then
+					byLower[lower] = norm
+				end
+			end
+		end
+	end
+	editRosterCache.guildKey = key
+	editRosterCache.generation = gen
+	editRosterCache.byLower = byLower
+	return editRosterCache
+end
+
+local function ResolveEditAttribution(text, allowUnassigned)
+	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	if trimmed == "" or string.lower(trimmed) == string.lower(unassigned) then
+		if allowUnassigned then
+			return nil, true, nil
+		end
+		return nil, false, "invalid_attribution"
+	end
+	local cache = EnsureEditRosterCache()
+	local exact = cache.byLower[string.lower(trimmed)]
+	if exact then
+		return exact, true, nil
+	end
+	return nil, false, "invalid_attribution"
+end
+
+local function ReportLogsStatus(status, reason)
+	local panel = Page.panel
+	local section = panel and panel.__sfPrimarySection
+	local g = GS()
+	local message, severity
+	if g and g.FormatMutationFeedback then
+		message, severity = g.FormatMutationFeedback(status, reason)
+	else
+		message = tostring(status or "rejected")
+		severity = (status == "accepted" and "success")
+			or (status == "duplicate" and "info")
+			or (status == "pending" and "warn")
+			or "error"
+	end
+	if section and section.SetMessage then
+		section:SetMessage(message, severity)
+	end
+	cachedProjectedRows = nil
+	cachedProjectionKey = nil
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+OpenEditContributorDialog = function(eventId, rowData)
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		return
+	end
+	if type(eventId) ~= "string" or eventId == "" then
+		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	local kind = rowData and rowData._eventKind or rowData and rowData.kind
+	local allowUnassigned = kind == "adjustment"
+	local current = (rowData and rowData._contributorName) or ""
+	local itemText = (rowData and rowData._itemText) or ""
+	local qtyText = (rowData and rowData._quantityText) or ""
+	local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not Dialogs or not Dialogs.Prompt then
+		ReportLogsStatus("rejected", "api_unavailable")
+		return
+	end
+	local prompt = Loc("GUILD_SUPPLIES_LOGS_EDIT_PROMPT",
+		"Edit contributor for %s × %s.\nCurrent credit: %s.\nEnter an exact guild character name%s:")
+		:format(
+			tostring(qtyText),
+			tostring(itemText),
+			tostring(current),
+			allowUnassigned
+				and Loc("GUILD_SUPPLIES_LOGS_EDIT_PROMPT_UNASSIGNED",
+					" (or Unassigned)")
+				or "")
+	Dialogs:Prompt(prompt, Loc("GUILD_SUPPLIES_LOGS_EDIT_CONTINUE", "Continue"), current,
+		function(text)
+			if Caps().canEdit ~= true then
+				ReportLogsStatus("rejected", "unauthorized")
+				return
+			end
+			local attributed, resolved, resolveErr = ResolveEditAttribution(text, allowUnassigned)
+			if not resolved then
+				ReportLogsStatus("rejected", resolveErr or "invalid_attribution")
+				return
+			end
+			local g = GS()
+			if not g or not g.NewContributorCorrectionOperation then
+				ReportLogsStatus("rejected", "unsupported_kind")
+				return
+			end
+			local op, status, reason = g:NewContributorCorrectionOperation(eventId, attributed, nil)
+			if not op then
+				ReportLogsStatus(status or "rejected", reason or "invalid_value")
+				return
+			end
+			local newLabel = attributed
+				or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+			local confirm = Loc("GUILD_SUPPLIES_LOGS_EDIT_CONFIRM",
+				"Move contribution credit for %s × %s\nfrom %s\nto %s?\nItem, quantity, and original evidence stay unchanged.")
+				:format(tostring(qtyText), tostring(itemText), tostring(current), tostring(newLabel))
+			if not Dialogs.Confirm then
+				ReportLogsStatus("rejected", "api_unavailable")
+				return
+			end
+			Dialogs:Confirm(confirm, Loc("GUILD_SUPPLIES_LOGS_EDIT_SAVE", "Save correction"), function()
+				if Caps().canEdit ~= true then
+					ReportLogsStatus("rejected", "unauthorized")
+					return
+				end
+				local applyStatus, applyReason = g:ApplyStagedConfigOperation(op)
+				ReportLogsStatus(applyStatus, applyReason)
+			end)
+		end)
 end
 
 local function FilteredRows()
@@ -579,17 +756,23 @@ local function Definition()
 							{
 								key = "contributor",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_CONTRIBUTOR", "Contributor"),
-								width = 200,
+								width = 180,
 							},
 							{
 								key = "quantity",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_QUANTITY", "Quantity"),
-								width = 90,
+								width = 80,
 								justifyH = "RIGHT",
 							},
 							{
 								key = "item",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_ITEM", "Item"),
+							},
+							{
+								key = "editAction",
+								kind = "action",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_EDIT", "Edit"),
+								width = 70,
 							},
 						},
 						emptyText = EmptyLogsText,
@@ -790,6 +973,8 @@ Page.__sfTest = {
 		EndRenderPass()
 		return rows, calls
 	end,
+	OpenEditContributorDialog = OpenEditContributorDialog,
+	ResolveEditAttribution = ResolveEditAttribution,
 }
 
 EnsureRosterListener()

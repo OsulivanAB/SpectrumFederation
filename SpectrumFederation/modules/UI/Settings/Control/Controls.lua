@@ -3291,43 +3291,55 @@ function Controls:AddLogTable(section, opts)
 			dataRow.Cells = {}
 			for columnIndex, column in ipairs(columns) do
 				local cell = CreateFrame("Frame", nil, dataRow)
-				local text = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-				text:SetPoint("LEFT", cell, "LEFT", 4, 0)
-				text:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
-				text:SetJustifyH(column.justifyH or "LEFT")
-				if text.SetWordWrap then
-					text:SetWordWrap(false)
+				-- Opt-in action cells (#459). Default columns stay text-only so
+				-- Loot Logs and other consumers are unchanged.
+				if column.kind == "action" then
+					local button = CreateFrame("Button", nil, cell, "UIPanelButtonTemplate")
+					button:SetPoint("LEFT", cell, "LEFT", 2, 0)
+					button:SetPoint("RIGHT", cell, "RIGHT", -2, 0)
+					button:SetHeight(math.max(16, (rowHeight or 22) - 6))
+					button:Hide()
+					cell.ActionButton = button
+					cell:EnableMouse(false)
+				else
+					local text = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+					text:SetPoint("LEFT", cell, "LEFT", 4, 0)
+					text:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
+					text:SetJustifyH(column.justifyH or "LEFT")
+					if text.SetWordWrap then
+						text:SetWordWrap(false)
+					end
+					if text.SetMaxLines then
+						text:SetMaxLines(1)
+					end
+					cell.Text = text
+					cell:EnableMouse(true)
+					cell:SetScript("OnEnter", function()
+						dataRow.Hover:Show()
+						if cell.hyperlink and GameTooltip and GameTooltip.SetHyperlink then
+							GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
+							GameTooltip:SetHyperlink(cell.hyperlink)
+							GameTooltip:Show()
+						elseif dataRow.__sfTooltip then
+							ShowRowTooltip(dataRow)
+						end
+					end)
+					cell:SetScript("OnLeave", function()
+						dataRow.Hover:Hide()
+						if GameTooltip and GameTooltip.Hide then
+							GameTooltip:Hide()
+						end
+					end)
+					cell:SetScript("OnMouseUp", function()
+						local itemRef = cell.itemRef
+						if type(itemRef) ~= "string" or itemRef == "" then
+							return
+						end
+						if type(SetItemRef) == "function" then
+							SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
+						end
+					end)
 				end
-				if text.SetMaxLines then
-					text:SetMaxLines(1)
-				end
-				cell.Text = text
-				cell:EnableMouse(true)
-				cell:SetScript("OnEnter", function()
-					dataRow.Hover:Show()
-					if cell.hyperlink and GameTooltip and GameTooltip.SetHyperlink then
-						GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
-						GameTooltip:SetHyperlink(cell.hyperlink)
-						GameTooltip:Show()
-					elseif dataRow.__sfTooltip then
-						ShowRowTooltip(dataRow)
-					end
-				end)
-				cell:SetScript("OnLeave", function()
-					dataRow.Hover:Hide()
-					if GameTooltip and GameTooltip.Hide then
-						GameTooltip:Hide()
-					end
-				end)
-				cell:SetScript("OnMouseUp", function()
-					local itemRef = cell.itemRef
-					if type(itemRef) ~= "string" or itemRef == "" then
-						return
-					end
-					if type(SetItemRef) == "function" then
-						SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
-					end
-				end)
 				dataRow.Cells[columnIndex] = cell
 			end
 
@@ -3338,21 +3350,57 @@ function Controls:AddLogTable(section, opts)
 		local function BindRow(dataRow, rowData, enabled, availableWidth)
 			dataRow:SetAlpha(enabled and 1 or 0.45)
 			dataRow.__sfTooltip = type(rowData) == "table" and rowData.tooltip or nil
+			-- Bind against the current row payload (event id), never the pool index.
+			dataRow.__sfRowData = rowData
 			for columnIndex, column in ipairs(columns) do
-				local value = rowData and rowData[column.key]
 				local cell = dataRow.Cells[columnIndex]
-				cell.Text:SetText(value or "")
-				local hyperlink
-				local itemRef
-				if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
-					hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+				if column.kind == "action" then
+					local button = cell.ActionButton
+					if button then
+						button:SetScript("OnClick", nil)
+						local show = enabled and type(rowData) == "table"
+							and rowData.showAction == true
+							and type(rowData.onAction) == "function"
+						if show then
+							local label = rowData.actionLabel
+							if type(label) ~= "string" or label == "" then
+								label = column.label or "Edit"
+							end
+							button:SetText(label)
+							-- Capture durable id at bind time so recycled frames
+							-- always invoke the newly bound entry.
+							local boundId = rowData.id
+							local boundAction = rowData.onAction
+							button:SetScript("OnClick", function()
+								if type(boundAction) == "function" then
+									boundAction(boundId, dataRow.__sfRowData)
+								end
+							end)
+							button:Show()
+							if button.Enable then
+								button:Enable()
+							end
+						else
+							button:Hide()
+						end
+					end
+				else
+					local value = rowData and rowData[column.key]
+					if cell.Text then
+						cell.Text:SetText(value or "")
+					end
+					local hyperlink
+					local itemRef
+					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+					end
+					if SF.LootLog and SF.LootLog.ExtractItemRef then
+						itemRef = SF.LootLog.ExtractItemRef(value)
+					end
+					cell.hyperlink = hyperlink
+					cell.itemRef = itemRef
+					cell.itemLinkText = hyperlink and value or nil
 				end
-				if SF.LootLog and SF.LootLog.ExtractItemRef then
-					itemRef = SF.LootLog.ExtractItemRef(value)
-				end
-				cell.hyperlink = hyperlink
-				cell.itemRef = itemRef
-				cell.itemLinkText = hyperlink and value or nil
 			end
 			if availableWidth and availableWidth > 0 then
 				LayoutCells(dataRow, dataRow.Cells, availableWidth)
