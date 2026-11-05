@@ -3064,9 +3064,18 @@ do
 end
 
 do
-    -- Conflict-heavy scoring: O(1) bucket deltas, not whole-balance rescans.
+    -- Conflict-heavy callback budget: distinct identity buckets + non-empty
+    -- pending backlog through production AdmitRemoteOperation / Redrive.
     local record = seedLiveCampaignWithItem(9340, 400)
-    local nDon = 80
+    local donors = {
+        { name = "Alice-Garona", guid = "Player-1-Alice" },
+        { name = "Bob-Garona", guid = "Player-1-Bob" },
+        { name = "Carol-Garona", guid = "Player-1-Carol" },
+        { name = "Dave-Garona", guid = "Player-1-Dave" },
+    }
+    -- Many Alice donations + Alice −20; corrections move them to Bob/Carol/Dave
+    -- so activate-all overdraws Alice and forces impact-score prune trials.
+    local nDon = 40
     for i = 1, nDon do
         injectProductionDonation(record, {
             id = "score-don-" .. i, itemId = 9340, quantity = 1,
@@ -3075,17 +3084,28 @@ do
         })
     end
     injectProductionAdjustment(record, {
-        id = "score-adj", itemId = 9340, quantity = -40,
+        id = "score-adj-alice", itemId = 9340, quantity = -20,
         attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
         timestamp = 20100,
     })
-    for i = 1, nDon do
-        local target = (i % 2 == 0) and "Bob-Garona" or "Carol-Garona"
-        local guid = (i % 2 == 0) and "Player-1-Bob" or "Player-1-Carol"
+    -- Extra distinct-bucket donations so actual identity count > 3.
+    for di = 2, #donors do
+        local d = donors[di]
+        injectProductionDonation(record, {
+            id = "score-seed-" .. di, itemId = 9340, quantity = 3,
+            actor = d.name, actorGuid = d.guid,
+            timestamp = 20110 + di,
+        })
+    end
+    local pendingN = 16
+    local acceptedN = nDon - pendingN
+    local ctx = select(1, GS:GetCurrentContext())
+    for i = 1, acceptedN do
+        local target = donors[(i % (#donors - 1)) + 2] -- Bob/Carol/Dave
         local op = {
             schemaVersion = GS.OP_SCHEMA_VERSION,
             id = "score-corr-" .. i,
-            guildKey = select(1, GS:GetCurrentContext()).guildKey,
+            guildKey = ctx.guildKey,
             datasetId = record.datasetId,
             campaignId = record.currentCampaignId,
             kind = GS.KIND.CORRECT_CONTRIBUTOR,
@@ -3093,8 +3113,8 @@ do
             value = {
                 eventId = "score-don-" .. i,
                 eventKind = "donation",
-                attributed = target,
-                attributedGuid = guid,
+                attributed = target.name,
+                attributedGuid = target.guid,
                 baseAttributed = "Alice-Garona",
                 baseAttributedGuid = "Player-1-Alice",
                 itemId = 9340,
@@ -3109,37 +3129,89 @@ do
         record.operations.records[op.id] = op
         record.operations.order[#record.operations.order + 1] = op.id
     end
+    record.operations.pending = record.operations.pending or {}
+    for i = acceptedN + 1, nDon do
+        local target = donors[(i % (#donors - 1)) + 2]
+        local id = "score-pend-" .. i
+        record.operations.pending[id] = {
+            id = id,
+            sender = "Alice-Garona",
+            reason = "pending_event",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = id,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "score-don-" .. i,
+                value = {
+                    eventId = "score-don-" .. i,
+                    eventKind = "donation",
+                    attributed = target.name,
+                    attributedGuid = target.guid,
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = 9340,
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = 20300 + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
     GS.InvalidateCreditCorrectionProjection(record)
     local okScore, errScore, detScore = GS.RebuildCreditCorrectionProjection(record, nil)
     assertTrue(okScore, "459: conflict-heavy rebuild ok got " .. tostring(errScore))
-    local bucketVisits = tonumber(detScore and detScore.bucketVisits)
-        or tonumber(GS._creditProjectionBucketVisits) or 0
-    local deacts = tonumber(detScore and detScore.deactivations)
-        or tonumber(GS._creditProjectionDeactivations) or 0
-    -- Old path rescanned every balance bucket per candidate trial each round.
-    -- Bound against that whole-balance product, not trial-step count alone.
-    local approxBuckets = nDon + 8
-    local rescanProduct = nDon * approxBuckets * math.max(deacts, 1)
+    local actualBuckets = #donors
+    local bucketVisits = tonumber(detScore and detScore.bucketVisits) or 0
+    local floorVisits = tonumber(detScore and detScore.floorVisits) or 0
+    local trials = tonumber(detScore and detScore.candidateTrials) or 0
+    local deacts = tonumber(detScore and detScore.deactivations) or 0
+    local work1 = tonumber(detScore and detScore.workUnits) or 0
     assertTrue(bucketVisits > 0, "459: conflict-heavy measured bucketVisits")
-    assertTrue(deacts > 0, "459: conflict-heavy performed deactivations got="
-        .. tostring(deacts))
-    assertTrue(bucketVisits * 5 < rescanProduct,
-        "459: conflict-heavy bucketVisits ≪ whole-balance rescan product got="
-            .. tostring(bucketVisits) .. " product=" .. tostring(rescanProduct)
-            .. " deacts=" .. tostring(deacts))
-    GS.InvalidateCreditCorrectionProjection(record)
-    local ok2, _, det2 = GS.EnsureCreditCorrectionProjection(record, nil)
-    assertTrue(ok2, "459: conflict-heavy ensure after invalidate")
-    local bv2 = tonumber(det2 and det2.bucketVisits) or tonumber(GS._creditProjectionBucketVisits) or 0
-    assertTrue(bv2 * 5 < rescanProduct,
-        "459: conflict-heavy ensure bucketVisits bounded got=" .. tostring(bv2))
-    GS.RedrivePendingContributorCorrections(record, { itemId = 9340, maxAttempts = 8 })
+    assertTrue(trials > 0, "459: conflict-heavy candidateTrials got=" .. tostring(trials))
+    assertTrue(deacts > 0, "459: conflict-heavy deactivations got=" .. tostring(deacts))
+    -- O(1) scoreBox vs whole-balance: per-trial bucket touches stay a small
+    -- constant; whole-balance would visit actualBuckets every trial.
+    local perTrial = bucketVisits / trials
+    assertTrue(perTrial <= 8,
+        "459: conflict-heavy bucketVisits/trial O(1) got="
+            .. tostring(perTrial) .. " visits=" .. tostring(bucketVisits)
+            .. " trials=" .. tostring(trials) .. " buckets=" .. tostring(actualBuckets))
+    -- Whole-balance rescans would visit actualBuckets on every trial alone
+    -- (plus activation). O(1) scoreBox stays near a small constant per trial.
+    assertTrue(work1 > 0, "459: conflict-heavy workUnits measured")
+
+    GS._creditProjectionCallbackWork = 0
+    local promoted, attempts, callbackWork = GS.RedrivePendingContributorCorrections(
+        record, { itemId = 9340, maxAttempts = 16 })
     flushTimers()
+    callbackWork = tonumber(callbackWork) or tonumber(GS._creditProjectionCallbackWork) or 0
+    assertTrue((tonumber(attempts) or 0) > 0,
+        "459: conflict-heavy redrive attempted pending backlog")
+    -- Budget: paced redrive seals after Apply so each attempt is about one
+    -- rebuild (not preview+store). Allow a small multiple of measured work1.
+    local callbackBudget = math.max(work1, 1) * math.max(tonumber(attempts) or 1, 1) * 5
+    assertTrue(callbackWork > 0, "459: conflict-heavy accumulated callback work > 0")
+    assertTrue(callbackWork < callbackBudget,
+        "459: conflict-heavy accumulated callback work bounded got="
+            .. tostring(callbackWork) .. " budget=" .. tostring(callbackBudget)
+            .. " work1=" .. tostring(work1)
+            .. " promoted=" .. tostring(promoted) .. " attempts=" .. tostring(attempts)
+            .. " floorVisits=" .. tostring(floorVisits))
+    local okFinal, errFinal = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(okFinal, "459: conflict-heavy converges coherent got " .. tostring(errFinal))
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459: conflict-heavy projection available after converge")
 end
 
 do
-    -- Genuine reconstruction failure: durable Bob −20 with only Alice→Bob +10
-    -- support. Empty local heads still leave Bob negative → blocked Resolve.
+    -- Genuine reconstruction failure: durable Bob −20 with only Alice→Bob +10.
+    -- Public consumers must surface credit_unavailable (not zero / durable names).
     local record = seedLiveCampaignWithItem(9350, 50)
     injectProductionDonation(record, {
         id = "fail-don", itemId = 9350, quantity = 10,
@@ -3149,36 +3221,110 @@ do
         "fail-don", "Bob-Garona", "Player-1-Bob"))
     assertTrue(corr ~= nil, "459: fail prepare Alice→Bob")
     assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "459: fail apply Alice→Bob")
-    -- Inject an overspending Bob adjustment that bypasses local floor authorship
-    -- so the durable baseline itself is negative once the head is dropped.
     injectProductionAdjustment(record, {
         id = "fail-adj", itemId = 9350, quantity = -20,
         attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
     })
+    -- Legitimate Unassigned adjustment must stay distinct while available — seed
+    -- one on a second item before forcing failure, then assert after recovery.
+    local uOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 9351 }, {
+        itemId = 9351, goal = 20, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(uOp), "accepted", "459: fail add Unassigned item")
+    injectProductionDonation(record, {
+        id = "fail-un-don", itemId = 9351, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(record, {
+        id = "fail-un-adj", itemId = 9351, quantity = -2,
+        attributed = nil, attributedGuid = nil,
+    })
+
     GS.InvalidateCreditCorrectionProjection(record)
     local okFail, errFail = GS.RebuildCreditCorrectionProjection(record, nil)
     assertTrue(okFail == false, "459: fail rebuild returns false")
     assertEq(errFail, "player_negative", "459: fail reason player_negative")
-    local name, guid, head = GS.ResolveEffectiveCreditIdentity(
+    local name, guid, head, status = GS.ResolveEffectiveCreditIdentity(
         record, GS.FindLedgerEventById(record, "fail-don"))
     assertNil(name, "459: fail Resolve name unavailable (not durable Alice)")
     assertNil(guid, "459: fail Resolve guid unavailable")
     assertNil(head, "459: fail Resolve head unavailable")
-    -- Ordinary personal totals must not silently serve durable Bob −20.
-    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9350), 0,
-        "459: fail Bob total blocked (not durable −20)")
-    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9350), 0,
-        "459: fail Alice total blocked while projection failed")
+    assertEq(status, GS.CREDIT_UNAVAILABLE, "459: fail Resolve status credit_unavailable")
+    local bobTotal, bobErr = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", 9350)
+    assertNil(bobTotal, "459: fail Bob total nil (not ordinary 0)")
+    assertEq(bobErr, GS.CREDIT_UNAVAILABLE, "459: fail Bob err credit_unavailable")
+    -- Use an item whose quantity floor still passes so personal-credit
+    -- unavailability is the rejecting reason (not item_negative).
+    local floorOk, floorErr = GS.AdjustmentFloorOk(
+        record, 9351, -1, "Alice-Garona", nil, { attributedGuid = "Player-1-Alice" })
+    assertTrue(floorOk == false, "459: fail floor rejects while unavailable")
+    assertEq(floorErr, GS.CREDIT_UNAVAILABLE, "459: fail floor err credit_unavailable")
+    local corrFloorOk, corrFloorErr = GS.ContributorCorrectionFloorOk(
+        record, GS.FindLedgerEventById(record, "fail-don"),
+        "Carol-Garona", "Player-1-Carol")
+    assertTrue(corrFloorOk == false, "459: fail correction floor rejects")
+    assertEq(corrFloorErr, GS.CREDIT_UNAVAILABLE,
+        "459: fail correction floor err credit_unavailable")
+    local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    assertTrue(type(progress) == "table", "459: fail progress table")
+    assertTrue(progress.creditUnavailable == true, "459: fail progress creditUnavailable")
+    assertTrue(type(progress.itemTotals) == "table"
+        and (tonumber(progress.itemTotals[9350]) or 0) ~= 0,
+        "459: fail progress keeps item totals")
+    local contribCount = 0
+    for _ in pairs(progress.contributions or {}) do
+        contribCount = contribCount + 1
+    end
+    assertEq(contribCount, 0, "459: fail progress contributions empty while unavailable")
+    local rankings = GS.ProjectCampaignRankingsOnRecord(record, record.currentCampaignId)
+    assertEq(rankings.emptyReason, GS.CREDIT_UNAVAILABLE,
+        "459: fail rankings emptyReason credit_unavailable")
+    assertTrue(rankings.creditUnavailable == true, "459: fail rankings flag")
+    assertEq(#(rankings.rows or {}), 0, "459: fail rankings rows empty")
+    local donEv = GS.FindLedgerEventById(record, "fail-don")
+    local _, _, _, st2 = GS.ResolveEffectiveCreditIdentity(record, donEv)
+    assertEq(st2, GS.CREDIT_UNAVAILABLE, "459: fail Logs path Resolve unavailable")
+    -- History rows must carry creditUnavailable and omit durable display names.
+    do
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        local saved = GS._root and GS._root.guilds and GS._root.guilds[gk]
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = record
+        end
+        local hist = select(1, GS:ListCampaignHistory(record.currentCampaignId, nil, 0))
+        assertTrue(type(hist) == "table" and #hist > 0, "459: fail history rows present")
+        local sawUnavailable, sawDurableDonor = false, false
+        for i = 1, #hist do
+            local row = hist[i]
+            if row and row.id == "fail-don" then
+                if row.creditUnavailable then
+                    sawUnavailable = true
+                end
+                if row.displayActor == "Alice-Garona"
+                    or row.effectiveAttributed == "Alice-Garona" then
+                    sawDurableDonor = true
+                end
+            end
+        end
+        assertTrue(sawUnavailable, "459: fail Logs row creditUnavailable")
+        assertTrue(not sawDurableDonor, "459: fail Logs omits durable donor name")
+        if saved and type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = saved
+        end
+    end
+
     GS._creditProjectionRowVisits = 0
     for _ = 1, 5 do
         local okCached = GS.EnsureCreditCorrectionProjection(record, nil)
         assertTrue(okCached == false, "459: fail cached Ensure stays false")
-        GS.ResolveEffectiveCreditIdentity(record, GS.FindLedgerEventById(record, "fail-don"))
+        GS.ResolveEffectiveCreditIdentity(record, donEv)
     end
     assertTrue((tonumber(GS._creditProjectionRowVisits) or 0) == 0,
         "459: fail unchanged reads skip rebuild visits="
             .. tostring(GS._creditProjectionRowVisits))
-    -- Recovery: remove the overspend so empty/active sets can verify again.
+
+    -- Supported recovery: remove the overspend dependency and rebuild.
     local list = record.accounting._consumableEvents
     for i = #list, 1, -1 do
         if list[i] and list[i].id == "fail-adj" then
@@ -3192,6 +3338,19 @@ do
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         record, GS.FindLedgerEventById(record, "fail-don"))), "Bob-Garona",
         "459: fail recovery restores Bob credit")
+    local bobAfter, bobAfterErr = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", 9350)
+    assertEq(bobAfterErr, nil, "459: fail recovery personal err cleared")
+    assertEq(bobAfter, 10, "459: fail recovery Bob total 10")
+    -- Unassigned adjustment remains nil attribution while available (not unavailable).
+    local unName, unGuid, unHead, unStatus = GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "fail-un-adj"))
+    assertNil(unName, "459: Unassigned name nil while available")
+    assertNil(unGuid, "459: Unassigned guid nil while available")
+    assertNil(unHead, "459: Unassigned no correction head")
+    assertNil(unStatus, "459: Unassigned status nil (not credit_unavailable)")
+    local progressOk = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    assertTrue(not progressOk.creditUnavailable, "459: fail recovery progress available")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

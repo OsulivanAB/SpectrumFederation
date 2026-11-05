@@ -8059,11 +8059,17 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             GS._StoreAccepted(ops, stored, targetKey)
         end
         if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
-            if GS.InvalidateCreditCorrectionProjection then
-                GS.InvalidateCreditCorrectionProjection(record)
-            end
-            if GS.EnsureCreditCorrectionProjection then
-                GS.EnsureCreditCorrectionProjection(record, nil)
+            -- Redrive already rebuilt with this op as extraOp in Apply; seal the
+            -- stamp after store instead of a second full rebuild (#459 budget).
+            if admissionCtx._creditRedrive and GS.SealCreditCorrectionProjection then
+                GS.SealCreditCorrectionProjection(record, true)
+            else
+                if GS.InvalidateCreditCorrectionProjection then
+                    GS.InvalidateCreditCorrectionProjection(record)
+                end
+                if GS.EnsureCreditCorrectionProjection then
+                    GS.EnsureCreditCorrectionProjection(record, nil)
+                end
             end
             if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
                 and GS.RedrivePendingContributorCorrections then

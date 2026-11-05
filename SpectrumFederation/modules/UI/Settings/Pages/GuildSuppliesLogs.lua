@@ -326,7 +326,18 @@ local function BuildProjectedRows()
 		local contributorName
 		local contributorGuid
 		local quantityText
-		if kind == "adjustment" then
+		if event.creditUnavailable then
+			-- Reconstruction blocked: never restore durable donor/attributed (#459).
+			contributorName = Loc("GUILD_SUPPLIES_HISTORY_CREDIT_UNAVAILABLE", "Credit unavailable")
+			contributorGuid = nil
+			if kind == "adjustment" then
+				local qty = tonumber(event.quantity) or 0
+				quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_SIGNED", "%+d"):format(qty)
+			else
+				local qty = math.abs(tonumber(event.quantity) or 0)
+				quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_PLAIN", "%d"):format(qty)
+			end
+		elseif kind == "adjustment" then
 			local hasCorrection = type(event.creditCorrection) == "table"
 			local credited = event.displayAttributed
 			if credited == nil and hasCorrection then
@@ -343,6 +354,7 @@ local function BuildProjectedRows()
 					contributorGuid = event.effectiveAttributedGuid or event.attributedGuid
 				end
 			else
+				-- Legitimate Unassigned while credit projection is available.
 				contributorName = unassigned
 				contributorGuid = nil
 			end

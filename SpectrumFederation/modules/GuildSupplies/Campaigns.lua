@@ -889,8 +889,14 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
 
     local itemTotals = {}
     local contributions = {}
+    -- Item totals stay quantity-based even when credit attribution is blocked.
+    local creditUnavailable = false
+    if GS.EnsureCreditCorrectionProjection
+        and GS.EnsureCreditCorrectionProjection(record, nil) == false then
+        creditUnavailable = true
+    end
     -- One read-only resolution context for the whole projection (not per event).
-    local resolveCtx = GS.BeginContributorProjectionContext
+    local resolveCtx = (not creditUnavailable) and GS.BeginContributorProjectionContext
         and GS.BeginContributorProjectionContext(record) or nil
     ForEachCampaignLedgerEvent(record, generation, function(event)
         -- Active datasets exclude pre-activation staged accounting from live totals.
@@ -906,10 +912,19 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
         if IsDonationEvent(event) then
             if qty > 0 then
                 itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
+                if creditUnavailable then
+                    return
+                end
                 -- Effective credit (#459) then current Guild Info main projection.
-                local creditName, creditGuid = event.actor, event.actorGuid or event.donorGuid
+                local creditName, creditGuid, _, status = event.actor,
+                    event.actorGuid or event.donorGuid, nil, nil
                 if GS.ResolveEffectiveCreditIdentity then
-                    creditName, creditGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+                    creditName, creditGuid, _, status =
+                        GS.ResolveEffectiveCreditIdentity(record, event)
+                    if status == (GS.CREDIT_UNAVAILABLE or "credit_unavailable") then
+                        creditUnavailable = true
+                        return
+                    end
                 end
                 local actor = nil
                 if GS.ResolveDisplayContributor then
@@ -924,10 +939,19 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
             end
         elseif IsAdjustmentEvent(event) then
             itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
-            local creditName, creditGuid = event.attributed, event.attributedGuid
-            if GS.ResolveEffectiveCreditIdentity then
-                creditName, creditGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+            if creditUnavailable then
+                return
             end
+            local creditName, creditGuid, _, status = event.attributed, event.attributedGuid, nil, nil
+            if GS.ResolveEffectiveCreditIdentity then
+                creditName, creditGuid, _, status =
+                    GS.ResolveEffectiveCreditIdentity(record, event)
+                if status == (GS.CREDIT_UNAVAILABLE or "credit_unavailable") then
+                    creditUnavailable = true
+                    return
+                end
+            end
+            -- Legitimate Unassigned (nil credit while available) stays omitted.
             local credit = nil
             if creditName or creditGuid then
                 if GS.ResolveDisplayContributor then
@@ -942,10 +966,14 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
             end
         end
     end)
+    if creditUnavailable then
+        contributions = {}
+    end
     return {
         itemTotals = itemTotals,
         contributions = contributions,
         generation = generation,
+        creditUnavailable = creditUnavailable or nil,
     }
 end
 
@@ -1037,6 +1065,23 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
         }
     end
 
+    local creditUnavailable = false
+    if GS.EnsureCreditCorrectionProjection
+        and GS.EnsureCreditCorrectionProjection(record, nil) == false then
+        creditUnavailable = true
+    end
+    if creditUnavailable then
+        return {
+            campaignId = campaignId,
+            generation = generation,
+            rows = {},
+            maxPositive = 0,
+            hasHistory = true,
+            emptyReason = GS.CREDIT_UNAVAILABLE or "credit_unavailable",
+            creditUnavailable = true,
+        }
+    end
+
     local totals = {}
     local names = {}
     local hasHistory = false
@@ -1059,13 +1104,25 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
             actorName = event.actor
             actorGuid = event.actorGuid or event.donorGuid
             if GS.ResolveEffectiveCreditIdentity then
-                actorName, actorGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+                local status
+                actorName, actorGuid, _, status =
+                    GS.ResolveEffectiveCreditIdentity(record, event)
+                if status == (GS.CREDIT_UNAVAILABLE or "credit_unavailable") then
+                    creditUnavailable = true
+                    return
+                end
             end
         elseif IsAdjustmentEvent(event) then
             actorName = event.attributed
             actorGuid = event.attributedGuid
             if GS.ResolveEffectiveCreditIdentity then
-                actorName, actorGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+                local status
+                actorName, actorGuid, _, status =
+                    GS.ResolveEffectiveCreditIdentity(record, event)
+                if status == (GS.CREDIT_UNAVAILABLE or "credit_unavailable") then
+                    creditUnavailable = true
+                    return
+                end
             end
             if not actorName and not actorGuid then
                 -- Unattributed / Unassigned manual adjustments never appear on Rankings.
@@ -1091,6 +1148,18 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
         totals[display] = (totals[display] or 0) + copper
         names[display] = true
     end)
+
+    if creditUnavailable then
+        return {
+            campaignId = campaignId,
+            generation = generation,
+            rows = {},
+            maxPositive = 0,
+            hasHistory = true,
+            emptyReason = GS.CREDIT_UNAVAILABLE or "credit_unavailable",
+            creditUnavailable = true,
+        }
+    end
 
     local rows = {}
     for name in pairs(names) do
@@ -1238,6 +1307,9 @@ local function FormatHistoryTimestamp(event)
 end
 
 local function HistoryDisplayActor(record, event)
+    if type(event) == "table" and event.creditUnavailable then
+        return Loc("GUILD_SUPPLIES_HISTORY_CREDIT_UNAVAILABLE", "Credit unavailable")
+    end
     -- Prefer a precomputed projection on history rows; otherwise resolve live.
     local pre = BoundedActorName(event and event.displayActor)
     if pre then
@@ -1255,6 +1327,9 @@ local function HistoryDisplayActor(record, event)
 end
 
 local function HistoryDisplayAttribution(record, event)
+    if type(event) == "table" and event.creditUnavailable then
+        return Loc("GUILD_SUPPLIES_HISTORY_CREDIT_UNAVAILABLE", "Credit unavailable")
+    end
     -- Explicit Unassigned correction must not fall back to durable attributed (#459).
     local hasCorrection = type(event) == "table" and type(event.creditCorrection) == "table"
     if hasCorrection then
@@ -1538,14 +1613,20 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         end
         local markUncredited = isArchived and GS.IsLiveActive(record)
             and event.gsProductionCredit ~= true
-        local creditName, creditGuid, correctionHead = nil, nil, nil
+        local creditName, creditGuid, correctionHead, creditStatus = nil, nil, nil, nil
         if GS.ResolveEffectiveCreditIdentity then
-            creditName, creditGuid, correctionHead = GS.ResolveEffectiveCreditIdentity(record, event)
+            creditName, creditGuid, correctionHead, creditStatus =
+                GS.ResolveEffectiveCreditIdentity(record, event)
         end
-        local hasCorrection = type(correctionHead) == "table"
+        local creditUnavailable = creditStatus == (GS.CREDIT_UNAVAILABLE or "credit_unavailable")
+        local hasCorrection = (not creditUnavailable) and type(correctionHead) == "table"
         local displayActor = nil
         local displayAttributed = nil
-        if IsDonationEvent(event) then
+        if creditUnavailable then
+            -- Do not restore durable donor/attributed names while blocked (#459).
+            displayActor = nil
+            displayAttributed = nil
+        elseif IsDonationEvent(event) then
             -- Keep corrected recipient name/GUID paired. Never mix a corrected
             -- name with the original donor GUID (#459).
             local srcName, srcGuid
@@ -1564,6 +1645,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         elseif IsAdjustmentEvent(event) then
             local srcName, srcGuid = creditName, creditGuid
             if not hasCorrection and srcName == nil and srcGuid == nil then
+                -- Legitimate Unassigned while projection is available.
                 srcName = event.attributed
                 srcGuid = event.attributedGuid
             end
@@ -1582,8 +1664,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         end
         projected.displayActor = displayActor
         projected.displayAttributed = displayAttributed
-        projected.effectiveAttributed = creditName
-        projected.effectiveAttributedGuid = creditGuid
+        projected.effectiveAttributed = creditUnavailable and nil or creditName
+        projected.effectiveAttributedGuid = creditUnavailable and nil or creditGuid
+        projected.creditUnavailable = creditUnavailable or nil
         if hasCorrection then
             projected.creditCorrection = correctionHead
         end
@@ -1591,14 +1674,18 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         if text and text ~= "" then
             local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
             local rowDisplayAttributed
-            if hasCorrection then
+            if creditUnavailable then
+                rowDisplayAttributed = nil
+            elseif hasCorrection then
                 -- Preserve explicit Unassigned (nil) — do not fall back to durable.
                 rowDisplayAttributed = displayAttributed or creditName
             else
                 rowDisplayAttributed = displayAttributed or creditName or event.attributed
             end
             local rowDisplayActor
-            if hasCorrection then
+            if creditUnavailable then
+                rowDisplayActor = nil
+            elseif hasCorrection then
                 rowDisplayActor = displayActor or creditName
             else
                 rowDisplayActor = displayActor or creditName or event.actor
@@ -1616,8 +1703,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 attributed = event.attributed,
                 attributedGuid = event.attributedGuid,
                 displayAttributed = rowDisplayAttributed,
-                effectiveAttributed = creditName,
-                effectiveAttributedGuid = creditGuid,
+                effectiveAttributed = creditUnavailable and nil or creditName,
+                effectiveAttributedGuid = creditUnavailable and nil or creditGuid,
+                creditUnavailable = creditUnavailable or nil,
                 gsProductionCredit = event.gsProductionCredit == true or nil,
                 timestamp = event.timestamp,
                 generation = event.generation,
@@ -1808,6 +1896,8 @@ function GS.FormatReasonText(reason)
             "received quantity cannot become negative"),
         player_negative = Loc("GUILD_SUPPLIES_REASON_PLAYER_NEGATIVE",
             "that player's contribution cannot become negative"),
+        credit_unavailable = Loc("GUILD_SUPPLIES_REASON_CREDIT_UNAVAILABLE",
+            "contribution credit is temporarily unavailable while corrections reconcile"),
         adjustment_floor = Loc("GUILD_SUPPLIES_REASON_ADJUSTMENT_FLOOR",
             "that adjustment would make totals negative"),
         item_over_goal = Loc("GUILD_SUPPLIES_REASON_ITEM_OVER_GOAL",

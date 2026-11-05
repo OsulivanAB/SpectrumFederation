@@ -46,6 +46,9 @@ GS.VERIFICATION = {
     OFFICER = "officer",
 }
 
+--- Distinct from legitimate Unassigned (nil attribution) and ordinary zero totals.
+GS.CREDIT_UNAVAILABLE = "credit_unavailable"
+
 --- Durable verification label. Unknown values stay on the three-witness mode.
 function GS.CanonicalVerificationMode(mode)
     if mode == GS.VERIFICATION.OFFICER then
@@ -678,6 +681,10 @@ end
 -- Used for attributed negative-adjustment floors so linked balances cannot be
 -- spent against another character and then go negative after unassign/move.
 -- GUID-first when present; exact normalized name fallback for legacy rows.
+--- Personal credited total for one actor/item (#459).
+-- When credit projection reconstruction is failed/blocked, returns
+-- nil, GS.CREDIT_UNAVAILABLE — not the ordinary number 0 (which means a
+-- legitimate empty balance) and not durable-only identities.
 function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, campaignId)
     itemId = tonumber(itemId)
     if type(record) ~= "table" or not IsItemId(itemId) then
@@ -691,6 +698,12 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
     local identityGuid = ValidGuid(actorGuid)
     if not identityName and not identityGuid then
         return 0
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return nil, GS.CREDIT_UNAVAILABLE
+        end
     end
     local generation = nil
     if record.currentCampaignId == campaignId then
@@ -752,10 +765,13 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
             return
         end
         -- #459: personal floors follow effective credited identity, not durable
-        -- donor/attributed fields alone.
-        local creditName, creditGuid
+        -- donor/attributed fields alone. Projection already ensured available.
+        local creditName, creditGuid, _, status
         if GS.ResolveEffectiveCreditIdentity then
-            creditName, creditGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+            creditName, creditGuid, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+            if status == GS.CREDIT_UNAVAILABLE then
+                return "unavailable"
+            end
         elseif isDonation then
             creditName, creditGuid = event.actor, event.actorGuid or event.donorGuid
         else
@@ -775,12 +791,16 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
     local archived = record.accounting and record.accounting._consumableEventArchive
     if type(live) == "table" then
         for i = 1, #live do
-            consider(live[i])
+            if consider(live[i]) == "unavailable" then
+                return nil, GS.CREDIT_UNAVAILABLE
+            end
         end
     end
     if type(archived) == "table" then
         for i = 1, #archived do
-            consider(archived[i])
+            if consider(archived[i]) == "unavailable" then
+                return nil, GS.CREDIT_UNAVAILABLE
+            end
         end
     end
     return total
@@ -2545,6 +2565,9 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     if type(ops.pending) ~= "table" then
         return 0, 0
     end
+    -- Accumulate rebuild work across nested AdmitRemoteOperation callbacks.
+    GS._creditProjectionCallbackWork = 0
+    GS._creditProjectionAccumulating = true
     -- Always merge the incoming wake; never overwrite cont.opts with a narrow
     -- filter while an existing snapshot drains (A/B/C interleaving).
     local cont = MergeCreditRedriveWake(record, opts)
@@ -2640,7 +2663,8 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             ScheduleCreditRedriveContinuation(record, wasFull and {} or nil)
         end
     end
-    return promoted, attempts
+    GS._creditProjectionAccumulating = false
+    return promoted, attempts, tonumber(GS._creditProjectionCallbackWork) or 0
 end
 
 local function AppendLedgerEvent(record, event)
@@ -4659,9 +4683,17 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, 
     if attributed and quantity < 0 then
         local attrGuid = GS.ResolveUniqueCharacterGuid and GS.ResolveUniqueCharacterGuid(
             record, attributed, opts.attributedGuid) or nil
-        local personal = GS.PersonalContributorItemTotal
-            and GS.PersonalContributorItemTotal(record, attributed, attrGuid, itemId, campaignId)
-            or ActorItemTotal(record, attributed, itemId, campaignId)
+        local personal, personalErr = nil, nil
+        if GS.PersonalContributorItemTotal then
+            personal, personalErr = GS.PersonalContributorItemTotal(
+                record, attributed, attrGuid, itemId, campaignId)
+        else
+            personal = ActorItemTotal(record, attributed, itemId, campaignId)
+        end
+        if personalErr == GS.CREDIT_UNAVAILABLE or personal == nil and personalErr then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+        personal = tonumber(personal) or 0
         if personal + quantity < 0 then
             return false, "player_negative"
         end
@@ -5129,18 +5161,32 @@ function GS.CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
     return CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
 end
 
+--- True when the credit correction projection is verified for ordinary reads.
+-- Distinct from Ensure's rebuild details; false means credit_unavailable.
+function GS.IsCreditCorrectionProjectionAvailable(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    if not GS.EnsureCreditCorrectionProjection then
+        return true
+    end
+    return GS.EnsureCreditCorrectionProjection(record, nil) ~= false
+end
+
 --- Effective credited identity for one ledger event (#459).
--- When projection reconstruction is failed/blocked, returns nil (unavailable)
--- instead of silently falling back to durable identities that may be negative.
--- @return name|nil, guid|nil, correctionHead|nil
+-- When projection reconstruction is failed/blocked, returns
+-- nil, nil, nil, GS.CREDIT_UNAVAILABLE — never durable fallback.
+-- Legitimate Unassigned adjustments still return nil, nil, nil, nil while
+-- the projection is available.
+-- @return name|nil, guid|nil, correctionHead|nil, status|nil
 function GS.ResolveEffectiveCreditIdentity(record, event)
     if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
-        return nil, nil, nil
+        return nil, nil, nil, nil
     end
     if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
         local ok = GS.EnsureCreditCorrectionProjection(record, nil)
         if ok == false then
-            return nil, nil, nil
+            return nil, nil, nil, GS.CREDIT_UNAVAILABLE
         end
     end
     local map = type(record) == "table" and record.creditCorrections or nil
@@ -5155,10 +5201,10 @@ function GS.ResolveEffectiveCreditIdentity(record, event)
         end
     end
     if type(head) == "table" then
-        return NormName(head.attributed), ValidGuid(head.attributedGuid), head
+        return NormName(head.attributed), ValidGuid(head.attributedGuid), head, nil
     end
     local name, guid = DurableCreditIdentity(event)
-    return name, guid, nil
+    return name, guid, nil, nil
 end
 
 --- Count retained correction projection heads (capacity guard).
@@ -5324,6 +5370,12 @@ end
 
 --- Personal floor check against the live effective projection (#459).
 function GS.ContributorCorrectionFloorOk(record, event, newName, newGuid)
+    if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+    end
     -- Use current creditCorrections as the active map.
     local activeMap = nil
     if type(record) == "table" and type(record.creditCorrections) == "table" then
@@ -5460,6 +5512,8 @@ end
 
 local function TotalsAllNonNegative(totals)
     for _, total in pairs(totals) do
+        GS._creditProjectionFloorVisits =
+            (tonumber(GS._creditProjectionFloorVisits) or 0) + 1
         if total < 0 then
             return false
         end
@@ -5713,6 +5767,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     GS._creditProjectionLookupMisses = 0
     GS._creditProjectionDeactivations = 0
     GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
     local ops = record.operations
     local candidates = {}
     local function considerOp(op)
@@ -5862,6 +5918,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         for i = 1, #bound do
             local entry = bound[i]
             if entry and activeMap[entry.event.id] then
+                GS._creditProjectionCandidateTrials =
+                    (tonumber(GS._creditProjectionCandidateTrials) or 0) + 1
                 ApplyCorrectionFloorDelta(
                     record, totals, entry.event, entry.newName, entry.newGuid,
                     relationshipsReady, -1, scoreBox)
@@ -5925,9 +5983,19 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     local stamp = CreditProjectionDependencyStamp(record)
     local bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0
+    local floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0
+    local candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0
+    local workUnits = rowVisits + bucketVisits + floorVisits + candidateTrials
+    if GS._creditProjectionAccumulating then
+        GS._creditProjectionCallbackWork =
+            (tonumber(GS._creditProjectionCallbackWork) or 0) + workUnits
+    end
     -- Final invariant: never leave a stale active map and never mark a negative
     -- projection verified. On failure, clear heads and cache under the stamp;
-    -- ResolveEffectiveCreditIdentity treats that as unavailable (not durable).
+    -- ResolveEffectiveCreditIdentity returns CREDIT_UNAVAILABLE (not durable).
+    -- Bounded selector may leave a conflict unresolved even when some subset
+    -- would verify — consumers must treat failure as unavailable, not as proof
+    -- that no valid set exists.
     if not TotalsAllNonNegative(totals) then
         record.creditCorrections = {}
         creditProjectionCache[record] = {
@@ -5939,6 +6007,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             activeIds = {},
             rowVisits = rowVisits,
             bucketVisits = bucketVisits,
+            floorVisits = floorVisits,
+            candidateTrials = candidateTrials,
+            workUnits = workUnits,
             deactivations = GS._creditProjectionDeactivations,
             lookupMisses = lookupMisses,
         }
@@ -5959,8 +6030,25 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         activeIds = activeIds,
         rowVisits = rowVisits,
         bucketVisits = bucketVisits,
+        floorVisits = floorVisits,
+        candidateTrials = candidateTrials,
+        workUnits = workUnits,
         deactivations = GS._creditProjectionDeactivations,
         lookupMisses = lookupMisses,
+    }
+end
+
+--- After Apply already published a coherent projection (e.g. extraOp preview)
+-- and the matching op was stored, adopt the current dependency stamp without a
+-- second full rebuild (#459 redrive callback budget).
+function GS.SealCreditCorrectionProjection(record, ok)
+    if type(record) ~= "table" then
+        return
+    end
+    creditProjectionCache[record] = {
+        stamp = CreditProjectionDependencyStamp(record),
+        ok = ok ~= false,
+        err = (ok == false) and "player_negative" or nil,
     }
 end
 
@@ -6029,7 +6117,10 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
             return false, "stale_campaign"
         end
     end
-    local curName, curGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+    local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    if creditStatus == GS.CREDIT_UNAVAILABLE then
+        return false, GS.CREDIT_UNAVAILABLE
+    end
     if opts.localPrepare and not opts.skipExpected then
         local baseName = NormName(op.value.baseAttributed)
         local baseGuid = ValidGuid(op.value.baseAttributedGuid)
@@ -6100,7 +6191,10 @@ function GS.BuildContributorCorrectionValue(record, eventId, attributed, attribu
             return nil, "stale_campaign"
         end
     end
-    local curName, curGuid = GS.ResolveEffectiveCreditIdentity(record, event)
+    local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    if creditStatus == GS.CREDIT_UNAVAILABLE then
+        return nil, GS.CREDIT_UNAVAILABLE
+    end
     local newName, newGuid, bindErr = BindCorrectionNewIdentity(
         record, event, attributed, attributedGuid)
     if bindErr then

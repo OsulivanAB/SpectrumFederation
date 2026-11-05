@@ -3022,6 +3022,15 @@ function Controls:AddContributionRankingChart(section, opts)
 				content:SetHeight(1)
 				return
 			end
+			if #rows == 0 and emptyReason == "credit_unavailable" then
+				scroll:Hide()
+				emptyText:Show()
+				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_CREDIT_UNAVAILABLE",
+					"Contribution credit is temporarily unavailable while corrections reconcile."))
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
 			if #rows == 0 and emptyReason == "no_contributions" then
 				scroll:Hide()
 				emptyText:Show()
