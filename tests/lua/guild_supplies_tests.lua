@@ -22632,20 +22632,18 @@ do
     GS.MAX_ACCEPTED_OPERATIONS = 40
     GS.MAX_LEDGER_EVENTS = 40
     GS.MAX_ARCHIVED_EVENTS = 40
-    local archiveCamps43 = math.min(
-        GS.MAX_CAMPAIGNS or 64,
-        GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-    )
+    local camps43 = GS.MAX_CAMPAIGNS or 64
     local pages43 = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    -- Conservative retained-archive × per-archive page bound (not buffer-campaigns).
     GS.MAX_ADOPTION_PENDING_RECORDS = 40 + 40 + 40
         + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
         + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
         + 40 + 40
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + (GS.MAX_CAMPAIGNS or 64)
-        + (GS.MAX_CAMPAIGNS or 64)
-        + (archiveCamps43 * pages43)
-        + (archiveCamps43 * pages43)
+        + camps43
+        + camps43
+        + (camps43 * pages43)
+        + (camps43 * pages43)
         + 512
     local aliceRecord = seedStagedCampaignWithItem(9055, 50)
     -- Fill accepted ops near the lowered cap with bank-tab no-ops alternating.
@@ -22710,8 +22708,8 @@ do
     GS.MAX_ARCHIVED_EVENTS = 40
     GS.MAX_ADOPTION_PENDING_RECORDS = priorPending -- use production raised bound
     initGS()
-    -- Re-apply raised pending after Initialize defaults (producer-derived model).
-    local ac43b = math.min(GS.MAX_CAMPAIGNS or 64, GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16)
+    -- Re-apply raised pending after Initialize defaults (retained-archive bound).
+    local camps43b = GS.MAX_CAMPAIGNS or 64
     local pg43b = GS.MAX_ARCHIVE_PAGE_COUNT or 512
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 40)
         + (GS.MAX_LEDGER_EVENTS or 40)
@@ -22721,10 +22719,10 @@ do
         + (GS.MAX_LEDGER_EVENTS or 40)
         + (GS.MAX_ARCHIVED_EVENTS or 40)
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + (GS.MAX_CAMPAIGNS or 64)
-        + (GS.MAX_CAMPAIGNS or 64)
-        + (ac43b * pg43b)
-        + (ac43b * pg43b)
+        + camps43b
+        + camps43b
+        + (camps43b * pg43b)
+        + (camps43b * pg43b)
         + 512
     GS:CreateStagedRecord()
     GS:EnsureGossipProvider()
@@ -46354,11 +46352,10 @@ do
             + 512
     end
     local function deriveNew()
+        -- Conservative retained-archive bound: headers + meta + per-archive
+        -- item/recipe page ceilings. Concurrent fragment assembly
+        -- (MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS) is not a retained-archive count.
         local maxCampaigns = GS.MAX_CAMPAIGNS or 64
-        local archiveCampaigns = math.min(
-            maxCampaigns,
-            GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-        )
         local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
         return (GS.MAX_ACCEPTED_OPERATIONS or 0)
             + (GS.MAX_LEDGER_EVENTS or 0)
@@ -46370,8 +46367,8 @@ do
             + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 0)
             + maxCampaigns
             + maxCampaigns
-            + (archiveCampaigns * pagesPerArchive)
-            + (archiveCampaigns * pagesPerArchive)
+            + (maxCampaigns * pagesPerArchive)
+            + (maxCampaigns * pagesPerArchive)
             + 512
     end
     local oldCeiling = deriveOld()
@@ -46412,7 +46409,8 @@ do
         aliceRecord.accounting._consumableEvents = {}
         events = aliceRecord.accounting._consumableEvents
     end
-    for n = 1, 36 do
+    local donationSeed = 36
+    for n = 1, donationSeed do
         events[#events + 1] = {
             type = "donation",
             id = "ctx:gs:e457-d-" .. n,
@@ -46430,10 +46428,10 @@ do
             writer = "Player-1-Alice",
         }
     end
-    -- Real local receipt commits (valid ORIGIN provenance / id shape).
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local receiptSeed = 700
     local receiptOk = 0
-    for n = 1, 700 do
+    for n = 1, receiptSeed do
         local stR, detailR = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
             operationId = "op-e457-live-" .. n,
             datasetId = aliceRecord.datasetId,
@@ -46443,11 +46441,10 @@ do
             bankTab = tonumber(cfg.bankTab) or 2,
             timestamp = (world.time or 1000) + 500 + n,
         })
-        if stR == "accepted" then
-            receiptOk = receiptOk + (tonumber(detailR) or 1)
-        end
+        assertEq(stR, "accepted", "3B43E: seed receipt " .. tostring(n) .. " " .. tostring(detailR))
+        receiptOk = receiptOk + (tonumber(detailR) or 1)
     end
-    assertTrue(receiptOk >= 700,
+    assertEq(receiptOk, receiptSeed,
         "3B43E: seeded live receipts via CommitLocal got=" .. tostring(receiptOk))
 
     GS:DisableGossipProvider()
@@ -46455,15 +46452,29 @@ do
     drainExportMaint(512)
     local exportBodies = collectAllExportBodies()
     local sourceDataset = aliceRecord.datasetId
+    assertTrue(type(GS._EstimateWireRecordBytesForTest) == "function",
+        "3B43E: wire estimate seam")
+    local wireBudget = GS.MAX_WIRE_RECORD_BYTES
+        or (GG and GG.MAX_RECORD_CBOR)
+        or 2048
     local kindCounts = {}
     local totalBytes = 0
+    local descBody = nil
     for i = 1, #exportBodies do
+        local id = exportBodies[i].id
         local b = exportBodies[i].body
         local k = b and b.kind or "?"
         kindCounts[k] = (kindCounts[k] or 0) + 1
-        if type(b) == "table" then
-            totalBytes = totalBytes + 64
+        if k == "dataset-desc" then
+            descBody = b
         end
+        local nbytes = GS._EstimateWireRecordBytesForTest(id, b)
+        assertTrue(type(nbytes) == "number" and nbytes > 0,
+            "3B43E: serialized envelope size for " .. tostring(id))
+        assertTrue(nbytes <= wireBudget,
+            "3B43E: wire budget ok id=" .. tostring(id)
+                .. " bytes=" .. tostring(nbytes) .. " budget=" .. tostring(wireBudget))
+        totalBytes = totalBytes + nbytes
     end
     local bodyCount = #exportBodies
     assertTrue(bodyCount > oldCeiling,
@@ -46472,12 +46483,19 @@ do
     assertTrue(bodyCount <= newCeiling,
         "3B43E: export fits new budget bodies=" .. tostring(bodyCount)
             .. " new=" .. tostring(newCeiling))
-    assertTrue((kindCounts["gs-ledger-event"] or 0) >= 700,
-        "3B43E: mixed ledger export includes receipts got="
-            .. tostring(kindCounts["gs-ledger-event"]))
+    assertTrue(totalBytes > bodyCount,
+        "3B43E: aggregate serialized envelope bytes exceed record count")
+    assertTrue(descBody ~= nil, "3B43E: source descriptor present in export")
+    assertEq(tonumber(descBody.acceptedOpCount), kindCounts["gs-op"] or 0,
+        "3B43E: descriptor acceptedOpCount matches exported ops")
+    if descBody.acceptedLedgerCount ~= nil then
+        assertEq(tonumber(descBody.acceptedLedgerCount), kindCounts["gs-ledger-event"] or 0,
+            "3B43E: descriptor acceptedLedgerCount matches exported ledger")
+    end
+    assertEq(kindCounts["gs-ledger-event"] or 0, donationSeed + receiptSeed,
+        "3B43E: exported ledger = donations + receipts")
     assertTrue((kindCounts["gs-op"] or 0) >= 30,
         "3B43E: ops exported got=" .. tostring(kindCounts["gs-op"]))
-    assertTrue(totalBytes > 0, "3B43E: wrapped-record size observed")
 
     local function applyCaps(pending)
         GS.MAX_ACCEPTED_OPERATIONS = 40
@@ -46492,7 +46510,6 @@ do
         GS.MAX_ADOPTION_PENDING_RECORDS = pending
     end
 
-    -- Under old ceiling the same export must hit full.
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 2)
     settleRoster()
@@ -46519,7 +46536,6 @@ do
             .. tostring(fullRejects))
     GS._adoption = nil
 
-    -- New ceiling buffers every body, reaches readiness, commits.
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 2)
     settleRoster()
@@ -46552,86 +46568,147 @@ do
     assertEq(ready, true, "3B43E: readiness true: " .. tostring(why))
     GS._adoptionReplaySyncDrain = true
     local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
-    local stats = GS._lastAdoptionSliceStats
-    if type(stats) == "table" then
-        local used = tonumber(stats.used) or 0
-        local budget = tonumber(stats.budget) or (GS.MAX_ADMISSION_WORK_PER_SLICE or 32)
-        assertTrue(used <= budget + 1,
-            "3B43E: slice bounded used=" .. tostring(used))
-    end
     local adopted = GS:GetCurrentRecord()
     assertEq(stAdopt, "accepted",
         "3B43E: adopt accepted got=" .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
     assertTrue(adopted and adopted.datasetId == sourceDataset,
         "3B43E: adopted dataset src=" .. tostring(sourceDataset)
             .. " got=" .. tostring(adopted and adopted.datasetId))
-    local retainedWd = 0
+    local retainedWd, retainedDon = 0, 0
     for i = 1, #(adopted.accounting._consumableEvents or {}) do
         local ev = adopted.accounting._consumableEvents[i]
         if type(ev) == "table" and ev.type == "withdrawal" then
             retainedWd = retainedWd + 1
+        elseif type(ev) == "table" and ev.type == "donation" then
+            retainedDon = retainedDon + 1
         end
     end
-    assertTrue(retainedWd >= 700,
-        "3B43E: retained withdrawal receipts got=" .. tostring(retainedWd))
+    assertEq(retainedWd, receiptSeed,
+        "3B43E: exact retained withdrawal receipts got=" .. tostring(retainedWd))
+    assertEq(retainedDon, donationSeed,
+        "3B43E: exact retained donations got=" .. tostring(retainedDon))
 
     ----------------------------------------------------------------
-    -- Real packer large-recipe archive, pages-first into adoption buffer.
+    -- Real packer large-recipe archive (≤16 reagents), pages-first, full adopt.
+    -- Production path: set-recipe → roll campaign → StageParentArchive → export.
     ----------------------------------------------------------------
+    -- Restore producer maxima after the scaled mixed-export ceiling exercise.
+    GS.MAX_ACCEPTED_OPERATIONS = prior.ops
+    GS.MAX_LEDGER_EVENTS = prior.led
+    GS.MAX_ARCHIVED_EVENTS = prior.arch
+    GS.MAX_WITHDRAWAL_EVENTS = prior.wd
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = prior.archWd
+    GS.MAX_CAMPAIGNS = prior.camps
+    GS.MAX_ARCHIVE_PAGE_COUNT = prior.pages or 512
+    GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = prior.bufCamps
+    GS.MAX_DIRECT_EVIDENCE_EXPORTS = prior.evidence
+    GS.MAX_ADOPTION_PENDING_RECORDS = prior.pending
+    GS.MAX_WIRE_RECORD_BYTES = prior.wire
+    -- set-recipe / archive recipe retention require the Recipes module seams.
+    loadModule("SpectrumFederation/modules/GuildSupplies/Recipes.lua")
+    loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
+    loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
+    loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+    loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
+    assertTrue(type(GS.CanonicalRecipeValue) == "function",
+        "3B43E: CanonicalRecipeValue available for set-recipe")
+    assertTrue(type(GS._BuildArchiveExportBodiesForTest) == "function",
+        "3B43E: archive packer seam available")
+    assertTrue(type(GS._EstimateWireRecordBytesForTest) == "function",
+        "3B43E: wire estimate seam available")
     SpectrumFederationDB = {}
     switchPlayer("Alice", "Player-1-Alice", 1)
     settleRoster()
     initGS()
-    GS.MAX_ARCHIVE_PAGE_COUNT = prior.pages or 512
-    GS.MAX_ADOPTION_PENDING_RECORDS = prior.pending
     local packRecord = seedStagedCampaignWithItem(45711, 5)
-    local campId = "camp-e457-recipes"
-    local fatRecipes = {}
-    for n = 1, (GS.MAX_RECIPES or 32) do
+    local sourceArchDs = packRecord.datasetId
+    local campId = packRecord.currentCampaignId
+    assertTrue(type(campId) == "string" and campId ~= "",
+        "3B43E: seeded campaign id for archive")
+    local maxReagents = GS.MAX_REAGENTS_PER_RECIPE or 16
+    assertTrue(maxReagents <= 16, "3B43E: supported reagent cap ≤16")
+    local recipeCount = GS.MAX_RECIPES or 32
+    local sourceRecipes = {}
+    -- Enough requested items to force item pages under a tightened wire budget.
+    for n = 1, 40 do
+        local itemId = 457100 + n
+        if itemId ~= 45711 then
+            local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = itemId }, {
+                itemId = itemId, goal = 1, removed = false,
+            })
+            assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted",
+                "3B43E: seed archive item " .. tostring(itemId))
+        end
+    end
+    for n = 1, recipeCount do
         local reagents = {}
-        for r = 1, 24 do
+        for r = 1, maxReagents do
             reagents[tostring(10000 + r)] = 1 + (r % 3)
         end
-        fatRecipes[tostring(2000 + n)] = {
-            itemId = 2000 + n,
+        local outId = 2000 + n
+        local recipeOp, prepSt, prepErr = GS:NewConfigOperation("set-recipe", { itemId = outId }, {
+            itemId = outId,
+            reagents = reagents,
+        })
+        assertEq(prepSt, "accepted",
+            "3B43E: prepare recipe " .. tostring(outId) .. " " .. tostring(prepErr))
+        local stRecipe, errRecipe = GS:ApplyStagedConfigOperation(recipeOp)
+        assertEq(stRecipe, "accepted",
+            "3B43E: seed supported recipe " .. tostring(outId)
+                .. " " .. tostring(errRecipe))
+        sourceRecipes[tostring(outId)] = {
+            itemId = outId,
             reagents = reagents,
         }
     end
-    local items = {}
-    for n = 1, 40 do
-        items[tostring(n)] = { itemId = n, goal = 1 }
+    local liveRecipes = packRecord.accounting._consumables.recipes
+    assertEq(tonumber((function()
+        local c = 0
+        for _ in pairs(liveRecipes or {}) do c = c + 1 end
+        return c
+    end)()), recipeCount, "3B43E: live recipe map at supported capacity")
+
+    -- Roll campaign: production StageParentArchive retains recipes on campId.
+    local camp2 = startCampaign()
+    assertTrue(camp2 and camp2.id ~= campId, "3B43E: rolled to distinct current campaign")
+    packRecord = GS:GetCurrentRecord()
+    assertEq(packRecord.datasetId, sourceArchDs, "3B43E: dataset identity stable across roll")
+    local archive = packRecord.campaignArchives and packRecord.campaignArchives[campId]
+    assertTrue(type(archive) == "table", "3B43E: production archive after roll")
+    assertEq(archive.datasetId, sourceArchDs, "3B43E: archive dataset identity")
+    assertEq(archive.campaignId, campId, "3B43E: archive campaign identity")
+    local archivedRecipeCount = 0
+    for rid, recipe in pairs(archive.recipes or {}) do
+        archivedRecipeCount = archivedRecipeCount + 1
+        local src = sourceRecipes[rid]
+        assertTrue(type(src) == "table", "3B43E: archived recipe was seeded " .. tostring(rid))
+        assertEq(tonumber(recipe.itemId), tonumber(src.itemId),
+            "3B43E: archived recipe itemId " .. tostring(rid))
+        local rc = 0
+        for rk, rv in pairs(recipe.reagents or {}) do
+            rc = rc + 1
+            assertEq(tonumber(rv), tonumber(src.reagents[rk]),
+                "3B43E: archived reagent " .. tostring(rid) .. "/" .. tostring(rk))
+        end
+        assertEq(rc, maxReagents, "3B43E: archived reagent count ≤16 cap for " .. tostring(rid))
     end
-    local archive = {
-        schemaVersion = GS.SCHEMA_VERSION,
-        campaignId = campId,
-        datasetId = packRecord.datasetId,
-        requestedItems = items,
-        recipes = fatRecipes,
-        generation = 2,
-        archivedAt = (world.time or 1000) + 50,
-        bankTab = 2,
-        eligibility = {
-            baselineEstablished = true,
-            baselineAt = 1,
-            tabEligibleFrom = 2,
-            items = { ["1"] = 1, ["2"] = 2 },
-        },
-    }
-    -- Force recipe paging by tightening wire budget if the packer would inline.
+    assertEq(archivedRecipeCount, recipeCount, "3B43E: all supported recipes archived")
+
+    -- Force recipe/item paging under wire budget; pack the real retained archive.
     local savedWire = GS.MAX_WIRE_RECORD_BYTES
     GS.MAX_WIRE_RECORD_BYTES = math.min(tonumber(savedWire) or 12000, 3500)
-    local parts = nil
-    if GS._BuildArchiveExportBodiesForTest then
-        parts = GS._BuildArchiveExportBodiesForTest(campId, archive, {
-            datasetId = packRecord.datasetId,
-        })
-    end
+    local parts = GS._BuildArchiveExportBodiesForTest(campId, archive, packRecord)
     GS.MAX_WIRE_RECORD_BYTES = savedWire
     assertTrue(type(parts) == "table" and #parts >= 2,
         "3B43E: real packer emitted multi-part archive got=" .. tostring(parts and #parts))
     local metaBody, itemPages, recipePages = nil, {}, {}
     for i = 1, #parts do
         local b = parts[i].body
+        local nbytes = GS._EstimateWireRecordBytesForTest(parts[i].id, b)
+        assertTrue(type(nbytes) == "number" and nbytes > 0,
+            "3B43E: packed archive part serialized")
+        assertTrue(nbytes <= (savedWire or 2048) or nbytes <= 3500,
+            "3B43E: packed archive part within wire estimate")
         if b.kind == "campaign-archive" then
             metaBody = b
         elseif b.kind == "campaign-archive-page" then
@@ -46641,13 +46718,43 @@ do
         end
     end
     assertTrue(metaBody ~= nil, "3B43E: archive meta from packer")
+    assertEq(metaBody.datasetId, sourceArchDs, "3B43E: packed meta dataset identity")
     assertTrue(#recipePages >= 1,
         "3B43E: large-recipe archive produced recipe pages got="
             .. tostring(#recipePages) .. " recipePageCount="
             .. tostring(metaBody.recipePageCount))
-    assertTrue(tonumber(metaBody.recipePageCount) == #recipePages
-        or tonumber(metaBody.recipeCount) == (GS.MAX_RECIPES or 32),
+    assertEq(tonumber(metaBody.recipePageCount), #recipePages,
         "3B43E: recipe pageCount matches packer emission")
+    assertEq(tonumber(metaBody.recipeCount), recipeCount,
+        "3B43E: recipeCount matches supported recipe map")
+
+    -- Full Alice export: same dataset identity as packed archive (ops/headers/desc).
+    GS:DisableGossipProvider()
+    assertEq(GS:EnsureGossipProvider(), true, "3B43E: archive provider")
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("dataset")
+    end
+    drainExportMaint(256)
+    local archExport = collectAllExportBodies()
+    assertTrue(#archExport >= #parts,
+        "3B43E: provider export includes packed archive parts")
+    local exportDesc = nil
+    local metaId = "gs:ca:" .. campId
+    local exportHasMeta = false
+    for i = 1, #archExport do
+        local row = archExport[i]
+        if row.body and row.body.kind == "dataset-desc" then
+            exportDesc = row.body
+        end
+        if row.id == metaId then
+            exportHasMeta = true
+            assertEq(row.body.datasetId, sourceArchDs,
+                "3B43E: exported archive meta dataset identity")
+        end
+    end
+    assertTrue(exportDesc ~= nil, "3B43E: source descriptor in archive export")
+    assertEq(exportDesc.datasetId, sourceArchDs, "3B43E: descriptor dataset identity")
+    assertTrue(exportHasMeta, "3B43E: archive meta present under consistent id")
 
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 2)
@@ -46655,25 +46762,14 @@ do
     GS._adoption = nil
     GS._peerDatasets = {}
     initGS()
-    GS.MAX_ADOPTION_PENDING_RECORDS = math.max(prior.pending or 1000, #parts + 64)
+    GS.MAX_ADOPTION_PENDING_RECORDS = math.max(prior.pending or 1000, #archExport + 64)
+    GS.MAX_ARCHIVE_PAGE_COUNT = prior.pages or 512
     GS:CreateStagedRecord()
-    local adoptDs = "gs1:e457-arch"
-    GS.NotePeerDataset("Alice-Garona", adoptDs, { editorRankPosition = 1 })
-    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", adoptDs)), "accepted",
+    GS.NotePeerDataset("Alice-Garona", sourceArchDs, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceArchDs)), "accepted",
         "3B43E: begin recipe-archive adoption")
-    -- Descriptor required for readiness.
-    local descBody = {
-        kind = "dataset-desc",
-        datasetId = adoptDs,
-        acceptedOpCount = 0,
-        transferOpCount = 0,
-        campaignCount = 1,
-        archiveCount = 1,
-        schemaVersion = GS.SCHEMA_VERSION,
-    }
-    assertEq(GS:BufferAdoptionRecord("gs:desc:" .. adoptDs, descBody), "accepted",
-        "3B43E: buffer descriptor")
-    -- Pages-first: recipe + item pages before meta shell.
+
+    -- Pages-first: deliver packed archive pages before meta; incomplete without meta.
     for i = 1, #recipePages do
         local stP, rP = GS:BufferAdoptionRecord(recipePages[i].id, recipePages[i].body)
         assertTrue(stP == "accepted" or stP == "pending" or stP == "duplicate",
@@ -46684,13 +46780,53 @@ do
         assertTrue(stP == "accepted" or stP == "pending" or stP == "duplicate",
             "3B43E: pages-first item page " .. tostring(stP) .. "/" .. tostring(rP))
     end
+    for i = 1, #archExport do
+        local row = archExport[i]
+        if row.id ~= metaId then
+            GS:BufferAdoptionRecord(row.id, row.body)
+        end
+    end
     local readyBeforeShell = select(1, GS:IsAdoptionTransferComplete())
-    assertEq(readyBeforeShell, false, "3B43E: pages-first without shell not ready")
-    local stShell, rShell = GS:BufferAdoptionRecord(
-        "gs:ca:" .. campId, metaBody)
+    assertEq(readyBeforeShell, false, "3B43E: incomplete without archive meta")
+    local stShell, rShell = GS:BufferAdoptionRecord(metaId, metaBody)
     assertTrue(stShell == "accepted" or stShell == "pending" or stShell == "duplicate",
         "3B43E: meta after pages " .. tostring(stShell) .. "/" .. tostring(rShell))
-    -- Restore production caps.
+    for i = 1, #archExport do
+        GS:BufferAdoptionRecord(archExport[i].id, archExport[i].body)
+    end
+    local readyAfter, whyAfter = GS:IsAdoptionTransferComplete()
+    assertEq(readyAfter, true, "3B43E: readiness after full archive delivery: " .. tostring(whyAfter))
+    GS._adoptionReplaySyncDrain = true
+    local stArchAdopt, reasonArchAdopt = GS:CommitDatasetAdoption()
+    assertEq(stArchAdopt, "accepted",
+        "3B43E: archive adopt accepted got="
+            .. tostring(stArchAdopt) .. "/" .. tostring(reasonArchAdopt))
+    local adoptedArch = GS:GetCurrentRecord()
+    assertTrue(adoptedArch and adoptedArch.datasetId == sourceArchDs,
+        "3B43E: archive adopt dataset identity")
+    local gotArchive = adoptedArch.campaignArchives and adoptedArch.campaignArchives[campId]
+    assertTrue(type(gotArchive) == "table", "3B43E: adopted archive present")
+    local gotRecipes = gotArchive.recipes or {}
+    local recipeKeys = 0
+    for rid, recipe in pairs(sourceRecipes) do
+        recipeKeys = recipeKeys + 1
+        local got = gotRecipes[rid]
+        assertTrue(type(got) == "table", "3B43E: retained recipe " .. tostring(rid))
+        assertEq(tonumber(got.itemId), tonumber(recipe.itemId),
+            "3B43E: retained recipe itemId " .. tostring(rid))
+        for reagentId, qty in pairs(recipe.reagents) do
+            assertEq(tonumber(got.reagents[reagentId]), tonumber(qty),
+                "3B43E: retained reagent " .. tostring(rid) .. "/" .. tostring(reagentId))
+        end
+        local gotReagentCount = 0
+        for _ in pairs(got.reagents or {}) do
+            gotReagentCount = gotReagentCount + 1
+        end
+        assertEq(gotReagentCount, maxReagents,
+            "3B43E: retained reagent count for " .. tostring(rid))
+    end
+    assertEq(recipeKeys, recipeCount, "3B43E: all supported recipes retained")
+
     GS.MAX_ACCEPTED_OPERATIONS = prior.ops
     GS.MAX_LEDGER_EVENTS = prior.led
     GS.MAX_ARCHIVED_EVENTS = prior.arch

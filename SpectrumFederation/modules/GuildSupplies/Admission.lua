@@ -57,21 +57,18 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- independent of donation history; valuations remain donation-bounded.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
--- Campaign/archive structure derived from producer + retention constraints:
+-- Campaign/archive structure: conservative dataset-wide upper bound from
+-- enforced retention + per-archive producer limits (not a claim that every
+-- archive simultaneously reaches both page ceilings):
 -- - Campaign headers (live + archived identities) ≤ MAX_CAMPAIGNS.
--- - Archive count ≤ MAX_CAMPAIGNS (Campaigns.lua); each archive exports one meta.
--- - BuildArchiveExportBodies applies MAX_ARCHIVE_PAGE_COUNT per archive for item
---   and recipe pages. Dataset-wide page capacity uses the transfer-supported
---   concurrent archive-campaign bound (MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS), which
---   is the real cross-history constraint for page-heavy archives in adoption —
---   not a blind MAX_CAMPAIGNS × page-ceiling product, and not a single global
---   page ceiling that under-counts multi-archive exports.
+-- - Retained archives ≤ MAX_CAMPAIGNS (Campaigns.lua); each archive exports one meta.
+-- - BuildArchiveExportBodies applies ≤ MAX_ARCHIVE_PAGE_COUNT item pages and
+--   ≤ MAX_ARCHIVE_PAGE_COUNT recipe pages per retained archive.
+-- MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS separately limits concurrent ordinary
+-- fragment assembly during transfer; it is not a retained-archive count and is
+-- not used to shrink this logical pending-record ceiling.
 do
     local maxCampaigns = GS.MAX_CAMPAIGNS or 64
-    local archiveCampaigns = math.min(
-        maxCampaigns,
-        GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-    )
     local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
         + (GS.MAX_LEDGER_EVENTS or 4096)
@@ -83,8 +80,8 @@ do
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
         + maxCampaigns
         + maxCampaigns
-        + (archiveCampaigns * pagesPerArchive)
-        + (archiveCampaigns * pagesPerArchive)
+        + (maxCampaigns * pagesPerArchive)
+        + (maxCampaigns * pagesPerArchive)
         + 512
 end
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
@@ -92,6 +89,7 @@ GS.MAX_ADOPTION_ASSEMBLY_OPS = 24
 GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24)
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
+-- Concurrent ordinary archive-page assemblies (transfer-time), not retained archive count.
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
 -- Operation-manifest FragmentBuffer (confirm/resolve pages). Kept independent of
 -- the raised campaign-archive page ceiling so assembly_full / recovery tests and

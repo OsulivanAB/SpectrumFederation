@@ -4870,6 +4870,7 @@ end
 
 -- Test seams for exporter → provider archive regressions (#457).
 GS._BuildArchiveExportBodiesForTest = BuildArchiveExportBodies
+GS._EstimateWireRecordBytesForTest = EstimateWireRecordBytes
 GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
 GS._ValidateAndApplyForTest = ValidateAndApply
 

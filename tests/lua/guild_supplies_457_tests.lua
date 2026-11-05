@@ -4673,12 +4673,19 @@ do
             Show = function(self) self.shown = true end,
             Hide = function(self) self.shown = false end,
         }
+        -- Preserve the AcquireRow pool across rebuilds so ownership rebind can
+        -- assert the same row/Edit object identity (production ClearRows only hides).
         local function rebuildQW()
             RT:ClearRows()
-            RT.review.Rows = {}
             RT:AppendQuickWithdrawSection(RT.review, 0, 0)
         end
         local function findEdit(itemId)
+            for _, row in pairs(RT.review.Rows or {}) do
+                if row.boundItemId == itemId and row.Edit and row:IsShown() ~= false then
+                    return row
+                end
+            end
+            -- Fallback: bound id match even if Hide stub left shown=false briefly.
             for _, row in pairs(RT.review.Rows or {}) do
                 if row.boundItemId == itemId and row.Edit then
                     return row
@@ -4912,23 +4919,59 @@ do
         rebuildQW()
         local rowB = findEdit(200)
         assertTrue(rowB ~= nil and rowB.Edit, "B: pooled row for same-ID after reopen")
+        local pooledRow = rowB
+        local pooledEdit = rowB.Edit
         -- Simulate focused pooled widget carrying a stale prior-owner key + text.
-        rowB._qwDraftOwnerKey = oldOwnerFp
-        rowB._qwDraftKey = "200"
-        rowB.Edit._text = "9"
-        rowB.Edit._hasFocus = true
-        -- Production rebuild must rebind text to current owner draft (0), not keep 9.
+        pooledRow._qwDraftOwnerKey = oldOwnerFp
+        pooledRow._qwDraftKey = "200"
+        pooledEdit._text = "9"
+        pooledEdit._hasFocus = true
+        -- Production rebuild must rebind the SAME row/Edit object to current owner.
         rebuildQW()
-        rowB = findEdit(200)
-        assertTrue(rowB ~= nil, "B: row rebound")
-        assertEq(rowB.Edit:GetText(), "0",
+        local rowAfter = findEdit(200)
+        assertTrue(rowAfter == pooledRow, "B: same pooled row object rebound")
+        assertTrue(rowAfter.Edit == pooledEdit, "B: same pooled Edit object rebound")
+        assertEq(pooledEdit:GetText(), "0",
             "B: focused same-ID field rebinds to current owner draft, not stale 9")
-        assertTrue(rowB._qwDraftOwnerKey ~= oldOwnerFp,
+        assertTrue(pooledRow._qwDraftOwnerKey ~= oldOwnerFp,
             "B: pooled row owner key updated to current visit")
-        -- Type a new same-ID draft via installed OnTextChanged.
-        rowB.Edit._hasFocus = false
-        rowB.Edit:SetText("7")
-        assertEq(WR.craftDrafts["200"], 7, "B: new same-ID draft via widget")
+        -- Installed OnTextChanged: mismatched owner must not repopulate drafts.
+        WR.craftDrafts["200"] = 0
+        pooledRow._qwDraftOwnerKey = oldOwnerFp
+        pooledEdit._hasFocus = false
+        pooledEdit:SetText("9")
+        assertEq(WR.craftDrafts["200"], 0,
+            "B: OnTextChanged owner guard blocks stale-owner write of 9")
+        -- Matching owner writes through the installed callback.
+        pooledRow._qwDraftOwnerKey = WR.DraftOwnerFingerprint(WR.craftDraftOwner)
+        pooledEdit:SetText("7")
+        assertEq(WR.craftDrafts["200"], 7, "B: new same-ID draft via installed OnTextChanged")
+        -- Sensitivity: if rebuild focus-preserve ignored owner, stale focused "9" survives.
+        pooledRow._qwDraftOwnerKey = oldOwnerFp
+        pooledRow._qwDraftKey = "200"
+        pooledEdit._text = "9"
+        pooledEdit._hasFocus = true
+        local savedFingerprint = WR.DraftOwnerFingerprint
+        WR.DraftOwnerFingerprint = function()
+            return oldOwnerFp
+        end
+        rebuildQW()
+        assertTrue(findEdit(200) == pooledRow, "B: sensitivity rebuild keeps pool object")
+        assertEq(pooledEdit:GetText(), "9",
+            "B: sensitivity — matching owner fingerprint preserves focused stale text")
+        WR.DraftOwnerFingerprint = savedFingerprint
+        -- With real fingerprint restored, focused stale "9" under old owner key
+        -- must be replaced by the current draft value (still 7 from earlier write).
+        pooledRow._qwDraftOwnerKey = oldOwnerFp
+        pooledEdit._text = "9"
+        pooledEdit._hasFocus = true
+        rebuildQW()
+        assertTrue(findEdit(200) == pooledRow, "B: pool object survives post-sensitivity rebuild")
+        assertEq(pooledEdit:GetText(), "7",
+            "B: owner-mismatch rebuild replaces focused stale 9 with current draft")
+        assertTrue(pooledEdit:GetText() ~= "9",
+            "B: stale focused 9 cannot survive owner-aware rebuild")
+        assertEq(WR.craftDrafts["200"], 7, "B: draft remains 7 before settle")
         -- Complete the OLD pending operation with bag evidence.
         bagByItem[20] = 1
         bankBySlot[1].count = 19
@@ -5144,55 +5187,45 @@ do
         WR.EnsureDraftOwner()
         publish = 0
         local eventsBefore = #(record.accounting._consumableEvents or {})
+        bagByItem[10] = 0
+        bankBySlot[1] = { itemId = 10, count = 5 }
+        cursor = nil
         local ok, err = WR.BeginWithdraw({ ["100"] = 1 }, {})
         assertTrue(ok, "D: BeginWithdraw ok under membership-ready context: " .. tostring(err))
         assertTrue(WR.work ~= nil, "D: work attached")
-        for _ = 1, 25 do
+        assertTrue(WR.work.pendingStep ~= nil or (WR.work.confirmedTotal or 0) > 0,
+            "D: PlaceNext advanced (pending observe or already confirmed)")
+        -- Natural production settlement: bag evidence + observe timers only.
+        for _ = 1, 40 do
             if not WR.work then break end
-            bagByItem[10] = (bagByItem[10] or 0) + 1
+            if WR.work.pendingStep then
+                bagByItem[10] = (bagByItem[10] or 0) + 1
+            end
             WR.OnBagOrBankUpdate()
             C_Timer._drain()
+            _G.GetServerTime = function() return 9000 + _ end
         end
-        if WR.work then
-            -- Force confirmed path if observe stubs were slow: CommitConfirmed once.
-            WR.work.confirmed = WR.work.confirmed or { ["10"] = 1 }
-            WR.work.confirmedTotal = 1
-            WR.work.movementStarted = true
-            WR.CommitConfirmed(WR.work)
-            WR.StopWork("complete", false)
-        end
+        assertEq(WR.work, nil, "D: natural settlement detached work (no force-confirm)")
         assertEq(publish, 1, "D: ledger publish exactly once via settlement receipt path")
         local eventsAfter = #(record.accounting._consumableEvents or {})
         assertTrue(eventsAfter > eventsBefore, "D: receipt appended to history")
+        local receiptCount = 0
         local donationCount = 0
+        local firstWd = nil
         for i = 1, eventsAfter do
             local ev = record.accounting._consumableEvents[i]
             if type(ev) == "table" and ev.type == "donation" then
                 donationCount = donationCount + 1
+            elseif type(ev) == "table" and ev.type == "withdrawal" then
+                receiptCount = receiptCount + 1
+                firstWd = ev
             end
         end
         assertEq(donationCount, donationBaseline, "D: no donation credit from withdrawal receipt")
-        -- Duplicate commit of same operation amounts is idempotent (no second publish).
-        local publishBeforeDup = publish
-        local stDup, nDup = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
-            datasetId = "gs1:rcpt",
-            campaignId = "camp1",
-            generation = 1,
-            operationId = WR and nil,
-            bankTab = 1,
-            timestamp = 9000,
-        })
-        -- Fresh op id → another receipt; use explicit duplicate id from first event.
-        local firstWd = nil
-        for i = #record.accounting._consumableEvents, 1, -1 do
-            local ev = record.accounting._consumableEvents[i]
-            if type(ev) == "table" and ev.type == "withdrawal" then
-                firstWd = ev
-                break
-            end
-        end
+        assertEq(receiptCount, 1, "D: exactly one withdrawal receipt after settlement")
         assertTrue(firstWd ~= nil, "D: withdrawal event present")
-        publish = publishBeforeDup
+        local publishBeforeDup = publish
+        local receiptCountBeforeDup = receiptCount
         local stAgain, detailAgain = GS:CommitLocalWithdrawalReceipts({
             [tostring(firstWd.itemId)] = firstWd.quantity,
         }, {
@@ -5202,14 +5235,24 @@ do
             operationId = firstWd.operationId,
             bankTab = firstWd.bankTab,
             timestamp = firstWd.timestamp,
+            guildKey = firstWd.guildKey,
         })
-        assertTrue(stAgain == "accepted" or stAgain == "duplicate",
-            "D: re-commit same op is accepted/duplicate got=" .. tostring(stAgain))
-        -- Duplicate body must not publish another ledger notify when nothing new accepted.
-        if stAgain == "duplicate" or detailAgain == 0 then
-            assertEq(publish, publishBeforeDup,
-                "D: duplicate receipt does not publish again")
+        -- Duplicate of the captured original operation: zero new accepts / no publish.
+        assertTrue(
+            (stAgain == "accepted" and (tonumber(detailAgain) or 0) == 0)
+                or stAgain == "duplicate",
+            "D: recommit original op is duplicate or accepted-with-zero got="
+                .. tostring(stAgain) .. "/" .. tostring(detailAgain))
+        assertEq(publish, publishBeforeDup, "D: duplicate does not publish again")
+        local receiptCountAfterDup = 0
+        for i = 1, #(record.accounting._consumableEvents or {}) do
+            local ev = record.accounting._consumableEvents[i]
+            if type(ev) == "table" and ev.type == "withdrawal" then
+                receiptCountAfterDup = receiptCountAfterDup + 1
+            end
         end
+        assertEq(receiptCountAfterDup, receiptCountBeforeDup,
+            "D: duplicate leaves exact receipt count unchanged")
 
         -- Missing membership fails closed (real context).
         memberOk = false
@@ -5221,6 +5264,39 @@ do
         assertTrue(err2 == "not_ready" or err2 == "not_a_member",
             "D: missing membership reason got=" .. tostring(err2))
         memberOk = true
+
+        -- Missing GUID: member present without guid, UnitGUID fallback unavailable.
+        local savedUnitGuid = _G.UnitGUID
+        SF.GuildGossip.GetGuildMember = function(name)
+            if name ~= "Alice-Garona" then return nil, "not_a_member" end
+            return {
+                name = "Alice-Garona",
+                guid = nil,
+                rankOrder = 1,
+                guildKey = "club:rcpt",
+            }
+        end
+        _G.UnitGUID = function() return nil end
+        local ctxNoGuid = GS:GetCurrentContext()
+        assertEq(ctxNoGuid.membershipReady, false, "D: missing GUID → membershipReady false")
+        local stGuid, errGuid = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
+            datasetId = "gs1:rcpt", campaignId = "camp1", generation = 1,
+            operationId = "op-rcpt-guid", bankTab = 1,
+        })
+        assertEq(stGuid, "rejected", "D: missing GUID rejected")
+        assertTrue(errGuid == "not_ready" or errGuid == "guid_unavailable",
+            "D: missing GUID reason got=" .. tostring(errGuid))
+        _G.UnitGUID = savedUnitGuid
+        SF.GuildGossip.GetGuildMember = function(name)
+            if not memberOk then return nil, "not_a_member" end
+            if name ~= "Alice-Garona" then return nil, "not_a_member" end
+            return {
+                name = "Alice-Garona",
+                guid = "Player-1-ALICE",
+                rankOrder = 1,
+                guildKey = "club:rcpt",
+            }
+        end
 
         -- Mismatched captured guild fails closed under real membership-ready context.
         local st3, err3 = GS:CommitLocalWithdrawalReceipts({ ["10"] = 1 }, {
@@ -5265,11 +5341,10 @@ do
         GS.MAX_DIRECT_EVIDENCE_EXPORTS = 256
         loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
         local maxCampaigns = GS.MAX_CAMPAIGNS or 64
-        local archiveCampaigns = math.min(
-            maxCampaigns,
-            GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-        )
         local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+        -- Conservative upper bound: retained archives ≤ MAX_CAMPAIGNS, each with
+        -- ≤ MAX_ARCHIVE_PAGE_COUNT item pages and recipe pages. Concurrent
+        -- fragment assembly (MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS) is separate.
         local expected = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
             + (GS.MAX_LEDGER_EVENTS or 4096)
             + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
@@ -5280,15 +5355,17 @@ do
             + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
             + maxCampaigns
             + maxCampaigns
-            + (archiveCampaigns * pagesPerArchive)
-            + (archiveCampaigns * pagesPerArchive)
+            + (maxCampaigns * pagesPerArchive)
+            + (maxCampaigns * pagesPerArchive)
             + 512
         assertEq(GS.MAX_ADOPTION_PENDING_RECORDS, expected,
-            "E: pending budget matches producer-derived archive-campaign page model")
+            "E: pending budget matches retained-archive × per-archive page bound")
         assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS > oldCeiling,
             "E: new budget exceeds old 22784 ceiling")
-        assertTrue(archiveCampaigns * pagesPerArchive * 2 > 64 * 24,
+        assertTrue(maxCampaigns * pagesPerArchive * 2 > 64 * 24,
             "E: archive page allowance exceeds opaque campaigns*24")
+        assertEq(GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES, GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS,
+            "E: buffer-campaigns still bound concurrent fragment assembly only")
         -- Real exporter/packer → buffer → readiness/commit crossing the scaled
         -- old complete budget lives in guild_supplies_tests.lua (3B43E).
     end
