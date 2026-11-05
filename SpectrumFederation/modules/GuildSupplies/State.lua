@@ -247,7 +247,7 @@ local function ValidateRetainedAdmissionEntry(id, entry)
     return true
 end
 
-local function ValidateOperationsHeads(ops)
+local function ValidateOperationsHeads(ops, record)
     local headCount = 0
     for targetKey, headId in pairs(ops.heads) do
         headCount = headCount + 1
@@ -268,7 +268,17 @@ local function ValidateOperationsHeads(ops)
             return false, "invalid_operations"
         end
         local expectedKey = GS.ComputeTargetKey(body.kind, body.target)
-        if expectedKey == nil or expectedKey ~= targetKey then
+        local okKey = expectedKey ~= nil and expectedKey == targetKey
+        -- #459: correction heads may be keyed by the canonical donation id while
+        -- the immutable body still names an alias target (or vice versa).
+        if not okKey and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+            and GS.CorrectionTargetKey and type(record) == "table" then
+            local canonKey = GS.CorrectionTargetKey(record, body.target)
+            if canonKey ~= nil and canonKey == targetKey then
+                okKey = true
+            end
+        end
+        if not okKey then
             return false, "invalid_operations"
         end
     end
@@ -329,6 +339,14 @@ function GS._BumpOpsValidationGen(ops)
     end
 end
 
+--- Ephemeral ops mutation generation for projection invalidation (#459).
+function GS.GetOpsValidationGen(ops)
+    if type(ops) ~= "table" then
+        return 0
+    end
+    return tonumber(opsValidationGen[ops]) or 0
+end
+
 --- Test/diagnostic counters for ops-store validation work.
 GS._opsValidationBodyScans = 0
 GS._opsValidationFullScans = 0
@@ -347,7 +365,8 @@ end
 --- @param ops table
 -- @param guildKey string|nil owning guild key for body consistency
 -- @param datasetId string|nil owning dataset id for body consistency
-local function ValidateOperationsStore(ops, guildKey, datasetId)
+-- @param record table|nil owning guild record (alias-aware correction heads)
+local function ValidateOperationsStore(ops, guildKey, datasetId, record)
     if type(ops) ~= "table" then
         return false, "invalid_operations"
     end
@@ -462,7 +481,7 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         return false, "invalid_operations"
     end
 
-    local headsOk, headsErr = ValidateOperationsHeads(ops)
+    local headsOk, headsErr = ValidateOperationsHeads(ops, record)
     if not headsOk then
         CacheOpsValidationResult(ops, gen, guildKey, datasetId, false, headsErr)
         return false, headsErr
@@ -802,7 +821,8 @@ local function ValidateGuildRecordStructure(guildKey, record)
     -- Archived/other headers are retained even when malformed; ListInspectableCampaigns
     -- validates each before exposure. Do not fail the whole guild record for them.
 
-    local ok, err = ValidateOperationsStore(record.operations, guildKey, record.datasetId)
+    local ok, err = ValidateOperationsStore(
+        record.operations, guildKey, record.datasetId, record)
     if not ok then
         return false, err
     end
@@ -810,14 +830,8 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if not ok then
         return false, err
     end
-    -- #459: re-derive active correction heads from accepted ops so reload and
-    -- peers converge under the deterministic floor policy.
-    if GS.RebuildCreditCorrectionProjection then
-        local rebuilt, rebuildErr = GS.RebuildCreditCorrectionProjection(record, nil)
-        if not rebuilt then
-            return false, rebuildErr or "invalid_record_shape"
-        end
-    end
+    -- #459: do not rebuild credit projections on ordinary record reads.
+    -- EnsureCreditCorrectionProjection reuses ops/accounting mutation stamps.
     return true
 end
 

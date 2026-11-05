@@ -1701,6 +1701,384 @@ do
     logsPage.__sfTest.ClearEditSession()
 end
 
+do
+    -- #459 dependency policy: later D1→B + B−10 must stay active when older D2→C
+    -- arrives; every personal floor stays nonnegative (descending greedy).
+    local function seedDepPeers()
+        local record = seedLiveCampaignWithItem(9301, 100)
+        injectProductionDonation(record, {
+            id = "dep-don-1", itemId = 9301, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 8000,
+        })
+        injectProductionDonation(record, {
+            id = "dep-don-2", itemId = 9301, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 8001,
+        })
+        injectProductionAdjustment(record, {
+            id = "dep-adj-a", itemId = 9301, quantity = -10,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice", timestamp = 8002,
+        })
+        return record
+    end
+    local peer1 = seedDepPeers()
+    world.time = 9000
+    local moveD1 = select(1, GS:NewContributorCorrectionOperation(
+        "dep-don-1", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(moveD1 ~= nil, "459: dep peer1 prepare D1→B")
+    assertEq(GS:ApplyStagedConfigOperation(moveD1), "accepted", "459: dep peer1 apply D1→B")
+    injectProductionAdjustment(peer1, {
+        id = "dep-adj-b", itemId = 9301, quantity = -10,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", timestamp = 9001,
+    })
+    assertEq(GS.PersonalContributorItemTotal(peer1, "Bob-Garona", "Player-1-Bob", 9301), 0,
+        "459: Bob spent corrected credit to zero")
+    local snapD1 = select(1, GS._SnapshotPublicOp(moveD1))
+
+    local peer2 = seedDepPeers()
+    world.time = 8500
+    local moveD2 = select(1, GS:NewContributorCorrectionOperation(
+        "dep-don-2", "Carol-Garona", "Player-1-Carol"))
+    assertTrue(moveD2 ~= nil, "459: dep peer2 prepare D2→C")
+    assertEq(GS:ApplyStagedConfigOperation(moveD2), "accepted", "459: dep peer2 apply D2→C")
+    local snapD2 = select(1, GS._SnapshotPublicOp(moveD2))
+
+    local function rebase(snap, record)
+        local body = {}
+        for k, v in pairs(snap) do body[k] = v end
+        body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        body.datasetId = record.datasetId
+        body.campaignId = record.currentCampaignId
+        body.baseCampaignId = record.currentCampaignId
+        body.basePolicyRevision = record.permission and record.permission.revisionId
+        body.baseTargetRevision = record.datasetId
+        return body
+    end
+
+    local function assertAllNonNeg(record, label)
+        assertTrue(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9301) >= 0,
+            "459: " .. label .. " Alice nonnegative")
+        assertTrue(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9301) >= 0,
+            "459: " .. label .. " Bob nonnegative")
+        assertTrue(GS.PersonalContributorItemTotal(record, "Carol-Garona", "Player-1-Carol", 9301) >= 0,
+            "459: " .. label .. " Carol nonnegative")
+    end
+
+    -- Delivery order: older D2→C after D1→B + B−10 on peer1.
+    local bodyD2 = rebase(snapD2, peer1)
+    local stDep, rDep = GS:AdmitRemoteOperation(bodyD2, {
+        sender = "Alice-Garona", offlineRecord = peer1, preserveAttribution = true,
+    })
+    assertTrue(stDep == "accepted" or stDep == "pending" or stDep == "duplicate",
+        "459: peer1 admits older D2→C got " .. tostring(stDep) .. "/" .. tostring(rDep))
+    GS.EnsureCreditCorrectionProjection(peer1, nil)
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peer1, GS.FindLedgerEventById(peer1, "dep-don-1"))), "Bob-Garona",
+        "459: D1→B stays active after older D2→C")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peer1, GS.FindLedgerEventById(peer1, "dep-don-2"))), "Alice-Garona",
+        "459: older D2→C inactive when it would break Bob floor")
+    assertAllNonNeg(peer1, "peer1-after-D2")
+    assertTrue(peer1.operations.records[snapD2.id] ~= nil
+        or (peer1.operations.pending and peer1.operations.pending[snapD2.id]),
+        "459: older D2 evidence retained accepted or pending")
+
+    -- Reverse delivery: peer2 has D2→C first, then receives D1→B (+ local B−10).
+    local peer2b = seedDepPeers()
+    local bodyD2b = rebase(snapD2, peer2b)
+    assertEq(select(1, GS:AdmitRemoteOperation(bodyD2b, {
+        sender = "Alice-Garona", offlineRecord = peer2b, preserveAttribution = true,
+    })), "accepted", "459: peer2b accepts D2→C first")
+    local bodyD1b = rebase(snapD1, peer2b)
+    local stD1b = select(1, GS:AdmitRemoteOperation(bodyD1b, {
+        sender = "Alice-Garona", offlineRecord = peer2b, preserveAttribution = true,
+    }))
+    assertTrue(stD1b == "accepted" or stD1b == "pending",
+        "459: peer2b admits D1→B got " .. tostring(stD1b))
+    injectProductionAdjustment(peer2b, {
+        id = "dep-adj-b2", itemId = 9301, quantity = -10,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", timestamp = 9100,
+    })
+    GS.EnsureCreditCorrectionProjection(peer2b, nil)
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peer2b, GS.FindLedgerEventById(peer2b, "dep-don-1"))), "Bob-Garona",
+        "459: reverse order keeps D1→B active")
+    assertAllNonNeg(peer2b, "peer2b-reverse")
+end
+
+do
+    -- Correction-before-alias: pending on X, then trusted AddTxnAlias X→Y wakes it.
+    local record = seedLiveCampaignWithItem(9302, 40)
+    local don = injectProductionDonation(record, {
+        id = "ctx:alias-y", itemId = 9302, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don.txnId = "ctx:alias-y"
+    local cfg = record.accounting._consumables
+    cfg.txnRegistry = cfg.txnRegistry or {}
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = "ctx:alias-y",
+        status = "verified",
+        committed = true,
+        aliases = {},
+        itemId = 9302,
+        quantity = 5,
+        donor = "Alice-Garona",
+    }
+    local pendingOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "corr-before-alias",
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:alias-x",
+        value = {
+            eventId = "ctx:alias-x",
+            eventKind = "donation",
+            attributed = "Bob-Garona",
+            attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona",
+            baseAttributedGuid = "Player-1-Alice",
+            itemId = 9302,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stP, rP = GS:AdmitRemoteOperation(pendingOp, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stP, "pending", "459: correction-before-alias pending got " .. tostring(stP) .. "/" .. tostring(rP))
+    assertEq(rP, "pending_event", "459: pending_event before alias")
+    assertTrue(GS._AddTxnAlias(record, "ctx:alias-y", "ctx:alias-x", don),
+        "459: trusted AddTxnAlias installs X→Y")
+    flushTimers()
+    assertTrue(record.operations.records["corr-before-alias"] ~= nil,
+        "459: alias wake promoted correction")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459: credit after alias wake")
+    local headKey = GS.CorrectionTargetKey(record, "ctx:alias-x")
+    assertEq(headKey, "credit:ctx:alias-y", "459: canonical head key after alias")
+    assertEq(record.operations.heads[headKey], "corr-before-alias",
+        "459: head stored under canonical key")
+end
+
+do
+    -- Warm-provider notify when newly retaining an obsolete LWW-losing correction.
+    local record = seedLiveCampaignWithItem(9303, 40)
+    injectProductionDonation(record, {
+        id = "hist-lww", itemId = 9303, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    world.time = world.time + 1
+    local early = select(1, GS:NewContributorCorrectionOperation("hist-lww", "Bob-Garona", nil))
+    world.time = world.time + 5
+    local late = select(1, GS:NewContributorCorrectionOperation("hist-lww", "Carol-Garona", nil))
+    assertEq(GS:ApplyStagedConfigOperation(late), "accepted", "459: late winner first")
+    local notifies = {}
+    local prevNotify = GS._NotifyLocalDurableChange
+    GS._NotifyLocalDurableChange = function(reason)
+        notifies[#notifies + 1] = reason
+        if prevNotify then prevNotify(reason) end
+    end
+    local snapEarly = select(1, GS._SnapshotPublicOp(early))
+    snapEarly.baseTargetRevision = record.datasetId
+    local stE, rE = GS:AdmitRemoteOperation(snapEarly, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    GS._NotifyLocalDurableChange = prevNotify
+    assertTrue(stE == "accepted" or stE == "obsolete",
+        "459: losing correction retained got " .. tostring(stE) .. "/" .. tostring(rE))
+    local sawHistory = false
+    for i = 1, #notifies do
+        if notifies[i] == "remote-correction-history" then
+            sawHistory = true
+        end
+    end
+    assertTrue(sawHistory, "459: warm provider notified for retained losing correction")
+    assertTrue(record.operations.records[early.id] ~= nil,
+        "459: losing body kept in accepted history")
+end
+
+do
+    -- Redrive attempt budget + eventual continuation for >32 pending corrections.
+    local record = seedLiveCampaignWithItem(9304, 200)
+    injectProductionDonation(record, {
+        id = "budget-don", itemId = 9304, quantity = 50,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    record.operations.pending = record.operations.pending or {}
+    for i = 1, 40 do
+        local id = string.format("budget-corr-%02d", i)
+        record.operations.pending[id] = {
+            id = id,
+            sender = "Alice-Garona",
+            reason = "pending_event",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = id,
+                guildKey = select(1, GS:GetCurrentContext()).guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = "budget-don",
+                value = {
+                    eventId = "budget-don",
+                    eventKind = "donation",
+                    attributed = "Bob-Garona",
+                    attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = 9304,
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = world.time + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
+    local promoted, attempts = GS.RedrivePendingContributorCorrections(record, {
+        eventId = "budget-don",
+        itemId = 9304,
+        maxAttempts = 32,
+    })
+    assertEq(attempts, 32, "459: redrive stops at attempt budget got " .. tostring(attempts))
+    assertTrue(#timers >= 1, "459: continuation scheduled when backlog remains")
+    flushTimers()
+    local remaining = 0
+    for _ in pairs(record.operations.pending or {}) do
+        remaining = remaining + 1
+    end
+    -- First promotion accepts; later same-target ops become obsolete/duplicate paths.
+    assertTrue(promoted >= 1 or record.operations.records["budget-corr-01"] ~= nil
+        or remaining < 40,
+        "459: budget redrive made progress promoted=" .. tostring(promoted)
+            .. " remaining=" .. tostring(remaining))
+end
+
+do
+    -- Confirm binds to captured payload; selection/session change invalidates Save.
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local record = seedLiveCampaignWithItem(9305, 40)
+    injectProductionDonation(record, {
+        id = "confirm-don", itemId = 9305, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local rows = logsPage.__sfTest.BuildProjectedRows()
+    local row = nil
+    for i = 1, #rows do
+        if rows[i].id == "confirm-don" then row = rows[i] break end
+    end
+    assertTrue(row ~= nil, "459: confirm row projected")
+    logsPage.__sfTest.OpenEditContributorDialog("confirm-don", row)
+    local session = logsPage.__sfTest.GetEditSession()
+    session.attributed = "Bob-Garona"
+    session.attributedGuid = "Player-1-Bob"
+    session.attributionText = "Bob-Garona"
+    session.attributionResolved = true
+
+    local savedCb = nil
+    local prevConfirm = SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        savedCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    assertTrue(type(savedCb) == "function", "459: confirm callback captured")
+    assertTrue(type(logsPage.__sfTest.GetPendingConfirm()) == "table",
+        "459: pending confirm payload set")
+    -- Change selection while confirmation is open.
+    session.attributed = "Carol-Garona"
+    session.attributedGuid = "Player-1-Carol"
+    session.attributionText = "Carol-Garona"
+    logsPage.__sfTest.InvalidatePendingConfirm()
+    local beforeRecords = 0
+    for _ in pairs(record.operations.records or {}) do
+        beforeRecords = beforeRecords + 1
+    end
+    savedCb()
+    local afterRecords = 0
+    for _ in pairs(record.operations.records or {}) do
+        afterRecords = afterRecords + 1
+    end
+    assertEq(afterRecords, beforeRecords,
+        "459: stale confirm callback did not commit")
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+
+    -- Fresh confirm with deferred dialog then successful save.
+    logsPage.__sfTest.OpenEditContributorDialog("confirm-don", row)
+    session = logsPage.__sfTest.GetEditSession()
+    session.attributed = "Bob-Garona"
+    session.attributedGuid = "Player-1-Bob"
+    session.attributionText = "Bob-Garona"
+    session.attributionResolved = true
+    local okCb = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        okCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    okCb()
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "confirm-don"))), "Bob-Garona",
+        "459: bound confirm committed Bob")
+    logsPage.__sfTest.ClearEditSession()
+end
+
+do
+    -- Projection cache: unchanged GetCurrentRecord does not rebuild; mutations do.
+    local record = seedLiveCampaignWithItem(9306, 40)
+    injectProductionDonation(record, {
+        id = "cache-don", itemId = 9306, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local rebuilds = 0
+    local realRebuild = GS.RebuildCreditCorrectionProjection
+    GS.RebuildCreditCorrectionProjection = function(...)
+        rebuilds = rebuilds + 1
+        return realRebuild(...)
+    end
+    GS.EnsureCreditCorrectionProjection(record, nil)
+    local afterEnsure = rebuilds
+    assertTrue(afterEnsure >= 1, "459: first ensure rebuilds")
+    for _ = 1, 20 do
+        GS:GetCurrentRecord()
+        GS.EnsureCreditCorrectionProjection(record, nil)
+        GS.ResolveEffectiveCreditIdentity(record, GS.FindLedgerEventById(record, "cache-don"))
+    end
+    assertEq(rebuilds, afterEnsure,
+        "459: unchanged reads reuse projection got rebuilds=" .. tostring(rebuilds))
+    local op = select(1, GS:NewContributorCorrectionOperation("cache-don", "Bob-Garona", nil))
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "459: mutation invalidates cache")
+    local afterMut = rebuilds
+    assertTrue(afterMut > afterEnsure, "459: apply rebuilt projection")
+    GS.EnsureCreditCorrectionProjection(record, nil)
+    assertEq(rebuilds, afterMut, "459: post-mutation ensure hits cache")
+    -- Substantial retained history: Ensure remains stamp-gated (not per-read full rebuild).
+    for i = 1, 80 do
+        injectProductionDonation(record, {
+            id = "hist-" .. i, itemId = 9306, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    local beforeHist = rebuilds
+    GS.EnsureCreditCorrectionProjection(record, nil)
+    local histRebuilds = rebuilds - beforeHist
+    assertEq(histRebuilds, 1, "459: one rebuild after invalidation over history")
+    for _ = 1, 10 do
+        GS.EnsureCreditCorrectionProjection(record, nil)
+    end
+    assertEq(rebuilds - beforeHist, 1, "459: history ensure stays cached")
+    GS.RebuildCreditCorrectionProjection = realRebuild
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

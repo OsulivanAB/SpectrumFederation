@@ -1205,6 +1205,24 @@ local function CurrentTargetRevision(record, targetKey)
     return record.datasetId
 end
 
+--- Target key for admission/classify/store. Contributor corrections use the
+-- canonical donation id so alias-targeted ops share one LWW head (#459).
+local function OperationTargetKey(record, op)
+    if type(op) ~= "table" then
+        return nil
+    end
+    if op.kind == GS.KIND.START_CAMPAIGN then
+        return GS.CAMPAIGN_TARGET_KEY
+    end
+    if op.kind == GS.KIND.CORRECT_CONTRIBUTOR and GS.CorrectionTargetKey then
+        return GS.CorrectionTargetKey(record, op.target)
+    end
+    if GS._TargetKey then
+        return GS._TargetKey(op.kind, op.target)
+    end
+    return nil
+end
+
 local function HasAcceptedId(ops, id)
     return type(ops.records) == "table" and type(ops.records[id]) == "table"
 end
@@ -3094,10 +3112,7 @@ local function DurableRetainOnRecord(record, op, reason, boundary, opts)
     -- Always classify: foreign evidence that shares ancestry with the current
     -- head must open an explicit conflict, including when it arrived before the
     -- accepted sibling and was initially stored as plain pending.
-    local targetKey = GS._TargetKey and GS._TargetKey(op.kind, op.target)
-    if op.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, op)
     if targetKey then
         local class, classReason = ClassifyStaleBase(record, op, targetKey)
         if class == "conflict" or (ops.openConflicts and ops.openConflicts[targetKey]) then
@@ -5804,10 +5819,9 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         GS.EstablishCampaignBaseline(shadow.accounting._consumables, header and header.startedAt or nil)
     end
     local function targetKeyOf(op)
-        if GS._TargetKey then
-            return GS._TargetKey(op.kind, op.target)
-        end
-        return tostring(op.kind) .. ":" .. tostring(op.target)
+        return OperationTargetKey(shadow, op)
+            or (GS._TargetKey and GS._TargetKey(op.kind, op.target))
+            or (tostring(op.kind) .. ":" .. tostring(op.target))
     end
     local function applyMut(op)
         if GS._ApplyMutations then
@@ -6162,7 +6176,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     -- succeeds so rollback can restore exact prior conflict/relay/boundary state.
     for i = 1, #(plan.promoteOps or {}) do
         local pop = plan.promoteOps[i]
-        local targetKey = GS._TargetKey and GS._TargetKey(pop.kind, pop.target)
+        local targetKey = OperationTargetKey(record, pop)
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, pop, targetKey)
             promotedIds[#promotedIds + 1] = pop.id
@@ -6375,10 +6389,7 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
         end
     end
 
-    local targetKey = GS._TargetKey and GS._TargetKey(stored.kind, stored.target)
-    if stored.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, stored)
     if not targetKey then
         return "rejected", "invalid_target"
     end
@@ -6556,10 +6567,7 @@ local function ClassifyConfirmationPromotion(record, authBody, admissionCtx)
         or authBody.kind == GS.KIND.RESOLVE_CONFLICT then
         return "skip"
     end
-    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
-    if authBody.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, authBody)
     if not targetKey then
         return "skip"
     end
@@ -6583,7 +6591,7 @@ local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, 
     if type(shadow) ~= "table" or type(authBody) ~= "table" then
         return false, "invalid_operation"
     end
-    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
+    local targetKey = OperationTargetKey(shadow, authBody)
     if authBody.kind == GS.KIND.START_CAMPAIGN then
         targetKey = GS.CAMPAIGN_TARGET_KEY
         shadow.currentCampaignId = authBody.id
@@ -7417,7 +7425,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         return "rejected", "full"
     end
 
-    local targetKey = GS._TargetKey and GS._TargetKey(stored.kind, stored.target)
+    local targetKey = OperationTargetKey(record, stored)
     if not targetKey and stored.kind ~= GS.KIND.CONFIRM_CANDIDATE then
         return "rejected", "invalid_target"
     end
@@ -7890,7 +7898,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     and admissionCtx.sourceAcceptedSet[stored.id] == true
             end
             if allowRetain then
-                if not ops.records[stored.id] then
+                local newlyRetained = not (ops.records and ops.records[stored.id])
+                if newlyRetained then
                     if GS._AcceptedCount
                         and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
                         return "rejected", "full"
@@ -7899,8 +7908,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         GS._StoreAccepted(ops, stored, nil)
                     end
                 end
-                if GS.RebuildCreditCorrectionProjection then
-                    GS.RebuildCreditCorrectionProjection(record, nil)
+                if GS.InvalidateCreditCorrectionProjection then
+                    GS.InvalidateCreditCorrectionProjection(record)
+                end
+                if GS.EnsureCreditCorrectionProjection then
+                    GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+                -- Warm providers must export newly retained older corrections.
+                if newlyRetained and not admissionCtx.adoptionReplay
+                    and GS._NotifyLocalDurableChange then
+                    GS._NotifyLocalDurableChange("remote-correction-history")
                 end
                 return "accepted", nil
             end
@@ -8042,18 +8059,25 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             GS._StoreAccepted(ops, stored, targetKey)
         end
         if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
-            if GS.RebuildCreditCorrectionProjection then
-                GS.RebuildCreditCorrectionProjection(record, nil)
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
             end
-            if not admissionCtx.adoptionReplay and GS.RedrivePendingContributorCorrections then
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
+                and GS.RedrivePendingContributorCorrections then
                 GS.RedrivePendingContributorCorrections(record, {
                     eventId = stored.target,
                     itemId = stored.value and stored.value.itemId,
                 })
             end
         elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
-            if GS.RebuildCreditCorrectionProjection then
-                GS.RebuildCreditCorrectionProjection(record, nil)
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
             end
             if not admissionCtx.adoptionReplay and GS.RedrivePendingContributorCorrections then
                 GS.RedrivePendingContributorCorrections(record, {

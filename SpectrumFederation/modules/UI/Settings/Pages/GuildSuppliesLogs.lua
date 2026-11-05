@@ -461,6 +461,10 @@ local editRosterCache = {
 
 -- Session-only editor state captured at open; never persisted (#459).
 local editSession = nil
+-- Confirmation binds to one immutable payload; selection/session changes bump
+-- the token so a stale Confirm callback cannot commit a different edit (#459).
+local confirmGeneration = 0
+local pendingConfirm = nil
 
 local function EditRosterGeneration()
 	local GG = SF.GuildGossip
@@ -470,7 +474,13 @@ local function EditRosterGeneration()
 	return 0
 end
 
+local function InvalidatePendingConfirm()
+	confirmGeneration = confirmGeneration + 1
+	pendingConfirm = nil
+end
+
 local function ClearEditSession()
+	InvalidatePendingConfirm()
 	editSession = nil
 end
 
@@ -627,6 +637,8 @@ local function SetEditAttributionFromText(v)
 	if type(editSession) ~= "table" then
 		return
 	end
+	-- Changing the reviewed recipient invalidates any open confirmation.
+	InvalidatePendingConfirm()
 	local text = tostring(v or "")
 	editSession.attributionText = text
 	local name, guid, ok = ResolveEditAttribution(text, editSession.allowUnassigned)
@@ -705,8 +717,9 @@ local function EditSessionStillFresh(session)
 			curName, curGuid, session.effectiveName, session.effectiveGuid) then
 		return false, "stale_credit"
 	end
-	local tKey = g.ComputeTargetKey
-		and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id)
+	local tKey = g.CorrectionTargetKey and g.CorrectionTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id))
 	local headId = tKey and record.operations and record.operations.heads
 		and record.operations.heads[tKey]
 	local expected = session.baseTargetRevision
@@ -721,41 +734,73 @@ local function EditSessionStillFresh(session)
 	return true, nil, record, event
 end
 
-local function CommitEditSession()
+--- Commit one immutable confirmation payload (not the live mutable session).
+local function CommitCapturedEdit(payload)
 	if Caps().canEdit ~= true then
 		ReportLogsStatus("rejected", "unauthorized")
 		ClearEditSession()
 		return
 	end
-	local session = editSession
-	if type(session) ~= "table" then
+	if type(payload) ~= "table" then
 		ReportLogsStatus("rejected", "stale_credit")
 		return
 	end
-	if not session.attributionResolved then
+	-- Stale Confirm callbacks must not apply after selection/session change.
+	if pendingConfirm ~= payload
+		or payload.confirmGeneration ~= confirmGeneration then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	if not payload.attributionResolved then
 		ReportLogsStatus("rejected", "invalid_attribution")
 		return
 	end
-	local fresh, reason = EditSessionStillFresh(session)
+	local fresh, reason = EditSessionStillFresh(payload)
 	if not fresh then
 		ClearEditSession()
 		ReportLogsStatus("rejected", reason or "stale_credit")
 		return
 	end
+	-- Live session must still describe the same reviewed entry/recipient.
+	local session = editSession
+	if type(session) ~= "table"
+		or session.eventId ~= payload.eventId
+		or session.datasetId ~= payload.datasetId
+		or session.campaignId ~= payload.campaignId
+		or session.guildKey ~= payload.guildKey
+		or session.baseTargetRevision ~= payload.baseTargetRevision then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
 	local g = GS()
+	if g and g.CreditIdentitiesEqual then
+		if not g.CreditIdentitiesEqual(
+			session.attributed, session.attributedGuid,
+			payload.attributed, payload.attributedGuid) then
+			ClearEditSession()
+			ReportLogsStatus("rejected", "stale_credit")
+			return
+		end
+	elseif session.attributed ~= payload.attributed
+		or session.attributedGuid ~= payload.attributedGuid then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
 	if not g or not g.NewContributorCorrectionOperation then
 		ReportLogsStatus("rejected", "unsupported_kind")
 		return
 	end
 	local op, status, prepReason = g:NewContributorCorrectionOperation(
-		session.eventId, session.attributed, session.attributedGuid)
+		payload.eventId, payload.attributed, payload.attributedGuid)
 	if not op then
 		ClearEditSession()
 		ReportLogsStatus(status or "rejected", prepReason or "invalid_value")
 		return
 	end
 	-- Reconfirm open-time revision still matches prepare-time head.
-	if op.baseTargetRevision ~= session.baseTargetRevision then
+	if op.baseTargetRevision ~= payload.baseTargetRevision then
 		ClearEditSession()
 		ReportLogsStatus("rejected", "stale_credit")
 		return
@@ -763,6 +808,35 @@ local function CommitEditSession()
 	local applyStatus, applyReason = g:ApplyStagedConfigOperation(op)
 	ClearEditSession()
 	ReportLogsStatus(applyStatus, applyReason)
+end
+
+local function CommitEditSession()
+	local session = editSession
+	if type(session) ~= "table" then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	-- Immediate commit (no dialog): capture the current session as the payload.
+	InvalidatePendingConfirm()
+	local payload = {
+		confirmGeneration = confirmGeneration,
+		eventId = session.eventId,
+		kind = session.kind,
+		allowUnassigned = session.allowUnassigned,
+		effectiveName = session.effectiveName,
+		effectiveGuid = session.effectiveGuid,
+		baseTargetRevision = session.baseTargetRevision,
+		guildKey = session.guildKey,
+		datasetId = session.datasetId,
+		campaignId = session.campaignId,
+		quantityText = session.quantityText,
+		itemText = session.itemText,
+		attributed = session.attributed,
+		attributedGuid = session.attributedGuid,
+		attributionResolved = session.attributionResolved,
+	}
+	pendingConfirm = payload
+	CommitCapturedEdit(payload)
 end
 
 OpenEditContributorDialog = function(eventId, rowData)
@@ -807,8 +881,9 @@ OpenEditContributorDialog = function(eventId, rowData)
 	if g.ResolveEffectiveCreditIdentity then
 		effectiveName, effectiveGuid = g.ResolveEffectiveCreditIdentity(record, event)
 	end
-	local tKey = g.ComputeTargetKey
-		and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id)
+	local tKey = g.CorrectionTargetKey and g.CorrectionTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id))
 	local headRev = tKey and record.operations and record.operations.heads
 		and record.operations.heads[tKey] or nil
 	-- Match CurrentTargetRevision: datasetId stands in when no correction head.
@@ -816,6 +891,8 @@ OpenEditContributorDialog = function(eventId, rowData)
 	local prefill = effectiveName
 	local prefillGuid = effectiveGuid
 	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	-- Opening another entry invalidates any in-flight confirmation.
+	InvalidatePendingConfirm()
 	editSession = {
 		eventId = event.id,
 		kind = kind,
@@ -862,25 +939,45 @@ local function ConfirmAndSaveEdit()
 		ReportLogsStatus("rejected", reason or "stale_credit")
 		return
 	end
+	-- Freeze the reviewed recipient/entry before the confirm dialog opens.
+	InvalidatePendingConfirm()
+	local payload = {
+		confirmGeneration = confirmGeneration,
+		eventId = session.eventId,
+		kind = session.kind,
+		allowUnassigned = session.allowUnassigned,
+		effectiveName = session.effectiveName,
+		effectiveGuid = session.effectiveGuid,
+		baseTargetRevision = session.baseTargetRevision,
+		guildKey = session.guildKey,
+		datasetId = session.datasetId,
+		campaignId = session.campaignId,
+		quantityText = session.quantityText,
+		itemText = session.itemText,
+		attributed = session.attributed,
+		attributedGuid = session.attributedGuid,
+		attributionResolved = session.attributionResolved,
+	}
+	pendingConfirm = payload
 	local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 	if not Dialogs or not Dialogs.Confirm then
 		-- Fall back to immediate save when dialogs are unavailable (tests).
-		CommitEditSession()
+		CommitCapturedEdit(payload)
 		return
 	end
-	local newLabel = session.attributed
+	local newLabel = payload.attributed
 		or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
-	local current = session.effectiveName
+	local current = payload.effectiveName
 		or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
 	local confirm = Loc("GUILD_SUPPLIES_LOGS_EDIT_CONFIRM",
 		"Move contribution credit for %s × %s\nfrom %s\nto %s?\nItem, quantity, and original evidence stay unchanged.")
 		:format(
-			tostring(session.quantityText),
-			tostring(session.itemText),
+			tostring(payload.quantityText),
+			tostring(payload.itemText),
 			tostring(current),
 			tostring(newLabel))
 	Dialogs:Confirm(confirm, Loc("GUILD_SUPPLIES_LOGS_EDIT_SAVE", "Save correction"), function()
-		CommitEditSession()
+		CommitCapturedEdit(payload)
 	end)
 end
 
@@ -1111,6 +1208,7 @@ local function Definition()
 							if type(editSession) ~= "table" then
 								return
 							end
+							InvalidatePendingConfirm()
 							if not item then
 								editSession.attributionResolved = false
 								return
@@ -1410,8 +1508,13 @@ Page.__sfTest = {
 	GetEditSession = function()
 		return editSession
 	end,
+	GetPendingConfirm = function()
+		return pendingConfirm
+	end,
 	ClearEditSession = ClearEditSession,
+	InvalidatePendingConfirm = InvalidatePendingConfirm,
 	CommitEditSession = CommitEditSession,
+	CommitCapturedEdit = CommitCapturedEdit,
 	ConfirmAndSaveEdit = ConfirmAndSaveEdit,
 	EnsureEditRosterCache = EnsureEditRosterCache,
 }

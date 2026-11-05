@@ -1113,9 +1113,11 @@ function GS:NewContributorCorrectionOperation(eventId, attributed, attributedGui
             value.baseAttributed, value.baseAttributedGuid) then
         return nil, "rejected", "unchanged_attribution"
     end
-    -- Target the canonical ledger event id (alias-aware prepare).
+    -- Target the canonical ledger event id (alias-aware prepare/head key).
     local canonicalTarget = value.eventId
-    local tKey = TargetKey(KIND.CORRECT_CONTRIBUTOR, canonicalTarget)
+    local tKey = GS.CorrectionTargetKey
+        and GS.CorrectionTargetKey(record, canonicalTarget)
+        or TargetKey(KIND.CORRECT_CONTRIBUTOR, canonicalTarget)
     if not tKey then
         return nil, "rejected", "invalid_target"
     end

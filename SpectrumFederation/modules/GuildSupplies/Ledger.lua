@@ -1782,6 +1782,10 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
         -- when a known accepted donation is supplied.
         if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
             GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            if GS.WakePendingCorrectionsAfterAlias then
+                GS.WakePendingCorrectionsAfterAlias(
+                    record, primaryTxnId, aliasTxnId, knownEvent.itemId)
+            end
         end
         return false
     end
@@ -1794,6 +1798,11 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
             -- accepted donation is supplied (cold competing-ID convergence).
             if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
                 GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            end
+            -- #459: re-confirming a trusted alias must still wake pending corrections.
+            if type(record) == "table" and GS.WakePendingCorrectionsAfterAlias then
+                GS.WakePendingCorrectionsAfterAlias(
+                    record, primaryTxnId, aliasTxnId, row.itemId)
             end
             return true
         end
@@ -1823,7 +1832,24 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
     if type(record) == "table" and GS.OnDonationTxnAlias then
         GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
     end
+    -- #459: alias discovery can unblock corrections pending on either txn id.
+    if type(record) == "table" and GS.WakePendingCorrectionsAfterAlias then
+        GS.WakePendingCorrectionsAfterAlias(
+            record, primaryTxnId, aliasTxnId, row.itemId)
+    end
     return true
+end
+
+--- Test/harness: register a trusted donation txn alias and wake corrections.
+function GS._AddTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return false
+    end
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false
+    end
+    return AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
 end
 
 local function EnsureEventArchive(record)
@@ -2092,6 +2118,19 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             if GS.TryAssignDonationValuation then
                 GS.TryAssignDonationValuation(record, existing, nil)
             end
+            -- #459: late production credit can unblock pending/not_credited corrections.
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            if GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
+                    eventId = existing.id,
+                    itemId = existing.itemId,
+                })
+            end
         end
     end
     return changed
@@ -2330,23 +2369,127 @@ end
 
 --- Retry trusted pending correct-contributor ops through authenticated admission (#459).
 -- Skips untrusted_relay/evidence. Bounds attempted work (including failures).
--- opts.eventId / opts.itemId narrow dependency-driven retries.
+-- opts.eventId / opts.itemId wake related deps with OR matching when both set.
+-- Non-reentrant: nested accepts coalesce into one continuation with a saved cursor.
 -- @return promotedCount, attemptCount
+local creditRedriveDepth = 0
+local creditRedriveContinuation = setmetatable({}, { __mode = "k" })
+
+local function CreditRedriveMatch(record, body, opts)
+    local eventIdFilter = opts.eventId
+    local itemIdFilter = tonumber(opts.itemId)
+    if (type(eventIdFilter) ~= "string" or eventIdFilter == "") and not itemIdFilter then
+        return true
+    end
+    local matchEvent = false
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        local canonical = GS.CanonicalCreditEventId
+            and GS.CanonicalCreditEventId(record, body.target) or body.target
+        local filterCanon = GS.CanonicalCreditEventId
+            and GS.CanonicalCreditEventId(record, eventIdFilter) or eventIdFilter
+        matchEvent = (canonical == filterCanon or body.target == eventIdFilter)
+        -- Alias of either side also matches.
+        if not matchEvent and type(body.target) == "string" then
+            local bodyCanon = canonical
+            local filterPrimary = filterCanon
+            matchEvent = bodyCanon ~= nil and filterPrimary ~= nil and bodyCanon == filterPrimary
+        end
+    end
+    local matchItem = false
+    if itemIdFilter then
+        local bodyItem = tonumber(body.value and body.value.itemId)
+        if bodyItem and bodyItem == itemIdFilter then
+            matchItem = true
+        else
+            local ev = GS.FindLedgerEventById and GS.FindLedgerEventById(record, body.target)
+            if ev and tonumber(ev.itemId) == itemIdFilter then
+                matchItem = true
+            end
+        end
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" and itemIdFilter then
+        return matchEvent or matchItem
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        return matchEvent
+    end
+    return matchItem
+end
+
+local function ScheduleCreditRedriveContinuation(record, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = creditRedriveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = { cursor = 1, opts = opts or {}, scheduled = false }
+        creditRedriveContinuation[record] = cont
+    else
+        -- Coalesce wakes: broaden filters toward a full drain when mixed.
+        local prev = cont.opts or {}
+        local merged = {}
+        for k, v in pairs(prev) do
+            merged[k] = v
+        end
+        if opts then
+            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+                merged.eventId = nil
+            elseif opts.eventId and not prev.eventId and not prev.itemId then
+                merged.eventId = opts.eventId
+            elseif opts.eventId and prev.itemId and not prev.eventId then
+                merged.eventId = opts.eventId
+            end
+            if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+                merged.itemId = nil
+                merged.eventId = nil
+            elseif opts.itemId and not (prev.eventId or prev.itemId) then
+                merged.itemId = opts.itemId
+            elseif opts.itemId then
+                merged.itemId = opts.itemId
+            end
+            if opts.maxAttempts then
+                merged.maxAttempts = opts.maxAttempts
+            end
+        end
+        cont.opts = merged
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = creditRedriveContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        if GS.RedrivePendingContributorCorrections then
+            GS.RedrivePendingContributorCorrections(record, state.opts)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+    else
+        run()
+    end
+end
+
 function GS.RedrivePendingContributorCorrections(record, opts)
     opts = opts or {}
     if type(opts) == "string" then
-        -- Back-compat: prior call sites passed eventIdFilter as a string.
         opts = { eventId = opts }
     end
     if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return 0, 0
+    end
+    if creditRedriveDepth > 0 then
+        ScheduleCreditRedriveContinuation(record, opts)
         return 0, 0
     end
     local ops = record.operations
     if type(ops.pending) ~= "table" then
         return 0, 0
     end
-    local eventIdFilter = opts.eventId
-    local itemIdFilter = tonumber(opts.itemId)
     local ids = {}
     for id, entry in pairs(ops.pending) do
         local body = entry and entry.body
@@ -2355,50 +2498,39 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             and type(body.target) == "string" then
             local reason = entry.reason
             if reason ~= "untrusted_relay" and reason ~= "evidence" then
-                local include = true
-                if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
-                    local canonical = GS.CanonicalCreditEventId
-                        and GS.CanonicalCreditEventId(record, body.target) or body.target
-                    local filterCanon = GS.CanonicalCreditEventId
-                        and GS.CanonicalCreditEventId(record, eventIdFilter) or eventIdFilter
-                    if canonical ~= filterCanon and body.target ~= eventIdFilter then
-                        include = false
-                    end
-                end
-                if include and itemIdFilter then
-                    local bodyItem = tonumber(body.value and body.value.itemId)
-                    if bodyItem and bodyItem ~= itemIdFilter then
-                        include = false
-                    elseif not bodyItem then
-                        local ev = GS.FindLedgerEventById and GS.FindLedgerEventById(record, body.target)
-                        if ev and tonumber(ev.itemId) and tonumber(ev.itemId) ~= itemIdFilter then
-                            include = false
-                        end
-                    end
-                end
-                if include then
+                if CreditRedriveMatch(record, body, opts) then
                     ids[#ids + 1] = id
                 end
             end
         end
     end
     table.sort(ids)
+    local cont = creditRedriveContinuation[record]
+    local startIndex = 1
+    if type(cont) == "table" and tonumber(cont.cursor) and cont.cursor >= 1 then
+        startIndex = math.floor(cont.cursor)
+        if startIndex > #ids + 1 then
+            startIndex = 1
+        end
+    end
     local promoted = 0
     local attempts = 0
     local maxAttempts = tonumber(opts.maxAttempts) or 32
-    for i = 1, #ids do
+    creditRedriveDepth = creditRedriveDepth + 1
+    local i = startIndex
+    while i <= #ids do
         if attempts >= maxAttempts then
             break
         end
         attempts = attempts + 1
         local id = ids[i]
+        i = i + 1
         local entry = ops.pending[id]
         local body = entry and entry.body
         if type(body) ~= "table" then
             -- counted toward the attempt budget
         elseif type(entry.sender) ~= "string" or entry.sender == "" then
-            -- Trusted pending without a retained authenticated sender cannot be
-            -- re-admitted safely; leave pending until redelivery/auth path.
+            -- leave pending until authenticated sender is known
         else
             local alreadyAccepted = ops.records and ops.records[id]
             if not alreadyAccepted and GS._AcceptedCount
@@ -2409,12 +2541,29 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                     sender = entry.sender,
                     offlineRecord = record,
                     preserveAttribution = true,
+                    _creditRedrive = true,
                 })
                 if status == "accepted" or status == "duplicate" then
                     promoted = promoted + 1
                 end
             end
         end
+    end
+    creditRedriveDepth = creditRedriveDepth - 1
+    if i <= #ids then
+        -- More work remains: save cursor and continue eventually.
+        creditRedriveContinuation[record] = {
+            cursor = i,
+            opts = opts,
+            scheduled = false,
+        }
+        ScheduleCreditRedriveContinuation(record, opts)
+    else
+        creditRedriveContinuation[record] = {
+            cursor = 1,
+            opts = opts,
+            scheduled = false,
+        }
     end
     return promoted, attempts
 end
@@ -2432,8 +2581,11 @@ local function AppendLedgerEvent(record, event)
     if eventGen and curGen and eventGen < curGen then
         local ok, err = AppendArchivedLedgerEvent(record, event)
         if ok and type(event) == "table" then
-            if GS.RebuildCreditCorrectionProjection then
-                GS.RebuildCreditCorrectionProjection(record, nil)
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
             end
             GS.RedrivePendingContributorCorrections(record, {
                 eventId = event.id,
@@ -2462,9 +2614,12 @@ local function AppendLedgerEvent(record, event)
     BumpAccountingMutation(record)
     if type(event) == "table" then
         -- Balance/credit changes can activate previously floor-held accepted heads
-        -- and redrive trusted pending corrections for the same item.
-        if GS.RebuildCreditCorrectionProjection then
-            GS.RebuildCreditCorrectionProjection(record, nil)
+        -- and redrive trusted pending corrections for related events/items.
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(record)
+        end
+        if GS.EnsureCreditCorrectionProjection then
+            GS.EnsureCreditCorrectionProjection(record, nil)
         end
         GS.RedrivePendingContributorCorrections(record, {
             eventId = event.id,
@@ -4789,6 +4944,87 @@ function GS.CanonicalCreditEventId(record, eventId)
     return primary or eventId
 end
 
+--- Operation-head key for correct-contributor, bound to the canonical event id.
+-- Admission, apply, and prepare must share this key so alias-targeted ops
+-- LWW against the same head as locally prepared canonical corrections (#459).
+function GS.CorrectionTargetKey(record, target)
+    if type(target) ~= "string" or target == "" then
+        return nil
+    end
+    local canonical = GS.CanonicalCreditEventId(record, target) or target
+    if not GS.ComputeTargetKey then
+        return "credit:" .. canonical
+    end
+    return GS.ComputeTargetKey(
+        GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR, canonical)
+end
+
+--- Fold alias-keyed correction heads onto the canonical primary after trusted
+-- A→X discovery so obsolete/LWW classification sees one head (#459).
+function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId)
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return
+    end
+    local ops = record.operations
+    if type(ops.heads) ~= "table" then
+        return
+    end
+    local primaryKey = GS.CorrectionTargetKey
+        and GS.CorrectionTargetKey(record, primaryTxnId)
+        or ("credit:" .. tostring(primaryTxnId))
+    local aliasKey = "credit:" .. tostring(aliasTxnId)
+    if primaryKey == aliasKey then
+        return
+    end
+    local aliasHeadId = ops.heads[aliasKey]
+    if type(aliasHeadId) ~= "string" then
+        return
+    end
+    local primaryHeadId = ops.heads[primaryKey]
+    if type(primaryHeadId) ~= "string" then
+        ops.heads[primaryKey] = aliasHeadId
+        ops.heads[aliasKey] = nil
+        return
+    end
+    if primaryHeadId == aliasHeadId then
+        ops.heads[aliasKey] = nil
+        return
+    end
+    local primaryBody = ops.records and ops.records[primaryHeadId]
+    local aliasBody = ops.records and ops.records[aliasHeadId]
+    if type(aliasBody) == "table" and type(primaryBody) == "table"
+        and GS.CreditCorrectionRevisionWins
+        and GS.CreditCorrectionRevisionWins(aliasBody, primaryBody) then
+        ops.heads[primaryKey] = aliasHeadId
+    end
+    ops.heads[aliasKey] = nil
+end
+
+--- After trusted alias discovery: migrate heads, rebuild projection, redrive (#459).
+function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, itemId)
+    if type(record) ~= "table" then
+        return
+    end
+    GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId)
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(record, nil)
+    end
+    if not GS.RedrivePendingContributorCorrections then
+        return
+    end
+    GS.RedrivePendingContributorCorrections(record, {
+        eventId = primaryTxnId,
+        itemId = itemId,
+    })
+    GS.RedrivePendingContributorCorrections(record, {
+        eventId = aliasTxnId,
+        itemId = itemId,
+    })
+end
+
 local function DurableCreditIdentity(event)
     if IsDonationLedgerEvent(event) then
         return NormName(event.actor), ValidGuid(event.actorGuid or event.donorGuid)
@@ -4823,6 +5059,9 @@ end
 function GS.ResolveEffectiveCreditIdentity(record, event)
     if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
         return nil, nil, nil
+    end
+    if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(record, nil)
     end
     local map = type(record) == "table" and record.creditCorrections or nil
     local head = nil
@@ -5069,9 +5308,143 @@ local function BindCorrectionNewIdentity(record, event, attributed, attributedGu
     return nil, nil, nil
 end
 
+local function CopyActiveMap(map)
+    local out = {}
+    if type(map) ~= "table" then
+        return out
+    end
+    for k, v in pairs(map) do
+        out[k] = v
+    end
+    return out
+end
+
+local function IdentityBucketKey(name, guid, itemId, campaignId)
+    local g = ValidGuid(guid)
+    local n = NormName(name)
+    if not g and not n then
+        return nil
+    end
+    itemId = tonumber(itemId)
+    if not itemId then
+        return nil
+    end
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return nil
+    end
+    if g then
+        return "g:" .. g .. "\0" .. tostring(itemId) .. "\0" .. campaignId
+    end
+    return "n:" .. n .. "\0" .. tostring(itemId) .. "\0" .. campaignId
+end
+
+--- True when every personal (identity, item, campaign) total is nonnegative
+-- under the candidate active correction map (#459 dependency policy).
+-- Identity buckets match personal-floor semantics: GUID-first when Guild Info
+-- relationships are ready; when they are not, BindCharacterIdentity may strip
+-- claimed GUIDs from correction heads while durable adjustments still carry
+-- GUIDs — prefer name keys in that state so one character does not split.
+local function AllPersonalNonNegative(record, activeMap)
+    if type(record) ~= "table" then
+        return false
+    end
+    local relationshipsReady = GS.WitnessRelationshipsReady
+        and select(1, GS.WitnessRelationshipsReady(record))
+    local totals = {}
+    local function addQty(name, guid, itemId, campaignId, qty)
+        local g = ValidGuid(guid)
+        local n = NormName(name)
+        if not g and n and GS.ResolveUniqueCharacterGuid then
+            g = ValidGuid(GS.ResolveUniqueCharacterGuid(record, n, nil))
+        end
+        local key
+        if n and not relationshipsReady then
+            key = IdentityBucketKey(n, nil, itemId, campaignId)
+        else
+            key = IdentityBucketKey(n, g, itemId, campaignId)
+        end
+        if not key or not qty or qty == 0 then
+            return
+        end
+        totals[key] = (totals[key] or 0) + qty
+    end
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        local itemId = tonumber(event.itemId)
+        local qty = tonumber(event.quantity) or 0
+        if not itemId or qty == 0 then
+            return
+        end
+        local campaignId = event.campaignId or record.currentCampaignId
+        local creditName, creditGuid
+        local override = type(activeMap) == "table" and type(event.id) == "string"
+            and activeMap[event.id] or nil
+        if type(override) == "table" then
+            creditName, creditGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
+        else
+            creditName, creditGuid = DurableCreditIdentity(event)
+        end
+        local isDonation = IsDonationLedgerEvent(event)
+        local isAdjustment = IsAdjustmentLedgerEvent(event)
+        if isDonation then
+            if qty > 0 then
+                addQty(creditName, creditGuid, itemId, campaignId, qty)
+            end
+        elseif isAdjustment then
+            if creditName or creditGuid then
+                addQty(creditName, creditGuid, itemId, campaignId, qty)
+            end
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        for i = 1, #live do
+            consider(live[i])
+        end
+    end
+    if type(archived) == "table" then
+        for i = 1, #archived do
+            consider(archived[i])
+        end
+    end
+    for _, total in pairs(totals) do
+        if total < 0 then
+            return false
+        end
+    end
+    return true
+end
+
+local creditProjectionCache = setmetatable({}, { __mode = "k" })
+
+local function CreditProjectionDependencyStamp(record)
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    return tostring(opsGen) .. ":" .. tostring(acctMut) .. ":" .. tostring(record.datasetId or "")
+end
+
+--- Invalidate cached credit projection after dependency mutations (#459).
+function GS.InvalidateCreditCorrectionProjection(record)
+    if type(record) == "table" then
+        creditProjectionCache[record] = nil
+    end
+end
+
 --- Rebuild creditCorrections from accepted correct-contributor ops (#459).
 -- Deterministic active-head policy: LWW winner per canonical event, then greedy
--- activation in ascending (timestamp, id) under personal nonnegative floors.
+-- activation in descending (timestamp, id) order, admitting a head only when the
+-- full ledger stays personally nonnegative for every identity (covers later
+-- signed adjustments that spent corrected credit).
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
 -- @return boolean ok, string|nil err, table|nil details { activeIds = {...} }
 function GS.RebuildCreditCorrectionProjection(record, extraOp)
@@ -5140,13 +5513,15 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             event = entry.event,
         }
     end
+    -- Newest-first greedy under global personal floors so later adjustments that
+    -- spent corrected credit keep that correction active when possible.
     table.sort(ordered, function(a, b)
         local ta = tonumber(a.op.timestamp) or 0
         local tb = tonumber(b.op.timestamp) or 0
         if ta ~= tb then
-            return ta < tb
+            return ta > tb
         end
-        return tostring(a.op.id) < tostring(b.op.id)
+        return tostring(a.op.id) > tostring(b.op.id)
     end)
     local activeMap = {}
     local activeIds = {}
@@ -5158,16 +5533,16 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             local newName, newGuid, bindErr = BindCorrectionNewIdentity(
                 record, event, op.value.attributed, op.value.attributedGuid)
             if not bindErr then
-                local floorOk = FloorOkWithActive(record, event, newName, newGuid, activeMap)
-                if floorOk then
-                    local prior = activeMap[event.id]
-                    activeMap[event.id] = CorrectionHeadFromOp(op, event, newName, newGuid, prior)
+                local tentative = CopyActiveMap(activeMap)
+                local prior = tentative[event.id]
+                tentative[event.id] = CorrectionHeadFromOp(op, event, newName, newGuid, prior)
+                if AllPersonalNonNegative(record, tentative) then
+                    activeMap = tentative
                     activeIds[op.id] = true
                 end
             end
         end
     end
-    -- Capacity: never grow unbounded; keep only active heads (canonical keys).
     local nActive = 0
     for _ in pairs(activeMap) do
         nActive = nActive + 1
@@ -5176,7 +5551,28 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return false, "full"
     end
     record.creditCorrections = activeMap
+    creditProjectionCache[record] = {
+        stamp = CreditProjectionDependencyStamp(record),
+        ok = true,
+    }
     return true, nil, { activeIds = activeIds }
+end
+
+--- Ensure the credit projection matches current ops/ledger dependency stamps.
+-- Unchanged reads reuse the last verified projection (#459).
+function GS.EnsureCreditCorrectionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    if extraOp ~= nil then
+        return GS.RebuildCreditCorrectionProjection(record, extraOp)
+    end
+    local stamp = CreditProjectionDependencyStamp(record)
+    local cached = creditProjectionCache[record]
+    if cached and cached.ok and cached.stamp == stamp then
+        return true
+    end
+    return GS.RebuildCreditCorrectionProjection(record, nil)
 end
 
 --- Eligibility + binding for a contributor correction prepare/apply.
@@ -5326,13 +5722,19 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
     end
     local eventId = op.target or (op.value and op.value.eventId)
     local canonical = GS.CanonicalCreditEventId(record, eventId)
-    local tKey = GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId) or nil
-    -- Also accept heads keyed by the raw target string for alias delivery.
+    local tKey = GS.CorrectionTargetKey and GS.CorrectionTargetKey(record, eventId)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId))
+    -- Also accept heads keyed by the raw target string for pre-migration peers.
     local ops = record.operations
     local headId = ops and ops.heads and tKey and ops.heads[tKey]
     if not headId and type(eventId) == "string" and GS.ComputeTargetKey then
         local rawKey = GS.ComputeTargetKey(op.kind, eventId)
         headId = rawKey and ops and ops.heads and ops.heads[rawKey]
+    end
+    if not headId and type(canonical) == "string" and canonical ~= eventId
+        and GS.ComputeTargetKey then
+        local canonRaw = GS.ComputeTargetKey(op.kind, canonical)
+        headId = canonRaw and ops and ops.heads and ops.heads[canonRaw]
     end
     local headBody = headId and ops.records and ops.records[headId]
     if type(headBody) == "table" and headBody.id ~= op.id
