@@ -5980,6 +5980,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local priorCache = creditProjectionCache[record]
     local resumeDeactivated = nil
     local resumePhase = nil
+    local resumeScan = nil
     -- Resume an interrupted paced rebuild (same dependency stamp).
     -- Speculative extraOp resumes only when the caller re-supplies that exact op
     -- (Apply/Admit). Accepted-history Rebuild(nil) never adopts a preview op.
@@ -5992,12 +5993,15 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             and type(resume.extraOp) == "table"
             and resume.extraOp.id == extraOp.id then
             resumeDeactivated = resume.deactivatedEventIds
+            resumeScan = resume.scan
         elseif type(extraOp) ~= "table" and not resume.speculative then
             resumeDeactivated = resume.deactivatedEventIds
+            resumeScan = resume.scan
         elseif type(extraOp) ~= "table" and resume.speculative then
             -- Stale speculative pause must not affect accepted-history rebuild.
             resumeDeactivated = nil
             resumePhase = nil
+            resumeScan = nil
         end
     end
     -- Top-level Rebuild/Ensure opens a callback budget when not nested.
@@ -6193,71 +6197,17 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local activeMap = {}
     local activeIds = {}
     local bound = {}
-    local scoreBox = { TotalsNegScore(totals) }
-    -- Activate every bindable production-credited winner, then prune by impact.
-    for i = 1, #ordered do
-        local entry = ordered[i]
-        local op = entry.op
-        local event = entry.event
-        if event.gsProductionCredit == true then
-            local newName, newGuid, bindErr = BindCorrectionNewIdentity(
-                record, event, op.value.attributed, op.value.attributedGuid)
-            if not bindErr then
-                local head = CorrectionHeadFromOp(op, event, newName, newGuid, nil)
-                activeMap[event.id] = head
-                activeIds[op.id] = true
-                bound[#bound + 1] = {
-                    event = event,
-                    op = op,
-                    newName = newName,
-                    newGuid = newGuid,
-                }
-                ApplyCorrectionFloorDelta(
-                    record, totals, event, newName, newGuid, relationshipsReady, 1, scoreBox)
-            end
-        end
-    end
+    local scoreBox
     local deactivatedEventIds = {}
-    local boundByEventId = {}
-    for i = 1, #bound do
-        if bound[i] then
-            boundByEventId[bound[i].event.id] = i
-        end
-    end
-    -- Restore prune progress from a prior work_budget slice.
     if type(resumeDeactivated) == "table" then
         for ri = 1, #resumeDeactivated do
-            local eid = resumeDeactivated[ri]
-            local bi = boundByEventId[eid]
-            local entry = bi and bound[bi]
-            if entry and activeMap[eid] then
-                ApplyCorrectionFloorDelta(
-                    record, totals, entry.event, entry.newName, entry.newGuid,
-                    relationshipsReady, -1, scoreBox)
-                activeMap[eid] = nil
-                activeIds[entry.op.id] = nil
-                bound[bi] = nil
-                deactivatedEventIds[#deactivatedEventIds + 1] = eid
-                GS._creditProjectionDeactivations =
-                    (tonumber(GS._creditProjectionDeactivations) or 0) + 1
-            end
+            deactivatedEventIds[ri] = resumeDeactivated[ri]
         end
-    end
-    -- Activate(+restore) re-establishes prior slice state; charge only new prune
-    -- work in this callback so progress can continue under the soft limit.
-    if type(scratch) == "table" and scratch.stamp == stampEarly then
-        GS._creditProjectionBucketVisits = 0
-        GS._creditProjectionFloorVisits = 0
-        GS._creditProjectionCandidateTrials = 0
-        rowVisits = 0
-        GS._creditProjectionRowVisits = 0
     end
     local stamp = stampEarly
     local softLimit = CreditProjectionSoftLimit()
     local hardLimit = CreditProjectionHardLimit()
-    -- Yield only when a timer can return control; otherwise finish this unit.
     local allowDefer = (C_Timer and C_Timer.After) and true or false
-    -- Speculative preview: proposed op not yet in accepted history.
     local speculative = type(extraOp) == "table"
         and not (type(ops) == "table" and type(ops.records) == "table"
             and ops.records[extraOp.id])
@@ -6267,15 +6217,42 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             GS._creditProjectionOwnedCallbackBudget = false
         end
     end
-    local function deferProjection(phase)
-        local workUnits = CreditProjectionWorkNow(rowVisits)
-        AccumulateCreditProjectionCallbackWork(workUnits)
-        -- Persist scratch so the next slice need not rebuild baseline/ordered.
-        -- baselineTotals stays the immutable post-baseline floor snapshot.
+    local scanState = nil
+    if type(resumeScan) == "table" then
+        scanState = {
+            index = tonumber(resumeScan.index) or 1,
+            bestEventId = resumeScan.bestEventId,
+            bestScore = resumeScan.bestScore,
+            bestTs = resumeScan.bestTs,
+            bestId = resumeScan.bestId,
+            currentScore = resumeScan.currentScore,
+        }
+    end
+    local function savePruneScratch()
         local priorScratch = creditProjectionScratch[record]
         local baseSnap = baselineTotals
         if type(priorScratch) == "table" and type(priorScratch.baselineTotals) == "table" then
             baseSnap = priorScratch.baselineTotals
+        end
+        local boundSnap = {}
+        for i = 1, #bound do
+            local entry = bound[i]
+            if entry then
+                boundSnap[#boundSnap + 1] = {
+                    event = entry.event,
+                    op = entry.op,
+                    newName = entry.newName,
+                    newGuid = entry.newGuid,
+                }
+            end
+        end
+        local mapSnap = {}
+        for eid, head in pairs(activeMap) do
+            mapSnap[eid] = head
+        end
+        local idsSnap = {}
+        for oid, v in pairs(activeIds) do
+            idsSnap[oid] = v
         end
         creditProjectionScratch[record] = {
             stamp = stamp,
@@ -6285,7 +6262,19 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             relationshipsReady = relationshipsReady,
             ordered = ordered,
             lookupMisses = lookupMisses,
+            pruneReady = true,
+            pruneTotals = CloneCreditProjectionTotals(totals),
+            pruneBound = boundSnap,
+            pruneActiveMap = mapSnap,
+            pruneActiveIds = idsSnap,
+            pruneScore = scoreBox and scoreBox[1] or 0,
+            deactivatedEventIds = deactivatedEventIds,
         }
+    end
+    local function deferProjection(phase)
+        local workUnits = CreditProjectionWorkNow(rowVisits)
+        AccumulateCreditProjectionCallbackWork(workUnits)
+        savePruneScratch()
         -- Do not publish a partial prune; leave any prior coherent map alone.
         creditProjectionCache[record] = {
             stamp = stamp,
@@ -6294,18 +6283,15 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             resume = {
                 deactivatedEventIds = deactivatedEventIds,
                 phase = phase,
+                scan = scanState,
                 speculative = speculative and true or false,
                 extraOp = speculative and extraOp or nil,
                 extraOpId = speculative and extraOp.id or nil,
             },
         }
-        -- Background continuation is accepted-history only — never speculative.
+        -- Accepted-history always owns its successor timer while unfinished.
         if not speculative then
-            -- Nested accumulating redrive schedules its own continuation.
-            if not GS._creditProjectionAccumulating
-                or GS._creditProjectionOwnedCallbackBudget then
-                ScheduleCreditProjectionContinuation(record)
-            end
+            ScheduleCreditProjectionContinuation(record)
         end
         finishOwnedBudget()
         return false, "work_budget", {
@@ -6327,6 +6313,101 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return allowDefer
             and CreditProjectionCallbackWorkTotal(localWork) >= softLimit
     end
+    -- Prefer retained post-activate/restore scratch so that work is not repeated
+    -- (and therefore not under-counted by resetting counters).
+    local reusedPrune = false
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.pruneReady == true
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table" then
+        local sameDeact = true
+        local priorDeact = scratch.deactivatedEventIds
+        if type(priorDeact) ~= "table" or #priorDeact ~= #deactivatedEventIds then
+            sameDeact = false
+        else
+            for i = 1, #deactivatedEventIds do
+                if priorDeact[i] ~= deactivatedEventIds[i] then
+                    sameDeact = false
+                    break
+                end
+            end
+        end
+        if sameDeact then
+            totals = CloneCreditProjectionTotals(scratch.pruneTotals)
+            bound = {}
+            for i = 1, #scratch.pruneBound do
+                bound[i] = scratch.pruneBound[i]
+            end
+            activeMap = {}
+            for eid, head in pairs(scratch.pruneActiveMap or {}) do
+                activeMap[eid] = head
+            end
+            activeIds = {}
+            for oid, v in pairs(scratch.pruneActiveIds or {}) do
+                activeIds[oid] = v
+            end
+            scoreBox = { tonumber(scratch.pruneScore) or TotalsNegScore(totals) }
+            reusedPrune = true
+        end
+    end
+    if not reusedPrune then
+        scoreBox = { TotalsNegScore(totals) }
+        -- Activate every bindable production-credited winner, then prune by impact.
+        for i = 1, #ordered do
+            local entry = ordered[i]
+            local op = entry.op
+            local event = entry.event
+            if event.gsProductionCredit == true then
+                local newName, newGuid, bindErr = BindCorrectionNewIdentity(
+                    record, event, op.value.attributed, op.value.attributedGuid)
+                if not bindErr then
+                    local head = CorrectionHeadFromOp(op, event, newName, newGuid, nil)
+                    activeMap[event.id] = head
+                    activeIds[op.id] = true
+                    bound[#bound + 1] = {
+                        event = event,
+                        op = op,
+                        newName = newName,
+                        newGuid = newGuid,
+                    }
+                    ApplyCorrectionFloorDelta(
+                        record, totals, event, newName, newGuid, relationshipsReady, 1, scoreBox)
+                end
+            end
+        end
+        local boundByEventId = {}
+        for i = 1, #bound do
+            if bound[i] then
+                boundByEventId[bound[i].event.id] = i
+            end
+        end
+        -- Restore prune progress from a prior work_budget slice (charged).
+        for ri = 1, #deactivatedEventIds do
+            local eid = deactivatedEventIds[ri]
+            local bi = boundByEventId[eid]
+            local entry = bi and bound[bi]
+            if entry and activeMap[eid] then
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, -1, scoreBox)
+                activeMap[eid] = nil
+                activeIds[entry.op.id] = nil
+                bound[bi] = nil
+                GS._creditProjectionDeactivations =
+                    (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+            end
+        end
+        -- Compact bound holes from restore so scan indices stay dense.
+        do
+            local compact = {}
+            for i = 1, #bound do
+                if bound[i] then
+                    compact[#compact + 1] = bound[i]
+                end
+            end
+            bound = compact
+        end
+    end
     -- Soft yield before prune when baseline/activate already spent the allowance.
     if shouldYield(CreditProjectionWorkNow(rowVisits))
         and not TotalsAllNonNegative(totals) then
@@ -6334,18 +6415,43 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     -- Conflict rule: drop the head whose removal most improves personal floors.
     -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
+    -- A yield mid-scan preserves scan progress; never commit a prefix winner.
     while not TotalsAllNonNegative(totals) do
-        -- Checkpoint before a full candidate-trial pass.
-        if shouldYield(CreditProjectionWorkNow(rowVisits)) then
-            return deferProjection("prune")
+        if not scanState then
+            if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                return deferProjection("prune")
+            end
+            scanState = {
+                index = 1,
+                bestEventId = nil,
+                bestScore = nil,
+                bestTs = nil,
+                bestId = nil,
+                currentScore = scoreBox[1],
+            }
         end
-        local currentScore = scoreBox[1]
-        local bestIdx, bestScore, bestTs, bestId = nil, nil, nil, nil
-        for i = 1, #bound do
+        local currentScore = tonumber(scanState.currentScore) or scoreBox[1]
+        local bestEventId = scanState.bestEventId
+        local bestScore = scanState.bestScore
+        local bestTs = scanState.bestTs
+        local bestId = scanState.bestId
+        local i = tonumber(scanState.index) or 1
+        local yieldedMidScan = false
+        while i <= #bound do
             local entry = bound[i]
+            i = i + 1
             if entry and activeMap[entry.event.id] then
-                -- Stop before another trial when already at/over soft limit.
                 if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                    -- Preserve scan cursor before this untried candidate.
+                    scanState = {
+                        index = i - 1,
+                        bestEventId = bestEventId,
+                        bestScore = bestScore,
+                        bestTs = bestTs,
+                        bestId = bestId,
+                        currentScore = currentScore,
+                    }
+                    yieldedMidScan = true
                     break
                 end
                 GS._creditProjectionCandidateTrials =
@@ -6361,7 +6467,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     local ts = tonumber(entry.op.timestamp) or 0
                     local id = tostring(entry.op.id)
                     local take = false
-                    if not bestIdx then
+                    if not bestEventId then
                         take = true
                     elseif score > bestScore then
                         take = true
@@ -6371,21 +6477,43 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                         end
                     end
                     if take then
-                        bestIdx, bestScore, bestTs, bestId = i, score, ts, id
+                        bestEventId, bestScore, bestTs, bestId =
+                            entry.event.id, score, ts, id
                     end
                 end
-                -- Hard ceiling: one atomic trial may overshoot soft by at most
-                -- CREDIT_PROJECTION_ATOMIC_OVERSHOOT, then must yield.
                 if CreditProjectionCallbackWorkTotal(CreditProjectionWorkNow(rowVisits))
                     >= hardLimit then
+                    -- Atomic trial finished; yield before the next candidate.
+                    scanState = {
+                        index = i,
+                        bestEventId = bestEventId,
+                        bestScore = bestScore,
+                        bestTs = bestTs,
+                        bestId = bestId,
+                        currentScore = currentScore,
+                    }
+                    yieldedMidScan = true
                     break
                 end
             end
         end
-        if not bestIdx then
-            if shouldYield(CreditProjectionWorkNow(rowVisits)) then
-                return deferProjection("prune")
+        if yieldedMidScan then
+            return deferProjection("prune_scan")
+        end
+        -- Full comparison complete for this pass.
+        scanState = nil
+        if not bestEventId then
+            break
+        end
+        local bestIdx = nil
+        for bi = 1, #bound do
+            local entry = bound[bi]
+            if entry and entry.event.id == bestEventId then
+                bestIdx = bi
+                break
             end
+        end
+        if not bestIdx then
             break
         end
         local entry = bound[bestIdx]
@@ -6395,6 +6523,16 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         activeMap[entry.event.id] = nil
         activeIds[entry.op.id] = nil
         bound[bestIdx] = nil
+        -- Compact after removal so later full passes stay dense.
+        do
+            local compact = {}
+            for bi = 1, #bound do
+                if bound[bi] then
+                    compact[#compact + 1] = bound[bi]
+                end
+            end
+            bound = compact
+        end
         deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
         GS._creditProjectionDeactivations =
             (tonumber(GS._creditProjectionDeactivations) or 0) + 1

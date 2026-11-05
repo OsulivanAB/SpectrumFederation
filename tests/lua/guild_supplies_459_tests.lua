@@ -3155,24 +3155,22 @@ do
             .. tostring(ensureWork) .. " hard=" .. tostring(hardCeilingEnsure))
     assertTrue(#timers > timersBeforeEnsure,
         "459: paced Ensure scheduled continuation (control returns)")
-    local ensureSlices = 1
-    local maxEnsureSlices = 80
-    while ensureSlices < maxEnsureSlices do
+    -- Autonomous timer drain: do not call Ensure between callbacks.
+    local ensureSlices = 0
+    local maxEnsureSlices = 200
+    while #timers > 0 and ensureSlices < maxEnsureSlices do
         assertTrue(runOneDueTimer(),
-            "459: paced Ensure continuation callback " .. tostring(ensureSlices + 1))
+            "459: paced Ensure autonomous timer " .. tostring(ensureSlices + 1))
         ensureSlices = ensureSlices + 1
-        local okE, errE = GS.EnsureCreditCorrectionProjection(record, nil)
-        if okE then
-            break
-        end
-        assertEq(errE, "work_budget",
-            "459: paced Ensure intermediate still work_budget got " .. tostring(errE))
     end
     assertTrue(ensureSlices > 1, "459: paced Ensure used multiple slices got="
         .. tostring(ensureSlices))
+    assertEq(#timers, 0, "459: paced Ensure idles with no queued timers")
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
-        "459: paced Ensure eventually available")
-    flushTimers()
+        "459: paced Ensure eventually available without intervening Ensure")
+    local okAutonomous, errAutonomous = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(okAutonomous,
+        "459: paced Ensure terminal coherent got " .. tostring(errAutonomous))
 
     -- O(1) scoreBox on a completed unlimited rebuild.
     GS._creditProjectionWorkBudgetOverride = nil
@@ -3301,6 +3299,240 @@ do
     assertTrue(okSmall, "459: small Ensure completes synchronously")
     assertEq(#timers, tSmall, "459: small Ensure did not schedule continuation")
 end
+
+do
+    -- Deterministic selection across slice budgets (#459 / discussion_r4476698352).
+    -- Alice D1=+2, D2=+8, Alice−8; corrections older D1→Bob, newer D2→Carol.
+    -- Full pass removes D2 (impact 8), retaining D1→Bob. Partial-prefix must not
+    -- remove D1 first.
+    local function buildUnequalImpactRecord()
+        local record = seedLiveCampaignWithItem(9370, 40)
+        injectProductionDonation(record, {
+            id = "sel-d1", itemId = 9370, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 22001,
+        })
+        injectProductionDonation(record, {
+            id = "sel-d2", itemId = 9370, quantity = 8,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 22002,
+        })
+        injectProductionAdjustment(record, {
+            id = "sel-adj", itemId = 9370, quantity = -8,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            timestamp = 22010,
+        })
+        local ctx = select(1, GS:GetCurrentContext())
+        local op1 = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "sel-corr-d1",
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "sel-d1",
+            value = {
+                eventId = "sel-d1", eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9370,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 22020,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local op2 = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "sel-corr-d2",
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "sel-d2",
+            value = {
+                eventId = "sel-d2", eventKind = "donation",
+                attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9370,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 22030,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[op1.id] = op1
+        record.operations.order[#record.operations.order + 1] = op1.id
+        record.operations.records[op2.id] = op2
+        record.operations.order[#record.operations.order + 1] = op2.id
+        return record
+    end
+    local function settleProjection(record)
+        GS.InvalidateCreditCorrectionProjection(record)
+        local ok, err = GS.EnsureCreditCorrectionProjection(record, nil)
+        local guard = 0
+        while ok == false and err == "work_budget" and guard < 200 do
+            if not runOneDueTimer() then
+                break
+            end
+            guard = guard + 1
+            -- Autonomous: do not poke Ensure until timers idle.
+        end
+        while #timers > 0 and guard < 400 do
+            runOneDueTimer()
+            guard = guard + 1
+        end
+        ok, err = GS.EnsureCreditCorrectionProjection(record, nil)
+        assertTrue(ok, "459: selection settle ok got " .. tostring(err))
+        return record
+    end
+    local function creditNames(record)
+        local d1 = select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "sel-d1")))
+        local d2 = select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "sel-d2")))
+        return d1, d2
+    end
+
+    -- Fresh full budget.
+    local rFull = settleProjection(buildUnequalImpactRecord())
+    local d1Full, d2Full = creditNames(rFull)
+    assertEq(d1Full, "Bob-Garona", "459: selection full budget D1→Bob")
+    assertEq(d2Full, "Alice-Garona", "459: selection full budget D2 durable Alice")
+
+    -- Tiny multi-slice budget.
+    GS._creditProjectionWorkBudgetOverride = 12
+    local rTiny = settleProjection(buildUnequalImpactRecord())
+    GS._creditProjectionWorkBudgetOverride = nil
+    local d1Tiny, d2Tiny = creditNames(rTiny)
+    assertEq(d1Tiny, d1Full, "459: selection tiny budget D1 matches full")
+    assertEq(d2Tiny, d2Full, "459: selection tiny budget D2 matches full")
+
+    -- Nearly exhausted shared parent allowance (models nested callback).
+    GS._creditProjectionWorkBudgetOverride = 16384
+    local rNear = buildUnequalImpactRecord()
+    GS.InvalidateCreditCorrectionProjection(rNear)
+    -- Seed remaining allowance as nearly exhausted before Rebuild.
+    GS._creditProjectionAccumulating = true
+    GS._creditProjectionCallbackWork = 16372
+    GS._creditProjectionCallbackLimit = 16384
+    GS._creditProjectionCallbackHardLimit = 16384
+        + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+    local okNear, errNear = GS.RebuildCreditCorrectionProjection(rNear, nil)
+    GS._creditProjectionAccumulating = false
+    if okNear == false and errNear == "work_budget" then
+        local g = 0
+        while #timers > 0 and g < 400 do
+            runOneDueTimer()
+            g = g + 1
+        end
+    end
+    GS._creditProjectionWorkBudgetOverride = nil
+    local okNear2, errNear2 = GS.EnsureCreditCorrectionProjection(rNear, nil)
+    assertTrue(okNear2, "459: selection near-exhausted settles got " .. tostring(errNear2))
+    local d1Near, d2Near = creditNames(rNear)
+    assertEq(d1Near, d1Full, "459: selection near-exhausted D1 matches full")
+    assertEq(d2Near, d2Full, "459: selection near-exhausted D2 matches full")
+end
+
+do
+    -- Autonomous accepted-history completion: one Ensure kickoff, then only timers.
+    local record = seedLiveCampaignWithItem(9371, 400)
+    local donors = {
+        { name = "Alice-Garona", guid = "Player-1-Alice" },
+        { name = "Bob-Garona", guid = "Player-1-Bob" },
+        { name = "Carol-Garona", guid = "Player-1-Carol" },
+        { name = "Dave-Garona", guid = "Player-1-Dave" },
+    }
+    for i = 1, 40 do
+        injectProductionDonation(record, {
+            id = "auto-don-" .. i, itemId = 9371, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 23000 + i,
+        })
+    end
+    injectProductionAdjustment(record, {
+        id = "auto-adj", itemId = 9371, quantity = -20,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        timestamp = 23100,
+    })
+    for di = 2, #donors do
+        local d = donors[di]
+        injectProductionDonation(record, {
+            id = "auto-seed-" .. di, itemId = 9371, quantity = 3,
+            actor = d.name, actorGuid = d.guid,
+            timestamp = 23110 + di,
+        })
+    end
+    local ctx = select(1, GS:GetCurrentContext())
+    for i = 1, 24 do
+        local target = donors[(i % (#donors - 1)) + 2]
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "auto-corr-" .. i,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "auto-don-" .. i,
+            value = {
+                eventId = "auto-don-" .. i, eventKind = "donation",
+                attributed = target.name, attributedGuid = target.guid,
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9371,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 23200 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[op.id] = op
+        record.operations.order[#record.operations.order + 1] = op.id
+    end
+    local tightBudget = 80
+    local hardCeiling = tightBudget
+        + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+    GS._creditProjectionWorkBudgetOverride = tightBudget
+    GS.InvalidateCreditCorrectionProjection(record)
+    local callbackWorks = {}
+    local realRebuild = GS.RebuildCreditCorrectionProjection
+    GS.RebuildCreditCorrectionProjection = function(...)
+        local ok, err, det = realRebuild(...)
+        local cw = tonumber(det and det.workUnits) or 0
+        local cb = tonumber(det and det.callbackWork)
+            or tonumber(GS._creditProjectionCallbackWork) or 0
+        if cb > cw then
+            cw = cb
+        end
+        if err == "work_budget" or ok then
+            callbackWorks[#callbackWorks + 1] = cw
+        end
+        return ok, err, det
+    end
+    local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertEq(err0, "work_budget", "459: autonomous kickoff work_budget")
+    local g = 0
+    while #timers > 0 and g < 400 do
+        runOneDueTimer()
+        g = g + 1
+    end
+    GS.RebuildCreditCorrectionProjection = realRebuild
+    GS._creditProjectionWorkBudgetOverride = nil
+    assertEq(#timers, 0, "459: autonomous idles with empty timer queue")
+    assertTrue(g > 1, "459: autonomous drained multiple timers got=" .. tostring(g))
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459: autonomous projection available after timers only")
+    for i = 1, #callbackWorks do
+        assertTrue(callbackWorks[i] <= hardCeiling,
+            "459: autonomous callback within soft+atomic i="
+                .. tostring(i) .. " work=" .. tostring(callbackWorks[i])
+                .. " hard=" .. tostring(hardCeiling))
+    end
+end
+
 
 do
     -- Rejected local preview must not publish via background resume (#459
