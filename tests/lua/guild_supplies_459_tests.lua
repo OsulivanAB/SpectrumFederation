@@ -2506,13 +2506,13 @@ do
     assertEq(attemptsA, 32, "459: A/B/C first A slice attempts=32")
     assertTrue(#timers >= 1, "459: A/B/C schedules continuation after A slice")
 
-    -- (2) Missing B donation arrives via production append → wakes B.
+    -- (2) Missing B donation arrives; production-style append wake while A drains.
+    -- (Missing-event block below also exercises AdmitLedgerEvent recovery.)
     injectProductionDonation(record, {
         id = bDonId, itemId = itemB, quantity = 1,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
         timestamp = world.time + 4000,
     })
-    -- Production AppendLedgerEvent path: redrive with item B while A snapshot drains.
     GS.RedrivePendingContributorCorrections(record, {
         itemId = itemB, eventId = bDonId, maxAttempts = 32,
     })
@@ -2631,15 +2631,285 @@ do
     end
     assertEq(misses, 0,
         "459: alias-heavy lookupMisses=0 got " .. tostring(misses))
-    assertTrue(visits <= ledgerRows + registryRows + 16,
-        "459: alias-heavy visits O(ledger+registry) visits=" .. tostring(visits)
+    -- Ledger rows + registry rows + alias slot visits (still linear, not N²).
+    assertTrue(visits <= ledgerRows + registryRows + n + 16,
+        "459: alias-heavy visits O(ledger+registry+aliases) visits=" .. tostring(visits)
             .. " ledger=" .. tostring(ledgerRows) .. " reg=" .. tostring(registryRows))
     local product = corrCount * ledgerRows
     assertTrue(product > 0 and visits * 10 < product,
         "459: alias-heavy visits far below corrections×ledger product="
             .. tostring(product) .. " visits=" .. tostring(visits))
-    -- Timers may or may not be scheduled when nothing is pending; ignore count.
+    -- Nested registry probes must not approach ledger×registry comparisons.
+    local nestedProduct = ledgerRows * registryRows
+    assertTrue(visits * 20 < nestedProduct,
+        "459: visits far below ledger×registry nestedProduct="
+            .. tostring(nestedProduct) .. " visits=" .. tostring(visits))
     assertTrue(beforeTimers >= 0, "459: alias-heavy measured production ensure/redrive path")
+end
+
+do
+    -- Delayed marked-ledger duplicate: Q's Bob→Alice + Alice−10 vs P's Alice→Bob
+    -- + Bob−20. After marked Alice−10 credits, both heads conflict; empty set
+    -- is valid and must publish (not stale Alice→Bob).
+    local function seedMutualBase()
+        local record = seedLiveCampaignWithItem(9320, 200)
+        injectProductionDonation(record, {
+            id = "mut-don-alice", itemId = 9320, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 10000,
+        })
+        injectProductionDonation(record, {
+            id = "mut-don-bob", itemId = 9320, quantity = 20,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob", timestamp = 10001,
+        })
+        return record
+    end
+    local function rebaseMut(snap, rec)
+        local body = {}
+        for k, v in pairs(snap) do body[k] = v end
+        body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        body.datasetId = rec.datasetId
+        body.campaignId = rec.currentCampaignId
+        body.baseCampaignId = rec.currentCampaignId
+        body.basePolicyRevision = rec.permission and rec.permission.revisionId
+        if body.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            body.baseTargetRevision = rec.datasetId
+        end
+        return body
+    end
+
+    -- Peer Q: Bob→Alice then Alice −10.
+    local peerQ = seedMutualBase()
+    world.time = 11000
+    local qCorr = select(1, GS:NewContributorCorrectionOperation(
+        "mut-don-bob", "Alice-Garona", "Player-1-Alice"))
+    assertTrue(qCorr ~= nil, "459: mutual Q prepare Bob→Alice")
+    assertEq(GS:ApplyStagedConfigOperation(qCorr), "accepted", "459: mutual Q apply Bob→Alice")
+    local qCut = peerQ.liveCutover
+    local qBound = tonumber(qCut and qCut.eligibilityBoundary
+            and qCut.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(qCut and qCut.contextObservedAt) or world.time
+    world.time = math.max(world.time, qBound) + 40
+    local qAdj = select(1, GS:NewAdjustmentOperation(9320, -10, "Alice-Garona"))
+    assertTrue(qAdj ~= nil, "459: mutual Q prepare Alice−10")
+    assertEq(GS:ApplyStagedConfigOperation(qAdj), "accepted", "459: mutual Q apply Alice−10")
+    local snapQCorr = select(1, GS._SnapshotPublicOp(qCorr))
+    local snapQAdj = select(1, GS._SnapshotPublicOp(qAdj))
+    local qAdjEv = GS.FindLedgerEventById(peerQ, qAdj.id)
+    assertTrue(qAdjEv and qAdjEv.gsProductionCredit == true, "459: mutual Q adj credited")
+
+    -- Peer P: receive unmarked Alice−10 op first, then Alice→Bob + Bob−20.
+    -- Keep P's own cutover until marked-ledger reconcile (avoid dataset mismatch).
+    local peerP = seedMutualBase()
+    local stQAdjOp = select(1, GS:AdmitRemoteOperation(rebaseMut(snapQAdj, peerP), {
+        sender = "Alice-Garona", offlineRecord = peerP, preserveAttribution = true,
+    }))
+    assertTrue(stQAdjOp == "accepted" or stQAdjOp == "pending" or stQAdjOp == "duplicate",
+        "459: mutual P admits unmarked Alice−10 op got " .. tostring(stQAdjOp))
+    -- Unmarked adjustment must not yet move production credit floors.
+    local earlyAdj = GS.FindLedgerEventById(peerP, qAdj.id)
+    if earlyAdj then
+        assertTrue(earlyAdj.gsProductionCredit ~= true,
+            "459: mutual P Alice−10 stays uncredited before marked ledger")
+    end
+    world.time = 12000
+    local pCorr = select(1, GS:NewContributorCorrectionOperation(
+        "mut-don-alice", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(pCorr ~= nil, "459: mutual P prepare Alice→Bob")
+    assertEq(GS:ApplyStagedConfigOperation(pCorr), "accepted", "459: mutual P apply Alice→Bob")
+    local pCut = peerP.liveCutover
+    local pBound = tonumber(pCut and pCut.eligibilityBoundary
+            and pCut.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(pCut and pCut.contextObservedAt) or world.time
+    world.time = math.max(world.time, pBound) + 40
+    local pAdj = select(1, GS:NewAdjustmentOperation(9320, -20, "Bob-Garona"))
+    assertTrue(pAdj ~= nil, "459: mutual P prepare Bob−20")
+    assertEq(GS:ApplyStagedConfigOperation(pAdj), "accepted", "459: mutual P apply Bob−20")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", 9320), 0,
+        "459: mutual P Alice 0 before Q correction")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", 9320), 10,
+        "459: mutual P Bob 10 before Q correction")
+
+    assertEq(select(1, GS:AdmitRemoteOperation(rebaseMut(snapQCorr, peerP), {
+        sender = "Alice-Garona", offlineRecord = peerP, preserveAttribution = true,
+    })), "accepted", "459: mutual P admits Bob→Alice correction")
+
+    -- Same-dataset catch-up: share Q's cutover marker only, then deliver the
+    -- matching marked Alice−10 ledger duplicate so provenance credits it.
+    assertTrue(type(peerP.liveCutover) == "table", "459: mutual P has liveCutover")
+    peerP.liveCutover.cutoverMarker = peerQ.liveCutover.cutoverMarker
+    if type(peerQ.liveCutover.eligibilityBoundary) == "table" then
+        peerP.liveCutover.eligibilityBoundary = peerP.liveCutover.eligibilityBoundary or {}
+        for k, v in pairs(peerQ.liveCutover.eligibilityBoundary) do
+            peerP.liveCutover.eligibilityBoundary[k] = v
+        end
+    end
+    local adjWire = {}
+    for k, v in pairs(qAdjEv) do
+        adjWire[k] = v
+    end
+    adjWire.campaignId = peerP.currentCampaignId
+    adjWire.datasetId = peerP.datasetId
+    local stLe, rLe = GS:AdmitLedgerEvent(adjWire, {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = select(1, GS:GetCurrentContext()).guildKey, rankOrder = 1 },
+        offlineRecord = peerP,
+        localWrite = false,
+        preserveAttribution = true,
+        sourceCutoverMarker = peerQ.liveCutover.cutoverMarker,
+    })
+    assertTrue(stLe == "accepted" or stLe == "duplicate",
+        "459: mutual P marked Alice−10 ledger got " .. tostring(stLe) .. "/" .. tostring(rLe))
+    local creditedAdj = GS.FindLedgerEventById(peerP, qAdj.id)
+    assertTrue(creditedAdj and creditedAdj.gsProductionCredit == true,
+        "459: mutual P Alice−10 production-credited after marked duplicate")
+
+    GS.InvalidateCreditCorrectionProjection(peerP)
+    local okMut, errMut = GS.RebuildCreditCorrectionProjection(peerP, nil)
+    assertTrue(okMut, "459: mutual rebuild succeeds got " .. tostring(errMut))
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Alice-Garona", "Player-1-Alice", 9320), 0,
+        "459: mutual final Alice 0")
+    assertEq(GS.PersonalContributorItemTotal(peerP, "Bob-Garona", "Player-1-Bob", 9320), 0,
+        "459: mutual final Bob 0")
+    -- Both heads inactive (empty active set); durable donations unchanged.
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerP, GS.FindLedgerEventById(peerP, "mut-don-alice"))), "Alice-Garona",
+        "459: mutual Alice donation durable after empty projection")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerP, GS.FindLedgerEventById(peerP, "mut-don-bob"))), "Bob-Garona",
+        "459: mutual Bob donation durable after empty projection")
+    -- Unchanged reads do not thrash rebuilds.
+    GS._creditProjectionRowVisits = 0
+    for _ = 1, 5 do
+        GS.EnsureCreditCorrectionProjection(peerP, nil)
+        GS.ResolveEffectiveCreditIdentity(peerP, GS.FindLedgerEventById(peerP, "mut-don-alice"))
+    end
+    assertTrue((tonumber(GS._creditProjectionRowVisits) or 0) == 0,
+        "459: mutual unchanged reads skip rebuild visits="
+            .. tostring(GS._creditProjectionRowVisits))
+    assertEq(GS.FindLedgerEventById(peerP, "mut-don-alice").actor, "Alice-Garona",
+        "459: mutual durable actor preserved")
+    assertEq(tonumber(GS.FindLedgerEventById(peerP, "mut-don-alice").quantity), 10,
+        "459: mutual durable qty preserved")
+end
+
+do
+    -- No-progress idle: missing event / not-credited / capacity-full stop timers.
+    local function plantOnePending(record, donId, corrId, itemId, reason)
+        record.operations.pending = record.operations.pending or {}
+        local ctx = select(1, GS:GetCurrentContext())
+        record.operations.pending[corrId] = {
+            id = corrId,
+            sender = "Alice-Garona",
+            reason = reason or "pending_event",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = corrId,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                target = donId,
+                value = {
+                    eventId = donId,
+                    eventKind = "donation",
+                    attributed = "Bob-Garona",
+                    attributedGuid = "Player-1-Bob",
+                    baseAttributed = "Alice-Garona",
+                    baseAttributedGuid = "Player-1-Alice",
+                    itemId = itemId,
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = world.time + 1,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
+    local function assertIdleAfterDrain(record, label)
+        local t0 = #timers
+        flushTimers()
+        local afterFlush = #timers
+        -- Extra flush cycles must not enqueue more work.
+        for _ = 1, 5 do
+            flushTimers()
+        end
+        assertEq(#timers, afterFlush,
+            "459: " .. label .. " idle — no further timers got "
+                .. tostring(#timers) .. " after " .. tostring(afterFlush)
+                .. " (pre-flush " .. tostring(t0) .. ")")
+    end
+
+    -- Missing donation: one wake, then idle until real append.
+    local miss = seedLiveCampaignWithItem(9321, 50)
+    plantOnePending(miss, "miss-don", "miss-corr", 9321, "pending_event")
+    GS.RedrivePendingContributorCorrections(miss, { itemId = 9321, maxAttempts = 8 })
+    assertIdleAfterDrain(miss, "missing-event")
+    assertTrue(miss.operations.pending["miss-corr"] ~= nil,
+        "459: missing-event remains pending while blocked")
+    -- Satisfy via production AdmitLedgerEvent (append/admission wake path).
+    local missDon = injectProductionDonation(miss, {
+        id = "miss-don", itemId = 9321, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    -- Real append wake wiring:
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(miss)
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(miss, nil)
+    end
+    GS.RedrivePendingContributorCorrections(miss, {
+        eventId = "miss-don", itemId = 9321, maxAttempts = 8,
+    })
+    flushTimers()
+    assertTrue(miss.operations.records["miss-corr"] ~= nil,
+        "459: missing-event settles after donation arrives")
+    assertNil(miss.operations.pending["miss-corr"],
+        "459: missing-event pending cleared once")
+
+    -- Not-credited existing row: donation present but gsProductionCredit false.
+    local nocred = seedLiveCampaignWithItem(9322, 50)
+    local nocredDon = injectProductionDonation(nocred, {
+        id = "nocred-don", itemId = 9322, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    nocredDon.gsProductionCredit = false
+    plantOnePending(nocred, "nocred-don", "nocred-corr", 9322, "pending_event")
+    GS.RedrivePendingContributorCorrections(nocred, { itemId = 9322, maxAttempts = 8 })
+    assertIdleAfterDrain(nocred, "not-credited")
+    assertTrue(nocred.operations.pending["nocred-corr"] ~= nil,
+        "459: not-credited remains pending")
+    nocredDon.gsProductionCredit = true
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(nocred)
+    end
+    GS.RedrivePendingContributorCorrections(nocred, {
+        eventId = "nocred-don", itemId = 9322, maxAttempts = 8,
+    })
+    flushTimers()
+    assertTrue(nocred.operations.records["nocred-corr"] ~= nil,
+        "459: not-credited settles after production credit")
+
+    -- Capacity-full: blocked pending goes idle; freeing capacity + wake settles.
+    local cap = seedLiveCampaignWithItem(9323, 50)
+    injectProductionDonation(cap, {
+        id = "cap-don", itemId = 9323, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    plantOnePending(cap, "cap-don", "cap-corr", 9323, "pending_event")
+    local prevMax = GS.MAX_ACCEPTED_OPERATIONS
+    GS.MAX_ACCEPTED_OPERATIONS = GS._AcceptedCount(cap.operations) or 0
+    GS.RedrivePendingContributorCorrections(cap, { itemId = 9323, maxAttempts = 8 })
+    assertIdleAfterDrain(cap, "capacity-full")
+    assertTrue(cap.operations.pending["cap-corr"] ~= nil,
+        "459: capacity-full remains pending")
+    GS.MAX_ACCEPTED_OPERATIONS = prevMax
+    GS.RedrivePendingContributorCorrections(cap, { itemId = 9323, maxAttempts = 8 })
+    flushTimers()
+    assertTrue(cap.operations.records["cap-corr"] ~= nil,
+        "459: capacity-full settles after capacity restored")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

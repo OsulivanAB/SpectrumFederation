@@ -2418,11 +2418,14 @@ end
 
 --- Merge an incoming redrive wake into continuation filters (#459).
 -- Broader filters clear any mid-wave snapshot so newly eligible work is included.
+-- A non-nil opts wake during an active/saved snapshot marks followUpWake so a
+-- drained wave schedules one more pass for newly eligible work — without
+-- spinning forever on unchanged blocked pending.
 -- @return table cont, boolean broadened
 local function MergeCreditRedriveWake(record, opts)
     local cont = creditRedriveContinuation[record]
     if type(cont) ~= "table" then
-        cont = { opts = opts or {}, scheduled = false }
+        cont = { opts = opts or {}, scheduled = false, followUpWake = false }
         creditRedriveContinuation[record] = cont
         return cont, false
     end
@@ -2432,7 +2435,8 @@ local function MergeCreditRedriveWake(record, opts)
         merged[k] = v
     end
     local broadened = false
-    if opts then
+    local externalWake = type(opts) == "table"
+    if externalWake then
         if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
             merged.eventId = nil
             broadened = true
@@ -2463,6 +2467,16 @@ local function MergeCreditRedriveWake(record, opts)
         cont.snapshot = nil
         cont.index = nil
     end
+    -- Any real dependency wake while a snapshot exists (or is draining) needs
+    -- a follow-up wave after the current drain — even when filters did not
+    -- broaden (new pending ids would otherwise be skipped).
+    if externalWake and (type(cont.snapshot) == "table" or creditRedriveDepth > 0
+        or cont.scheduled) then
+        cont.followUpWake = true
+        if not broadened then
+            -- Keep draining the current snapshot; follow-up rebuilds after.
+        end
+    end
     return cont, broadened
 end
 
@@ -2483,7 +2497,8 @@ local function ScheduleCreditRedriveContinuation(record, opts)
         state.scheduled = false
         if GS.RedrivePendingContributorCorrections then
             -- Pass nil so Redrive merges against current cont.opts (preserves
-            -- wakes coalesced while this timer was queued).
+            -- wakes coalesced while this timer was queued) without treating
+            -- the timer itself as a new dependency wake.
             GS.RedrivePendingContributorCorrections(record, nil)
         end
     end
@@ -2537,6 +2552,8 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         startIndex = 1
         cont.snapshot = snapshot
         cont.index = 1
+        -- Starting a fresh snapshot consumes the follow-up request that caused it.
+        cont.followUpWake = false
     end
     local promoted = 0
     local attempts = 0
@@ -2582,28 +2599,16 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         cont.scheduled = false
         ScheduleCreditRedriveContinuation(record, nil)
     else
-        -- Wave complete. If a broader wake cleared and rebuilt mid-flight we
-        -- already drained that snapshot; start a fresh wave only when pending
-        -- still matches current filters (covers wakes merged after last id).
+        -- Wave complete: become idle unless a real dependency wake arrived
+        -- during this drain (followUpWake). Do not reschedule merely because
+        -- blocked pending entries still match filters.
+        local followUp = cont.followUpWake == true
         creditRedriveContinuation[record] = {
             opts = waveOpts,
             scheduled = false,
+            followUpWake = false,
         }
-        local still = false
-        for _, entry in pairs(ops.pending) do
-            local body = entry and entry.body
-            if type(body) == "table"
-                and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
-                and type(body.target) == "string"
-                and entry.reason ~= "untrusted_relay"
-                and entry.reason ~= "evidence"
-                and type(entry.sender) == "string"
-                and CreditRedriveMatch(record, body, waveOpts) then
-                still = true
-                break
-            end
-        end
-        if still then
+        if followUp then
             ScheduleCreditRedriveContinuation(record, nil)
         end
     end
@@ -5423,8 +5428,10 @@ local function TotalsNegScore(totals)
     return score
 end
 
---- Index a ledger event under id, txnId, and trusted registry aliases (#459).
-local function IndexCreditEventKeys(byId, record, event)
+--- Index a ledger event under id and txnId only (#459).
+-- Trusted aliases are folded in one separate registry pass — never call
+-- FindRegistryByTxn per ledger row (that is O(ledger×registry)).
+local function IndexCreditEventKeys(byId, event)
     if type(byId) ~= "table" or type(event) ~= "table" then
         return
     end
@@ -5435,34 +5442,11 @@ local function IndexCreditEventKeys(byId, record, event)
     if txnId and txnId ~= "" then
         byId[txnId] = event
     end
-    local cfg = record and record.accounting and record.accounting._consumables
-    if type(cfg) ~= "table" or type(FindRegistryByTxn) ~= "function" then
-        return
-    end
-    local key = txnId or event.id
-    if type(key) ~= "string" or key == "" then
-        return
-    end
-    local reg = FindRegistryByTxn(cfg, key)
-    if type(reg) ~= "table" then
-        return
-    end
-    if type(reg.txnId) == "string" and reg.txnId ~= "" then
-        byId[reg.txnId] = event
-    end
-    if type(reg.aliases) == "table" then
-        for i = 1, #reg.aliases do
-            local alias = reg.aliases[i]
-            if type(alias) == "string" and alias ~= "" then
-                byId[alias] = event
-            end
-        end
-    end
 end
 
 --- Scan live+archive once into durable baseline totals and an id/alias index.
 -- Returns totals, byId, rowVisits, relationshipsReady. Callers apply correction
--- deltas in O(1).
+-- deltas in O(1). Alias mapping is one linear registry pass.
 local function BuildDurableCreditFloorBaseline(record)
     local relationshipsReady = GS.WitnessRelationshipsReady
         and select(1, GS.WitnessRelationshipsReady(record))
@@ -5475,7 +5459,7 @@ local function BuildDurableCreditFloorBaseline(record)
             return
         end
         visits = visits + 1
-        IndexCreditEventKeys(byId, record, event)
+        IndexCreditEventKeys(byId, event)
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
             return
@@ -5515,18 +5499,33 @@ local function BuildDurableCreditFloorBaseline(record)
             consider(archived[i])
         end
     end
-    -- One registry pass: map alias pointer rows onto already-indexed events.
+    -- One linear registry pass: map verified primary aliases + alias pointers.
     local cfg = record.accounting and record.accounting._consumables
     local registry = cfg and cfg.txnRegistry
     if type(registry) == "table" then
         for i = 1, #registry do
             local row = registry[i]
             visits = visits + 1
-            if type(row) == "table" and row.status == "alias"
-                and type(row.txnId) == "string" and type(row.aliasOf) == "string" then
-                local primary = byId[row.aliasOf]
-                if primary then
-                    byId[row.txnId] = primary
+            if type(row) == "table" then
+                if type(row.txnId) == "string" and row.txnId ~= ""
+                    and type(row.aliases) == "table" then
+                    local primary = byId[row.txnId]
+                    if primary then
+                        for j = 1, #row.aliases do
+                            local alias = row.aliases[j]
+                            if type(alias) == "string" and alias ~= "" then
+                                byId[alias] = primary
+                                visits = visits + 1
+                            end
+                        end
+                    end
+                end
+                if row.status == "alias"
+                    and type(row.txnId) == "string" and type(row.aliasOf) == "string" then
+                    local primary = byId[row.aliasOf]
+                    if primary then
+                        byId[row.txnId] = primary
+                    end
                 end
             end
         end
@@ -5616,15 +5615,15 @@ end
 -- Deterministic active-head policy:
 --   1) LWW winner per canonical event
 --   2) Activate *all* production-credited winners that bind
---   3) While personal floors fail, deactivate the active head whose removal
---      maximizes TotalsNegScore (sum of min(0,total)); tie-break newer-first
---      so a transfer supporting an accepted deduction is kept when a newer
---      conflicting transfer can be dropped instead. Jointly required heads
---      (two +10→Bob with Bob−15) stay active because dropping either worsens
---      the score. Never publish an empty/negative map as verified success.
+--   3) While floors fail, deactivate the head whose removal maximizes
+--      TotalsNegScore; ties drop older. Jointly required heads stay.
+--   4) If no single removal improves but the empty set is nonnegative,
+--      deactivate all remaining heads (bounded mutual-conflict recovery —
+--      not an unbounded subset search).
+--   5) Never leave a stale active map; never mark a negative projection ok.
+--      Failed reconstructions cache under the dependency stamp.
 -- Floor checks use one durable ledger baseline plus O(1) deltas per head.
--- Alias targets resolve through the baseline id/txn/registry index (no
--- per-candidate full-ledger FindLedgerEventById scans).
+-- Alias targets resolve through the baseline id/txn + one linear registry pass.
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
 -- @return boolean ok, string|nil err, table|nil details { activeIds, rowVisits, deactivations }
 function GS.RebuildCreditCorrectionProjection(record, extraOp)
@@ -5709,7 +5708,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             GS._creditProjectionRowVisits = rowVisits
             event = GS.FindLedgerEventById(record, op.target)
             if event then
-                IndexCreditEventKeys(byId, record, event)
+                IndexCreditEventKeys(byId, event)
                 byId[op.target] = event
             else
                 byId[op.target] = false
@@ -5775,11 +5774,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     -- Conflict rule: drop the head whose removal most improves personal floors
     -- (TotalsNegScore). Require strict score improvement. When scores tie,
-    -- deactivate the older head (prefer keeping newer) — but a transfer that
-    -- already supports an accepted deduction wins on score when dropping it
-    -- would leave that identity negative (e.g. older D1→Bob + Bob−10 vs newer
-    -- D2→Carol). Jointly required heads stay because dropping either does not
-    -- improve the score.
+    -- deactivate the older head (prefer keeping newer). Jointly required heads
+    -- stay because dropping either does not improve the score.
     while not TotalsAllNonNegative(totals) do
         local currentScore = TotalsNegScore(totals)
         local bestIdx, bestScore, bestTs, bestId = nil, nil, nil, nil
@@ -5802,7 +5798,6 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     elseif score > bestScore then
                         take = true
                     elseif score == bestScore then
-                        -- Prefer deactivating older when scores tie.
                         if ts < bestTs or (ts == bestTs and id < bestId) then
                             take = true
                         end
@@ -5826,14 +5821,36 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         GS._creditProjectionDeactivations =
             (tonumber(GS._creditProjectionDeactivations) or 0) + 1
     end
-    -- Final invariant: never mark a negative projection verified.
+    -- When no single removal improves the score but the empty set is valid
+    -- (cross-entry mutual conflict after delayed marked adjustments), drop all
+    -- remaining heads in one bounded step — not an unbounded subset search.
     if not TotalsAllNonNegative(totals) then
+        for i = 1, #bound do
+            local entry = bound[i]
+            if entry and activeMap[entry.event.id] then
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, -1)
+                activeMap[entry.event.id] = nil
+                activeIds[entry.op.id] = nil
+                GS._creditProjectionDeactivations =
+                    (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+            end
+        end
+    end
+    local stamp = CreditProjectionDependencyStamp(record)
+    -- Final invariant: never leave a stale active map and never mark a negative
+    -- projection verified. Publish durable-only (empty) when that is nonnegative;
+    -- otherwise clear heads, cache the failure under the stamp, and stop.
+    if not TotalsAllNonNegative(totals) then
+        record.creditCorrections = {}
         creditProjectionCache[record] = {
-            stamp = CreditProjectionDependencyStamp(record),
+            stamp = stamp,
             ok = false,
+            err = "player_negative",
         }
         return false, "player_negative", {
-            activeIds = activeIds,
+            activeIds = {},
             rowVisits = rowVisits,
             deactivations = GS._creditProjectionDeactivations,
             lookupMisses = lookupMisses,
@@ -5848,7 +5865,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     end
     record.creditCorrections = activeMap
     creditProjectionCache[record] = {
-        stamp = CreditProjectionDependencyStamp(record),
+        stamp = stamp,
         ok = true,
     }
     return true, nil, {
@@ -5860,7 +5877,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
 end
 
 --- Ensure the credit projection matches current ops/ledger dependency stamps.
--- Unchanged reads reuse the last verified projection (#459).
+-- Unchanged reads reuse the last verified *or failed* stamp (#459) so a
+-- failed reconstruction does not rebuild on every ResolveEffectiveCreditIdentity.
 function GS.EnsureCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
@@ -5870,8 +5888,11 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
     end
     local stamp = CreditProjectionDependencyStamp(record)
     local cached = creditProjectionCache[record]
-    if cached and cached.ok and cached.stamp == stamp then
-        return true
+    if cached and cached.stamp == stamp then
+        if cached.ok then
+            return true
+        end
+        return false, cached.err or "player_negative"
     end
     return GS.RebuildCreditCorrectionProjection(record, nil)
 end
