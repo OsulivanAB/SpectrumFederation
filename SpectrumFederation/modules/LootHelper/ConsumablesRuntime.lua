@@ -1945,24 +1945,58 @@ end
 --- Retry unseen unresolved notices at an existing UI opportunity (bank open).
 -- Rebuilds prior-visit labeling from current visit token; does not overwrite
 -- current-visit status, drafts, or tokens. No timers or polling.
+-- Multiple retained rows are combined into one SF_SETTINGS_CONFIRM acknowledgement:
+-- native StaticPopup_Show reuses that key, so a synchronous series would replace
+-- earlier messages and clear them as "delivered" while only the last stayed visible.
 function Runtime:FlushPendingUnresolvedWithdrawNotices()
     local pending = self._unresolvedWithdrawPending
     if type(pending) ~= "table" or #pending < 1 then
         return
     end
-    -- Snapshot keys: successful shows mutate the pending array.
     local snapshot = {}
     for i = 1, #pending do
-        snapshot[i] = pending[i]
+        local notice = pending[i]
+        if type(notice) == "table" then
+            local opKey = notice.opKey
+            if opKey == nil or not UnresolvedWithdrawRecentHas(self, opKey) then
+                snapshot[#snapshot + 1] = notice
+            end
+        end
+    end
+    if #snapshot < 1 then
+        return
+    end
+    if #snapshot == 1 then
+        local notice = snapshot[1]
+        self:PresentUnresolvedQuickWithdrawSettlement({
+            operationId = notice.operationId,
+            visitToken = notice.visitToken,
+        }, notice.text)
+        return
+    end
+    local parts = {}
+    for i = 1, #snapshot do
+        parts[#parts + 1] = UnresolvedWithdrawBuildMessage(self, snapshot[i])
+    end
+    local message = table.concat(parts, "\n\n")
+    local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+    if not (Dialogs and Dialogs.Confirm) then
+        return
+    end
+    local shown = Dialogs:Confirm(
+        message,
+        Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED_ACK", "OK"),
+        nil
+    )
+    if not shown then
+        -- Keep every unseen row pending for a later opportunity.
+        return
     end
     for i = 1, #snapshot do
         local notice = snapshot[i]
-        if type(notice) == "table" then
-            self:PresentUnresolvedQuickWithdrawSettlement({
-                operationId = notice.operationId,
-                visitToken = notice.visitToken,
-            }, notice.text)
-        end
+        local opKey = notice and notice.opKey
+        UnresolvedWithdrawClearPending(self, opKey)
+        UnresolvedWithdrawRememberRecent(self, opKey)
     end
 end
 

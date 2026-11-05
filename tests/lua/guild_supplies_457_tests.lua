@@ -3407,16 +3407,16 @@ do
     end
     -- Start through real BeginQuickWithdraw without the counting settle spy so
     -- work.onSettle remains the production SettleHandler (PresentUnresolved path).
-    local function startVisibilityWithdraw(label)
+    local function startVisibilityWithdraw(label, draftOverride, bankQty)
         if WR.work then WR.StopWork("test_cleanup", true) end
         C_Timer._clear()
         settleCount, receiptCount, handoffCount = 0, 0, 0
         settleReasons = {}
         pickupCount = 0
         bagByItem[10] = 0
-        bankBySlot[1] = 5
+        bankBySlot[1] = tonumber(bankQty) or 5
         bankAvailable = true
-        WR.craftDrafts = { ["100"] = 1 }
+        WR.craftDrafts = type(draftOverride) == "table" and draftOverride or { ["100"] = 1 }
         installCursorStubs()
         local visitAtStart = RT._quickWithdrawVisitToken
         RT:BeginQuickWithdraw()
@@ -3576,14 +3576,20 @@ do
     StaticPopupDialogs = StaticPopupDialogs or {}
     local popupAllow = false
     local popupShows = {}
+    -- Model native StaticPopup_Show: one visible message per dialog key; a later
+    -- show with the same key replaces the earlier visible message.
+    local visibleByKey = {}
     function StaticPopup_Show(key, message, _, _data)
+        local k = tostring(key or "")
+        local msg = tostring(message or "")
         popupShows[#popupShows + 1] = {
-            key = tostring(key or ""),
-            message = tostring(message or ""),
+            key = k,
+            message = msg,
         }
         if not popupAllow then
             return nil
         end
+        visibleByKey[k] = msg
         return { key = key, message = message }
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
@@ -3692,12 +3698,144 @@ do
     assertEq(statusText, "post-refuse-visit-status",
         "D: post-delivery replay leaves newer-visit status intact")
 
+    -- 5) Two distinct refused notices: flush must keep both readable (combine),
+    -- not clear A as delivered when same-key StaticPopup replaces it with B.
+    clearUnresolvedNoticeState()
+    visibleByKey = {}
+    popupShows = {}
+    popupAllow = false
+    helperLifecycleHidden = false
+    bankAvailable = true
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    RT.bankOpen = false
+    RT._quickWithdrawVisitSeq = 0
+    RT._quickWithdrawVisitToken = nil
+    statusText = ""
+    RT:OnBankOpened()
+    local multiVisitA = RT._quickWithdrawVisitToken
+    local multiOpA = startVisibilityWithdraw("D: multi-refuse-A", { ["100"] = 1 }, 5)
+    bagByItem[10] = 0
+    bankBySlot[1] = 5
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    RT:OnBankClosed()
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: multi-refuse-A settles once")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: multi-refuse-A reason")
+    assertEq(receiptCount, 0, "D: multi-refuse-A no receipt")
+    assertEq(handoffCount, 0, "D: multi-refuse-A no handoff")
+    assertEq(#RT._unresolvedWithdrawPending, 1, "D: multi-refuse-A retained pending")
+    local textA = RT._unresolvedWithdrawPending[1].text
+    assertTrue(type(textA) == "string" and textA ~= "", "D: multi-refuse-A stores settlement text")
+    -- Intermediate bank open while popup still refused: flush must retain A.
+    RT:OnBankOpened()
+    local multiVisitMid = RT._quickWithdrawVisitToken
+    assertTrue(multiVisitMid ~= multiVisitA, "D: multi mid-open rotates visit")
+    assertEq(#RT._unresolvedWithdrawPending, 1,
+        "D: refused multi flush keeps notice A pending")
+    assertTrue(type(RT._unresolvedWithdrawRecent) ~= "table"
+        or #RT._unresolvedWithdrawRecent == 0,
+        "D: refused multi flush does not mark A delivered")
+    -- Second refused notice without clearing notification state between ops.
+    local multiOpB = startVisibilityWithdraw("D: multi-refuse-B", { ["100"] = 2 }, 10)
+    assertTrue(tostring(multiOpB) ~= tostring(multiOpA),
+        "D: multi-refuse-B is a distinct operationId")
+    bagByItem[10] = 0
+    bankBySlot[1] = 10
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    RT:OnBankClosed()
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: multi-refuse-B settles once")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: multi-refuse-B reason")
+    assertEq(receiptCount, 0, "D: multi-refuse-B no receipt")
+    assertEq(handoffCount, 0, "D: multi-refuse-B no handoff")
+    assertEq(#RT._unresolvedWithdrawPending, 2,
+        "D: two refused notices accumulate without clearing state")
+    local textB = nil
+    for i = 1, #RT._unresolvedWithdrawPending do
+        local row = RT._unresolvedWithdrawPending[i]
+        if row.opKey == tostring(multiOpB) then
+            textB = row.text
+        end
+    end
+    assertTrue(type(textB) == "string" and textB ~= "", "D: multi-refuse-B stores settlement text")
+    assertTrue(textA ~= textB,
+        "D: multi-refuse A/B settlement texts are distinct for observable delivery")
+    -- Refused combined flush still retains both.
+    local showsBeforeRefuseFlush = #popupShows
+    RT:OnBankOpened()
+    local multiVisitRefuseFlush = RT._quickWithdrawVisitToken
+    assertTrue(multiVisitRefuseFlush ~= multiVisitMid,
+        "D: refused multi flush open rotates visit")
+    assertEq(#RT._unresolvedWithdrawPending, 2,
+        "D: refused combined flush retains both pending notices")
+    assertTrue(#popupShows > showsBeforeRefuseFlush,
+        "D: refused combined flush still attempts Confirm once")
+    RT:OnBankClosed()
+    -- Successful flush: one visible same-key acknowledgement covering both.
+    popupAllow = true
+    visibleByKey = {}
+    local showsBeforeOkFlush = #popupShows
+    WR.craftDrafts = { ["200"] = 11 }
+    RT:OnBankOpened()
+    local multiVisitFinal = RT._quickWithdrawVisitToken
+    assertTrue(multiVisitFinal ~= multiVisitRefuseFlush, "D: multi final open rotates visit")
+    assertEq(WR.craftDrafts["200"], 11,
+        "D: multi flush preserves newer-visit drafts")
+    RT:SetQuickWithdrawStatus("multi-flush-visit-status", { visitToken = multiVisitFinal })
+    assertEq(statusText, "multi-flush-visit-status",
+        "D: newer visit publishes status after multi flush")
+    assertEq(#popupShows, showsBeforeOkFlush + 1,
+        "D: multi flush emits one Confirm (not a same-key series)")
+    local visible = visibleByKey["SF_SETTINGS_CONFIRM"]
+    assertTrue(type(visible) == "string" and visible ~= "",
+        "D: multi flush leaves a visible acknowledgement for SF_SETTINGS_CONFIRM")
+    -- Observable delivery: both retained results appear in the visible message
+    -- (API call counts alone are insufficient — same-key replace would hide A).
+    assertTrue(visible:find(textA, 1, true) ~= nil,
+        "D: visible multi ack includes notice A settlement text")
+    assertTrue(visible:find(textB, 1, true) ~= nil,
+        "D: visible multi ack includes notice B settlement text")
+    assertTrue(visible:find("not this bank visit", 1, true) ~= nil
+        or visible:find("earlier withdrawal", 1, true) ~= nil
+        or visible:find("Earlier withdrawal", 1, true) ~= nil,
+        "D: multi flush uses prior-operation labeling at presentation time")
+    assertTrue(type(RT._unresolvedWithdrawPending) ~= "table"
+        or #RT._unresolvedWithdrawPending == 0,
+        "D: successful multi flush clears pending for displayed ops")
+    local recentHasA, recentHasB = false, false
+    for i = 1, #(RT._unresolvedWithdrawRecent or {}) do
+        local k = RT._unresolvedWithdrawRecent[i]
+        if k == tostring(multiOpA) then recentHasA = true end
+        if k == tostring(multiOpB) then recentHasB = true end
+    end
+    assertTrue(recentHasA and recentHasB,
+        "D: successful multi flush remembers only the displayed operation IDs")
+    assertTrue(#(RT._unresolvedWithdrawRecent or {}) <= 8,
+        "D: multi flush keeps recent within bound")
+    assertEq(receiptCount, 0, "D: multi flush adds no receipt")
+    assertEq(handoffCount, 0, "D: multi flush adds no handoff")
+    -- Replay of either op must not re-present or move items.
+    local showsAfterMulti = #popupShows
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = multiOpA, visitToken = multiVisitA, unresolved = true,
+    }, textA)
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = multiOpB, visitToken = multiVisitMid, unresolved = true,
+    }, textB)
+    assertEq(#popupShows, showsAfterMulti, "D: multi delivered ops do not re-present")
+    assertEq(WR.craftDrafts["200"], 11, "D: multi replay leaves drafts intact")
+    assertEq(statusText, "multi-flush-visit-status",
+        "D: multi replay leaves newer-visit status intact")
+
     -- Bounded recent/pending across repeated operations without manual resets.
     popupAllow = true
     for i = 1, 20 do
         local shown = RT:PresentUnresolvedQuickWithdrawSettlement({
             operationId = "bound-ok-" .. tostring(i),
-            visitToken = afterRefuseVisit,
+            visitToken = multiVisitFinal,
             unresolved = { itemId = 10 },
             requested = { ["10"] = i },
             authorized = { ["10"] = i },
@@ -3715,7 +3853,7 @@ do
     for i = 1, 10 do
         local shown = RT:PresentUnresolvedQuickWithdrawSettlement({
             operationId = "bound-fail-" .. tostring(i),
-            visitToken = afterRefuseVisit,
+            visitToken = multiVisitFinal,
             unresolved = { itemId = 10 },
         }, "bounded fail " .. tostring(i))
         assertTrue(shown == false, "D: bound-fail-" .. i .. " refuses display")
