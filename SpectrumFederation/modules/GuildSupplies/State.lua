@@ -810,6 +810,14 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if not ok then
         return false, err
     end
+    -- #459: re-derive active correction heads from accepted ops so reload and
+    -- peers converge under the deterministic floor policy.
+    if GS.RebuildCreditCorrectionProjection then
+        local rebuilt, rebuildErr = GS.RebuildCreditCorrectionProjection(record, nil)
+        if not rebuilt then
+            return false, rebuildErr or "invalid_record_shape"
+        end
+    end
     return true
 end
 

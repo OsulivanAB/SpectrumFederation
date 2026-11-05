@@ -110,7 +110,7 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 | --- | --- |
 | **Raid Supplies → Configuration** | Initialize (first-time only), bank tab, New Campaign, rename target (current/archived), current-campaign goals/progress, **Activate Guild Supplies** (while still staged), and the personal reminder checkbox. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here; opaque status IDs are not shown (#453). Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
 | **Raid Supplies → Manage** | Officer-only (`canEdit` / Preview as Non-Admin). Requested items and quantity adjustments (#453). Mutation authorization is still checked when committing. |
-| **Raid Supplies → Logs** | Current-campaign donation/adjustment table (Contributor / Quantity / Item) with contributor and item filters; archived history retained; goals/progress live on Configuration (#453) |
+| **Raid Supplies → Logs** | Current-campaign donation/adjustment table (Contributor / Quantity / Item) with contributor and item filters; archived history retained; goals/progress live on Configuration (#453). Officers may **Edit contributor** on production-credited current-campaign rows (#459): searchable guild-roster picker (offline included, realm-disambiguated), Continue/Save with open-time freshness, Unassigned for adjustments only. |
 | **Raid Supplies → Troubleshooting** | Staged dataset adoption and configuration-conflict resolution (#422). Same editor/authority restrictions as before; ordinary members can navigate. |
 | **Personal preferences** | Account-local reminder checkbox on Configuration only (#428) |
 | **Loot Helper → Consumables / Consumable Logs** | Removed from the packaged addon (#415). They are not registered before or after activation, including across profile switches. Legacy profile writers, SavedVariables, and the #389 eligibility gates stay in place. |
@@ -121,6 +121,12 @@ Officer eligibility is the established Guild Info threshold at the moment a new 
 
 Accepted officer-trusted rows sync through the existing Guild Gossip ledger export. A guildmate who already has the row can serve a late peer after the original officer logs off. Live receivers credit that relay only when the authenticated canonical cutover marker matches. A staged receiver keeps marked accepted history so installing that same marker later classifies it. Competing authenticated markers for one occurrence are retained without last-writer-wins (primary plus one bounded alternate); the established cutover selects the canonical marker. Only a complete officer-history duplicate may attach those markers. A missing or different marker alone is not promoted into live credit. An unverified ledger candidate does not block a later valid officer row for the same occurrence, and that admission clears the matching pending cluster and candidate without dropping unrelated ambiguous or repeated deposits. Catch-up and adoption do not invent a missing `verifierGuid`. Three-witness ledger rows still do not self-credit from gossip. Dataset adoption replays stored witness exports as votes and does not turn one of them into an officer credit. A bare `verification`, `writer`, `rankOrder`, `isAdmin`, or `observedBy` claim is not authority. **v1 limit:** there is no cryptographic proof of which officer saw Blizzard's bank log. An authenticated guild member who sends a complete, eligible officer-provenance row is treated as relaying accepted history.
 
+## Contributor credit corrections (#459)
+
+Officers may reassign contribution credit for one production-credited donation or adjustment without rewriting ledger evidence, quantities, campaign totals, original timestamps, or saved signed valuation. Accepted `correct-contributor` ops project an effective credited identity used by personal floors, progress, rankings, Logs, and history audit. **Unassigned** remains explicit for adjustments (no rankings contribution).
+
+**Deterministic active-head sync:** per-event last-write-wins selects a winner, then peers rebuild the same active set by greedily activating winners in ascending `(timestamp, op.id)` under personal nonnegative floors. Inactive accepted heads stay for audit/LWW but do not move credit until floors allow. Trusted donation txn aliases resolve onto the canonical ledger event. Ordinary authenticated gossip and adoption retain LWW-losing correction bodies under capacity rules. Deferred pending corrections re-enter only through authenticated admission (never bare mutation); `untrusted_relay` / `evidence` stays untrusted; retries are bounded and restored when balances, eligibility, corrections, or aliases change.
+
 ## Chat-free policy
 
 No normal game Chat from Guild Supplies or rewired live Consumables paths. Diagnostics only through enabled `SF.Debug`. User action feedback uses contextual Settings banners via `FormatMutationFeedback`.
@@ -128,6 +134,7 @@ No normal game Chat from Guild Supplies or rewired live Consumables paths. Diagn
 ## Evidence
 
 - Production-Lua suite: `tests/lua/guild_supplies_tests.lua` via `tests/test_guild_supplies.py` (includes 3A–3C and #411 officer-trusted paths)
+- Contributor corrections (#459): `tests/lua/guild_supplies_459_tests.lua` via `tests/test_guild_supplies.py`
 - Gossip idle/repair regressions: `tests/test_guild_gossip.py`
 - Consumables regressions: `tests/test_consumables.py`
 - Settings navigation/layout when pages change: `tests/test_settings_navigation.py`, `tests/test_settings_window_layout.py`

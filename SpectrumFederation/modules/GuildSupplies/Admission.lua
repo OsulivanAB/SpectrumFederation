@@ -7878,23 +7878,32 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
             return "accepted", nil
         end
-        -- #459: retain source-accepted LWW-losing corrections without changing
-        -- the effective credit head (mirrors rename-campaign losers).
+        -- #459: retain LWW-losing corrections without changing the credit head.
+        -- Ordinary authenticated gossip and adoption both keep prior accepted
+        -- evidence under capacity rules (mirrors rename losers on adoption;
+        -- corrections also retain on ordinary gossip so audit survives).
         if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
-            and classReason == "stale_credit"
-            and admissionCtx.adoptionReplay
-            and type(admissionCtx.sourceAcceptedSet) == "table"
-            and admissionCtx.sourceAcceptedSet[stored.id] == true then
-            if not ops.records[stored.id] then
-                if GS._AcceptedCount
-                    and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
-                    return "rejected", "full"
-                end
-                if GS._StoreAccepted then
-                    GS._StoreAccepted(ops, stored, nil)
-                end
+            and classReason == "stale_credit" then
+            local allowRetain = true
+            if admissionCtx.adoptionReplay then
+                allowRetain = type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
             end
-            return "accepted", nil
+            if allowRetain then
+                if not ops.records[stored.id] then
+                    if GS._AcceptedCount
+                        and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                        return "rejected", "full"
+                    end
+                    if GS._StoreAccepted then
+                        GS._StoreAccepted(ops, stored, nil)
+                    end
+                end
+                if GS.RebuildCreditCorrectionProjection then
+                    GS.RebuildCreditCorrectionProjection(record, nil)
+                end
+                return "accepted", nil
+            end
         end
         return "rejected", classReason or "stale_base"
     end
@@ -8008,14 +8017,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     end
                     return stPend, reasonPend
                 end
-                -- #459: correction-before-event and temporary personal-floor
-                -- failures stay pending; do not open Troubleshooting conflicts.
+                -- #459: correction-before-event stays pending; floor failures are
+                -- accepted inactive via rebuild (skipFloor on remote apply). Still
+                -- pending when the ledger event is missing or not yet credited.
                 if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
-                    and (err == "pending_event" or err == "player_negative"
-                        or err == "missing_event" or err == "not_credited") then
+                    and (err == "pending_event" or err == "missing_event"
+                        or err == "not_credited") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
-                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
                     end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay
@@ -8029,6 +8040,26 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, stored, targetKey)
+        end
+        if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            if GS.RebuildCreditCorrectionProjection then
+                GS.RebuildCreditCorrectionProjection(record, nil)
+            end
+            if not admissionCtx.adoptionReplay and GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
+                    eventId = stored.target,
+                    itemId = stored.value and stored.value.itemId,
+                })
+            end
+        elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
+            if GS.RebuildCreditCorrectionProjection then
+                GS.RebuildCreditCorrectionProjection(record, nil)
+            end
+            if not admissionCtx.adoptionReplay and GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
+                    itemId = stored.value and stored.value.itemId,
+                })
+            end
         end
     end
 

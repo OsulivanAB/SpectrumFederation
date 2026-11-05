@@ -351,6 +351,32 @@ loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Valuation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
 
+-- Minimal Settings UI stub so Logs page hooks can exercise Edit eligibility (#459).
+SF.SettingsUI = {
+    pagesById = {},
+    RegisterPage = function(self, page)
+        if type(page) == "table" and type(page.id) == "string" then
+            self.pagesById[page.id] = page
+        end
+    end,
+    GetPage = function(self, id)
+        return self.pagesById and self.pagesById[id]
+    end,
+    Dialogs = {
+        Confirm = function(_, _msg, _btn, onConfirm)
+            if type(onConfirm) == "function" then
+                onConfirm()
+            end
+        end,
+        Prompt = function(_, _msg, _btn, _default, onContinue)
+            if type(onContinue) == "function" then
+                onContinue(_default or "")
+            end
+        end,
+    },
+}
+loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
 -- Minimal provider registry stub so EnsureGossipProvider can register without the
 -- full engine. 3A multi-client tests exercise ValidateAndApply / AdmitRemote*.
 do
@@ -1279,7 +1305,8 @@ do
 end
 
 do
-    -- Correction-before-event: mutation stays pending_event until base exists, then redrive.
+    -- Correction-before-event: remote admit stays pending until base exists, then
+    -- authenticated redrive promotes through AdmitRemoteOperation (#459).
     local record = seedLiveCampaignWithItem(9107, 40)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     settleRoster()
@@ -1298,23 +1325,58 @@ do
             attributedGuid = "Player-1-Bob",
             baseAttributed = "Alice-Garona",
             baseAttributedGuid = "Player-1-Alice",
+            itemId = 9107,
         },
         actorGuid = "Player-1-Alice",
         actorName = "Alice-Garona",
         timestamp = world.time + 1,
+        -- Match CurrentTargetRevision fallback when no correction head exists.
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
     }
-    local ok, err = GS.ApplyContributorCorrectionMutation(record, pendingOp, { remoteAdmit = true })
-    assertEq(ok, false, "459: correction-before-event apply fails closed")
-    assertEq(err, "pending_event", "459: pending_event reason got " .. tostring(err))
-    -- Retain like remote pending admission, then introduce the base event.
-    record.operations.pending = record.operations.pending or {}
-    record.operations.pending[pendingOp.id] = { body = pendingOp, reason = "pending_event" }
+    local st, reason = GS:AdmitRemoteOperation(pendingOp, {
+        sender = "Alice-Garona",
+        offlineRecord = record,
+        preserveAttribution = true,
+    })
+    assertEq(st, "pending", "459: early correction pending got " .. tostring(st) .. "/" .. tostring(reason))
+    assertEq(reason, "pending_event", "459: pending_event reason got " .. tostring(reason))
+    local pend = record.operations.pending and record.operations.pending[pendingOp.id]
+    assertTrue(type(pend) == "table", "459: pending retained")
+    assertEq(pend.sender, "Alice-Garona", "459: pending keeps authenticated sender")
+    record.operations.pending["untrusted-corr"] = {
+        id = "untrusted-corr",
+        body = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "untrusted-corr",
+            guildKey = pendingOp.guildKey,
+            datasetId = pendingOp.datasetId,
+            campaignId = pendingOp.campaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "late-don",
+            value = pendingOp.value,
+            actorGuid = "Player-1-Eve",
+            actorName = "Eve-Garona",
+            timestamp = world.time + 2,
+        },
+        reason = "untrusted_relay",
+        sender = "Eve-Garona",
+    }
     injectProductionDonation(record, {
         id = "late-don", itemId = 9107, quantity = 3,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
     })
-    local promoted = GS.RedrivePendingContributorCorrections(record, "late-don")
-    assertTrue(promoted >= 1, "459: pending correction promoted after event")
+    GS.RebuildCreditCorrectionProjection(record, nil)
+    local promoted = GS.RedrivePendingContributorCorrections(record, {
+        eventId = "late-don",
+        itemId = 9107,
+    })
+    assertTrue(promoted >= 1, "459: pending correction promoted after event got " .. tostring(promoted))
+    assertTrue(record.operations.records["corr-before-event"] ~= nil,
+        "459: trusted correction accepted via redrive")
+    assertTrue(record.operations.records["untrusted-corr"] == nil,
+        "459: untrusted pending not promoted")
     local event = GS.FindLedgerEventById(record, "late-don")
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, event)), "Bob-Garona",
         "459: credit after redrive")
@@ -1375,6 +1437,268 @@ do
     local detail = GS.FormatCampaignHistoryDetail(found, "Flask")
     assertTrue(type(detail) == "string" and detail:find("corrected", 1, true),
         "459: detail mentions correction")
+end
+
+
+do
+    -- Cross-entry convergence: A +10/+10 donations and -10 adjustment.
+    -- Peer1 moves don1→Bob; peer2 moves don2→Carol. Both locally valid under
+    -- per-event floors, but deterministic active-head rebuild must converge.
+    local peerA = seedLiveCampaignWithItem(9201, 100)
+    injectProductionDonation(peerA, {
+        id = "cross-don-1", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6000,
+    })
+    injectProductionDonation(peerA, {
+        id = "cross-don-2", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6001,
+    })
+    injectProductionAdjustment(peerA, {
+        id = "cross-adj", itemId = 9201, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice", timestamp = 6002,
+    })
+    assertEq(GS.PersonalContributorItemTotal(peerA, "Alice-Garona", "Player-1-Alice", 9201), 10,
+        "459: Alice personal 10 before cross edits")
+    world.time = 7000
+    local move1 = select(1, GS:NewContributorCorrectionOperation("cross-don-1", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(move1 ~= nil, "459: peerA can prepare don1→Bob")
+    assertEq(GS:ApplyStagedConfigOperation(move1), "accepted", "459: peerA applies don1→Bob")
+    local snap1 = select(1, GS._SnapshotPublicOp(move1))
+
+    local peerB = seedLiveCampaignWithItem(9201, 100)
+    injectProductionDonation(peerB, {
+        id = "cross-don-1", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6000,
+    })
+    injectProductionDonation(peerB, {
+        id = "cross-don-2", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6001,
+    })
+    injectProductionAdjustment(peerB, {
+        id = "cross-adj", itemId = 9201, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice", timestamp = 6002,
+    })
+    world.time = 7001
+    local move2 = select(1, GS:NewContributorCorrectionOperation("cross-don-2", "Carol-Garona", "Player-1-Carol"))
+    assertTrue(move2 ~= nil, "459: peerB can prepare don2→Carol")
+    assertEq(GS:ApplyStagedConfigOperation(move2), "accepted", "459: peerB applies don2→Carol")
+    local snap2 = select(1, GS._SnapshotPublicOp(move2))
+
+    local function rebaseSnap(snap, record)
+        local body = {}
+        for k, v in pairs(snap) do body[k] = v end
+        body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        body.datasetId = record.datasetId
+        body.campaignId = record.currentCampaignId
+        body.baseCampaignId = record.currentCampaignId
+        body.basePolicyRevision = record.permission and record.permission.revisionId
+        if body.baseTargetRevision == nil or body.baseTargetRevision == snap.datasetId then
+            body.baseTargetRevision = record.datasetId
+        end
+        return body
+    end
+
+    -- Re-establish peerA with move1 only, then admit move2.
+    peerA = seedLiveCampaignWithItem(9201, 100)
+    injectProductionDonation(peerA, {
+        id = "cross-don-1", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6000,
+    })
+    injectProductionDonation(peerA, {
+        id = "cross-don-2", itemId = 9201, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 6001,
+    })
+    injectProductionAdjustment(peerA, {
+        id = "cross-adj", itemId = 9201, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice", timestamp = 6002,
+    })
+    local snap1A = rebaseSnap(snap1, peerA)
+    local snap2A = rebaseSnap(snap2, peerA)
+    -- move1 originally targeted peerA's earlier dataset; after rebase, baseTarget
+    -- for a first correction is datasetId (no head).
+    snap1A.baseTargetRevision = peerA.datasetId
+    snap2A.baseTargetRevision = peerA.datasetId
+    assertEq(select(1, GS:AdmitRemoteOperation(snap1A, {
+        sender = "Alice-Garona", offlineRecord = peerA, preserveAttribution = true,
+    })), "accepted", "459: peerA accepts move1")
+    local stA2, rA2 = GS:AdmitRemoteOperation(snap2A, {
+        sender = "Alice-Garona", offlineRecord = peerA, preserveAttribution = true,
+    })
+    assertTrue(stA2 == "accepted" or stA2 == "pending",
+        "459: peerA admits move2 got " .. tostring(stA2) .. "/" .. tostring(rA2))
+    GS.RebuildCreditCorrectionProjection(peerA, nil)
+
+    local snap1B = rebaseSnap(snap1, peerB)
+    snap1B.baseTargetRevision = peerB.datasetId
+    local stB1, rB1 = GS:AdmitRemoteOperation(snap1B, {
+        sender = "Alice-Garona", offlineRecord = peerB, preserveAttribution = true,
+    })
+    assertTrue(stB1 == "accepted" or stB1 == "pending",
+        "459: peerB admits move1 got " .. tostring(stB1) .. "/" .. tostring(rB1))
+    GS.RebuildCreditCorrectionProjection(peerB, nil)
+
+    local function creditOf(record, id)
+        local ev = GS.FindLedgerEventById(record, id)
+        return select(1, GS.ResolveEffectiveCreditIdentity(record, ev))
+    end
+    assertEq(creditOf(peerA, "cross-don-1"), creditOf(peerB, "cross-don-1"),
+        "459: peers converge don1 credit")
+    assertEq(creditOf(peerA, "cross-don-2"), creditOf(peerB, "cross-don-2"),
+        "459: peers converge don2 credit")
+    assertTrue(GS.PersonalContributorItemTotal(peerA, "Alice-Garona", "Player-1-Alice", 9201) >= 0,
+        "459: Alice personal nonnegative peerA")
+    assertTrue(GS.PersonalContributorItemTotal(peerB, "Alice-Garona", "Player-1-Alice", 9201) >= 0,
+        "459: Alice personal nonnegative peerB")
+    local activeMoves = 0
+    if creditOf(peerA, "cross-don-1") == "Bob-Garona" then activeMoves = activeMoves + 1 end
+    if creditOf(peerA, "cross-don-2") == "Carol-Garona" then activeMoves = activeMoves + 1 end
+    assertEq(activeMoves, 1, "459: exactly one cross transfer active got " .. tostring(activeMoves))
+end
+
+do
+    -- Authored previous credit survives reversed delivery order.
+    local record = seedLiveCampaignWithItem(9202, 50)
+    injectProductionDonation(record, {
+        id = "rev-don", itemId = 9202, quantity = 9,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    world.time = world.time + 1
+    local early = select(1, GS:NewContributorCorrectionOperation("rev-don", "Bob-Garona", nil))
+    assertTrue(early ~= nil, "459: early prepare")
+    world.time = world.time + 5
+    local late = select(1, GS:NewContributorCorrectionOperation("rev-don", "Carol-Garona", nil))
+    assertTrue(late ~= nil, "459: late prepare against current Alice base")
+    -- late was prepared while Alice still credited; rebuild a clean peer and
+    -- deliver late then early.
+    record.creditCorrections = nil
+    record.operations.records = {}
+    record.operations.order = {}
+    record.operations.heads = {}
+    record.operations.pending = {}
+    local snapLate = select(1, GS._SnapshotPublicOp(late))
+    local snapEarly = select(1, GS._SnapshotPublicOp(early))
+    assertEq(select(1, GS:AdmitRemoteOperation(snapLate, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })), "accepted", "459: late arrives first")
+    assertEq(record.creditCorrections["rev-don"].previousAttributed, "Alice-Garona",
+        "459: late authored previous is Alice")
+    local stEarly = select(1, GS:AdmitRemoteOperation(snapEarly, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    }))
+    assertTrue(stEarly == "accepted" or stEarly == "obsolete" or stEarly == "rejected",
+        "459: early after late status " .. tostring(stEarly))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, GS.FindLedgerEventById(record, "rev-don"))),
+        "Carol-Garona", "459: effective stays Carol")
+    assertEq(record.creditCorrections["rev-don"].previousAttributed, "Alice-Garona",
+        "459: audit previous stays authored Alice after reverse delivery")
+end
+
+do
+    -- Unassigned correction stays Unassigned in history projection.
+    local record = seedLiveCampaignWithItem(9203, 40)
+    injectProductionDonation(record, {
+        id = "ua-base", itemId = 9203, quantity = 12,
+        actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+    })
+    injectProductionAdjustment(record, {
+        id = "ua-adj", itemId = 9203, quantity = 4,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+    })
+    local op = select(1, GS:NewContributorCorrectionOperation("ua-adj", nil, nil))
+    assertTrue(op ~= nil, "459: prepare Bob→Unassigned")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "459: apply Unassigned")
+    local rows = select(1, GS:ListCampaignHistory(record.currentCampaignId, nil, 0))
+    local found = nil
+    for i = 1, #rows do
+        if rows[i].id == "ua-adj" then found = rows[i] break end
+    end
+    assertTrue(found ~= nil, "459: unassigned history row")
+    assertNil(found.effectiveAttributed, "459: effective Unassigned nil")
+    assertNil(found.displayAttributed, "459: displayAttributed nil for Unassigned")
+    assertTrue(type(found.text) == "string" and found.text:find("unattributed", 1, true),
+        "459: history text uses unattributed wording")
+end
+
+do
+    -- Alias-aware correction target resolves to canonical ledger event.
+    local record = seedLiveCampaignWithItem(9204, 40)
+    local don = injectProductionDonation(record, {
+        id = "ctx:canon-don", itemId = 9204, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don.txnId = "ctx:canon-don"
+    local cfg = record.accounting._consumables
+    cfg.txnRegistry = cfg.txnRegistry or {}
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = "ctx:canon-don",
+        status = "committed",
+        aliases = { "ctx:alias-don" },
+        committed = true,
+    }
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = "ctx:alias-don",
+        status = "alias",
+        aliasOf = "ctx:canon-don",
+        committed = true,
+    }
+    local found = GS.FindLedgerEventById(record, "ctx:alias-don")
+    assertTrue(found ~= nil and found.id == "ctx:canon-don", "459: alias resolves to canonical event")
+    local op = select(1, GS:NewContributorCorrectionOperation("ctx:alias-don", "Bob-Garona", nil))
+    assertTrue(op ~= nil, "459: prepare via alias id")
+    assertEq(op.target, "ctx:canon-don", "459: op targets canonical id")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "459: apply alias correction")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459: credit via alias correction")
+end
+
+do
+    -- Logs UI: production credit gate, concrete prefill, GetNumGuildMembers multi-return.
+    local logsPage = SF.SettingsUI and SF.SettingsUI.pagesById
+        and SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(logsPage and logsPage.__sfTest, "459: Logs page test hooks available")
+    local record = seedLiveCampaignWithItem(9205, 40)
+    injectProductionDonation(record, {
+        id = "ui-don", itemId = 9205, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local staged = injectProductionDonation(record, {
+        id = "ui-staged", itemId = 9205, quantity = 2,
+        actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+    })
+    staged.gsProductionCredit = false
+    staged.uncredited = nil
+    local rows = logsPage.__sfTest.BuildProjectedRows()
+    local credited, stagedRow = nil, nil
+    for i = 1, #rows do
+        if rows[i].id == "ui-don" then credited = rows[i] end
+        if rows[i].id == "ui-staged" then stagedRow = rows[i] end
+    end
+    assertTrue(credited and credited.showAction == true, "459: credited row shows Edit")
+    -- Live Logs omit uncredited rows (progress-aligned). Edit open still rejects.
+    assertNil(stagedRow, "459: staged uncredited row omitted from live Logs")
+    logsPage.__sfTest.OpenEditContributorDialog("ui-staged", {
+        _eventKind = "donation",
+        _contributorName = "Bob-Garona",
+        _quantityText = "2",
+        _itemText = "Item",
+    })
+    assertNil(logsPage.__sfTest.GetEditSession(),
+        "459: Edit refused for non-production-credited row")
+    assertEq(credited._effectiveName, "Alice-Garona", "459: prefill concrete effective name")
+    local cache = logsPage.__sfTest.EnsureEditRosterCache()
+    assertTrue(type(cache.names) == "table" and #cache.names >= 4,
+        "459: roster cache populated despite multi-return GetNumGuildMembers")
+    logsPage.__sfTest.OpenEditContributorDialog("ui-don", credited)
+    local session = logsPage.__sfTest.GetEditSession()
+    assertTrue(type(session) == "table", "459: edit session opened")
+    assertEq(session.effectiveName, "Alice-Garona", "459: session captures effective")
+    assertEq(session.attributed, "Alice-Garona", "459: prefill matches effective")
+    assertEq(session.datasetId, record.datasetId, "459: session captures dataset")
+    local op, st, reason = GS:NewContributorCorrectionOperation(
+        session.eventId, session.attributed, session.attributedGuid)
+    assertNil(op, "459: unchanged editor selection is no-op")
+    assertEq(reason, "unchanged_attribution", "459: unchanged reason")
+    logsPage.__sfTest.ClearEditSession()
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

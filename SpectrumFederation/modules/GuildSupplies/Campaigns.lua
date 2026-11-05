@@ -1255,6 +1255,15 @@ local function HistoryDisplayActor(record, event)
 end
 
 local function HistoryDisplayAttribution(record, event)
+    -- Explicit Unassigned correction must not fall back to durable attributed (#459).
+    local hasCorrection = type(event) == "table" and type(event.creditCorrection) == "table"
+    if hasCorrection then
+        local pre = BoundedActorName(event.displayAttributed)
+        if pre then
+            return pre
+        end
+        return BoundedActorName(event.effectiveAttributed)
+    end
     local pre = BoundedActorName(event and event.displayAttributed)
     if pre then
         return pre
@@ -1533,25 +1542,36 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         if GS.ResolveEffectiveCreditIdentity then
             creditName, creditGuid, correctionHead = GS.ResolveEffectiveCreditIdentity(record, event)
         end
+        local hasCorrection = type(correctionHead) == "table"
         local displayActor = nil
         local displayAttributed = nil
         if IsDonationEvent(event) then
-            local srcName = creditName or event.actor
-            local srcGuid = creditGuid or event.actorGuid or event.donorGuid
-            if GS.ResolveDisplayContributor then
+            -- Keep corrected recipient name/GUID paired. Never mix a corrected
+            -- name with the original donor GUID (#459).
+            local srcName, srcGuid
+            if hasCorrection then
+                srcName, srcGuid = creditName, creditGuid
+            else
+                srcName = creditName or event.actor
+                srcGuid = creditGuid or event.actorGuid or event.donorGuid
+            end
+            if (srcName or srcGuid) and GS.ResolveDisplayContributor then
                 displayActor = select(1, GS.ResolveDisplayContributor(
                     record, srcName, srcGuid, resolveCtx))
+            elseif srcName then
+                displayActor = srcName
             end
         elseif IsAdjustmentEvent(event) then
-            local srcName = creditName
-            local srcGuid = creditGuid
-            if srcName == nil and srcGuid == nil and not correctionHead then
+            local srcName, srcGuid = creditName, creditGuid
+            if not hasCorrection and srcName == nil and srcGuid == nil then
                 srcName = event.attributed
                 srcGuid = event.attributedGuid
             end
             if (srcName or srcGuid) and GS.ResolveDisplayContributor then
                 displayAttributed = select(1, GS.ResolveDisplayContributor(
                     record, srcName, srcGuid, resolveCtx))
+            elseif srcName then
+                displayAttributed = srcName
             end
         end
         -- Project display names onto a shallow copy; keep txn/valuation fields
@@ -1564,12 +1584,25 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         projected.displayAttributed = displayAttributed
         projected.effectiveAttributed = creditName
         projected.effectiveAttributedGuid = creditGuid
-        if type(correctionHead) == "table" then
+        if hasCorrection then
             projected.creditCorrection = correctionHead
         end
         local text = FormatCampaignHistoryText(record, projected, itemName, markUncredited)
         if text and text ~= "" then
             local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
+            local rowDisplayAttributed
+            if hasCorrection then
+                -- Preserve explicit Unassigned (nil) — do not fall back to durable.
+                rowDisplayAttributed = displayAttributed or creditName
+            else
+                rowDisplayAttributed = displayAttributed or creditName or event.attributed
+            end
+            local rowDisplayActor
+            if hasCorrection then
+                rowDisplayActor = displayActor or creditName
+            else
+                rowDisplayActor = displayActor or creditName or event.actor
+            end
             local row = {
                 text = text,
                 id = event.id,
@@ -1579,14 +1612,16 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 actor = event.actor,
                 actorGuid = event.actorGuid,
                 donorGuid = event.donorGuid,
-                displayActor = displayActor or creditName or event.actor,
+                displayActor = rowDisplayActor,
                 attributed = event.attributed,
                 attributedGuid = event.attributedGuid,
-                displayAttributed = displayAttributed or creditName or event.attributed,
+                displayAttributed = rowDisplayAttributed,
                 effectiveAttributed = creditName,
                 effectiveAttributedGuid = creditGuid,
+                gsProductionCredit = event.gsProductionCredit == true or nil,
                 timestamp = event.timestamp,
                 generation = event.generation,
+                campaignId = event.campaignId,
                 uncredited = markUncredited and true or nil,
                 valuationTotal = described and described.priced and described.totalCopper or nil,
                 valuationUnit = described and described.priced and described.unitCopper or nil,
@@ -1594,7 +1629,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 valuationUnitText = described and described.priced and described.unitText or nil,
                 verification = type(event.verification) == "string" and event.verification or nil,
             }
-            if type(correctionHead) == "table" then
+            if hasCorrection then
                 row.creditCorrection = correctionHead
             end
             rows[#rows + 1] = row
@@ -1737,6 +1772,10 @@ function GS.FormatReasonText(reason)
             "a newer campaign name revision already applied"),
         stale_credit = Loc("GUILD_SUPPLIES_REASON_STALE_CREDIT",
             "that contribution was corrected by another officer — refresh and try again"),
+        stale_guild = Loc("GUILD_SUPPLIES_REASON_STALE_GUILD",
+            "the guild context changed — reopen Edit and try again"),
+        ambiguous_character = Loc("GUILD_SUPPLIES_REASON_AMBIGUOUS_CHARACTER",
+            "choose a realm-qualified character name"),
         missing_event = Loc("GUILD_SUPPLIES_REASON_MISSING_EVENT",
             "that log entry is no longer available"),
         pending_event = Loc("GUILD_SUPPLIES_REASON_PENDING_EVENT",

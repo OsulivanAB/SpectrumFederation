@@ -848,6 +848,13 @@ local function ValidateKindValue(op)
                 return false, "invalid_guid"
             end
         end
+        -- Optional dependency hint for balance-driven redrive (#459).
+        if op.value.itemId ~= nil then
+            local itemId = tonumber(op.value.itemId)
+            if not itemId or itemId ~= math.floor(itemId) or itemId < 1 then
+                return false, "invalid_value"
+            end
+        end
         return true
     end
     return false, "unsupported_kind"
@@ -1106,7 +1113,9 @@ function GS:NewContributorCorrectionOperation(eventId, attributed, attributedGui
             value.baseAttributed, value.baseAttributedGuid) then
         return nil, "rejected", "unchanged_attribution"
     end
-    local tKey = TargetKey(KIND.CORRECT_CONTRIBUTOR, eventId)
+    -- Target the canonical ledger event id (alias-aware prepare).
+    local canonicalTarget = value.eventId
+    local tKey = TargetKey(KIND.CORRECT_CONTRIBUTOR, canonicalTarget)
     if not tKey then
         return nil, "rejected", "invalid_target"
     end
@@ -1121,7 +1130,7 @@ function GS:NewContributorCorrectionOperation(eventId, attributed, attributedGui
         datasetId = record.datasetId,
         campaignId = record.currentCampaignId,
         kind = KIND.CORRECT_CONTRIBUTOR,
-        target = eventId,
+        target = canonicalTarget,
         value = value,
         actorGuid = ctx.actorGuid,
         actorName = ctx.actorName,
@@ -1314,16 +1323,21 @@ local function RetainConflict(ops, op)
     return true
 end
 
-local function RetainPending(ops, op, reason)
+local function RetainPending(ops, op, reason, sender)
     if not CanRetainBody(ops, ops.pending, op.id) then
         return false
     end
-    ops.pending[op.id] = {
+    local entry = {
         id = op.id,
         reason = reason,
         body = op,
         at = ServerTime() or op.timestamp,
     }
+    -- Authenticated transport sender required for safe deferred re-admission (#459).
+    if type(sender) == "string" and sender ~= "" then
+        entry.sender = sender
+    end
+    ops.pending[op.id] = entry
     if GS._BumpOpsValidationGen then
         GS._BumpOpsValidationGen(ops)
     end
@@ -1332,10 +1346,17 @@ end
 
 --- Same-ID body comparison against pending store before overwrite/accept.
 -- @return status, reason  -- "ok" | "duplicate" | "id_conflict" | "full"
-local function AdmitPendingOrConflict(ops, stored, reason)
+local function AdmitPendingOrConflict(ops, stored, reason, sender)
     local pending = ops.pending[stored.id]
     if pending then
         if DeepEqual(pending.body, stored) then
+            -- Refresh sender when a later authenticated delivery re-states the body.
+            if type(sender) == "string" and sender ~= "" then
+                pending.sender = sender
+            end
+            if type(reason) == "string" and reason ~= "" then
+                pending.reason = reason
+            end
             return "pending", reason or pending.reason or "stale_base"
         end
         -- Different body: preserve original pending; retain conflict if capacity allows.
@@ -1356,7 +1377,7 @@ local function AdmitPendingOrConflict(ops, stored, reason)
         end
         return "rejected", "id_conflict"
     end
-    if not RetainPending(ops, stored, reason) then
+    if not RetainPending(ops, stored, reason, sender) then
         return "rejected", "full"
     end
     return "pending", reason
@@ -1711,6 +1732,17 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", applyErr or "apply_failed"
     end
     StoreAccepted(ops, stored, tKey)
+    if stored.kind == KIND.CORRECT_CONTRIBUTOR or stored.kind == KIND.ADJUST_QUANTITY then
+        if GS.RebuildCreditCorrectionProjection then
+            GS.RebuildCreditCorrectionProjection(record, nil)
+        end
+        if GS.RedrivePendingContributorCorrections then
+            GS.RedrivePendingContributorCorrections(record, {
+                eventId = stored.kind == KIND.CORRECT_CONTRIBUTOR and stored.target or nil,
+                itemId = stored.value and stored.value.itemId,
+            })
+        end
+    end
     GS._NotifyLocalDurableChange("config")
     return "accepted", nil
 end
@@ -2342,8 +2374,8 @@ function GS._RetentionBodyCount(ops)
     return RetentionBodyCount(ops)
 end
 
-function GS._AdmitPendingOrConflict(ops, stored, reason)
-    return AdmitPendingOrConflict(ops, stored, reason)
+function GS._AdmitPendingOrConflict(ops, stored, reason, sender)
+    return AdmitPendingOrConflict(ops, stored, reason, sender)
 end
 
 function GS._StoreAccepted(ops, stored, targetKey)
@@ -2358,8 +2390,8 @@ function GS._ApplyMutations(record, op, opts)
     return ApplyMutations(record, op, opts)
 end
 
-function GS._RetainPending(ops, op, reason)
-    return RetainPending(ops, op, reason)
+function GS._RetainPending(ops, op, reason, sender)
+    return RetainPending(ops, op, reason, sender)
 end
 
 function GS._AcceptedCount(ops)
