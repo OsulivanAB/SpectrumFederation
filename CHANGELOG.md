@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.7] - 2026-11-05
+
+### Changed
+- Quick Withdraw recipes, receipts, and bank/trade lifecycle
+
 ## [1.5.18-beta.6] - 2026-11-05
 
 ### Fixed

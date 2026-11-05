@@ -87,6 +87,7 @@ local function EmptyAccounting(clubId, guildName, guildRealm)
             },
             bankTab = nil,
             requestedItems = {},
+            recipes = {}, -- #457 Quick Withdraw; absent on older saves → treated as {}
             generation = 0,
             configSeq = 0,
             eventSeq = 0,
@@ -642,6 +643,18 @@ local function ValidateGuildRecordStructure(guildKey, record)
             return false, itemsErr or "invalid_accounting"
         end
     end
+    -- Optional #457 recipes: absent on older saves is fine; wrong type / overflow fails closed.
+    if cfg.recipes ~= nil then
+        if type(cfg.recipes) ~= "table" then
+            return false, "invalid_accounting"
+        end
+        if GS.ValidateRecipesMap then
+            local recipesOk, recipesErr = GS.ValidateRecipesMap(cfg.recipes)
+            if not recipesOk then
+                return false, recipesErr or "invalid_accounting"
+            end
+        end
+    end
     -- Eligibility container shape: allow absent/2A {} ; reject present non-tables.
     if GS.ValidateEligibilityContainer then
         local eligOk, eligErr = GS.ValidateEligibilityContainer(cfg.eligibility)
@@ -662,8 +675,10 @@ local function ValidateGuildRecordStructure(guildKey, record)
             return false, listsErr or "invalid_accounting"
         end
     else
-        local maxLive = GS.MAX_LEDGER_EVENTS or 4096
-        local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+        -- #457 withdrawals share the arrays under a separately capped allowance,
+        -- so the combined live/archive ceilings include MAX_WITHDRAWAL_EVENTS.
+        local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
         if #accounting._consumableEvents > maxLive
             or #accounting._consumableEventArchive > maxArch then
             return false, "ledger_overflow"

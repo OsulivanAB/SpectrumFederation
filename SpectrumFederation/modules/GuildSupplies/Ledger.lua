@@ -39,6 +39,8 @@ GS.MAX_TXN_CONFLICT_BODIES = 8
 GS.LEDGER_EVENT = {
     DONATION = "donation",
     ADJUSTMENT = "adjustment",
+    -- #457 informational Quick Withdraw receipts (never production credit).
+    WITHDRAWAL = "withdrawal",
 }
 
 GS.VERIFICATION = {
@@ -88,6 +90,35 @@ local function Now()
         end
     end
     return math.floor(time() or 0)
+end
+
+local function IsWithdrawalLedgerEvent(event)
+    if type(event) ~= "table" then
+        return false
+    end
+    local t = event.type
+    return t == GS.LEDGER_EVENT.WITHDRAWAL or t == "withdrawal"
+end
+
+local function CountNonWithdrawalEvents(list)
+    local n = 0
+    if type(list) ~= "table" then
+        return 0
+    end
+    for i = 1, #list do
+        if not IsWithdrawalLedgerEvent(list[i]) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function MaxLiveLedgerScan()
+    return (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+end
+
+local function MaxArchivedLedgerScan()
+    return (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
 end
 
 local function FloorNonNeg(n)
@@ -499,6 +530,11 @@ local function LedgerEstablishesNameGuid(record, name, guid)
         if type(ev) ~= "table" then
             return false
         end
+        -- Informational withdrawal receipts must not establish donor/attributed
+        -- name↔GUID provenance (live or archived).
+        if IsWithdrawalLedgerEvent(ev) then
+            return false
+        end
         local sideGuid = ValidGuid(ev.actorGuid) or ValidGuid(ev.donorGuid)
         if sideGuid == guid then
             if NormName(ev.actor) == name or NormName(ev.donor) == name then
@@ -511,8 +547,8 @@ local function LedgerEstablishesNameGuid(record, name, guid)
         return false
     end
     local lists = {
-        { record.accounting._consumableEvents, GS.MAX_LEDGER_EVENTS or 4096 },
-        { record.accounting._consumableEventArchive, GS.MAX_ARCHIVED_EVENTS or 4096 },
+        { record.accounting._consumableEvents, MaxLiveLedgerScan() },
+        { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
     }
     for li = 1, #lists do
         local list, maxLen = lists[li][1], lists[li][2]
@@ -1272,7 +1308,8 @@ local function FindLedgerDonationOccurrence(record, evidence)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, GS.MAX_LEDGER_EVENTS or 4096)
+            local maxScan = (li == 1) and MaxLiveLedgerScan() or MaxArchivedLedgerScan()
+            local limit = math.min(#list, maxScan)
             for i = 1, limit do
                 local event = list[i]
                 if type(event) == "table"
@@ -1915,6 +1952,8 @@ local function BumpAccountingMutation(record)
     end
 end
 
+GS._BumpAccountingMutation = BumpAccountingMutation
+
 function GS.GetAccountingMutationSeq(record)
     if type(record) ~= "table" or type(record.accounting) ~= "table" then
         return 0
@@ -2030,7 +2069,8 @@ local function FindLedgerEventByTxnId(record, txnId)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, GS.MAX_LEDGER_EVENTS or 4096)
+            local maxScan = (li == 1) and MaxLiveLedgerScan() or MaxArchivedLedgerScan()
+            local limit = math.min(#list, maxScan)
             for i = 1, limit do
                 local event = list[i]
                 if type(event) == "table"
@@ -2235,8 +2275,10 @@ function GS.ValidateLedgerEventLists(accounting, datasetId)
     if type(live) ~= "table" or type(archive) ~= "table" then
         return false, "invalid_accounting"
     end
-    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    -- #457: informational withdrawals share these arrays under a separate count
+    -- cap, so the array-length ceiling includes MAX_WITHDRAWAL_EVENTS headroom.
+    local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
     -- Always-cheap overflow gate (no pairs walk).
     if #live > maxLive or #archive > maxArch then
         return false, "ledger_overflow"
@@ -2296,30 +2338,59 @@ local function TrimEventArchive(record)
     if type(archive) ~= "table" then
         return false
     end
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
-    local overflow = #archive - maxArch
-    if overflow <= 0 then
-        return false
-    end
+    local maxDon = GS.MAX_ARCHIVED_EVENTS or 4096
+    local maxWd = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024
     local removedIds = {}
     local removedTxn = {}
-    for i = 1, overflow do
-        local ev = archive[i]
-        if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+    local function noteRemoved(ev)
+        if type(ev) ~= "table" then
+            return
+        end
+        if type(ev.id) == "string" and ev.id ~= "" then
             removedIds[#removedIds + 1] = "gs:le:" .. ev.id
         end
-        if type(ev) == "table" then
-            local txn = ev.txnId or ev.id
-            if type(txn) == "string" and txn ~= "" then
-                removedTxn[#removedTxn + 1] = txn
+        local txn = ev.txnId or ev.id
+        if type(txn) == "string" and txn ~= "" then
+            removedTxn[#removedTxn + 1] = txn
+        end
+    end
+    -- Count once per kind, then compact linearly. Evict only the oldest excess
+    -- rows of the kind that exceeds its independent cap (donation overflow must
+    -- not remove below-cap receipts, and vice versa).
+    local total = #archive
+    local nonWithdraw = CountNonWithdrawalEvents(archive)
+    local withdrawals = total - nonWithdraw
+    local excessDon = nonWithdraw - maxDon
+    if excessDon < 0 then excessDon = 0 end
+    local excessWd = withdrawals - maxWd
+    if excessWd < 0 then excessWd = 0 end
+    if excessDon < 1 and excessWd < 1 then
+        return false
+    end
+    local kept = {}
+    local dropDon = excessDon
+    local dropWd = excessWd
+    for i = 1, total do
+        local ev = archive[i]
+        local isWd = IsWithdrawalLedgerEvent(ev)
+        if isWd then
+            if dropWd > 0 then
+                noteRemoved(ev)
+                dropWd = dropWd - 1
+            else
+                kept[#kept + 1] = ev
+            end
+        else
+            if dropDon > 0 then
+                noteRemoved(ev)
+                dropDon = dropDon - 1
+            else
+                kept[#kept + 1] = ev
             end
         end
     end
-    local kept = {}
-    for i = overflow + 1, #archive do
-        kept[#kept + 1] = archive[i]
-    end
     record.accounting._consumableEventArchive = kept
+    archive = kept
     BumpAccountingMutation(record)
     -- Coalesce ledger + valuation export drops into one order compaction and
     -- one provider/manifest notification for this trusted retention trim.
@@ -2385,9 +2456,19 @@ local function AppendArchivedLedgerEvent(record, event)
     if type(archive) ~= "table" then
         return false, "invalid_accounting"
     end
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
-    if #archive >= maxArch then
-        return false, "full"
+    local maxDon = GS.MAX_ARCHIVED_EVENTS or 4096
+    local maxTotal = maxDon + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+    if IsWithdrawalLedgerEvent(event) then
+        if #archive >= maxTotal then
+            return false, "full"
+        end
+    else
+        if CountNonWithdrawalEvents(archive) >= maxDon then
+            return false, "full"
+        end
+        if #archive >= maxTotal then
+            return false, "full"
+        end
     end
     archive[#archive + 1] = event
     BumpAccountingMutation(record)
@@ -2734,9 +2815,10 @@ local function AppendLedgerEvent(record, event)
         record.accounting._consumableEvents = {}
         list = record.accounting._consumableEvents
     end
-    if #list >= (GS.MAX_LEDGER_EVENTS or 4096) then
+    local maxDonLive = GS.MAX_LEDGER_EVENTS or 4096
+    if CountNonWithdrawalEvents(list) >= maxDonLive then
         if GS.ShelvePriorGenerationsOnRecord(record)
-            and #(record.accounting._consumableEvents or {}) < (GS.MAX_LEDGER_EVENTS or 4096) then
+            and CountNonWithdrawalEvents(record.accounting._consumableEvents or {}) < maxDonLive then
             list = record.accounting._consumableEvents
         else
             return false, "full"
@@ -3732,6 +3814,12 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
         return false, "invalid_event"
     end
     local typ = event.type
+    if typ == GS.LEDGER_EVENT.WITHDRAWAL or typ == "withdrawal" then
+        if GS.ValidateWithdrawalEventBody then
+            return GS.ValidateWithdrawalEventBody(event, datasetId)
+        end
+        return false, "unsupported_kind"
+    end
     if typ ~= GS.LEDGER_EVENT.DONATION and typ ~= GS.LEDGER_EVENT.ADJUSTMENT
         and typ ~= "CONSUMABLE_DONATION" and typ ~= "CONSUMABLE_ADJUSTMENT" then
         return false, "invalid_kind"
@@ -4037,6 +4125,26 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     end
     if event.datasetId and event.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
+    end
+
+    -- #457 informational withdrawals: separate admission path (no editor gate,
+    -- no donation credit). Still requires authenticated same-guild membership.
+    if event.type == GS.LEDGER_EVENT.WITHDRAWAL or event.type == "withdrawal" then
+        if not GS.AdmitWithdrawalEvent then
+            return "rejected", "unsupported_kind"
+        end
+        local senderGuid = member and member.guid
+            or (admissionCtx.sender and tostring(admissionCtx.sender))
+        -- Informational trust: same-guild authenticated relay is allowed; actor
+        -- mismatch is relabeled RELAY inside AdmitWithdrawalEvent (not ORIGIN).
+        -- Pass adoptionReplay so temporary offline adoption writes do not
+        -- notify/update the live export index before atomic publish.
+        return GS.AdmitWithdrawalEvent(record, event, {
+            senderGuid = senderGuid,
+            memberAuthenticated = member ~= nil,
+            allowRelayOfOrigin = true,
+            adoptionReplay = admissionCtx.adoptionReplay == true,
+        })
     end
 
     -- Authenticated live cutover conflict blocks unsafe canonical writes.

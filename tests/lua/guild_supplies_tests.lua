@@ -22609,14 +22609,17 @@ do
 end
 
 do
-    -- 3B43) Adoption pending capacity fits independent ops + ledger maxima.
+    -- 3B43) Adoption pending capacity fits independent ops + ledger maxima,
+    -- including both withdrawal receipt classes and justified archive structure.
     assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS
         >= (GS.MAX_ACCEPTED_OPERATIONS or 4096)
             + (GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
             + (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
             + (GS.MAX_LEDGER_EVENTS or 4096)
             + (GS.MAX_ARCHIVED_EVENTS or 4096),
-        "3B43: adoption buffer covers ops+ledger+valuations got="
+        "3B43: adoption buffer covers ops+ledger+receipts+valuations got="
             .. tostring(GS.MAX_ADOPTION_PENDING_RECORDS))
     assertTrue(GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS >= GS.MAX_ADOPTION_PENDING_RECORDS,
         "3B43: aggregate admissions include the valuation buffer")
@@ -22629,9 +22632,19 @@ do
     GS.MAX_ACCEPTED_OPERATIONS = 40
     GS.MAX_LEDGER_EVENTS = 40
     GS.MAX_ARCHIVED_EVENTS = 40
+    local camps43 = GS.MAX_CAMPAIGNS or 64
+    local pages43 = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    -- Conservative retained-archive × per-archive page bound (not buffer-campaigns).
     GS.MAX_ADOPTION_PENDING_RECORDS = 40 + 40 + 40
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+        + 40 + 40
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + ((GS.MAX_CAMPAIGNS or 64) * 24) + 512
+        + camps43
+        + camps43
+        + (camps43 * pages43)
+        + (camps43 * pages43)
+        + 512
     local aliceRecord = seedStagedCampaignWithItem(9055, 50)
     -- Fill accepted ops near the lowered cap with bank-tab no-ops alternating.
     local acceptedNow = #(aliceRecord.operations.order or {})
@@ -22695,12 +22708,22 @@ do
     GS.MAX_ARCHIVED_EVENTS = 40
     GS.MAX_ADOPTION_PENDING_RECORDS = priorPending -- use production raised bound
     initGS()
-    -- Re-apply raised pending after Initialize defaults.
+    -- Re-apply raised pending after Initialize defaults (retained-archive bound).
+    local camps43b = GS.MAX_CAMPAIGNS or 64
+    local pg43b = GS.MAX_ARCHIVE_PAGE_COUNT or 512
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 40)
+        + (GS.MAX_LEDGER_EVENTS or 40)
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_EVENTS or 40)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
         + (GS.MAX_LEDGER_EVENTS or 40)
         + (GS.MAX_ARCHIVED_EVENTS or 40)
         + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-        + ((GS.MAX_CAMPAIGNS or 64) * 24) + 512
+        + camps43b
+        + camps43b
+        + (camps43b * pg43b)
+        + (camps43b * pg43b)
+        + 512
     GS:CreateStagedRecord()
     GS:EnsureGossipProvider()
     GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
@@ -23589,8 +23612,14 @@ do
     assertTrue(GS.ValidateLedgerEventLists(record.accounting),
         "3B51: valid empty/seed lists ok")
     -- Seed near-cap dense live list.
+    -- #457 array ceiling includes MAX_WITHDRAWAL_EVENTS headroom; pin that to 0
+    -- here so this overflow case still exercises the donation array bound.
     local priorMax = GS.MAX_LEDGER_EVENTS
+    local priorWithdraw = GS.MAX_WITHDRAWAL_EVENTS
+    local priorArchWithdraw = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS
     GS.MAX_LEDGER_EVENTS = 12
+    GS.MAX_WITHDRAWAL_EVENTS = 0
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = 0
     local events = record.accounting._consumableEvents
     for n = 1, 10 do
         events[#events + 1] = {
@@ -23651,6 +23680,8 @@ do
     assertTrue(elapsed < 1.0, "3B51: repeated structure checks stay bounded elapsed="
         .. tostring(elapsed))
     GS.MAX_LEDGER_EVENTS = priorMax
+    GS.MAX_WITHDRAWAL_EVENTS = priorWithdraw
+    GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS = priorArchWithdraw
 end
 
 do
@@ -46026,6 +46057,9 @@ do
     -- Real GI provider/bridge: readiness/identity changes invalidate accepted
     -- projection + owner scratch, then bounded Ensure/redrive. No witness
     -- promotion and no GS ledger/ops mutation from the bridge itself.
+    -- Binding/floor-result change via real AssignAlt NotifyLocalDurableChange;
+    -- mid-slice keeps queued callbacks; compare against independent rebuild
+    -- (discussion_r4483108265).
     ensureNonOfficerRoster()
     local record = seedStagedCampaignWithItem(98459, 200)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -46116,8 +46150,27 @@ do
         local daveBal = GS.PersonalContributorItemTotal
             and GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 98459)
             or 0
+        local carolBal = GS.PersonalContributorItemTotal
+            and GS.PersonalContributorItemTotal(record, "Carol-Garona", "Player-1-Carol", 98459)
+            or 0
         return table.concat(parts, ",") .. "#a=" .. tostring(active)
             .. "#bob=" .. tostring(bobBal) .. "#dave=" .. tostring(daveBal)
+            .. "#carol=" .. tostring(carolBal)
+    end
+    local function independentlyRebuildTruth()
+        GS.InvalidateCreditCorrectionProjection(record)
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        local guard = 0
+        while (not GS.IsCreditCorrectionProjectionAvailable(record)) and guard < 200 do
+            if not runOneDueTimer() then
+                ok = GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            guard = guard + 1
+        end
+        flushTimers()
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-GI: independent rebuild available")
+        return creditFp()
     end
     local natural = creditFp()
     assertTrue(natural:find("Bob%-Garona|Player%-1%-Bob", 1),
@@ -46132,7 +46185,7 @@ do
         end
     end
 
-    -- Into not-ready: bridge invalidates; no GS ledger/ops/witness mutation.
+    -- Into not-ready via durable GI notify (not a bare UI poke).
     local ensureCalls = 0
     local realEnsure = GS.EnsureCreditCorrectionProjection
     GS.EnsureCreditCorrectionProjection = function(...)
@@ -46140,7 +46193,7 @@ do
         return realEnsure(...)
     end
     giRec.baseline.complete = false
-    GI.NotifyUI("baseline-incomplete")
+    GI.NotifyLocalDurableChange("baseline-incomplete")
     drainExportMaint(16)
     -- not-ready path invalidates without Ensure/redrive.
     assertEq(ensureCalls, 0, "459-GI: no Ensure on out-of-readiness")
@@ -46149,10 +46202,10 @@ do
     assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
         "459-GI: no ledger mutation on not-ready")
 
-    -- Back to ready: Invalidate + Ensure/redrive via bridge.
+    -- Back to ready: Invalidate + Ensure/redrive via durable notify.
     ensureCalls = 0
     giRec.baseline.complete = true
-    GI.NotifyUI("baseline-complete")
+    GI.NotifyLocalDurableChange("baseline-complete")
     assertTrue(ensureCalls >= 1, "459-GI: Ensure on ready transition got="
         .. tostring(ensureCalls))
     local readyGuard = 0
@@ -46166,8 +46219,11 @@ do
     GS.EnsureCreditCorrectionProjection = realEnsure
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
         "459-GI: available after ready")
-    local fresh = creditFp()
-    assertEq(fresh, natural, "459-GI: natural==fresh after ready transition")
+    local liveAfterReady = creditFp()
+    local rebuiltAfterReady = independentlyRebuildTruth()
+    assertEq(liveAfterReady, natural, "459-GI: live matches pre-flip after ready")
+    assertEq(rebuiltAfterReady, liveAfterReady,
+        "459-GI: independent rebuild matches live after ready")
     assertEq(#(record.operations.order or {}), opsOrderBefore,
         "459-GI: no ops mutation on ready")
     assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
@@ -46180,26 +46236,44 @@ do
     end
     assertEq(witnessAfter, witnessBefore, "459-GI: no witness promotion")
 
-    -- Readiness flip between paced slices: invalidate mid-drain, then recover.
+    -- Mid-slice identity binding change via real AssignAlt (move Eve→Carol).
+    -- Keep queued callbacks; do not wipe the timer queue.
     GS._creditProjectionWorkBudgetOverride = 48
     GS.InvalidateCreditCorrectionProjection(record)
     local midOk = GS.EnsureCreditCorrectionProjection(record, nil)
-    assertTrue(midOk == false, "459-GI: paced yield before flip")
+    assertTrue(midOk == false, "459-GI: paced yield before binding change")
     assertTrue(#timers >= 1, "459-GI: continuation queued")
+    local queuedBefore = #timers
     ensureCalls = 0
     GS.EnsureCreditCorrectionProjection = function(...)
         ensureCalls = ensureCalls + 1
         return realEnsure(...)
     end
-    giRec.baseline.complete = false
-    GI.NotifyUI("mid-slice-incomplete")
-    assertEq(ensureCalls, 0, "459-GI: mid-slice not-ready does not Ensure")
-    -- Drop queued continuation; ready transition must redrive freshly.
-    timers = {}
-    giRec.baseline.complete = true
-    GI.NotifyUI("mid-slice-complete")
-    assertTrue(ensureCalls >= 1, "459-GI: mid-slice ready Ensure got="
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    local moveSt, moveReason, moveMeta = GI:AssignAlt("Carol-Garona", "Eve-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Dave",
+    })
+    if moveSt == "rejected" and moveReason == "move_confirmation_required" then
+        moveSt, moveReason = GI:AssignAlt("Carol-Garona", "Eve-Garona", {
+            roster = GI.GetRosterSnapshot(true),
+            moveConfirmed = true,
+            expectedOldMain = (moveMeta and moveMeta.oldMainGuid) or "Player-1-Dave",
+        })
+    end
+    assertEq(moveSt, "accepted",
+        "459-GI: real AssignAlt Eve→Carol got "
+            .. tostring(moveSt) .. "/" .. tostring(moveReason))
+    assertTrue(ensureCalls >= 1, "459-GI: binding change Ensure got="
         .. tostring(ensureCalls))
+    -- Queued callbacks retained (may grow with redrive; never cleared).
+    assertTrue(#timers >= 1,
+        "459-GI: queued callbacks retained after binding change had="
+            .. tostring(queuedBefore) .. " now=" .. tostring(#timers))
     local midGuard = 0
     while (not GS.IsCreditCorrectionProjectionAvailable(record)) and midGuard < 200 do
         if not runOneDueTimer() then
@@ -46211,8 +46285,13 @@ do
     GS.EnsureCreditCorrectionProjection = realEnsure
     GS._creditProjectionWorkBudgetOverride = nil
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
-        "459-GI: recovered after mid-slice readiness flip")
-    assertEq(creditFp(), natural, "459-GI: natural==fresh after mid-slice flip")
+        "459-GI: recovered after mid-slice binding change")
+    local liveAfterBind = creditFp()
+    assertTrue(liveAfterBind:find("Bob%-Garona|Player%-1%-Bob", 1),
+        "459-GI: Bob credit retained after binding change")
+    local rebuiltAfterBind = independentlyRebuildTruth()
+    assertEq(rebuiltAfterBind, liveAfterBind,
+        "459-GI: independent rebuild matches live after binding change")
     assertEq(#timers, 0, "459-GI: idle")
 end
 

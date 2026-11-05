@@ -233,14 +233,22 @@ local function ClassifyHistoryRow(row)
 		return nil
 	end
 	local t = row.type
+	-- #457: withdrawals must be explicit before the donation fallback.
+	if t == "withdrawal" then
+		return "withdrawal"
+	end
+	local GS = SF.GuildSupplies
+	if GS and GS.LEDGER_EVENT and t == GS.LEDGER_EVENT.WITHDRAWAL then
+		return "withdrawal"
+	end
 	if t == "adjustment" or t == "CONSUMABLE_ADJUSTMENT" then
 		return "adjustment"
 	end
 	if t == "donation" or t == "CONSUMABLE_DONATION" then
 		return "donation"
 	end
-	-- History projection only emits donation/adjustment rows; prefer attribution
-	-- and verification hints when type is unexpectedly missing.
+	-- History projection only emits donation/adjustment/withdrawal rows; prefer
+	-- attribution and verification hints when type is unexpectedly missing.
 	if row.attributed ~= nil or row.displayAttributed ~= nil then
 		return "adjustment"
 	end
@@ -318,6 +326,7 @@ local function BuildProjectedRows()
 	end
 	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
 	local adjustPrefix = Loc("GUILD_SUPPLIES_LOGS_ADJUST_MARK", "Adjustment")
+	local withdrawPrefix = Loc("GUILD_SUPPLIES_LOGS_WITHDRAW_MARK", "Withdrawal")
 	-- Warm the pass-scoped guild class lookup once before coloring rows.
 	GuildClassLookup()
 	for i = 1, #history do
@@ -382,6 +391,9 @@ local function BuildProjectedRows()
 		if kind == "adjustment" then
 			contributorDisplay = Loc("GUILD_SUPPLIES_LOGS_ADJUST_CONTRIBUTOR", "%s · %s")
 				:format(adjustPrefix, contributorDisplay)
+		elseif kind == "withdrawal" then
+			contributorDisplay = Loc("GUILD_SUPPLIES_LOGS_WITHDRAW_CONTRIBUTOR", "%s · %s")
+				:format(withdrawPrefix, contributorDisplay)
 		end
 		local itemId = tonumber(event.itemId)
 		local itemText = FormatItemCell(itemId)
@@ -441,6 +453,7 @@ local function BuildProjectedRows()
 			id = event.id,
 			kind = kind,
 			timestamp = event.timestamp,
+			creditUnavailable = event.creditUnavailable == true or nil,
 			showAction = canEdit,
 			actionLabel = Loc("GUILD_SUPPLIES_LOGS_EDIT_ACTION", "Edit"),
 			onAction = canEdit and OpenEditContributorDialog or nil,

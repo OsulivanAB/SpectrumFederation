@@ -501,6 +501,18 @@ function GS.ValidateCampaignArchive(archive, campaignId, record)
     if not itemsOk then
         return false, itemsErr or "invalid_campaign_archive"
     end
+    -- #457 recipes optional on older archives; present maps must validate.
+    if archive.recipes ~= nil then
+        if type(archive.recipes) ~= "table" then
+            return false, "invalid_campaign_archive"
+        end
+        if GS.ValidateRecipesMap then
+            local recipesOk, recipesErr = GS.ValidateRecipesMap(archive.recipes)
+            if not recipesOk then
+                return false, recipesErr or "invalid_campaign_archive"
+            end
+        end
+    end
     local gen = tonumber(archive.generation)
     if not gen or gen ~= math.floor(gen) or gen < 1 then
         return false, "invalid_generation"
@@ -583,6 +595,27 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     if type(copiedItems) ~= "table" then
         return false, copyErr or "invalid_accounting"
     end
+    local copiedRecipes = {}
+    if GS.CopyRecipes then
+        local recipesCopy, recipesErr = GS.CopyRecipes(cfg.recipes)
+        if type(recipesCopy) ~= "table" then
+            return false, recipesErr or "invalid_accounting"
+        end
+        copiedRecipes = recipesCopy
+    elseif type(cfg.recipes) == "table" then
+        -- Fallback shallow copy when Recipes.lua helpers are unavailable.
+        for k, v in pairs(cfg.recipes) do
+            if type(v) == "table" then
+                local reagents = {}
+                if type(v.reagents) == "table" then
+                    for rk, rv in pairs(v.reagents) do
+                        reagents[rk] = rv
+                    end
+                end
+                copiedRecipes[k] = { itemId = v.itemId, reagents = reagents }
+            end
+        end
+    end
     local eligibilityCopy = nil
     if type(cfg.eligibility) == "table" then
         eligibilityCopy = {
@@ -602,6 +635,7 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
         campaignId = campaignId,
         datasetId = record.datasetId,
         requestedItems = copiedItems,
+        recipes = copiedRecipes,
         generation = generation,
         archivedAt = timestamp,
         bankTab = tonumber(cfg.bankTab),
@@ -809,6 +843,14 @@ local function IsAdjustmentEvent(event)
     return event.type == "adjustment" or event.type == "CONSUMABLE_ADJUSTMENT"
 end
 
+local function IsWithdrawalEvent(event)
+    local t = event and event.type
+    if t == "withdrawal" then
+        return true
+    end
+    return GS.LEDGER_EVENT ~= nil and t == GS.LEDGER_EVENT.WITHDRAWAL
+end
+
 local function BoundedActorName(name)
     if type(name) ~= "string" then
         return nil
@@ -854,8 +896,12 @@ local function ForEachCampaignLedgerEvent(record, generation, visitor)
         end
     end
     -- Archive first, then live list — shared identities count once.
-    walk(record.accounting and record.accounting._consumableEventArchive, 4096)
-    walk(record.accounting and record.accounting._consumableEvents, 4096)
+    -- Mixed donation+withdrawal capacity: scan the supported combined ceilings
+    -- so informational withdrawals and donation rows past 4096 remain visible.
+    local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+    walk(record.accounting and record.accounting._consumableEventArchive, maxArch)
+    walk(record.accounting and record.accounting._consumableEvents, maxLive)
 end
 
 local function ResolveCampaignGeneration(record, campaignId)
@@ -1407,6 +1453,15 @@ local function FormatCampaignHistoryText(record, event, itemName, markUncredited
                 "%s adjusted %s by %+d (unattributed / miscellaneous).")
                 :format(who, name, qty)
         end
+    elseif IsWithdrawalEvent(event) then
+        -- Informational Quick Withdraw receipt (#457). No valuation/unpriced wording.
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+        body = Loc("GUILD_SUPPLIES_HISTORY_WITHDRAWAL",
+            "%s withdrew %d %s.")
+            :format(who, qty, name)
+        -- Never mark withdrawals as uncredited/donation-style; they never credit.
+        markUncredited = false
     else
         return nil
     end
@@ -1566,12 +1621,15 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
     local ordered = {}
     local seen = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        local isWithdrawal = IsWithdrawalEvent(event)
         local credited = true
-        if GS.EventCountsTowardLiveProgress then
+        if not isWithdrawal and GS.EventCountsTowardLiveProgress then
             credited = GS.EventCountsTowardLiveProgress(record, event) and true or false
         end
-        -- Live current campaign: keep history aligned with live progress.
-        if filterUncredited and not credited then
+        -- Live current campaign: keep donation/adjustment history aligned with
+        -- live progress. Informational withdrawals (#457) remain visible even
+        -- though they never contribute to progress.
+        if filterUncredited and not isWithdrawal and not credited then
             return
         end
         local id = event.id
@@ -1581,7 +1639,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
             end
             seen[id] = true
         end
-        if IsDonationEvent(event) or IsAdjustmentEvent(event) then
+        if IsDonationEvent(event) or IsAdjustmentEvent(event) or isWithdrawal then
             ordered[#ordered + 1] = event
         end
     end)
@@ -1616,7 +1674,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 itemName = value
             end
         end
-        local markUncredited = isArchived and GS.IsLiveActive(record)
+        local isWithdrawalRow = IsWithdrawalEvent(event)
+        local markUncredited = (not isWithdrawalRow) and isArchived and GS.IsLiveActive(record)
             and event.gsProductionCredit ~= true
         local creditName, creditGuid, correctionHead, creditStatus = nil, nil, nil, nil
         if GS.ResolveEffectiveCreditIdentity then
@@ -1627,7 +1686,18 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         local hasCorrection = (not creditUnavailable) and type(correctionHead) == "table"
         local displayActor = nil
         local displayAttributed = nil
-        if creditUnavailable then
+        if isWithdrawalRow then
+            -- Preserve actual withdrawing character; optional main annotation only (#457).
+            displayActor = BoundedActorName(event.actor)
+            if GS.ResolveDisplayContributor and event.actorGuid then
+                local annotated = select(1, GS.ResolveDisplayContributor(
+                    record, event.actor, event.actorGuid, resolveCtx))
+                -- Annotation must not rewrite the durable actor field used for filters.
+                if annotated and annotated ~= event.actor then
+                    displayActor = event.actor
+                end
+            end
+        elseif creditUnavailable then
             -- Do not restore durable donor/attributed names while blocked (#459).
             displayActor = nil
             displayAttributed = nil
@@ -1677,9 +1747,13 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         end
         local text = FormatCampaignHistoryText(record, projected, itemName, markUncredited)
         if text and text ~= "" then
-            local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
+            -- Withdrawals never receive donation valuation (#457).
+            local described = (not isWithdrawalRow) and GS.DescribeDonationValuation
+                and GS.DescribeDonationValuation(record, event) or nil
             local rowDisplayAttributed
-            if creditUnavailable then
+            if isWithdrawalRow then
+                rowDisplayAttributed = displayAttributed
+            elseif creditUnavailable then
                 rowDisplayAttributed = nil
             elseif hasCorrection then
                 -- Preserve explicit Unassigned (nil) — do not fall back to durable.
@@ -1688,7 +1762,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 rowDisplayAttributed = displayAttributed or creditName or event.attributed
             end
             local rowDisplayActor
-            if creditUnavailable then
+            if isWithdrawalRow then
+                rowDisplayActor = displayActor or event.actor
+            elseif creditUnavailable then
                 rowDisplayActor = nil
             elseif hasCorrection then
                 rowDisplayActor = displayActor or creditName
@@ -1720,7 +1796,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 valuationUnit = described and described.priced and described.unitCopper or nil,
                 valuationTotalText = described and described.priced and described.totalText or nil,
                 valuationUnitText = described and described.priced and described.unitText or nil,
-                verification = type(event.verification) == "string" and event.verification or nil,
+                verification = (not isWithdrawalRow)
+                    and type(event.verification) == "string" and event.verification or nil,
             }
             if hasCorrection then
                 row.creditCorrection = correctionHead
@@ -2375,6 +2452,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
     -- Retain the original eligibility object for rollback. Do not walk/copy
     -- eligibility.items: install a fresh container for the new campaign instead.
     local previousItems = cfg.requestedItems
+    local previousRecipes = cfg.recipes
     local previousGeneration = cfg.generation
     local previousEligibility = cfg.eligibility
     local previousConfigSeq = cfg.configSeq
@@ -2387,6 +2465,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
     local contextExisted = record.campaignContext and record.campaignContext[op.id] ~= nil
 
     cfg.requestedItems = {}
+    cfg.recipes = {}
     local currentGen = tonumber(cfg.generation)
     if parentId then
         -- Current campaign generation already validated by archive/admission.
@@ -2459,6 +2538,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
     local postOk, postErr = GS._ValidateGuildRecordStructure(op.guildKey, record)
     if not postOk then
         cfg.requestedItems = previousItems
+        cfg.recipes = previousRecipes
         cfg.generation = previousGeneration
         cfg.eligibility = previousEligibility
         cfg.configSeq = previousConfigSeq

@@ -10,10 +10,11 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- Wire schema for the Guild Supplies Gossip provider.
 -- 2: valuation-aware wire (#397). 3: Guild Info witness/attribution (#427).
 -- 4: attributed adjustment unitCopper on ledger events (#447 rankings).
--- 5: officer contributor credit corrections (#459 correct-contributor ops).
--- Older schema-4 peers reject/ignore unknown correction ops while still
--- appearing synchronized under Guild Gossip's strict equality, leaving wrong
--- credit; they are incompatible. Persisted GS.SCHEMA_VERSION stays independent.
+-- 5: officer contributor credit corrections (#459) and Quick Withdraw
+-- recipes/withdrawal receipts (#457). Older schema-4 peers reject/ignore
+-- unknown correction/recipe/withdrawal shapes while still appearing
+-- synchronized under Guild Gossip's strict equality; they are incompatible.
+-- Persisted GS.SCHEMA_VERSION stays independent.
 GS.PROVIDER_SCHEMA = 5
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
@@ -49,25 +50,45 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
--- Logical adoption buffer: accepted ops + live/archived ledger + one valuation
--- per retained ledger row + donation evidence + campaigns/archives + headroom.
--- Ledger and ops are independently capped; the shared buffer must hold both,
--- plus the valuation class, at once.
+-- Logical adoption buffer: accepted ops + live/archived donation ledger +
+-- live/archived withdrawal receipts + donation-only valuations + evidence +
+-- campaign/archive structure the producer actually emits. Receipt retention is
+-- independent of donation history; valuations remain donation-bounded.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
-GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
-    + (GS.MAX_LEDGER_EVENTS or 4096)
-    + (GS.MAX_ARCHIVED_EVENTS or 4096)
-    + (GS.MAX_LEDGER_EVENTS or 4096)
-    + (GS.MAX_ARCHIVED_EVENTS or 4096)
-    + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
-    + ((GS.MAX_CAMPAIGNS or 64) * 24)
-    + 512
+-- Campaign/archive structure: conservative dataset-wide upper bound from
+-- enforced retention + per-archive producer limits (not a claim that every
+-- archive simultaneously reaches both page ceilings):
+-- - Campaign headers (live + archived identities) ≤ MAX_CAMPAIGNS.
+-- - Retained archives ≤ MAX_CAMPAIGNS (Campaigns.lua); each archive exports one meta.
+-- - BuildArchiveExportBodies applies ≤ MAX_ARCHIVE_PAGE_COUNT item pages and
+--   ≤ MAX_ARCHIVE_PAGE_COUNT recipe pages per retained archive.
+-- MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS separately limits concurrent ordinary
+-- fragment assembly during transfer; it is not a retained-archive count and is
+-- not used to shrink this logical pending-record ceiling.
+do
+    local maxCampaigns = GS.MAX_CAMPAIGNS or 64
+    local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+        + (GS.MAX_LEDGER_EVENTS or 4096)
+        + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_ARCHIVED_EVENTS or 4096)
+        + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+        + (GS.MAX_LEDGER_EVENTS or 4096)
+        + (GS.MAX_ARCHIVED_EVENTS or 4096)
+        + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
+        + maxCampaigns
+        + maxCampaigns
+        + (maxCampaigns * pagesPerArchive)
+        + (maxCampaigns * pagesPerArchive)
+        + 512
+end
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
 GS.MAX_ADOPTION_ASSEMBLY_OPS = 24
 GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24)
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
+-- Concurrent ordinary archive-page assemblies (transfer-time), not retained archive count.
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
 -- Operation-manifest FragmentBuffer (confirm/resolve pages). Kept independent of
 -- the raised campaign-archive page ceiling so assembly_full / recovery tests and
@@ -1538,6 +1559,7 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
                 },
                 bankTab = nil,
                 requestedItems = {},
+                recipes = {},
                 generation = 0,
                 configSeq = 0,
                 eventSeq = 0,
@@ -1764,7 +1786,9 @@ local function CountBufferedKinds(adop)
             archivePages[cid] = {
                 meta = info.meta,
                 pages = info.pages or {},
+                recipePages = info.recipePages or {},
                 pageCount = info.pageCount or 1,
+                recipePageCount = info.recipePageCount,
             }
             if type(info.meta) == "table" and not desc and info.meta.kind == "dataset-desc" then
                 -- no-op; archives are not descriptors
@@ -1785,7 +1809,7 @@ local function CountBufferedKinds(adop)
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
-local function AssemblePagedArchive(meta, pagesByIndex)
+local function AssemblePagedArchive(meta, pagesByIndex, recipePagesByIndex)
     if type(meta) ~= "table" then
         return nil, "invalid_campaign_archive"
     end
@@ -1807,13 +1831,45 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         end
         return eligibility
     end
+    local function AssembleRecipesFromMeta()
+        if type(meta.recipes) == "table" then
+            return meta.recipes, nil
+        end
+        local recipePageCount = tonumber(meta.recipePageCount)
+        if not recipePageCount or recipePageCount < 1 then
+            return {}, nil
+        end
+        if type(recipePagesByIndex) ~= "table" then
+            return nil, "incomplete_archive_pages"
+        end
+        local merged, got = {}, 0
+        for page = 1, recipePageCount do
+            local p = recipePagesByIndex[page]
+            if type(p) ~= "table" or type(p.recipes) ~= "table" then
+                return nil, "incomplete_archive_pages"
+            end
+            for k, v in pairs(p.recipes) do
+                merged[k] = v
+                got = got + 1
+            end
+        end
+        if type(meta.recipeCount) == "number" and got ~= meta.recipeCount then
+            return nil, "invalid_campaign_archive"
+        end
+        return merged, nil
+    end
     if type(meta.requestedItems) == "table" then
+        local recipes, rerr = AssembleRecipesFromMeta()
+        if rerr then
+            return nil, rerr
+        end
         -- Inline small archive (no pages required).
         return {
             schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
             campaignId = meta.campaignId,
             datasetId = meta.datasetId,
             requestedItems = meta.requestedItems,
+            recipes = recipes or {},
             generation = meta.generation,
             archivedAt = meta.archivedAt,
             bankTab = tonumber(meta.bankTab),
@@ -1857,11 +1913,16 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             items = eligMerged,
         }
     end
+    local recipes, rerr = AssembleRecipesFromMeta()
+    if rerr then
+        return nil, rerr
+    end
     return {
         schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
         campaignId = meta.campaignId,
         datasetId = meta.datasetId,
         requestedItems = merged,
+        recipes = recipes or {},
         generation = meta.generation,
         archivedAt = meta.archivedAt,
         bankTab = tonumber(meta.bankTab),
@@ -1883,7 +1944,12 @@ local function ArchiveCoreEqual(a, b)
     if a.generation ~= b.generation or a.archivedAt ~= b.archivedAt then
         return false
     end
-    return DeepEqual(a.requestedItems, b.requestedItems)
+    if not DeepEqual(a.requestedItems, b.requestedItems) then
+        return false
+    end
+    local aRecipes = type(a.recipes) == "table" and a.recipes or {}
+    local bRecipes = type(b.recipes) == "table" and b.recipes or {}
+    return DeepEqual(aRecipes, bRecipes)
 end
 
 --- When core archive identity matches, prefer the gossip-assembled body so
@@ -1997,13 +2063,23 @@ function GS:IsAdoptionTransferComplete()
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
         return false, "incomplete_transfer"
     end
-    -- Paged archives must include every page referenced by meta.
+    -- Paged archives must include every ordinary and recipe page referenced by meta.
     if type(archivePages) == "table" then
         for _, info in pairs(archivePages) do
             if type(info.meta) == "table" and not info.meta.requestedItems then
                 local pc = tonumber(info.pageCount) or 1
                 for page = 1, pc do
                     if type(info.pages[page]) ~= "table" then
+                        return false, "incomplete_transfer"
+                    end
+                end
+            end
+            local rpc = tonumber(info.recipePageCount)
+                or (type(info.meta) == "table" and tonumber(info.meta.recipePageCount))
+            if rpc and rpc >= 1 then
+                local recipePages = info.recipePages or {}
+                for page = 1, rpc do
+                    if type(recipePages[page]) ~= "table" then
                         return false, "incomplete_transfer"
                     end
                 end
@@ -2903,9 +2979,18 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         adop._archiveIndex = adop._archiveIndex or {}
         local info = adop._archiveIndex[body.campaignId]
-            or { meta = nil, pages = {} }
+            or { meta = nil, pages = {}, recipePages = {} }
         if info.pageCount and archivePc and info.pageCount ~= archivePc then
             return "rejected", "invalid_operation"
+        end
+        if type(body.recipePageCount) == "number" then
+            local rpc = tonumber(body.recipePageCount)
+            if rpc and rpc >= 1 then
+                if info.recipePageCount and info.recipePageCount ~= rpc then
+                    return "rejected", "invalid_operation"
+                end
+                info.recipePageCount = info.recipePageCount or rpc
+            end
         end
         info.meta = body
         if archivePc then
@@ -2928,7 +3013,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         adop._archiveIndex = adop._archiveIndex or {}
         local info = adop._archiveIndex[body.campaignId]
-            or { meta = nil, pages = {} }
+            or { meta = nil, pages = {}, recipePages = {} }
         if info.pageCount and info.pageCount ~= pc then
             return "rejected", "invalid_operation"
         end
@@ -2941,6 +3026,34 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
+        adop._archiveIndex[body.campaignId] = info
+    elseif body.kind == "campaign-archive-recipe-page" and type(body.campaignId) == "string" then
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxArchivePages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._archiveIndex = adop._archiveIndex or {}
+        local info = adop._archiveIndex[body.campaignId]
+            or { meta = nil, pages = {}, recipePages = {} }
+        if info.recipePageCount and info.recipePageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.meta) == "table" and info.meta.recipePageCount ~= nil then
+            local metaRpc = tonumber(info.meta.recipePageCount)
+            if metaRpc and metaRpc ~= pc then
+                return "rejected", "invalid_operation"
+            end
+        end
+        info.recipePages = info.recipePages or {}
+        info.recipePages[page] = body
+        info.recipePageCount = info.recipePageCount or pc
         adop._archiveIndex[body.campaignId] = info
     end
 
@@ -3040,6 +3153,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                 },
                 bankTab = nil,
                 requestedItems = {},
+                recipes = {},
                 generation = 0,
                 configSeq = 0,
                 eventSeq = 0,
@@ -3568,10 +3682,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             local needsPages = (not body.requestedItems) and pageCount >= 1
             if temp.campaignArchives[body.campaignId] == nil then
                 if temp.currentCampaignId ~= body.campaignId and temp.campaigns[body.campaignId] then
+                    local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                     local pages = {}
                     if needsPages then
                         sliceUsed = sliceUsed + 1
-                        local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                         if type(info) == "table" and type(info.pages) == "table" then
                             for p, pb in pairs(info.pages) do
                                 pages[p] = pb
@@ -3580,7 +3694,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             end
                         end
                     end
-                    local archive, aerr = AssemblePagedArchive(body, pages)
+                    local archive, aerr = AssemblePagedArchive(body, pages,
+                        info and info.recipePages)
                     if not archive then
                         if aerr == "incomplete_archive_pages" then
                             unsettledSeen = true
@@ -3599,10 +3714,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                 end
             else
+                local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                 local pages = {}
                 if needsPages then
                     sliceUsed = sliceUsed + 1
-                    local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                     if type(info) == "table" and type(info.pages) == "table" then
                         for p, pb in pairs(info.pages) do
                             pages[p] = pb
@@ -3611,7 +3726,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         end
                     end
                 end
-                local archive, aerr = AssemblePagedArchive(body, pages)
+                local archive, aerr = AssemblePagedArchive(body, pages,
+                    info and info.recipePages)
                 if not archive then
                     if aerr == "incomplete_archive_pages" then
                         -- Generated presence alone is insufficient for advertised pages.
@@ -4579,32 +4695,70 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 -- Bounded presence validation only. Resume charges remaining pages;
                 -- assemble always uses the immutable indexed page set so a yield
                 -- mid-archive cannot drop pages 1..p-1 from a fresh local table.
-                local startPage = tonumber(opts.archivePageCursor and opts.archivePageCursor[body.campaignId]) or 1
-                for p = startPage, pageCount do
-                    if visited >= budget then
-                        opts.archivePageCursor = opts.archivePageCursor or {}
-                        opts.archivePageCursor[body.campaignId] = p
-                        opts.cursor = i
-                        opts.budgetExhausted = true
-                        publishCompletenessStats()
-                        return false, "budget"
+                opts.archivePhase = opts.archivePhase or {}
+                opts.archivePageCursor = opts.archivePageCursor or {}
+                opts.archiveRecipePageCursor = opts.archiveRecipePageCursor or {}
+                local phase = opts.archivePhase[body.campaignId] or "items"
+                if phase == "items" then
+                    local startPage = tonumber(opts.archivePageCursor[body.campaignId]) or 1
+                    for p = startPage, pageCount do
+                        if visited >= budget then
+                            opts.archivePageCursor[body.campaignId] = p
+                            opts.archivePhase[body.campaignId] = "items"
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false, "budget"
+                        end
+                        visited = visited + 1
+                        archiveVisitedCall = archiveVisitedCall + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        adop._workStats.archiveVisited =
+                            (adop._workStats.archiveVisited or 0) + 1
+                        if type(info.pages[p]) ~= "table" then
+                            opts.cursor = nil
+                            publishCompletenessStats()
+                            return false, "incomplete_archive_pages"
+                        end
                     end
-                    visited = visited + 1
-                    archiveVisitedCall = archiveVisitedCall + 1
-                    adop._workStats.completenessVisited =
-                        (adop._workStats.completenessVisited or 0) + 1
-                    adop._workStats.archiveVisited =
-                        (adop._workStats.archiveVisited or 0) + 1
-                    if type(info.pages[p]) ~= "table" then
-                        opts.cursor = nil
-                        publishCompletenessStats()
-                        return false, "incomplete_archive_pages"
-                    end
-                end
-                if opts.archivePageCursor then
                     opts.archivePageCursor[body.campaignId] = nil
+                    opts.archivePhase[body.campaignId] = "recipes"
+                    phase = "recipes"
                 end
-                local archive, aerr = AssemblePagedArchive(body, info.pages)
+                local recipePageCount = tonumber(body.recipePageCount)
+                    or (type(info.meta) == "table" and tonumber(info.meta.recipePageCount))
+                    or tonumber(info.recipePageCount)
+                if phase == "recipes" and recipePageCount and recipePageCount >= 1 then
+                    info.recipePages = info.recipePages or {}
+                    local startRp = tonumber(opts.archiveRecipePageCursor[body.campaignId]) or 1
+                    for rp = startRp, recipePageCount do
+                        if visited >= budget then
+                            opts.archiveRecipePageCursor[body.campaignId] = rp
+                            opts.archivePhase[body.campaignId] = "recipes"
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false, "budget"
+                        end
+                        visited = visited + 1
+                        archiveVisitedCall = archiveVisitedCall + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        adop._workStats.archiveVisited =
+                            (adop._workStats.archiveVisited or 0) + 1
+                        if type(info.recipePages[rp]) ~= "table" then
+                            opts.cursor = nil
+                            publishCompletenessStats()
+                            return false, "incomplete_archive_pages"
+                        end
+                    end
+                    opts.archiveRecipePageCursor[body.campaignId] = nil
+                end
+                if opts.archivePhase then
+                    opts.archivePhase[body.campaignId] = nil
+                end
+                local archive, aerr = AssemblePagedArchive(body, info.pages, info.recipePages)
                 if not archive then
                     opts.cursor = nil
                     publishCompletenessStats()
@@ -4967,6 +5121,9 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     publishCompletenessStats()
     return true, nil
 end
+
+-- Test seam: recipe-page resume / multi-slice completeness (#457).
+GS._ValidateAdoptionCompletenessForTest = ValidateAdoptionCompleteness
 
 --- Selected-source effective state: accepted membership + descriptor heads/config.
 local function ValidateAdoptionEffectiveState(temp, adop, desc)
@@ -5690,11 +5847,32 @@ local function StageParentArchive(record, parentId, timestamp)
             }
         end
     end
+    local recipesCopy = {}
+    if GS.CopyRecipes then
+        local copied, copyErr = GS.CopyRecipes(cfg.recipes)
+        if type(copied) ~= "table" then
+            return nil, copyErr or "invalid_accounting"
+        end
+        recipesCopy = copied
+    elseif type(cfg.recipes) == "table" then
+        for k, v in pairs(cfg.recipes) do
+            if type(v) == "table" then
+                local reagents = {}
+                if type(v.reagents) == "table" then
+                    for rk, rv in pairs(v.reagents) do
+                        reagents[rk] = rv
+                    end
+                end
+                recipesCopy[k] = { itemId = v.itemId, reagents = reagents }
+            end
+        end
+    end
     return {
         schemaVersion = GS.SCHEMA_VERSION,
         campaignId = parentId,
         datasetId = record.datasetId,
         requestedItems = itemsCopy,
+        recipes = recipesCopy,
         generation = generation,
         archivedAt = timestamp,
     }, nil
@@ -5783,6 +5961,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
     -- campaign-independent policy heads — do not retain losing-campaign heads
     -- that would mis-classify confirmed chosen-campaign edits as conflicts.
     local projItems = {}
+    local projRecipes = {}
     local projElig = {}
     local shadowHeads = {}
     if type(ops.heads) == "table" then
@@ -5807,6 +5986,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         accounting = {
             _consumables = {
                 requestedItems = projItems,
+                recipes = projRecipes,
                 eligibility = projElig,
                 bankTab = header and header.bankTabAtStart,
                 configSeq = tonumber(cfg.configSeq) or 0,
@@ -5943,6 +6123,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         promoteOps = orderedPromote,
         slotsNeeded = #orderedPromote,
         projectedItems = projItems,
+        projectedRecipes = projRecipes,
         projectedEligibility = projElig,
         projectedBankTab = shadow.accounting._consumables.bankTab,
         hasProjectedBankTab = true,
@@ -6006,6 +6187,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
 
     -- Sibling switch: keep generation; reconstruct off-record then publish atomically.
     local previousItems = cfg.requestedItems
+    local previousRecipes = cfg.recipes
     local previousEligibility = cfg.eligibility
     local previousBankTab = cfg.bankTab
     local previousConfigSeq = cfg.configSeq
@@ -6029,6 +6211,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
 
     local function rollbackActivation()
         cfg.requestedItems = previousItems
+        cfg.recipes = previousRecipes
         cfg.eligibility = previousEligibility
         cfg.bankTab = previousBankTab
         cfg.configSeq = previousConfigSeq
@@ -6138,6 +6321,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     end
 
     cfg.requestedItems = plan.projectedItems or {}
+    cfg.recipes = plan.projectedRecipes or {}
     cfg.eligibility = plan.projectedEligibility or {}
     -- Always publish the projected tab, including an explicitly captured nil
     -- from the chosen campaign's bankTabAtStart.
@@ -6278,12 +6462,14 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
     end
 
     local previousItems = cfg.requestedItems
+    local previousRecipes = cfg.recipes
     local previousGeneration = cfg.generation
     local previousEligibility = cfg.eligibility
     local previousConfigSeq = cfg.configSeq
     local previousCurrent = record.currentCampaignId
 
     cfg.requestedItems = {}
+    cfg.recipes = {}
     cfg.generation = currentGen + 1
     cfg.eligibility = {}
     -- Original startedAt / boundary timestamps — never receipt time.
@@ -6318,6 +6504,7 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
         local postOk, postErr = GS._ValidateGuildRecordStructure(stored.guildKey, record)
         if not postOk then
             cfg.requestedItems = previousItems
+            cfg.recipes = previousRecipes
             cfg.generation = previousGeneration
             cfg.eligibility = previousEligibility
             cfg.configSeq = previousConfigSeq
@@ -6610,7 +6797,8 @@ local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, 
         end
     elseif authBody.kind == GS.KIND.SET_EDITOR_RANK
         or authBody.kind == GS.KIND.SET_BANK_TAB
-        or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+        or authBody.kind == GS.KIND.SET_REQUESTED_ITEM
+        or authBody.kind == GS.KIND.SET_RECIPE then
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(shadow, authBody)
             if not ok then
@@ -6703,7 +6891,8 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                         if class == "apply" then
                             count = count + 1
                             if authBody.kind == GS.KIND.SET_BANK_TAB
-                                or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+                                or authBody.kind == GS.KIND.SET_REQUESTED_ITEM
+                                or authBody.kind == GS.KIND.SET_RECIPE then
                                 if not shadowConsumables
                                     and type(record.accounting) == "table"
                                     and type(record.accounting._consumables) == "table" then
@@ -6730,6 +6919,25 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                                             end
                                         end
                                         shadowConsumables.requestedItems = items
+                                    end
+                                    if GS.CloneRecipesMap then
+                                        shadowConsumables.recipes = GS.CloneRecipesMap(liveCfg.recipes)
+                                    elseif type(liveCfg.recipes) == "table" then
+                                        local recipes = {}
+                                        for rk, rv in pairs(liveCfg.recipes) do
+                                            if type(rv) == "table" then
+                                                local copy = { itemId = rv.itemId, reagents = {} }
+                                                if type(rv.reagents) == "table" then
+                                                    for rrk, rrv in pairs(rv.reagents) do
+                                                        copy.reagents[rrk] = rrv
+                                                    end
+                                                end
+                                                recipes[rk] = copy
+                                            end
+                                        end
+                                        shadowConsumables.recipes = recipes
+                                    else
+                                        shadowConsumables.recipes = {}
                                     end
                                     if type(liveCfg.eligibility) == "table" then
                                         local elig = {}

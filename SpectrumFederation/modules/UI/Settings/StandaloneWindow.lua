@@ -135,15 +135,29 @@ function SettingsWindow:_ReadSettingsWindowOpacitySetting()
     return self:_NormalizeSettingsWindowOpacity(raw)
 end
 
--- Apply backdrop background alpha only. Does not call SetAlpha on the frame,
--- so text, controls, and child windows remain fully opaque.
--- @param value number|nil Optional raw percent; when nil, reads from the store
-function SettingsWindow:ApplySettingsWindowOpacity(value)
-    local frame = self.frame
-    if not frame or type(frame.SetBackdropColor) ~= "function" then
+-- Secondary backdrop surfaces (e.g. Guild Supplies recipe editor) that share
+-- global.settingsWindowOpacity. Registration is identity-deduped so reopen
+-- paths cannot accumulate targets.
+SettingsWindow._opacityTargets = SettingsWindow._opacityTargets or {}
+
+function SettingsWindow:RegisterSettingsWindowOpacityTarget(frame)
+    if type(frame) ~= "table" or type(frame.SetBackdropColor) ~= "function" then
         return
     end
+    local targets = self._opacityTargets
+    for i = 1, #targets do
+        if targets[i] == frame then
+            return
+        end
+    end
+    targets[#targets + 1] = frame
+end
 
+-- Apply backdrop background alpha only. Does not call SetAlpha on the frame,
+-- so text, controls, and child windows remain fully opaque.
+-- Updates the main settings window (when present) and every registered target.
+-- @param value number|nil Optional raw percent; when nil, reads from the store
+function SettingsWindow:ApplySettingsWindowOpacity(value)
     local pct
     if value ~= nil then
         pct = self:_NormalizeSettingsWindowOpacity(value)
@@ -152,7 +166,19 @@ function SettingsWindow:ApplySettingsWindowOpacity(value)
     end
 
     local bg = C.BG
-    frame:SetBackdropColor(bg[1], bg[2], bg[3], pct / 100)
+    local alpha = pct / 100
+    local frame = self.frame
+    if frame and type(frame.SetBackdropColor) == "function" then
+        frame:SetBackdropColor(bg[1], bg[2], bg[3], alpha)
+    end
+
+    local targets = self._opacityTargets
+    for i = 1, #targets do
+        local target = targets[i]
+        if target and type(target.SetBackdropColor) == "function" then
+            target:SetBackdropColor(bg[1], bg[2], bg[3], alpha)
+        end
+    end
 end
 
 -- Get addon version string

@@ -5611,8 +5611,9 @@ end
 
 do
     -- B4: listener-driven Logs/Rankings recovery after accepted-history
-    -- work_budget→terminal (discussion_r4481471773). Keep cold unavailable
-    -- cache intact; complete via timers only; no pending promotion.
+    -- work_budget→terminal (discussion_r4483121096). Exercise actual page
+    -- data callbacks through a rendering harness; keep cold cache intact
+    -- until the terminal listener clears/rebuilds it.
     local nHeads = 80
     local itemId = 9803
     local record = seedLiveCampaignWithItem(itemId, nHeads + 40)
@@ -5648,61 +5649,138 @@ do
     end
     local opsOrderBefore = #(record.operations.order or {})
     local ledgerBefore = #(record.accounting._consumableEvents or {})
+
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
+    local shown = true
+    local logsDataCalls = 0
+    local rankingsDataCalls = 0
+    local hiddenLogsDataCalls = 0
+    local hiddenRankingsDataCalls = 0
+    local lastLogsRows = nil
+    local lastRankings = nil
+
+    local function collectDataCbs(pageDef)
+        local cbs = {}
+        for _, sec in ipairs((pageDef and pageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if type(item.getRows) == "function" then
+                    cbs.getRows = item.getRows
+                end
+                if type(item.getRankings) == "function" then
+                    cbs.getRankings = item.getRankings
+                end
+                for _, nested in ipairs(item.items or {}) do
+                    if type(nested.getRows) == "function" then
+                        cbs.getRows = nested.getRows
+                    end
+                    if type(nested.getRankings) == "function" then
+                        cbs.getRankings = nested.getRankings
+                    end
+                end
+            end
+        end
+        return cbs
+    end
+
+    local prevRenderer = SF.SettingsUI.DefinitionRenderer
+    SF.SettingsUI.DefinitionRenderer = {
+        Build = function(_, panel, pageDef)
+            panel.__sfPageDef = pageDef
+            panel.__sfDataCbs = collectDataCbs(pageDef)
+            panel.__sfPageBuilder = {
+                Refresh = function() end,
+                Reflow = function() end,
+            }
+            panel.__sfSections = {}
+            panel.__sfPrimarySection = {
+                SetMessage = function() end,
+            }
+        end,
+        Refresh = function(_, panel)
+            local cbs = panel and panel.__sfDataCbs or {}
+            if type(cbs.getRows) == "function" then
+                if not shown then
+                    hiddenLogsDataCalls = hiddenLogsDataCalls + 1
+                else
+                    logsDataCalls = logsDataCalls + 1
+                end
+                lastLogsRows = cbs.getRows()
+                panel.__sfLastRows = lastLogsRows
+            end
+            if type(cbs.getRankings) == "function" then
+                if not shown then
+                    hiddenRankingsDataCalls = hiddenRankingsDataCalls + 1
+                else
+                    rankingsDataCalls = rankingsDataCalls + 1
+                end
+                lastRankings = cbs.getRankings()
+                panel.__sfLastRankings = lastRankings
+            end
+        end,
+    }
+
+    local logsPanel = {
+        IsShown = function() return shown end,
+        IsVisible = function() return shown end,
+    }
+    local rankingsPanel = {
+        IsShown = function() return shown end,
+        IsVisible = function() return shown end,
+    }
+    logsPage:Build(logsPanel)
+    rankingsPage:Build(rankingsPanel)
+    assertTrue(type(logsPanel.__sfDataCbs) == "table"
+        and type(logsPanel.__sfDataCbs.getRows) == "function",
+        "459-B4: Logs getRows bound via Definition")
+    assertTrue(type(rankingsPanel.__sfDataCbs) == "table"
+        and type(rankingsPanel.__sfDataCbs.getRankings) == "function",
+        "459-B4: Rankings getRankings bound via Definition")
+
     GS._creditProjectionWorkBudgetOverride = 96
     GS.InvalidateCreditCorrectionProjection(record)
+    logsPage.__sfTest.ClearProjectedRowCache()
+
+    -- Cold unavailable via the real Logs data callback (not BuildProjectedRows helper).
+    logsDataCalls = 0
+    logsPage:Refresh(logsPanel)
+    assertEq(logsDataCalls, 1, "459-B4: cold Refresh invoked getRows")
+    assertTrue(type(lastLogsRows) == "table", "459-B4: cold getRows returned rows")
+    local sawUnavailable = false
+    for i = 1, #lastLogsRows do
+        if lastLogsRows[i].creditUnavailable then
+            sawUnavailable = true
+            break
+        end
+    end
+    assertTrue(sawUnavailable, "459-B4: cold history unavailable before drain")
+    local cachedCold = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
+    assertTrue(type(cachedCold) == "table", "459-B4: cold cache populated")
+    assertTrue(cachedCold == lastLogsRows or #cachedCold == #lastLogsRows,
+        "459-B4: cold cache holds unavailable rows")
+
     local notifies = {}
     local prevNotify = GS.NotifyUI
     GS.NotifyUI = function(reason)
         notifies[#notifies + 1] = reason
         if prevNotify then prevNotify(reason) end
     end
-    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
-    local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
-    local logsRefresh = 0
-    local rankingsRefresh = 0
-    local hiddenLogsRefresh = 0
-    local shown = true
-    logsPage.panel = {
-        IsShown = function() return shown end,
-        IsVisible = function() return shown end,
-    }
-    rankingsPage.panel = {
-        IsShown = function() return shown end,
-        IsVisible = function() return shown end,
-    }
-    local prevLogsRefresh = logsPage.Refresh
-    logsPage.Refresh = function(self, panel)
-        if not shown then
-            hiddenLogsRefresh = hiddenLogsRefresh + 1
-        end
-        logsRefresh = logsRefresh + 1
-        if prevLogsRefresh then
-            return prevLogsRefresh(self, panel)
-        end
-    end
-    local prevRankingsRefresh = rankingsPage.Refresh
-    rankingsPage.Refresh = function(self, panel)
-        rankingsRefresh = rankingsRefresh + 1
-        if prevRankingsRefresh then
-            return prevRankingsRefresh(self, panel)
-        end
-    end
-    -- Seed cold unavailable into the page cache; keep it intact through drain.
-    local rowsCold = logsPage.__sfTest.BuildProjectedRows()
-    local sawUnavailable = false
-    for i = 1, #rowsCold do
-        if rowsCold[i].creditUnavailable then
-            sawUnavailable = true
+
+    local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(ok == false, "459-B4: first Ensure yields")
+    -- Cold cache must survive paced slices until the terminal listener refresh.
+    local midCache = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
+    assertTrue(type(midCache) == "table", "459-B4: cold cache intact mid-drain")
+    local midUnavailable = false
+    for i = 1, #midCache do
+        if midCache[i].creditUnavailable then
+            midUnavailable = true
             break
         end
     end
-    assertTrue(sawUnavailable or not GS.IsCreditCorrectionProjectionAvailable(record),
-        "459-B4: cold history unavailable before drain")
-    local cachedCold = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
-    assertTrue(type(cachedCold) == "table", "459-B4: cold cache populated")
-    local ok = GS.EnsureCreditCorrectionProjection(record, nil)
-    assertTrue(ok == false, "459-B4: first Ensure yields")
-    -- Drain timers only — do not manually clear cache or rebuild rows.
+    assertTrue(midUnavailable, "459-B4: mid-drain cache still unavailable")
+
+    local dataCallsBeforeDrain = logsDataCalls + rankingsDataCalls
     local ticks = 0
     while #timers > 0 and ticks < 200 do
         runOneDueTimer()
@@ -5711,6 +5789,7 @@ do
     flushTimers()
     GS.NotifyUI = prevNotify
     GS._creditProjectionWorkBudgetOverride = nil
+
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
         "459-B4: projection available after timers")
     local readyCount = 0
@@ -5726,38 +5805,60 @@ do
         "459-B4: no pending promotion / ops mutation")
     assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
         "459-B4: no ledger mutation during recovery")
-    -- Listener-driven: durable notify cleared cache and queued Logs/Rankings refresh.
-    assertTrue(logsRefresh >= 1, "459-B4: Logs refreshed via listener got="
-        .. tostring(logsRefresh))
-    assertTrue(rankingsRefresh >= 1, "459-B4: Rankings refreshed via listener got="
-        .. tostring(rankingsRefresh))
-    local cachedAfter = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
-    -- After listener refresh, cache should be rebuilt available (or cleared then rebuilt).
-    local rowsWarm = logsPage.__sfTest.BuildProjectedRows()
+
+    -- Listener-driven Page:Refresh must have consumed recovered data callbacks.
+    assertTrue(logsDataCalls > dataCallsBeforeDrain,
+        "459-B4: Logs getRows via listener Refresh got="
+            .. tostring(logsDataCalls))
+    assertTrue(rankingsDataCalls >= 1, "459-B4: Rankings getRankings via listener got="
+        .. tostring(rankingsDataCalls))
+    assertTrue(type(lastLogsRows) == "table", "459-B4: listener captured Logs rows")
     local bobRows = 0
-    for i = 1, #rowsWarm do
-        if rowsWarm[i].creditUnavailable then
-            fail("459-B4: warm Logs still unavailable")
+    for i = 1, #lastLogsRows do
+        if lastLogsRows[i].creditUnavailable then
+            fail("459-B4: warm Logs still unavailable via rendered data")
         end
-        if rowsWarm[i].contributorKey == "Bob-Garona"
-            or rowsWarm[i].contributor == "Bob-Garona" then
+        if lastLogsRows[i].contributorKey == "Bob-Garona" then
             bobRows = bobRows + 1
         end
     end
-    assertTrue(bobRows > 0, "459-B4: Logs show Bob after listener recovery")
-    -- Rankings observed through its page Refresh path (not a direct helper call).
-    rankingsPage:Refresh(rankingsPage.panel)
-    local rankings = GS.ProjectCampaignRankingsOnRecord(record, record.currentCampaignId)
-    assertTrue(not rankings.creditUnavailable, "459-B4: Rankings available after refresh")
-    -- Hidden page: notify must not render.
+    assertTrue(bobRows > 0, "459-B4: rendered Logs show Bob after recovery")
+    assertTrue(type(lastRankings) == "table", "459-B4: listener captured Rankings")
+    assertTrue(not lastRankings.creditUnavailable,
+        "459-B4: rendered Rankings available after recovery")
+    local cachedAfter = select(1, logsPage.__sfTest.PeekCachedProjectedRows())
+    assertTrue(type(cachedAfter) == "table", "459-B4: cache rebuilt after listener")
+    local afterUnavailable = false
+    for i = 1, #cachedAfter do
+        if cachedAfter[i].creditUnavailable then
+            afterUnavailable = true
+            break
+        end
+    end
+    assertTrue(not afterUnavailable, "459-B4: rebuilt cache no longer unavailable")
+
+    -- Behavioral fail if terminal notify/cache invalidation were absent:
+    -- a second paced rebuild without notify must not leave Bob in lastLogsRows
+    -- from a stale cold cache. Verified above via listener data capture.
+
+    -- Both hidden pages: notify must not invoke data callbacks.
     shown = false
-    logsRefresh = 0
-    hiddenLogsRefresh = 0
+    local beforeHiddenLogs = hiddenLogsDataCalls
+    local beforeHiddenRank = hiddenRankingsDataCalls
+    local beforeVisibleLogs = logsDataCalls
+    local beforeVisibleRank = rankingsDataCalls
     GS.NotifyUI("credit-projection-ready")
     flushTimers()
-    assertEq(hiddenLogsRefresh, 0, "459-B4: no hidden-page rendering")
-    logsPage.Refresh = prevLogsRefresh
-    rankingsPage.Refresh = prevRankingsRefresh
+    assertEq(hiddenLogsDataCalls, beforeHiddenLogs,
+        "459-B4: hidden Logs makes no data calls")
+    assertEq(hiddenRankingsDataCalls, beforeHiddenRank,
+        "459-B4: hidden Rankings makes no data calls")
+    assertEq(logsDataCalls, beforeVisibleLogs,
+        "459-B4: hidden path does not refresh visible Logs counters")
+    assertEq(rankingsDataCalls, beforeVisibleRank,
+        "459-B4: hidden path does not refresh visible Rankings counters")
+
+    SF.SettingsUI.DefinitionRenderer = prevRenderer
     logsPage.panel = nil
     rankingsPage.panel = nil
 end
@@ -6063,17 +6164,24 @@ do
     assertEq(unavailStatus, GS.CREDIT_UNAVAILABLE,
         "459-C6: Resolve status credit_unavailable")
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    logsPage.panel = logsPage.panel or {
+        IsShown = function() return true end,
+        IsVisible = function() return true end,
+    }
+    logsPage.panel.__sfPrimarySection = logsPage.panel.__sfPrimarySection or {
+        SetMessage = function() end,
+    }
     local rows = logsPage.__sfTest.BuildProjectedRows()
     local donRow = nil
     for i = 1, #rows do
         if rows[i].id == "unavail-don" then donRow = rows[i] break end
     end
-    if donRow then
-        assertTrue(donRow.creditUnavailable == true or donRow.showAction ~= true,
-            "459-C6: row gated while unavailable")
-    end
-    logsPage.__sfTest.OpenEditContributorDialog("unavail-don",
-        donRow or { id = "unavail-don", kind = "donation" })
+    assertTrue(donRow ~= nil, "459-C6: unavailable donation row exists")
+    assertTrue(donRow.creditUnavailable == true,
+        "459-C6: unavailable row creditUnavailable=true")
+    assertTrue(donRow.showAction ~= true,
+        "459-C6: unavailable row edit action disabled")
+    logsPage.__sfTest.OpenEditContributorDialog("unavail-don", donRow)
     assertNil(logsPage.__sfTest.GetEditSession(),
         "459-C6: OpenEdit rejected while unavailable")
 
@@ -6173,6 +6281,16 @@ do
         return realApply(...)
     end
 
+    local feedbackCalls = {}
+    local realFmt = GS.FormatMutationFeedback
+    GS.FormatMutationFeedback = function(status, reason)
+        feedbackCalls[#feedbackCalls + 1] = {
+            status = status,
+            reason = reason,
+        }
+        return realFmt(status, reason)
+    end
+
     -- Before Continue: open editor on Unassigned, then force unavailable.
     logsPage.__sfTest.OpenEditContributorDialog("unavail-tx-adj", txRow)
     sess = logsPage.__sfTest.GetEditSession()
@@ -6191,10 +6309,9 @@ do
     local okBreak, errBreak = GS.RebuildCreditCorrectionProjection(record, nil)
     assertTrue(okBreak == false, "459-C6: transition rebuild fails")
     assertEq(errBreak, "player_negative", "459-C6: transition player_negative")
-    local statusMsgs = {}
-    local prevReport
     -- ConfirmAndSaveEdit → EditSessionStillFresh → credit_unavailable.
     local beforePrep, beforeApply = prepCalls, applyCalls
+    local feedbackBefore = #feedbackCalls
     logsPage.__sfTest.ConfirmAndSaveEdit()
     assertNil(logsPage.__sfTest.GetEditSession(),
         "459-C6: before-Continue clears session on credit_unavailable")
@@ -6202,6 +6319,13 @@ do
         "459-C6: before-Continue leaves no pending confirm")
     assertEq(prepCalls, beforePrep, "459-C6: before-Continue zero prepare")
     assertEq(applyCalls, beforeApply, "459-C6: before-Continue zero apply")
+    assertTrue(#feedbackCalls > feedbackBefore,
+        "459-C6: before-Continue reports mutation feedback")
+    local fbBefore = feedbackCalls[#feedbackCalls]
+    assertEq(fbBefore.status, "rejected",
+        "459-C6: before-Continue feedback status rejected")
+    assertEq(fbBefore.reason, "credit_unavailable",
+        "459-C6: before-Continue feedback reason credit_unavailable")
 
     -- Recover for after-confirm case: remove breaker, rebuild, reopen.
     local listTx = record.accounting._consumableEvents
@@ -6254,9 +6378,17 @@ do
     assertTrue(okBreak == false and errBreak == "player_negative",
         "459-C6: after-confirm unavailable")
     beforePrep, beforeApply = prepCalls, applyCalls
+    feedbackBefore = #feedbackCalls
     okCb()
     assertEq(prepCalls, beforePrep, "459-C6: after-confirm zero prepare")
     assertEq(applyCalls, beforeApply, "459-C6: after-confirm zero apply")
+    assertTrue(#feedbackCalls > feedbackBefore,
+        "459-C6: after-confirm reports mutation feedback")
+    local fbAfter = feedbackCalls[#feedbackCalls]
+    assertEq(fbAfter.status, "rejected",
+        "459-C6: after-confirm feedback status rejected")
+    assertEq(fbAfter.reason, "credit_unavailable",
+        "459-C6: after-confirm feedback reason credit_unavailable")
     local storedTx = false
     for _, op in pairs(record.operations.records or {}) do
         if type(op) == "table" and op.target == "unavail-tx-adj" then
@@ -6264,9 +6396,11 @@ do
         end
     end
     assertTrue(not storedTx, "459-C6: after-confirm no correction stored")
+    GS.FormatMutationFeedback = realFmt
     GS.NewContributorCorrectionOperation = realNew
     GS.ApplyStagedConfigOperation = realApply
     logsPage.__sfTest.ClearEditSession()
+    logsPage.panel = nil
 end
 
 do
@@ -6382,9 +6516,17 @@ do
             "459-B3: recovered Bob credit")
     end
 
-    -- Local ADJUST_QUANTITY must not Seal unfinished reconstruction as ok.
+    -- Local ADJUST_QUANTITY: share one outer allowance across mutation/store/
+    -- post-store Ensure; measure complete callback at production constants
+    -- (discussion_r4483108265).
     do
-        local nHeads = 80
+        local soft = tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+        local hard = soft + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+        assertEq(soft, 16384, "459-B3-adj: production soft budget")
+        assertEq(hard, 16896, "459-B3-adj: production hard ceiling")
+        -- Large enough that AppendLedgerEvent Ensure + post-store Ensure would
+        -- exceed one soft slice if each opened a fresh allowance.
+        local nHeads = 2500
         local itemId = 9811
         local record = seedLiveCampaignWithItem(itemId, nHeads + 40)
         local ctx = select(1, GS:GetCurrentContext())
@@ -6416,74 +6558,136 @@ do
             }
             GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
         end
+        GS._creditProjectionWorkBudgetOverride = nil
         GS.InvalidateCreditCorrectionProjection(record)
-        GS._creditProjectionWorkBudgetOverride = 96
         local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
         local g = 0
-        while warmOk == false and g < 200 do
-            if not runOneDueTimer() then break end
-            warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+        while warmOk == false and g < 8000 do
+            if not runOneDueTimer() then
+                warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
+            else
+                warmOk = GS.IsCreditCorrectionProjectionAvailable(record)
+            end
             g = g + 1
         end
         flushTimers()
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
             "459-B3-adj: warm available")
         local bobBefore = 0
-        for i = 1, nHeads do
+        for i = 1, math.min(40, nHeads) do
             local name = select(1, GS.ResolveEffectiveCreditIdentity(
                 record, GS.FindLedgerEventById(record, "b3a-don-" .. i)))
             if name == "Bob-Garona" then bobBefore = bobBefore + 1 end
         end
         assertTrue(bobBefore > 0, "459-B3-adj: warm Bob heads")
-        -- Attribute to Bob (who has corrected credit) so prepare floors pass.
-        -- Low budget forces post-store Ensure to yield rather than Seal.
-        GS._creditProjectionWorkBudgetOverride = 96
+
+        local slices = {}
+        local realRebuild = GS.RebuildCreditCorrectionProjection
+        GS.RebuildCreditCorrectionProjection = function(...)
+            local ok, err, det = realRebuild(...)
+            local work = tonumber(det and det.workUnits) or 0
+            local outer = tonumber(det and det.callbackWork)
+                or tonumber(GS._creditProjectionCallbackWork) or work
+            if err == "work_budget" or ok then
+                slices[#slices + 1] = {
+                    ok = ok and true or false,
+                    err = err,
+                    work = work,
+                    outer = outer,
+                    phase = det and det.phase,
+                }
+            end
+            return ok, err, det
+        end
+
         local adjOp, adjSt, adjReason = GS:NewAdjustmentOperation(
             itemId, -1, "Bob-Garona")
         assertTrue(adjOp ~= nil, "459-B3-adj: prepare adjust got "
             .. tostring(adjSt) .. "/" .. tostring(adjReason))
+        local applySliceStart = #slices
         local st, reason = GS:ApplyStagedConfigOperation(adjOp)
         assertEq(st, "accepted", "459-B3-adj: adjust accepted got "
             .. tostring(st) .. "/" .. tostring(reason))
-        -- Must not falsely certify unfinished reconstruction as available with
-        -- a mismatched credit set.
+        local applyMaxOuter = 0
+        for i = applySliceStart + 1, #slices do
+            local outer = tonumber(slices[i].outer) or 0
+            if outer > applyMaxOuter then applyMaxOuter = outer end
+            assertTrue(outer <= hard,
+                "459-B3-adj: Apply callback outer within soft+atomic i="
+                    .. tostring(i) .. " outer=" .. tostring(outer)
+                    .. " hard=" .. tostring(hard))
+        end
+        assertTrue(#slices > applySliceStart,
+            "459-B3-adj: Apply invoked Rebuild under shared allowance")
+        -- Incomplete credit must stay unavailable until timer-only completion.
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record) == false,
             "459-B3-adj: unfinished adjust leaves credit unavailable")
         assertEq(select(4, GS.ResolveEffectiveCreditIdentity(
             record, GS.FindLedgerEventById(record, "b3a-don-1"))),
             GS.CREDIT_UNAVAILABLE,
             "459-B3-adj: Resolve unavailable before drain")
+        assertTrue(#timers >= 1, "459-B3-adj: continuation queued after Apply")
+
+        local timerSliceStart = #slices
         local g3 = 0
-        while (not GS.IsCreditCorrectionProjectionAvailable(record)) and g3 < 200 do
+        while (not GS.IsCreditCorrectionProjectionAvailable(record)) and g3 < 8000 do
             if not runOneDueTimer() then
-                GS.EnsureCreditCorrectionProjection(record, nil)
+                break
             end
             g3 = g3 + 1
         end
         flushTimers()
+        GS.RebuildCreditCorrectionProjection = realRebuild
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
             "459-B3-adj: timers complete reconstruction")
-        local natural = {}
-        for i = 1, nHeads do
-            natural[i] = select(1, GS.ResolveEffectiveCreditIdentity(
-                record, GS.FindLedgerEventById(record, "b3a-don-" .. i)))
+        for i = timerSliceStart + 1, #slices do
+            local outer = tonumber(slices[i].outer) or 0
+            assertTrue(outer <= hard,
+                "459-B3-adj: timer callback outer within soft+atomic i="
+                    .. tostring(i) .. " outer=" .. tostring(outer)
+                    .. " hard=" .. tostring(hard))
         end
+        assertTrue(g3 >= 1, "459-B3-adj: timer-only completion got ticks="
+            .. tostring(g3))
+        assertEq(#timers, 0, "459-B3-adj: idle after timers")
+
+        local natural = {}
+        local sampleN = math.min(80, nHeads)
+        for i = 1, sampleN do
+            natural[i] = {
+                select(1, GS.ResolveEffectiveCreditIdentity(
+                    record, GS.FindLedgerEventById(record, "b3a-don-" .. i))),
+                select(2, GS.ResolveEffectiveCreditIdentity(
+                    record, GS.FindLedgerEventById(record, "b3a-don-" .. i))),
+            }
+        end
+        local bobBal = GS.PersonalContributorItemTotal(
+            record, "Bob-Garona", "Player-1-Bob", itemId)
         GS.InvalidateCreditCorrectionProjection(record)
         local okF = GS.EnsureCreditCorrectionProjection(record, nil)
         local gf = 0
-        while okF == false and gf < 200 do
-            if not runOneDueTimer() then break end
-            okF = GS.EnsureCreditCorrectionProjection(record, nil)
+        while okF == false and gf < 8000 do
+            if not runOneDueTimer() then
+                okF = GS.EnsureCreditCorrectionProjection(record, nil)
+            else
+                okF = GS.IsCreditCorrectionProjectionAvailable(record)
+            end
             gf = gf + 1
         end
         flushTimers()
-        for i = 1, nHeads do
-            assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
-                record, GS.FindLedgerEventById(record, "b3a-don-" .. i))),
-                natural[i],
-                "459-B3-adj: natural==fresh after adjust drain i=" .. tostring(i))
+        assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+            "459-B3-adj: independent rebuild available")
+        for i = 1, sampleN do
+            local name, guid = GS.ResolveEffectiveCreditIdentity(
+                record, GS.FindLedgerEventById(record, "b3a-don-" .. i))
+            assertEq(name, natural[i][1],
+                "459-B3-adj: natural==fresh name i=" .. tostring(i))
+            assertEq(guid, natural[i][2],
+                "459-B3-adj: natural==fresh guid i=" .. tostring(i))
         end
-        GS._creditProjectionWorkBudgetOverride = nil
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Bob-Garona", "Player-1-Bob", itemId), bobBal,
+            "459-B3-adj: natural==fresh Bob balance")
         assertEq(#timers, 0, "459-B3-adj: idle")
     end
 end

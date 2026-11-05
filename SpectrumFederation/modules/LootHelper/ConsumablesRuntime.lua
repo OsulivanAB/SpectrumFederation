@@ -1272,7 +1272,121 @@ local REVIEW_ICON_SIZE = 18
 local REVIEW_PROGRESS_WIDTH = 56
 local REVIEW_EDIT_WIDTH = 34
 local REVIEW_DEPOSIT_WIDTH = 72
+-- Quick Withdraw hides the per-item Deposit button, so craft-count inputs sit
+-- near the right edge and the recipe-name column expands into the freed space.
+-- Keep a small pad before the row's right edge (scroll gutter is outside the row).
+local REVIEW_QW_RIGHT_PAD = 4
+local REVIEW_QW_NAME_WIDTH = REVIEW_ROW_WIDTH
+    - REVIEW_ICON_SIZE - 4 - 4 - REVIEW_EDIT_WIDTH - REVIEW_QW_RIGHT_PAD
 local REVIEW_MOBILE_WIDTH = 140
+
+-- Deposit/progress layout (default AcquireRow geometry). Call when a pooled row
+-- leaves Quick Withdraw item layout so edit/button/goal-met stay in panel.
+function Runtime:ApplyDepositRowLayout(row)
+    if not row then return end
+    local iconBtn = row.IconButton
+    local progress = row.Progress
+    local edit = row.Edit
+    local button = row.Button
+    local goalMet = row.GoalMet
+    if progress then
+        if progress.ClearAllPoints then progress:ClearAllPoints() end
+        if iconBtn then
+            progress:SetPoint("LEFT", iconBtn, "RIGHT", 4, 0)
+        else
+            progress:SetPoint("LEFT", row, "LEFT", 0, 0)
+        end
+        progress:SetWidth(REVIEW_PROGRESS_WIDTH)
+        if progress.SetWordWrap then progress:SetWordWrap(false) end
+    end
+    if edit then
+        if edit.ClearAllPoints then edit:ClearAllPoints() end
+        if progress then
+            edit:SetPoint("LEFT", progress, "RIGHT", 4, 0)
+        else
+            edit:SetPoint("LEFT", row, "LEFT", 0, 0)
+        end
+        if edit.SetSize then
+            edit:SetSize(REVIEW_EDIT_WIDTH, 18)
+        else
+            if edit.SetWidth then edit:SetWidth(REVIEW_EDIT_WIDTH) end
+            if edit.SetHeight then edit:SetHeight(18) end
+        end
+    end
+    if button then
+        if button.ClearAllPoints then button:ClearAllPoints() end
+        if edit then
+            button:SetPoint("LEFT", edit, "RIGHT", 4, 0)
+        else
+            button:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        end
+        if button.SetSize then
+            button:SetSize(REVIEW_DEPOSIT_WIDTH, 18)
+        else
+            if button.SetWidth then button:SetWidth(REVIEW_DEPOSIT_WIDTH) end
+            if button.SetHeight then button:SetHeight(18) end
+        end
+    end
+    if goalMet then
+        if goalMet.ClearAllPoints then goalMet:ClearAllPoints() end
+        if progress then
+            goalMet:SetPoint("LEFT", progress, "RIGHT", 4, 0)
+        else
+            goalMet:SetPoint("LEFT", row, "LEFT", 0, 0)
+        end
+        goalMet:SetWidth(REVIEW_EDIT_WIDTH + 4 + REVIEW_DEPOSIT_WIDTH)
+        if goalMet.SetJustifyH then goalMet:SetJustifyH("CENTER") end
+    end
+    row._reviewLayout = "deposit"
+end
+
+-- Quick Withdraw recipe rows: name uses the freed Deposit-button space; craft
+-- count sits in a consistent right-edge column. Button stays parked for reuse.
+function Runtime:ApplyQuickWithdrawItemRowLayout(row)
+    if not row then return end
+    local iconBtn = row.IconButton
+    local progress = row.Progress
+    local edit = row.Edit
+    local button = row.Button
+    local goalMet = row.GoalMet
+    if edit then
+        if edit.ClearAllPoints then edit:ClearAllPoints() end
+        edit:SetPoint("RIGHT", row, "RIGHT", -REVIEW_QW_RIGHT_PAD, 0)
+        if edit.SetSize then
+            edit:SetSize(REVIEW_EDIT_WIDTH, 18)
+        else
+            if edit.SetWidth then edit:SetWidth(REVIEW_EDIT_WIDTH) end
+            if edit.SetHeight then edit:SetHeight(18) end
+        end
+    end
+    if progress then
+        if progress.ClearAllPoints then progress:ClearAllPoints() end
+        if iconBtn then
+            progress:SetPoint("LEFT", iconBtn, "RIGHT", 4, 0)
+        else
+            progress:SetPoint("LEFT", row, "LEFT", 0, 0)
+        end
+        progress:SetWidth(REVIEW_QW_NAME_WIDTH)
+        if progress.SetWordWrap then progress:SetWordWrap(false) end
+        if progress.SetJustifyH then progress:SetJustifyH("LEFT") end
+    end
+    if button then
+        if button.ClearAllPoints then button:ClearAllPoints() end
+        if edit then
+            button:SetPoint("LEFT", edit, "RIGHT", 4, 0)
+        end
+        if button.SetSize then
+            button:SetSize(REVIEW_DEPOSIT_WIDTH, 18)
+        end
+    end
+    if goalMet then
+        if goalMet.ClearAllPoints then goalMet:ClearAllPoints() end
+        goalMet:SetPoint("RIGHT", row, "RIGHT", -REVIEW_QW_RIGHT_PAD, 0)
+        goalMet:SetWidth(REVIEW_EDIT_WIDTH)
+        if goalMet.SetJustifyH then goalMet:SetJustifyH("CENTER") end
+    end
+    row._reviewLayout = "quickWithdraw"
+end
 
 -- Align beside the Guild Bank on opening. Height keeps following afterward;
 -- manual drag is preserved until the next ShowReview opening.
@@ -1313,12 +1427,25 @@ function Runtime:EnsureReview()
         self:SyncMobileButton()
     end)
     if frame.SetBackdrop then
+        -- Same opaque WHITE8X8 foundation as Settings / recipe editor so
+        -- global.settingsWindowOpacity produces matching backdrop alpha.
+        -- Keep DialogBox border and existing insets/edge geometry.
         frame:SetBackdrop({
-            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            bgFile = "Interface\\Buttons\\WHITE8X8",
             edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
             tile = true, tileSize = 32, edgeSize = 32,
             insets = { left = 11, right = 12, top = 12, bottom = 11 },
         })
+    end
+    -- Share the account-local Settings window opacity (backdrop only).
+    local settingsWindow = SF.SettingsWindow
+    if settingsWindow and settingsWindow.RegisterSettingsWindowOpacityTarget then
+        settingsWindow:RegisterSettingsWindowOpacityTarget(frame)
+    end
+    if settingsWindow and settingsWindow.ApplySettingsWindowOpacity then
+        settingsWindow:ApplySettingsWindowOpacity()
+    elseif frame.SetBackdropColor then
+        frame:SetBackdropColor(0, 0, 0, 0.90)
     end
     local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     title:SetPoint("TOP", frame, "TOP", 0, -12)
@@ -1507,9 +1634,8 @@ function Runtime:AcquireRow(index)
     row.IconButton = iconBtn
     row.Icon = icon
     local progress = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    progress:SetPoint("LEFT", iconBtn, "RIGHT", 4, 0)
-    progress:SetWidth(REVIEW_PROGRESS_WIDTH)
     progress:SetJustifyH("LEFT")
+    if progress.SetWordWrap then progress:SetWordWrap(false) end
     row.Progress = progress
     local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     text:SetPoint("LEFT", row, "LEFT", 0, 0)
@@ -1517,22 +1643,16 @@ function Runtime:AcquireRow(index)
     text:SetJustifyH("LEFT")
     row.Text = text
     local edit = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
-    edit:SetSize(REVIEW_EDIT_WIDTH, 18)
-    edit:SetPoint("LEFT", progress, "RIGHT", 4, 0)
     edit:SetAutoFocus(false)
     edit:SetNumeric(true)
     row.Edit = edit
     local button = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    button:SetSize(REVIEW_DEPOSIT_WIDTH, 18)
-    button:SetPoint("LEFT", edit, "RIGHT", 4, 0)
     row.Button = button
     -- Noninteractive label occupies the qty + Deposit space when a finite goal is met.
     local goalMet = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    goalMet:SetPoint("LEFT", progress, "RIGHT", 4, 0)
-    goalMet:SetWidth(REVIEW_EDIT_WIDTH + 4 + REVIEW_DEPOSIT_WIDTH)
-    goalMet:SetJustifyH("CENTER")
     goalMet:Hide()
     row.GoalMet = goalMet
+    self:ApplyDepositRowLayout(row)
     frame.Rows[index] = row
     return row
 end
@@ -1608,6 +1728,11 @@ function Runtime:ShowReview()
     self:WatchGuildBankFrame()
     local wasShown = frame.IsShown and frame:IsShown()
     frame:Show()
+    -- Re-apply current backdrop opacity on every open (create or reopen),
+    -- including when the main Settings window has never been opened.
+    if SF.SettingsWindow and SF.SettingsWindow.ApplySettingsWindowOpacity then
+        SF.SettingsWindow:ApplySettingsWindowOpacity()
+    end
     -- Realign only when the helper opens again; keep manual drag while visible.
     self:AlignReviewToGuildBank(not wasShown)
     self:RebuildReview()
@@ -1650,6 +1775,7 @@ function Runtime:RebuildReview()
         local group = groups[g]
         index = index + 1
         local header = self:AcquireRow(index)
+        self:ApplyDepositRowLayout(header)
         header:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, -y)
         header.Text:SetText(tostring(group.key))
         header.Text:Show()
@@ -1670,6 +1796,8 @@ function Runtime:RebuildReview()
             local line = group.lines[i]
             index = index + 1
             local row = self:AcquireRow(index)
+            -- Restore deposit geometry when a pooled Quick Withdraw row is reused.
+            self:ApplyDepositRowLayout(row)
             row:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
             row.Text:Hide()
             if row.IconButton then
@@ -1686,6 +1814,13 @@ function Runtime:RebuildReview()
             local depositable = not line.goalComplete
             if depositable then
                 if row.GoalMet then row.GoalMet:Hide() end
+                -- Clear pooled Quick Withdraw handlers before programmatic text so
+                -- deposit SetText cannot mutate craft drafts via retained scripts.
+                row.Edit:SetScript("OnTextChanged", nil)
+                row.Edit:SetScript("OnEnterPressed", nil)
+                row.Button:SetScript("OnClick", nil)
+                row._qwDraftKey = nil
+                row._qwAvailable = nil
                 row.Edit:Show()
                 local editing = row.Edit.HasFocus and row.Edit:HasFocus()
                 local sameItem = row.boundItemId == line.itemId
@@ -1756,6 +1891,7 @@ function Runtime:RebuildReview()
     if index == 0 then
         index = 1
         local empty = self:AcquireRow(index)
+        self:ApplyDepositRowLayout(empty)
         empty:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, 0)
         empty.Text:SetText("No raid supplies to deposit.")
         empty.Text:Show()
@@ -1769,8 +1905,639 @@ function Runtime:RebuildReview()
         if empty.GoalMet then empty.GoalMet:Hide() end
         y = 24
     end
+    -- #457 Quick Withdraw section below deposits (independent eligibility).
+    y, index = self:AppendQuickWithdrawSection(frame, y, index)
     frame.Child:SetHeight(math.max(1, y))
     self:SyncMobileButton()
+end
+
+function Runtime:FormatQuickWithdrawSettlement(result)
+    result = type(result) == "table" and result or {}
+    local function SumMap(m)
+        local n = 0
+        if type(m) ~= "table" then return 0 end
+        for _, v in pairs(m) do
+            n = n + (tonumber(v) or 0)
+        end
+        return n
+    end
+    local requested = SumMap(result.requested)
+    local authorized = SumMap(result.authorized)
+    if authorized < 1 and type(result.authorized) ~= "table" then
+        -- Fall back when older settle payloads omit authorized.
+        authorized = requested - SumMap(result.remaining) + SumMap(result.confirmed)
+        if authorized < SumMap(result.confirmed) then
+            authorized = SumMap(result.confirmed)
+        end
+    end
+    local confirmed = SumMap(result.confirmed)
+    local remaining = SumMap(result.remaining) -- unfilled of original request
+    local unresolved = result.unresolved and true or false
+    local parts = {
+        Loc("GUILD_SUPPLIES_WITHDRAW_SETTLE_FMT",
+            "Withdraw settled: requested %d, authorized %d, confirmed %d, remaining %d.")
+            :format(requested, authorized, confirmed, remaining),
+    }
+    if unresolved then
+        parts[#parts + 1] = Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED",
+            "Some movements are unresolved and were not retried.")
+    end
+    if result.receiptError then
+        parts[#parts + 1] = Loc("GUILD_SUPPLIES_WITHDRAW_RECEIPT_FAILED_FMT",
+            "Movement finished, but recording failed (%s). History was not repaired by another withdrawal.")
+            :format(tostring(result.receiptError))
+    end
+    return table.concat(parts, " ")
+end
+
+-- Session-only unresolved-notice state. Pending holds unseen failures until an
+-- existing UI lifecycle can retry; recent is a bounded ring of delivered ops.
+local UNRESOLVED_WITHDRAW_PENDING_MAX = 4
+local UNRESOLVED_WITHDRAW_RECENT_MAX = 8
+
+local function UnresolvedWithdrawRecentHas(self, opKey)
+    local recent = self._unresolvedWithdrawRecent
+    if type(recent) ~= "table" or opKey == nil then return false end
+    for i = 1, #recent do
+        if recent[i] == opKey then return true end
+    end
+    return false
+end
+
+local function UnresolvedWithdrawRememberRecent(self, opKey)
+    if opKey == nil then return end
+    local recent = self._unresolvedWithdrawRecent
+    if type(recent) ~= "table" then
+        recent = {}
+        self._unresolvedWithdrawRecent = recent
+    end
+    for i = #recent, 1, -1 do
+        if recent[i] == opKey then
+            table.remove(recent, i)
+        end
+    end
+    recent[#recent + 1] = opKey
+    while #recent > UNRESOLVED_WITHDRAW_RECENT_MAX do
+        table.remove(recent, 1)
+    end
+end
+
+local function UnresolvedWithdrawPendingIndex(self, opKey)
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" or opKey == nil then return nil end
+    for i = 1, #pending do
+        local row = pending[i]
+        if type(row) == "table" and row.opKey == opKey then
+            return i
+        end
+    end
+    return nil
+end
+
+local function UnresolvedWithdrawRetainPending(self, notice)
+    if type(notice) ~= "table" then return end
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" then
+        pending = {}
+        self._unresolvedWithdrawPending = pending
+    end
+    local existing = UnresolvedWithdrawPendingIndex(self, notice.opKey)
+    if existing then
+        pending[existing] = notice
+        return
+    end
+    pending[#pending + 1] = notice
+    while #pending > UNRESOLVED_WITHDRAW_PENDING_MAX do
+        table.remove(pending, 1)
+    end
+end
+
+local function UnresolvedWithdrawClearPending(self, opKey)
+    local idx = UnresolvedWithdrawPendingIndex(self, opKey)
+    if idx then
+        table.remove(self._unresolvedWithdrawPending, idx)
+    end
+end
+
+local function UnresolvedWithdrawBuildMessage(self, notice)
+    local text = type(notice.text) == "string" and notice.text or ""
+    local current = self._quickWithdrawVisitToken
+    local origin = notice.visitToken
+    if origin ~= nil and current ~= nil and tostring(origin) ~= tostring(current) then
+        return Loc("GUILD_SUPPLIES_WITHDRAW_PRIOR_OP_UNRESOLVED_FMT",
+            "An earlier withdrawal finished with unresolved movement (not this bank visit):\n%s")
+            :format(text)
+    end
+    return text
+end
+
+--- Present unresolved bank-close settlement on a visible dialog surface.
+-- Helper status text alone is not delivery: OnBankClosed can settle while the
+-- review is still briefly shown, then hide/clear it before the player reads it.
+-- Acknowledgement only — no movement, receipt, or handoff side effects.
+-- A refused popup does not count as delivery: the notice is retained (bounded)
+-- and retried from an existing UI lifecycle (bank open).
+function Runtime:PresentUnresolvedQuickWithdrawSettlement(result, text)
+    result = type(result) == "table" and result or {}
+    local opKey = result.operationId ~= nil and tostring(result.operationId) or nil
+    if opKey and UnresolvedWithdrawRecentHas(self, opKey) then
+        return false
+    end
+    text = type(text) == "string" and text or self:FormatQuickWithdrawSettlement(result)
+    local notice = {
+        opKey = opKey,
+        operationId = result.operationId,
+        visitToken = result.visitToken,
+        text = text,
+    }
+    local message = UnresolvedWithdrawBuildMessage(self, notice)
+    local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+    if not (Dialogs and Dialogs.Confirm) then
+        UnresolvedWithdrawRetainPending(self, notice)
+        return false
+    end
+    local shown = Dialogs:Confirm(
+        message,
+        Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED_ACK", "OK"),
+        nil
+    )
+    if shown then
+        UnresolvedWithdrawClearPending(self, opKey)
+        UnresolvedWithdrawRememberRecent(self, opKey)
+        return true
+    end
+    -- Native StaticPopup_Show can return nil; keep unseen notice recoverable.
+    UnresolvedWithdrawRetainPending(self, notice)
+    return false
+end
+
+--- Retry unseen unresolved notices at an existing UI opportunity (bank open).
+-- Rebuilds prior-visit labeling from current visit token; does not overwrite
+-- current-visit status, drafts, or tokens. No timers or polling.
+-- Multiple retained rows are combined into one SF_SETTINGS_CONFIRM acknowledgement:
+-- native StaticPopup_Show reuses that key, so a synchronous series would replace
+-- earlier messages and clear them as "delivered" while only the last stayed visible.
+function Runtime:FlushPendingUnresolvedWithdrawNotices()
+    local pending = self._unresolvedWithdrawPending
+    if type(pending) ~= "table" or #pending < 1 then
+        return
+    end
+    local snapshot = {}
+    for i = 1, #pending do
+        local notice = pending[i]
+        if type(notice) == "table" then
+            local opKey = notice.opKey
+            if opKey == nil or not UnresolvedWithdrawRecentHas(self, opKey) then
+                snapshot[#snapshot + 1] = notice
+            end
+        end
+    end
+    if #snapshot < 1 then
+        return
+    end
+    if #snapshot == 1 then
+        local notice = snapshot[1]
+        self:PresentUnresolvedQuickWithdrawSettlement({
+            operationId = notice.operationId,
+            visitToken = notice.visitToken,
+        }, notice.text)
+        return
+    end
+    local parts = {}
+    for i = 1, #snapshot do
+        parts[#parts + 1] = UnresolvedWithdrawBuildMessage(self, snapshot[i])
+    end
+    local message = table.concat(parts, "\n\n")
+    local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+    if not (Dialogs and Dialogs.Confirm) then
+        return
+    end
+    local shown = Dialogs:Confirm(
+        message,
+        Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED_ACK", "OK"),
+        nil
+    )
+    if not shown then
+        -- Keep every unseen row pending for a later opportunity.
+        return
+    end
+    for i = 1, #snapshot do
+        local notice = snapshot[i]
+        local opKey = notice and notice.opKey
+        UnresolvedWithdrawClearPending(self, opKey)
+        UnresolvedWithdrawRememberRecent(self, opKey)
+    end
+end
+
+function Runtime:SetQuickWithdrawStatus(text, opts)
+    opts = type(opts) == "table" and opts or {}
+    -- Scope status to the visit/operation that produced it. A late settlement
+    -- from an earlier bank visit must not overwrite a newer visit's feedback.
+    local token = opts.visitToken
+    if token ~= nil then
+        -- Require an active matching visit token. Nil current token means the
+        -- visit ended (or never started); reject stale writes.
+        if self._quickWithdrawVisitToken == nil
+            or tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
+            return
+        end
+        self._quickWithdrawStatusVisitToken = token
+    end
+    self._quickWithdrawStatus = text
+    if self.review and self.review.Status and type(text) == "string" then
+        self.review.Status:SetText(text)
+    end
+end
+
+function Runtime:QuickWithdrawHasPositiveDraft(ctx)
+    local WR = SF.ConsumablesWithdrawRuntime
+    local GS = SF.GuildSupplies
+    if not WR or not WR.craftDrafts or not ctx then return false end
+    for k, v in pairs(WR.craftDrafts) do
+        if (tonumber(v) or 0) > 0 then
+            local recipe = ctx.recipes and ctx.recipes[tostring(k)]
+            if recipe and GS and GS.RecipeAvailability
+                and GS.RecipeAvailability(ctx.record, recipe) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Runtime:SyncQuickWithdrawButton(actionRow, ctx, access)
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not actionRow or not actionRow.Button then return end
+    local busy = (WR and WR.IsBusy and WR.IsBusy())
+        or self.depositWork or self.depositIntent
+    local anyPositive = self:QuickWithdrawHasPositiveDraft(ctx)
+    if busy or not anyPositive or (access and not access.canWithdraw) then
+        actionRow.Button:Disable()
+    else
+        actionRow.Button:Enable()
+    end
+end
+
+function Runtime:AppendQuickWithdrawSection(frame, y, index)
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not WR or not WR.ShouldShowHelper then
+        return y, index
+    end
+    local show, reason, ctx, access = WR.ShouldShowHelper()
+    if not show and reason ~= "allowance_exhausted" then
+        return y, index
+    end
+    if not ctx then
+        return y, index
+    end
+    y = y + 8
+    index = index + 1
+    local header = self:AcquireRow(index)
+    self:ApplyDepositRowLayout(header)
+    header:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, -y)
+    header.Text:SetText(Loc("GUILD_SUPPLIES_QUICK_WITHDRAW", "Quick Withdraw"))
+    header.Text:Show()
+    header.boundItemId = nil
+    if header.IconButton then header.IconButton:Hide() end
+    if header.Progress then header.Progress:Hide() end
+    header.Edit:Hide()
+    header.Edit:SetScript("OnEnterPressed", nil)
+    header.Edit:SetScript("OnTextChanged", nil)
+    header.Button:Hide()
+    header.Button:SetScript("OnClick", nil)
+    if header.GoalMet then header.GoalMet:Hide() end
+    y = y + 22
+
+    if type(self._quickWithdrawStatus) == "string" and self._quickWithdrawStatus ~= "" then
+        index = index + 1
+        local statusRow = self:AcquireRow(index)
+        self:ApplyDepositRowLayout(statusRow)
+        statusRow:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        statusRow.Text:SetText(self._quickWithdrawStatus)
+        statusRow.Text:Show()
+        statusRow.boundItemId = nil
+        if statusRow.IconButton then statusRow.IconButton:Hide() end
+        if statusRow.Progress then statusRow.Progress:Hide() end
+        statusRow.Edit:Hide()
+        statusRow.Edit:SetScript("OnTextChanged", nil)
+        statusRow.Button:Hide()
+        statusRow.Button:SetScript("OnClick", nil)
+        if statusRow.GoalMet then statusRow.GoalMet:Hide() end
+        y = y + 22
+    end
+
+    if access and access.reason == "allowance_exhausted" then
+        index = index + 1
+        local note = self:AcquireRow(index)
+        self:ApplyDepositRowLayout(note)
+        note:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        note.Text:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_ALLOWANCE",
+            "Daily withdrawal allowance exhausted."))
+        note.Text:Show()
+        note.boundItemId = nil
+        if note.IconButton then note.IconButton:Hide() end
+        if note.Progress then note.Progress:Hide() end
+        note.Edit:Hide()
+        note.Edit:SetScript("OnTextChanged", nil)
+        note.Button:Hide()
+        note.Button:SetScript("OnClick", nil)
+        if note.GoalMet then note.GoalMet:Hide() end
+        y = y + 22
+        return y, index
+    end
+
+    local GS = SF.GuildSupplies
+    local recipes = GS and GS.ListCampaignRecipes and GS.ListCampaignRecipes(ctx.record) or {}
+    -- Reconcile UI drafts to the current visit/context and eligible recipes
+    -- before binding rows so deleted/unavailable selections cannot hide.
+    if WR.ReconcileCraftDrafts then
+        WR.ReconcileCraftDrafts(ctx)
+    elseif WR.EnsureDraftOwner then
+        WR.EnsureDraftOwner()
+    end
+    local draftOwnerKey = WR.DraftOwnerFingerprint
+        and WR.DraftOwnerFingerprint(WR.craftDraftOwner) or nil
+    local maxRows = 512
+    local actionRow = nil
+    for i = 1, #recipes do
+        if index >= maxRows then break end
+        local recipe = recipes[i]
+        local itemId = tonumber(recipe.itemId)
+        local available = true
+        if GS and GS.RecipeAvailability then
+            available = GS.RecipeAvailability(ctx.record, {
+                itemId = itemId,
+                reagents = recipe.reagents,
+            }) and true or false
+        end
+        index = index + 1
+        local row = self:AcquireRow(index)
+        -- Clear pooled deposit/withdraw handlers before rebinding.
+        row.Button:SetScript("OnClick", nil)
+        row.Edit:SetScript("OnEnterPressed", nil)
+        row.Edit:SetScript("OnTextChanged", nil)
+        -- Local Quick Withdraw geometry: expand name; craft count near right edge.
+        self:ApplyQuickWithdrawItemRowLayout(row)
+        row:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        row.Text:Hide()
+        if row.IconButton then
+            row.IconButton:Show()
+            if row.Icon then
+                row.Icon:SetTexture(self:ItemIcon(itemId))
+            end
+            self:BindItemTooltip(row.IconButton, itemId)
+        end
+        if row.Progress then
+            row.Progress:Show()
+            local name = self:ItemName(itemId) or tostring(itemId)
+            if not available then
+                name = name .. " " .. Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE_MARK", "(unavailable)")
+            end
+            row.Progress:SetText(name)
+        end
+        row.boundItemId = itemId
+        row.Edit:Show()
+        row.Edit:SetNumeric(true)
+        local draftKey = tostring(itemId)
+        local editing = row.Edit.HasFocus and row.Edit:HasFocus()
+        -- Focused text survives only for the same draft key AND draft owner.
+        -- After visit/context replacement, same-ID focus must not keep old text.
+        if not (editing and row._qwDraftKey == draftKey
+            and row._qwDraftOwnerKey == draftOwnerKey) then
+            local draft = WR.craftDrafts and WR.craftDrafts[draftKey]
+            row.Edit:SetText(tostring(draft or 0))
+        end
+        row._qwDraftKey = draftKey
+        row._qwDraftOwnerKey = draftOwnerKey
+        row._qwAvailable = available
+        row.Edit:SetScript("OnTextChanged", function(edit)
+            if not row._qwAvailable then return end
+            local key = row._qwDraftKey
+            if not key then return end
+            local ownerNow = WR.DraftOwnerFingerprint
+                and WR.DraftOwnerFingerprint(WR.craftDraftOwner) or nil
+            if row._qwDraftOwnerKey ~= ownerNow then
+                return
+            end
+            local n = tonumber(edit:GetText()) or 0
+            if n < 0 then n = 0 end
+            WR.craftDrafts = WR.craftDrafts or {}
+            WR.craftDrafts[key] = math.floor(n)
+            -- Enable/disable Withdraw immediately when craft counts change.
+            if actionRow then
+                self:SyncQuickWithdrawButton(actionRow, ctx, access)
+            end
+        end)
+        row.Button:Hide()
+        if row.GoalMet then
+            if available then
+                row.GoalMet:Hide()
+            else
+                row.GoalMet:SetText(Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE_MARK", "(unavailable)"))
+                row.GoalMet:Show()
+                row.Edit:Hide()
+            end
+        end
+        if not available then
+            row.Edit:Disable()
+        else
+            row.Edit:Enable()
+        end
+        y = y + 26
+    end
+
+    index = index + 1
+    actionRow = self:AcquireRow(index)
+    -- Withdraw action uses deposit button geometry so the control stays in-panel.
+    self:ApplyDepositRowLayout(actionRow)
+    actionRow:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+    actionRow.Text:Hide()
+    actionRow.boundItemId = nil
+    if actionRow.IconButton then actionRow.IconButton:Hide() end
+    if actionRow.Progress then actionRow.Progress:Hide() end
+    actionRow.Edit:Hide()
+    actionRow.Edit:SetScript("OnTextChanged", nil)
+    if actionRow.GoalMet then actionRow.GoalMet:Hide() end
+    actionRow.Button:Show()
+    actionRow.Button:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BUTTON", "Withdraw"))
+    self:SyncQuickWithdrawButton(actionRow, ctx, access)
+    actionRow.Button:SetScript("OnClick", function()
+        self:BeginQuickWithdraw()
+    end)
+    y = y + 26
+
+    -- Pending trade handoff status / clear in the helper.
+    local H = SF.ConsumablesTradeHandoff
+    if H and H.PendingSnapshot then
+        local totals = H.PendingSnapshot()
+        local pendingAny = false
+        for _ in pairs(totals) do pendingAny = true break end
+        if pendingAny then
+            index = index + 1
+            local pending = self:AcquireRow(index)
+            self:ApplyDepositRowLayout(pending)
+            pending:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+            pending.Text:SetText(Loc("GUILD_SUPPLIES_TRADE_PENDING_SHORT",
+                "Pending trade handoff active."))
+            pending.Text:Show()
+            pending.boundItemId = nil
+            if pending.IconButton then pending.IconButton:Hide() end
+            if pending.Progress then pending.Progress:Hide() end
+            pending.Edit:Hide()
+            pending.Edit:SetScript("OnTextChanged", nil)
+            pending.Button:Show()
+            pending.Button:SetText(Loc("GUILD_SUPPLIES_TRADE_CLEAR", "Clear"))
+            pending.Button:Enable()
+            pending.Button:SetScript("OnClick", function()
+                if H.ClearPending then H.ClearPending() end
+                self:RebuildReview()
+            end)
+            if pending.GoalMet then pending.GoalMet:Hide() end
+            y = y + 26
+        end
+    end
+    return y, index
+end
+
+function Runtime:BeginQuickWithdraw()
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not WR or not WR.BeginWithdraw then return end
+    local ctx = WR.CurrentContext and select(1, WR.CurrentContext()) or nil
+    if WR.ReconcileCraftDrafts then
+        WR.ReconcileCraftDrafts(ctx)
+    end
+    local selections = {}
+    if WR.craftDrafts then
+        for k, v in pairs(WR.craftDrafts) do
+            local qty = tonumber(v) or 0
+            if qty > 0 then
+                selections[tostring(k)] = qty
+            end
+        end
+    end
+    local boundSelections = WR.CopyCraftSelections and WR.CopyCraftSelections(selections) or selections
+    local function SettleHandler(result)
+        result = type(result) == "table" and result or {}
+        local text = self:FormatQuickWithdrawSettlement(result)
+        -- Visit-scoped status may no-op for a prior visit or be cleared on the
+        -- next open. Unresolved outcomes always use an independent visible
+        -- acknowledgement so bank-close hide/clear cannot erase them.
+        self:SetQuickWithdrawStatus(text, {
+            visitToken = result.visitToken,
+            operationId = result.operationId,
+        })
+        self:RebuildReview()
+        if result.unresolved then
+            self:PresentUnresolvedQuickWithdrawSettlement(result, text)
+        end
+    end
+    local function StartWithdraw(opts)
+        opts = opts or {}
+        opts.onSettle = SettleHandler
+        local ok, err, plan = WR.BeginWithdraw(boundSelections, opts)
+        if ok then
+            self:RebuildReview()
+            return true
+        end
+        return false, err, plan
+    end
+    local ok, err, detail = StartWithdraw({})
+    if ok then
+        return
+    end
+    if err == "shortage" and detail and SF.SettingsUI and SF.SettingsUI.Dialogs then
+        local Dialogs = SF.SettingsUI.Dialogs
+        -- BeginWithdraw returns the full preview on shortage. Do not use
+        -- `fn and fn(...)` — that collapses multi-returns so preview becomes nil.
+        local preview = detail
+        if type(detail) == "table" and detail.plan == nil and WR.PreviewWithdrawPlan then
+            local _, _, refreshed = WR.PreviewWithdrawPlan(boundSelections, {})
+            if type(refreshed) == "table" then
+                preview = refreshed
+            end
+        end
+        local plan = (preview and preview.plan) or detail
+        local ctx = preview and preview.ctx
+        local lines = {
+            Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
+                "There aren’t enough reagents to fulfill your request."),
+        }
+        for i = 1, #(plan.shortages or {}) do
+            local s = plan.shortages[i]
+            local name = self:ItemName(s.itemId) or tostring(s.itemId)
+            lines[#lines + 1] = string.format("%s: %d / %d (missing %d)",
+                name, s.available, s.requested, s.missing)
+        end
+        local shortageFingerprint = table.concat(lines, "\n")
+        local takeMap = (plan and plan.take) or {}
+        -- Bind the confirmation to the bank visit that opened it. A retained
+        -- popup callback after close/reopen must not validate or admit into a
+        -- later visit, and must not overwrite that visit's status.
+        local originVisitToken = self._quickWithdrawVisitToken
+        local bound = {
+            guildKey = ctx and ctx.guildKey,
+            datasetId = ctx and ctx.datasetId,
+            campaignId = ctx and ctx.campaignId,
+            bankTab = ctx and ctx.bankTab,
+            generation = ctx and ctx.generation,
+            selections = WR.CopyCraftSelections and WR.CopyCraftSelections(boundSelections) or boundSelections,
+            recipeFingerprints = (preview and preview.recipeFingerprints) or {},
+            requested = (preview and preview.requested and WR.CopyStringKeyQtyMap)
+                and WR.CopyStringKeyQtyMap(preview.requested) or {},
+            take = WR.CopyStringKeyQtyMap and WR.CopyStringKeyQtyMap(takeMap) or takeMap,
+            shortagesFingerprint = shortageFingerprint,
+            visitToken = originVisitToken,
+        }
+        if Dialogs.ConfirmChoice then
+            Dialogs:ConfirmChoice(
+                shortageFingerprint,
+                Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
+                Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
+                function()
+                    local token = bound.visitToken
+                    if token == nil
+                        or self._quickWithdrawVisitToken == nil
+                        or tostring(token) ~= tostring(self._quickWithdrawVisitToken) then
+                        -- Different (or ended) visit: reject before validation /
+                        -- admission. Any scoped write would no-op on the new visit.
+                        return
+                    end
+                    local valid = WR.QuickWithdrawConfirmationStillValid
+                        and WR.QuickWithdrawConfirmationStillValid(bound)
+                    if not valid then
+                        self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+                            "the page is out of date — refresh and try again"), {
+                            visitToken = token,
+                        })
+                        self:RebuildReview()
+                        return
+                    end
+                    local freshOk, freshErr = StartWithdraw({
+                        allowPartial = true,
+                        acceptedTake = bound.take,
+                    })
+                    if not freshOk then
+                        self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
+                            "Withdraw blocked: %s"):format(tostring(freshErr or "unknown")), {
+                            visitToken = token,
+                        })
+                        self:RebuildReview()
+                    end
+                end,
+                function()
+                    -- Edit quantities: preserve craft drafts; no movement.
+                end,
+                function()
+                    -- Escape / Cancel: preserve craft drafts; no movement.
+                end
+            )
+        end
+        return
+    end
+    self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
+        "Withdraw blocked: %s"):format(tostring(err or "unknown")), {
+        visitToken = self._quickWithdrawVisitToken,
+    })
 end
 
 function Runtime:Commit(profile, token, events)
@@ -2145,6 +2912,11 @@ function Runtime:BeginDeposit(line, collected)
         Warn("A deposit is already in progress.")
         return
     end
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.IsBusy and WR.IsBusy() then
+        Warn("Finish the quick withdraw before depositing raid supplies.")
+        return
+    end
     local beforeTab = (self:TabItemCounts(tab)[line.itemId]) or 0
     local beforeBags = have
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
@@ -2284,11 +3056,26 @@ function Runtime:OnBankOpened()
     self.bankOpen = true
     if first then
         self.autoReviewedThisOpen = false
-        -- Fresh visit: do not reuse prior manual quantity overrides.
+        -- Fresh visit: do not reuse prior manual quantity overrides or prior
+        -- visit status. Rotate the visit token so a late settle from the prior
+        -- visit cannot overwrite this visit's feedback.
         self.qtyOverrides = {}
+        self._quickWithdrawVisitSeq = (tonumber(self._quickWithdrawVisitSeq) or 0) + 1
+        self._quickWithdrawVisitToken = "visit:" .. tostring(self._quickWithdrawVisitSeq)
+        self._quickWithdrawStatus = nil
+        self._quickWithdrawStatusVisitToken = nil
+        if self.review and self.review.Status then
+            self.review.Status:SetText("")
+        end
         -- Banner-initiated tab selection must run before SyncReviewWithGuildBank
         -- so BankAccess can see the configured tab as usable when appropriate.
         self:ConsumeBannerBankNavigation()
+        -- Bind draft ownership to this visit. Idle close already cleared drafts;
+        -- EnsureDraftOwner also drops stale drafts if identity changed mid-session.
+        local WROpen = SF.ConsumablesWithdrawRuntime
+        if WROpen and WROpen.EnsureDraftOwner then
+            WROpen.EnsureDraftOwner()
+        end
     elseif self.bannerBankNav then
         -- Duplicate open signal while already open: never select twice.
         self:CancelBannerBankNavigation("duplicate_open")
@@ -2296,6 +3083,10 @@ function Runtime:OnBankOpened()
     self:WatchGuildBankFrame()
     self:RefreshReminder()
     self:SyncReviewWithGuildBank()
+    -- Retry unseen unresolved notices after visit token/status reset so a
+    -- refused earlier popup can surface with prior-operation labeling without
+    -- overwriting this visit's drafts or status.
+    self:FlushPendingUnresolvedWithdrawNotices()
 end
 
 function Runtime:OnBankClosed()
@@ -2311,9 +3102,23 @@ function Runtime:OnBankClosed()
             self:FinishDeposit(true)
         end
     end
+    local WR = SF.ConsumablesWithdrawRuntime
+    if WR and WR.OnBankClosed then
+        WR.OnBankClosed()
+    end
+    -- Craft drafts are bank-visit scoped (#457). Clear UI drafts at the actual
+    -- close boundary; captured in-flight work.selections remain on the work.
+    -- Do not ClearDrafts from late StopWork — that path is owner-scoped.
+    if WR then
+        if WR.ClearDrafts then
+            WR.ClearDrafts()
+        end
+        WR.craftDraftOwner = nil
+    end
     self.bankOpen = false
-    -- Bank-close is the visit boundary for local quantity overrides. Tab
-    -- switches alone must not clear them.
+    -- Quantity overrides end with the visit. Keep the visit token while closed
+    -- so a settle-while-closed callback can still publish originating-operation
+    -- status; the next OnBankOpened rotates the token and clears status.
     self.qtyOverrides = {}
     self:HideReviewForBankLifecycle()
     self:RefreshReminder()
@@ -2321,12 +3126,24 @@ end
 
 function Runtime:MaybeAutoReview()
     if self.autoReviewedThisOpen then return end
+    local Routing = SF.ConsumablesRouting
+    if not SF.Consumables or not Routing then return end
+
+    -- #457: Quick Withdraw can open the helper without depositable items,
+    -- deposit permission, or free bank slots. Deposit reminder preference does
+    -- not suppress withdrawal visibility when withdraw access + recipes exist.
+    local WR = SF.ConsumablesWithdrawRuntime
+    local withdrawShow = WR and WR.ShouldShowHelper and select(1, WR.ShouldShowHelper())
+    if withdrawShow then
+        self.autoReviewedThisOpen = true
+        self:ShowReview()
+        return
+    end
+
     if not self:RemindersEnabled() then
         self.autoReviewedThisOpen = true
         return
     end
-    local Routing = SF.ConsumablesRouting
-    if not SF.Consumables or not Routing then return end
     local collected = self:Collect()
     if not collected then return end
     -- Carried requested items remain eligible even when every finite goal is
@@ -2401,6 +3218,10 @@ function Runtime:OnEvent(event, arg1)
         elseif event == "BAG_UPDATE_DELAYED" and self.depositIntent then
             self:FinishDeposit(false)
         end
+        local WR = SF.ConsumablesWithdrawRuntime
+        if event == "BAG_UPDATE_DELAYED" and WR and WR.OnBagOrBankUpdate then
+            WR.OnBagOrBankUpdate()
+        end
         if InCombat() then
             self.reviewRefreshPending = true
             return
@@ -2454,6 +3275,10 @@ function Runtime:OnEvent(event, arg1)
             if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif self.depositIntent then
             self:FinishDeposit(false)
+        end
+        local WR = SF.ConsumablesWithdrawRuntime
+        if WR and WR.OnBagOrBankUpdate then
+            WR.OnBagOrBankUpdate()
         end
         -- Always resync after deposit bookkeeping. Tab changes during an
         -- in-flight deposit or confirmation intent still take this event, and

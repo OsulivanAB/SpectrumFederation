@@ -22,6 +22,8 @@ local KIND = {
     SET_EDITOR_RANK = "set-editor-rank",
     SET_BANK_TAB = "set-bank-tab",
     SET_REQUESTED_ITEM = "set-requested-item",
+    -- #457 Quick Withdraw recipes (campaign-scoped; distinct from requested items)
+    SET_RECIPE = "set-recipe",
     CONFIRM_CANDIDATE = "confirm-candidate",
     START_CAMPAIGN = "start-campaign",
     RESOLVE_CONFLICT = "resolve-conflict",
@@ -36,6 +38,8 @@ local KIND = {
 }
 
 GS.KIND = KIND
+-- Keep Recipes.lua constant aligned when Operations loads second.
+GS.KIND.SET_RECIPE = KIND.SET_RECIPE
 GS.MAX_CAMPAIGN_NAME_LEN = GS.MAX_CAMPAIGN_NAME_LEN or 64
 
 -- Public durable fields only; private "_" prepare metadata is never retained.
@@ -350,6 +354,13 @@ local function TargetKey(kind, target)
             return nil
         end
         return "item:" .. tostring(canon.itemId)
+    elseif kind == KIND.SET_RECIPE then
+        local canon = (GS.CanonicalRecipeTarget and GS.CanonicalRecipeTarget(target))
+            or CanonicalItemTarget(target)
+        if not canon then
+            return nil
+        end
+        return "recipe:" .. tostring(canon.itemId)
     elseif kind == KIND.START_CAMPAIGN then
         return GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
     elseif kind == KIND.CONFIRM_CANDIDATE then
@@ -733,6 +744,26 @@ local function ValidateKindValue(op)
             return false, "item_id_mismatch"
         end
         return true
+    elseif kind == KIND.SET_RECIPE then
+        local canon = (GS.CanonicalRecipeTarget and GS.CanonicalRecipeTarget(op.target))
+            or CanonicalItemTarget(op.target)
+        if not canon then
+            return false, "invalid_target"
+        end
+        if type(op.target) ~= "table" or tonumber(op.target.itemId) ~= canon.itemId then
+            return false, "invalid_target"
+        end
+        if not GS.NormalizeRecipeValue then
+            return false, "unsupported_kind"
+        end
+        local normalized, err = GS.NormalizeRecipeValue(op.value)
+        if not normalized then
+            return false, err
+        end
+        if normalized.removed ~= true and normalized.itemId ~= canon.itemId then
+            return false, "item_id_mismatch"
+        end
+        return true
     elseif kind == KIND.START_CAMPAIGN then
         return false, "use_campaign_api"
     elseif kind == KIND.CONFIRM_CANDIDATE then
@@ -886,6 +917,7 @@ function GS:NewConfigOperation(kind, target, value)
     end
 
     if kind ~= KIND.SET_EDITOR_RANK and kind ~= KIND.SET_BANK_TAB and kind ~= KIND.SET_REQUESTED_ITEM
+        and kind ~= KIND.SET_RECIPE
         and kind ~= KIND.LINK_CHARACTERS and kind ~= KIND.UNLINK_CHARACTERS
         and kind ~= KIND.ADJUST_QUANTITY then
         return nil, "rejected", "unsupported_kind"
@@ -929,6 +961,24 @@ function GS:NewConfigOperation(kind, target, value)
         end
         target = canon
         local normalized, err = CanonicalRequestedItemValue(value)
+        if not normalized then
+            return nil, "rejected", err
+        end
+        value = normalized
+    elseif kind == KIND.SET_RECIPE then
+        if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+            return nil, "rejected", "no_campaign"
+        end
+        local canon = (GS.CanonicalRecipeTarget and GS.CanonicalRecipeTarget(target))
+            or CanonicalItemTarget(target)
+        if not canon then
+            return nil, "rejected", "invalid_target"
+        end
+        target = canon
+        if not GS.CanonicalRecipeValue then
+            return nil, "rejected", "unsupported_kind"
+        end
+        local normalized, err = GS.CanonicalRecipeValue(value)
         if not normalized then
             return nil, "rejected", err
         end
@@ -1265,7 +1315,7 @@ function GS:ValidateConfigOperation(op, context)
         if not caps.canEdit then
             return false, caps.reason or "unauthorized"
         end
-        if op.kind == KIND.SET_REQUESTED_ITEM then
+        if op.kind == KIND.SET_REQUESTED_ITEM or op.kind == KIND.SET_RECIPE then
             if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
                 return false, "no_campaign"
             end
@@ -1480,6 +1530,53 @@ local function ApplyMutations(record, op, opts)
             GS.RefreshLiveEligibilityFloor(record)
         end
         return true
+    elseif op.kind == KIND.SET_RECIPE then
+        local cfg = record.accounting._consumables
+        if type(cfg) ~= "table" then
+            return false, "invalid_accounting"
+        end
+        if type(cfg.recipes) ~= "table" then
+            cfg.recipes = {}
+        end
+        if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+            return false, "no_campaign"
+        end
+        local canon = (GS.CanonicalRecipeTarget and GS.CanonicalRecipeTarget(op.target))
+            or CanonicalItemTarget(op.target)
+        if not canon then
+            return false, "invalid_target"
+        end
+        local key = tostring(canon.itemId)
+        if type(op.value) == "table" and op.value.removed == true then
+            cfg.recipes[key] = nil
+            return true
+        end
+        local maxRecipes = GS.MAX_RECIPES or 32
+        local isAdd = cfg.recipes[key] == nil
+        if isAdd then
+            local count = 0
+            for _ in pairs(cfg.recipes) do
+                count = count + 1
+                if count >= maxRecipes then
+                    return false, "full"
+                end
+            end
+        end
+        local normalized, normErr = GS.CanonicalRecipeValue and GS.CanonicalRecipeValue(op.value)
+        if not normalized or normalized.removed then
+            return false, normErr or "invalid_recipe_value"
+        end
+        local reagentsCopy = {}
+        if type(normalized.reagents) == "table" then
+            for rk, rv in pairs(normalized.reagents) do
+                reagentsCopy[rk] = rv
+            end
+        end
+        cfg.recipes[key] = {
+            itemId = canon.itemId,
+            reagents = reagentsCopy,
+        }
+        return true
     elseif op.kind == KIND.LINK_CHARACTERS or op.kind == KIND.UNLINK_CHARACTERS then
         if not GS.ApplyIdentityLinkMutation then
             return false, "unsupported_kind"
@@ -1605,6 +1702,21 @@ function GS:ApplyStagedConfigOperation(op, context)
             return "rejected", normErr or "invalid_item_value"
         end
         op.value = normalized
+    elseif op.kind == KIND.SET_RECIPE then
+        local canon = (GS.CanonicalRecipeTarget and GS.CanonicalRecipeTarget(op.target))
+            or CanonicalItemTarget(op.target)
+        if not canon then
+            return "rejected", "invalid_target"
+        end
+        op.target = canon
+        if not GS.CanonicalRecipeValue then
+            return "rejected", "unsupported_kind"
+        end
+        local normalized, normErr = GS.CanonicalRecipeValue(op.value)
+        if not normalized then
+            return "rejected", normErr or "invalid_recipe_value"
+        end
+        op.value = normalized
     elseif op.kind == KIND.SET_BANK_TAB then
         local coerced, coerceErr = CoerceBankTabValue(op.value)
         if coerceErr then
@@ -1727,6 +1839,19 @@ function GS:ApplyStagedConfigOperation(op, context)
     local tKey = TargetKey(op.kind, stored.target)
     -- Local authenticated editor writes may establish live cutover provenance on
     -- adjustments created after this client is already active (#389 A2).
+    -- Local ADJUST mutation→AppendLedgerEvent Ensure/redrive→post-store
+    -- Invalidate/Ensure must share one outer allowance (#459 B3).
+    local ownedCreditBudget = false
+    if stored.kind == KIND.ADJUST_QUANTITY
+        and GS.BeginOuterCreditProjectionCallbackBudget then
+        ownedCreditBudget = GS.BeginOuterCreditProjectionCallbackBudget()
+    end
+    local function releaseCreditBudget()
+        if ownedCreditBudget and GS.EndOuterCreditProjectionCallbackBudget then
+            GS.EndOuterCreditProjectionCallbackBudget(true)
+            ownedCreditBudget = false
+        end
+    end
     local applied, applyErr = ApplyMutations(record, stored, {
         localProductionAuthority = true,
     })
@@ -1744,8 +1869,10 @@ function GS:ApplyStagedConfigOperation(op, context)
             if GS.ScheduleLocalContributorCorrectionSaveContinuation then
                 GS.ScheduleLocalContributorCorrectionSaveContinuation(record)
             end
+            releaseCreditBudget()
             return "pending", "work_budget"
         end
+        releaseCreditBudget()
         return "rejected", applyErr or "apply_failed"
     end
     -- Soft-clear matching local save retain without discarding the speculative
@@ -1776,8 +1903,8 @@ function GS:ApplyStagedConfigOperation(op, context)
         end
     elseif stored.kind == KIND.ADJUST_QUANTITY then
         -- Adjustments change durable floors: never Seal(true) an unfinished
-        -- reconstruction. Invalidate published validity and Ensure/redrive so
-        -- readable credit matches current dependencies (#459 B3).
+        -- reconstruction. Invalidate published validity and Ensure/redrive under
+        -- the same outer allowance opened above (#459 B3).
         if GS.InvalidateCreditCorrectionProjection then
             GS.InvalidateCreditCorrectionProjection(record)
         end
@@ -1794,6 +1921,7 @@ function GS:ApplyStagedConfigOperation(op, context)
             end
         end
     end
+    releaseCreditBudget()
     GS._NotifyLocalDurableChange("config")
     return "accepted", nil
 end
@@ -2138,6 +2266,7 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         end
         return true
     elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM
+        or kind == KIND.SET_RECIPE
         or kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS
         or kind == KIND.ADJUST_QUANTITY or kind == KIND.RENAME_CAMPAIGN
         or kind == KIND.CORRECT_CONTRIBUTOR then

@@ -465,6 +465,51 @@ SpectrumFederationCharDB = { mouseTracer = { enabled = true } }
 Store.charDb = SpectrumFederationCharDB
 assertEq(Store:Get("global.settingsWindowOpacity"), accountOpacity, "opacity is unchanged when character DB is replaced")
 
+-- Secondary opacity targets (recipe editor popup shares the same setting)
+do
+    resetWindow()
+    resetDb()
+    SettingsWindow._opacityTargets = {}
+    -- Re-bind Apply callbacks after resetDb wiped Store._callbacks.
+    SF.SettingsApply.initialized = nil
+    SF.SettingsApply._debounce = nil
+    SF.SettingsApply:Init()
+    Store:Set("global.settingsWindowOpacity", 80)
+    SettingsWindow:CreateWindow()
+    local main = SettingsWindow.frame
+    local popup = CreateFrame("Frame", "SFOpacityTargetPopup")
+    popup.backdrop = nil
+    function popup:SetBackdrop(info)
+        self.backdrop = info
+    end
+    popup:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
+    local beforeCount = #(SettingsWindow._opacityTargets or {})
+    SettingsWindow:RegisterSettingsWindowOpacityTarget(popup)
+    SettingsWindow:RegisterSettingsWindowOpacityTarget(popup)
+    assertEq(#SettingsWindow._opacityTargets, beforeCount + 1,
+        "RegisterSettingsWindowOpacityTarget dedupes by identity")
+    SettingsWindow:ApplySettingsWindowOpacity(75)
+    assertAlmost(main.backdropColor.a, 0.75, 1e-6, "main window backdrop updates with target apply")
+    assertAlmost(popup.backdropColor.a, 0.75, 1e-6, "registered target gets same backdrop opacity")
+    assertAlmost(popup.alpha, 1, 1e-6, "registered target frame alpha stays 1")
+    SettingsWindow:ApplySettingsWindowOpacity(100)
+    assertAlmost(popup.backdropColor.a, 1.0, 1e-6, "100% makes registered target fully opaque")
+    -- Apply without main frame still updates registered targets.
+    SettingsWindow.frame = nil
+    SettingsWindow:ApplySettingsWindowOpacity(70)
+    assertAlmost(popup.backdropColor.a, 0.70, 1e-6,
+        "Apply updates targets even when main settings frame is absent")
+    -- ResetAll → sf.reset → ApplyAll reapplies default to targets.
+    SettingsWindow.frame = main
+    SettingsWindow:ApplySettingsWindowOpacity(70)
+    Store:ResetAll()
+    assertEq(Store:Get("global.settingsWindowOpacity"), 90, "ResetAll restores opacity default")
+    assertAlmost(popup.backdropColor.a, 0.90, 1e-6,
+        "ResetAll ApplyAll reapplies 90% to registered opacity targets")
+    assertAlmost(main.backdropColor.a, 0.90, 1e-6,
+        "ResetAll ApplyAll reapplies 90% to main settings window")
+end
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -18,6 +18,8 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
 | Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 5`) via Guild Gossip API |
+| Contributor credit corrections (#459) | Accepted `correct-contributor` ops + effective-credit projection; ledger evidence untouched |
+| Quick Withdraw recipes + informational withdrawal receipts (#457) | Campaign `recipes` map + `set-recipe` ops; `withdrawal` ledger events (separately capped); runtime-only trade handoff |
 | Campaign display names (#424) | `rename-campaign` ops + `campaignNames` projection; LWW by `(timestamp, op.id)`; no Troubleshooting conflict |
 | Donation evidence / officer or three-witness ledger | `Ledger` |
 | Witness identity + contribution attribution (#427) | Guild Info main/alt (read-only); durable donor fields unchanged; legacy `identityLinks` inert |
