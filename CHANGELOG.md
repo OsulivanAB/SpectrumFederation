@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.8] - 2026-11-05
+
+### Changed
+- Raid Supplies bank panel Quick Withdraw layout and opacity
+
 ## [1.5.18-beta.7] - 2026-11-05
 
 ### Changed
