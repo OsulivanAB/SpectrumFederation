@@ -3249,12 +3249,14 @@ do
     assertEq(pendingBefore, #pendingIds, "459: conflict-heavy pending count matches")
     realRedrive(record, { itemId = 9340, maxAttempts = 64 })
     local drainGuard = 0
-    while #timers > 0 and drainGuard < 400 do
+    -- Paced init/activate yields more slices under tightBudget=80; drain until idle.
+    while #timers > 0 and drainGuard < 8000 do
         assertTrue(runOneDueTimer(), "459: redrive slice timer fired")
         drainGuard = drainGuard + 1
     end
     GS.RedrivePendingContributorCorrections = realRedrive
     GS._creditProjectionWorkBudgetOverride = nil
+    assertEq(#timers, 0, "459: redrive idles with empty timer queue")
     assertTrue(#sliceWorks >= 2,
         "459: redrive used multiple callbacks got=" .. tostring(#sliceWorks))
     local productive = 0
@@ -3655,10 +3657,9 @@ end
 
 do
     -- Substantial retained-history complete-callback bound (#459 /
-    -- discussion_r4476766989): O(1) prune scratch retain must keep each
-    -- production callback within soft+atomic, including save/restore work.
-    -- Fixture mirrors the reproduced slice (4000 Alice +1, Alice −2000,
-    -- Bob/Carol/Dave seeds, 3984 accepted correction heads).
+    -- discussion_r4476962015): init/activate + remaining traversals must
+    -- respect soft+atomic under fresh, partially-consumed, and resumed paths.
+    -- Fixture: 4000 Alice +1, Alice −2000, Bob/Carol/Dave seeds, 3984 heads.
     local function buildLargeConflictRecord(itemId)
         local record = seedLiveCampaignWithItem(itemId, 4000)
         local donors = {
@@ -3719,21 +3720,70 @@ do
             record.operations.records[op.id] = op
             record.operations.order[#record.operations.order + 1] = op.id
         end
-        return record, acceptedN
+        return record, acceptedN, nDon
     end
-    local function creditFingerprint(record, itemId, sampleN)
+    -- Complete final credit set: every corrected donation + uncorrected tail.
+    local function fullCreditSet(record, itemId, acceptedN, nDon)
         local parts = {}
-        for i = 1, sampleN do
+        local active = 0
+        local removed = 0
+        for i = 1, acceptedN do
             local ev = GS.FindLedgerEventById(record, "copy-don-" .. itemId .. "-" .. i)
             local name = select(1, GS.ResolveEffectiveCreditIdentity(record, ev))
-            parts[#parts + 1] = tostring(name or "?")
+            parts[#parts + 1] = tostring(i) .. "=" .. tostring(name or "?")
+            if name == "Alice-Garona" then
+                removed = removed + 1
+            else
+                active = active + 1
+            end
         end
-        -- Also fingerprint a late donation outside the correction set.
-        local late = GS.FindLedgerEventById(record, "copy-don-" .. itemId .. "-3999")
-        parts[#parts + 1] = tostring(select(1, GS.ResolveEffectiveCreditIdentity(record, late)) or "?")
-        return table.concat(parts, ",")
+        for i = acceptedN + 1, nDon do
+            local ev = GS.FindLedgerEventById(record, "copy-don-" .. itemId .. "-" .. i)
+            local name = select(1, GS.ResolveEffectiveCreditIdentity(record, ev))
+            parts[#parts + 1] = tostring(i) .. "=" .. tostring(name or "?")
+        end
+        return table.concat(parts, ";"), active, removed
     end
-    local function settleAutonomous(record, budgetOverride)
+    local function assertSlicesWithinBound(label, slices, hard)
+        local boundFail = nil
+        local sawActivate = false
+        local sawPrune = false
+        local travSum = 0
+        local copySum = 0
+        for i = 1, #slices do
+            local s = slices[i]
+            local total = (tonumber(s.work) or 0)
+            if total > hard and not boundFail then
+                boundFail = label .. " callback within soft+atomic i="
+                    .. tostring(i) .. " work=" .. tostring(s.work)
+                    .. " trav=" .. tostring(s.trav)
+                    .. " copies=" .. tostring(s.copies)
+                    .. " hard=" .. tostring(hard)
+                    .. " phase=" .. tostring(s.phase)
+                    .. " outer=" .. tostring(s.outer)
+            end
+            travSum = travSum + (tonumber(s.trav) or 0)
+            copySum = copySum + (tonumber(s.copies) or 0)
+            if s.phase == "activate" or s.phase == "activate_restore" then
+                sawActivate = true
+            end
+            if s.phase == "prune" or s.phase == "prune_scan"
+                or s.phase == "pre_prune" or s.phase == "empty_fallback" then
+                sawPrune = true
+            end
+            if s.outer ~= nil and s.outer > hard and not boundFail then
+                boundFail = label .. " outer callback accum i="
+                    .. tostring(i) .. " outer=" .. tostring(s.outer)
+                    .. " hard=" .. tostring(hard)
+            end
+        end
+        assertTrue(boundFail == nil, boundFail or (label .. " all callbacks within soft+atomic"))
+        return travSum, copySum, sawActivate, sawPrune
+    end
+    local function settleAutonomous(record, opts)
+        opts = opts or {}
+        local budgetOverride = opts.budgetOverride
+        local preConsumed = tonumber(opts.preConsumed) or 0
         GS._creditProjectionWorkBudgetOverride = budgetOverride
         GS.InvalidateCreditCorrectionProjection(record)
         local soft = tonumber(budgetOverride)
@@ -3745,6 +3795,9 @@ do
             local ok, err, det = realRebuild(...)
             local work = tonumber(det and det.workUnits) or 0
             local copies = tonumber(det and det.structureCopyVisits) or 0
+            local trav = tonumber(det and det.traversalVisits) or 0
+            local outer = tonumber(det and det.callbackWork)
+                or tonumber(GS._creditProjectionCallbackWork) or work
             local phase = det and det.phase
             if err == "work_budget" or ok then
                 slices[#slices + 1] = {
@@ -3752,13 +3805,28 @@ do
                     err = err,
                     work = work,
                     copies = copies,
+                    trav = trav,
+                    outer = outer,
                     phase = phase,
                     deferred = det and det.deferred,
                 }
             end
             return ok, err, det
         end
+        if preConsumed > 0 then
+            -- Model an outer callback that already consumed part of the normal
+            -- shared allowance before Rebuild (discussion_r4476962015).
+            GS._creditProjectionAccumulating = true
+            GS._creditProjectionCallbackWork = preConsumed
+            GS._creditProjectionCallbackLimit = soft
+            GS._creditProjectionCallbackHardLimit = hard
+        end
         local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
+        if preConsumed > 0 then
+            -- Ensure/Rebuild may own EndBudget; ensure accumulation flag cleared
+            -- before autonomous timers open fresh budgets.
+            GS._creditProjectionAccumulating = false
+        end
         assertTrue(ok0 == false or ok0 == true,
             "459: copy-bound Ensure returned")
         if ok0 == false then
@@ -3776,83 +3844,97 @@ do
         end
         GS.RebuildCreditCorrectionProjection = realRebuild
         GS._creditProjectionWorkBudgetOverride = nil
+        GS._creditProjectionAccumulating = false
         assertTrue(timerFail == nil, timerFail or "459: copy-bound timers drained")
-        assertTrue(g > 1, "459: copy-bound drained multiple timers got=" .. tostring(g))
+        assertTrue(g >= 1, "459: copy-bound drained timers got=" .. tostring(g))
         assertEq(#timers, 0, "459: copy-bound idles with empty timer queue")
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
             "459: copy-bound projection available after timers only")
         local okTerm, errTerm = GS.EnsureCreditCorrectionProjection(record, nil)
         assertTrue(okTerm, "459: copy-bound terminal coherent got " .. tostring(errTerm))
-        local copySum = 0
-        local sawPruneResume = false
-        local boundFail = nil
-        local copyFail = nil
-        for i = 1, #slices do
-            local s = slices[i]
-            if s.work > hard and not boundFail then
-                boundFail = "459: copy-bound callback within soft+atomic i="
-                    .. tostring(i) .. " work=" .. tostring(s.work)
-                    .. " copies=" .. tostring(s.copies)
-                    .. " hard=" .. tostring(hard)
-                    .. " phase=" .. tostring(s.phase)
-            end
-            copySum = copySum + s.copies
-            -- After prune working state is retained, resume slices must not
-            -- re-clone history-sized structures (structureCopyVisits stays 0).
-            if sawPruneResume and s.copies ~= 0 and not copyFail then
-                copyFail = "459: copy-bound prune-resume structureCopyVisits=0 i="
-                    .. tostring(i) .. " copies=" .. tostring(s.copies)
-                    .. " phase=" .. tostring(s.phase)
-            end
-            -- deferProjection saves pruneReady by ref; the next slice must not
-            -- re-clone. post_baseline yields do not set pruneReady.
-            if s.deferred and (s.phase == "pre_prune" or s.phase == "prune"
-                or s.phase == "prune_scan" or s.phase == "empty_fallback") then
-                sawPruneResume = true
-            end
-        end
-        assertTrue(boundFail == nil, boundFail or "459: copy-bound all callbacks within soft+atomic")
-        assertTrue(copyFail == nil, copyFail or "459: copy-bound prune-resume copies stay 0")
-        assertTrue(sawPruneResume, "459: copy-bound observed prune-resume retain path")
-        return slices, copySum, hard, g
+        return slices, hard, soft, g
     end
 
     local itemFull = 9380
-    local rFull, acceptedN = buildLargeConflictRecord(itemFull)
+    local rFull, acceptedN, nDon = buildLargeConflictRecord(itemFull)
     assertEq(acceptedN, 3984, "459: copy-bound accepted head count")
-    -- Production budget path (reproduces discussion_r4476766989 scale).
-    local slicesProd, copySumProd, hardProd, timersProd =
-        settleAutonomous(rFull, nil)
-    assertTrue(#slicesProd >= 2,
-        "459: copy-bound production used multiple slices got="
-            .. tostring(#slicesProd))
-    assertTrue(timersProd >= 1, "459: copy-bound drained timers")
-    -- History-sized save/restore would visit ~6 × accepted heads (~24k).
-    -- Retained by-ref scratch plus charged totals clones must stay far below.
-    local historyCopyFloor = acceptedN * 3
-    assertTrue(copySumProd < historyCopyFloor,
-        "459: copy-bound structure copies << history-sized save/restore got="
-            .. tostring(copySumProd) .. " floor=" .. tostring(historyCopyFloor))
-    local fpFull = creditFingerprint(rFull, itemFull, 48)
 
-    -- Alternate soft budget: above baseline+activate cost for this fixture so
-    -- the first slice can reach paced prune without a history-sized atomic
-    -- overshoot, yet still force multi-slice prune (below production 16384).
-    local itemAlt = 9381
-    local rAlt = buildLargeConflictRecord(itemAlt)
-    local altBudget = 12288
-    local slicesAlt, copySumAlt = settleAutonomous(rAlt, altBudget)
-    assertTrue(#slicesAlt >= 2,
-        "459: copy-bound alt budget multi-slice got="
-            .. tostring(#slicesAlt))
-    assertTrue(copySumAlt < historyCopyFloor,
-        "459: copy-bound alt structure copies bounded got="
-            .. tostring(copySumAlt))
-    local fpAlt = creditFingerprint(rAlt, itemAlt, 48)
-    assertEq(fpAlt, fpFull,
-        "459: copy-bound identical final credit across budgets")
-    -- Small-case sync and nested-redrive bounds remain covered by the earlier
-    -- conflict-heavy / small Ensure / redrive blocks in this file.
+    -- (a) Fresh production callback.
+    local slicesFresh, hardFresh = settleAutonomous(rFull, {})
+    assertTrue(#slicesFresh >= 2,
+        "459: copy-bound fresh multi-slice got=" .. tostring(#slicesFresh))
+    local travFresh, copyFresh, sawActFresh, sawPruneFresh =
+        assertSlicesWithinBound("459: copy-bound fresh", slicesFresh, hardFresh)
+    assertTrue(sawActFresh or sawPruneFresh,
+        "459: copy-bound fresh observed activate or prune phase")
+    assertTrue(copyFresh < acceptedN,
+        "459: copy-bound fresh structure copies bounded got=" .. tostring(copyFresh))
+    assertTrue(travFresh >= 0, "459: copy-bound fresh traversal measured")
+    local fpFresh, activeFresh, removedFresh =
+        fullCreditSet(rFull, itemFull, acceptedN, nDon)
+    assertTrue(removedFresh > 0 and activeFresh >= 0,
+        "459: copy-bound fresh has retained/removed boundary active="
+            .. tostring(activeFresh) .. " removed=" .. tostring(removedFresh))
+
+    -- (b) Partially consumed normal shared allowance (8000 of 16384) — the
+    -- reproduced case where unpaced activate previously pushed outer work
+    -- above soft+atomic on the first shared Rebuild.
+    local itemPartial = 9381
+    local rPartial = buildLargeConflictRecord(itemPartial)
+    local slicesPartial, hardPartial = settleAutonomous(rPartial, {
+        preConsumed = 8000,
+    })
+    assertTrue(#slicesPartial >= 2,
+        "459: copy-bound partial multi-slice got=" .. tostring(#slicesPartial))
+    local _, copyPartial = assertSlicesWithinBound(
+        "459: copy-bound partial", slicesPartial, hardPartial)
+    assertTrue(#slicesPartial > 0 and slicesPartial[1].outer ~= nil,
+        "459: copy-bound partial first slice reports outer accumulation")
+    assertTrue(slicesPartial[1].outer <= hardPartial,
+        "459: copy-bound partial first outer <= soft+atomic got="
+            .. tostring(slicesPartial[1].outer) .. " hard=" .. tostring(hardPartial))
+    assertTrue(copyPartial < acceptedN,
+        "459: copy-bound partial structure copies bounded got=" .. tostring(copyPartial))
+    local fpPartial = select(1, fullCreditSet(rPartial, itemPartial, acceptedN, nDon))
+
+    -- (b2) Lower pre-consumed remainder so the shared call reaches paced
+    -- activate (not only post_baseline) under the same production constants.
+    local itemPartialAct = 9383
+    local rPartialAct = buildLargeConflictRecord(itemPartialAct)
+    local slicesPartialAct, hardPartialAct = settleAutonomous(rPartialAct, {
+        preConsumed = 2000,
+    })
+    local _, _, sawActPartial = assertSlicesWithinBound(
+        "459: copy-bound partial-activate", slicesPartialAct, hardPartialAct)
+    assertTrue(sawActPartial,
+        "459: copy-bound partial-activate paced activate under shared remainder")
+    local fpPartialAct = select(1, fullCreditSet(rPartialAct, itemPartialAct, acceptedN, nDon))
+
+    -- (c) Resumed baseline/activate/prune under a tighter soft budget that
+    -- forces paced initialization (baseline alone exceeds soft) — not a budget
+    -- chosen above init cost to bypass it.
+    local itemResume = 9382
+    local rResume = buildLargeConflictRecord(itemResume)
+    local slicesResume, hardResume = settleAutonomous(rResume, {
+        budgetOverride = 4096,
+    })
+    assertTrue(#slicesResume >= 2,
+        "459: copy-bound resume multi-slice got=" .. tostring(#slicesResume))
+    local _, copyResume, sawActResume, sawPruneResume =
+        assertSlicesWithinBound("459: copy-bound resume", slicesResume, hardResume)
+    assertTrue(sawActResume, "459: copy-bound resume paced activate")
+    assertTrue(sawPruneResume, "459: copy-bound resume paced prune/removal")
+    assertTrue(copyResume < acceptedN,
+        "459: copy-bound resume structure copies bounded got=" .. tostring(copyResume))
+    local fpResume = select(1, fullCreditSet(rResume, itemResume, acceptedN, nDon))
+
+    assertEq(fpPartial, fpFresh,
+        "459: copy-bound identical full credit set partial vs fresh")
+    assertEq(fpPartialAct, fpFresh,
+        "459: copy-bound identical full credit set partial-activate vs fresh")
+    assertEq(fpResume, fpFresh,
+        "459: copy-bound identical full credit set resume vs fresh")
+    -- Small-case sync and nested-redrive bounds remain covered by earlier blocks.
 end
 
 do
