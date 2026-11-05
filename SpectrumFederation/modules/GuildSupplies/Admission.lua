@@ -8039,7 +8039,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 -- pending when the ledger event is missing or not yet credited.
                 if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
                     and (err == "pending_event" or err == "missing_event"
-                        or err == "not_credited") then
+                        or err == "not_credited" or err == "work_budget") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(

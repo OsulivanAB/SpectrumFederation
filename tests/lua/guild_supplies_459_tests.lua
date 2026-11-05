@@ -2000,6 +2000,7 @@ do
     local record64 = seedPendingWave(64, 9304)
     local _, attempts64 = GS.RedrivePendingContributorCorrections(record64, {
         maxAttempts = 32,
+        workBudget = 1000000,
     })
     assertEq(attempts64, 32, "459: 64-wave first slice attempts=32 got " .. tostring(attempts64))
     assertTrue(#timers >= 1, "459: 64-wave schedules continuation")
@@ -2010,7 +2011,7 @@ do
 
     -- 80 entries: middle slice must not be skipped after first 32 accepts.
     local record80 = seedPendingWave(80, 9307)
-    GS.RedrivePendingContributorCorrections(record80, { maxAttempts = 32 })
+    GS.RedrivePendingContributorCorrections(record80, { maxAttempts = 32, workBudget = 1000000 })
     flushTimers()
     assertEq(countEligiblePending(record80), 0,
         "459: 80 eligible pending all settled after slices got "
@@ -2501,7 +2502,7 @@ do
 
     -- (1) Item-A wake processes 32 and schedules continuation.
     local _, attemptsA = GS.RedrivePendingContributorCorrections(record, {
-        itemId = itemA, maxAttempts = 32,
+        itemId = itemA, maxAttempts = 32, workBudget = 1000000,
     })
     assertEq(attemptsA, 32, "459: A/B/C first A slice attempts=32")
     assertTrue(#timers >= 1, "459: A/B/C schedules continuation after A slice")
@@ -3064,8 +3065,9 @@ do
 end
 
 do
-    -- Conflict-heavy callback budget: distinct identity buckets + non-empty
-    -- pending backlog through production AdmitRemoteOperation / Redrive.
+    -- Conflict-heavy callback budget (#459 / discussion_r4476449746):
+    -- independent CREDIT_PROJECTION_WORK_BUDGET, multi-slice redrive backlog,
+    -- and ordinary Invalidate/Ensure pacing for a single expensive rebuild.
     local record = seedLiveCampaignWithItem(9340, 400)
     local donors = {
         { name = "Alice-Garona", guid = "Player-1-Alice" },
@@ -3073,8 +3075,8 @@ do
         { name = "Carol-Garona", guid = "Player-1-Carol" },
         { name = "Dave-Garona", guid = "Player-1-Dave" },
     }
-    -- Many Alice donations + Alice −20; corrections move them to Bob/Carol/Dave
-    -- so activate-all overdraws Alice and forces impact-score prune trials.
+    -- 40 Alice +1 donations and Alice −20 ⇒ floor 20. Accepting 24 corrections
+    -- overdraws Alice (−4) so impact prune must run; 16 remain pending for redrive.
     local nDon = 40
     for i = 1, nDon do
         injectProductionDonation(record, {
@@ -3088,7 +3090,6 @@ do
         attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
         timestamp = 20100,
     })
-    -- Extra distinct-bucket donations so actual identity count > 3.
     for di = 2, #donors do
         local d = donors[di]
         injectProductionDonation(record, {
@@ -3129,10 +3130,69 @@ do
         record.operations.records[op.id] = op
         record.operations.order[#record.operations.order + 1] = op.id
     end
+
+    local independentBudget = tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+    assertTrue(independentBudget ~= nil and independentBudget > 0,
+        "459: CREDIT_PROJECTION_WORK_BUDGET defined independently")
+    -- Tight ceiling so prune cannot finish in one callback (not derived from work1).
+    local tightBudget = 80
+    GS._creditProjectionWorkBudgetOverride = tightBudget
+
+    -- Ordinary Invalidate/Ensure path before pending exists.
+    GS.InvalidateCreditCorrectionProjection(record)
+    local timersBeforeEnsure = #timers
+    local ok1, err1, det1 = GS.EnsureCreditCorrectionProjection(record, nil)
+    assertTrue(ok1 == false, "459: paced Ensure first slice incomplete")
+    assertEq(err1, "work_budget", "459: paced Ensure yields work_budget")
+    assertTrue(det1 and det1.deferred == true, "459: paced Ensure deferred flag")
+    assertTrue((tonumber(det1 and det1.workUnits) or 0) >= tightBudget,
+        "459: paced Ensure slice reached independent budget")
+    assertTrue(#timers > timersBeforeEnsure,
+        "459: paced Ensure scheduled continuation (control returns)")
+    local ensureSlices = 1
+    local maxEnsureSlices = 80
+    while ensureSlices < maxEnsureSlices do
+        assertTrue(runOneDueTimer(),
+            "459: paced Ensure continuation callback " .. tostring(ensureSlices + 1))
+        ensureSlices = ensureSlices + 1
+        local okE, errE = GS.EnsureCreditCorrectionProjection(record, nil)
+        if okE then
+            break
+        end
+        assertEq(errE, "work_budget",
+            "459: paced Ensure intermediate still work_budget got " .. tostring(errE))
+    end
+    assertTrue(ensureSlices > 1, "459: paced Ensure used multiple slices got="
+        .. tostring(ensureSlices))
+    assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
+        "459: paced Ensure eventually available")
+    flushTimers()
+
+    -- O(1) scoreBox on a completed unlimited rebuild.
+    GS._creditProjectionWorkBudgetOverride = nil
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okScore, errScore, detScore = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okScore, "459: conflict-heavy full rebuild ok got " .. tostring(errScore))
+    local actualBuckets = #donors
+    local bucketVisits = tonumber(detScore and detScore.bucketVisits) or 0
+    local trials = tonumber(detScore and detScore.candidateTrials) or 0
+    local deacts = tonumber(detScore and detScore.deactivations) or 0
+    assertTrue(bucketVisits > 0, "459: conflict-heavy measured bucketVisits")
+    assertTrue(trials > 0, "459: conflict-heavy candidateTrials got=" .. tostring(trials))
+    assertTrue(deacts > 0, "459: conflict-heavy deactivations got=" .. tostring(deacts))
+    local perTrial = bucketVisits / trials
+    assertTrue(perTrial <= 8,
+        "459: conflict-heavy bucketVisits/trial O(1) got="
+            .. tostring(perTrial) .. " visits=" .. tostring(bucketVisits)
+            .. " trials=" .. tostring(trials) .. " buckets=" .. tostring(actualBuckets))
+
+    -- Install pending backlog larger than one work-limited redrive slice.
     record.operations.pending = record.operations.pending or {}
+    local pendingIds = {}
     for i = acceptedN + 1, nDon do
         local target = donors[(i % (#donors - 1)) + 2]
         local id = "score-pend-" .. i
+        pendingIds[#pendingIds + 1] = id
         record.operations.pending[id] = {
             id = id,
             sender = "Alice-Garona",
@@ -3163,50 +3223,74 @@ do
             },
         }
     end
-    GS.InvalidateCreditCorrectionProjection(record)
-    local okScore, errScore, detScore = GS.RebuildCreditCorrectionProjection(record, nil)
-    assertTrue(okScore, "459: conflict-heavy rebuild ok got " .. tostring(errScore))
-    local actualBuckets = #donors
-    local bucketVisits = tonumber(detScore and detScore.bucketVisits) or 0
-    local floorVisits = tonumber(detScore and detScore.floorVisits) or 0
-    local trials = tonumber(detScore and detScore.candidateTrials) or 0
-    local deacts = tonumber(detScore and detScore.deactivations) or 0
-    local work1 = tonumber(detScore and detScore.workUnits) or 0
-    assertTrue(bucketVisits > 0, "459: conflict-heavy measured bucketVisits")
-    assertTrue(trials > 0, "459: conflict-heavy candidateTrials got=" .. tostring(trials))
-    assertTrue(deacts > 0, "459: conflict-heavy deactivations got=" .. tostring(deacts))
-    -- O(1) scoreBox vs whole-balance: per-trial bucket touches stay a small
-    -- constant; whole-balance would visit actualBuckets every trial.
-    local perTrial = bucketVisits / trials
-    assertTrue(perTrial <= 8,
-        "459: conflict-heavy bucketVisits/trial O(1) got="
-            .. tostring(perTrial) .. " visits=" .. tostring(bucketVisits)
-            .. " trials=" .. tostring(trials) .. " buckets=" .. tostring(actualBuckets))
-    -- Whole-balance rescans would visit actualBuckets on every trial alone
-    -- (plus activation). O(1) scoreBox stays near a small constant per trial.
-    assertTrue(work1 > 0, "459: conflict-heavy workUnits measured")
 
-    GS._creditProjectionCallbackWork = 0
-    local promoted, attempts, callbackWork = GS.RedrivePendingContributorCorrections(
-        record, { itemId = 9340, maxAttempts = 16 })
-    flushTimers()
-    callbackWork = tonumber(callbackWork) or tonumber(GS._creditProjectionCallbackWork) or 0
-    assertTrue((tonumber(attempts) or 0) > 0,
-        "459: conflict-heavy redrive attempted pending backlog")
-    -- Budget: paced redrive seals after Apply so each attempt is about one
-    -- rebuild (not preview+store). Allow a small multiple of measured work1.
-    local callbackBudget = math.max(work1, 1) * math.max(tonumber(attempts) or 1, 1) * 5
-    assertTrue(callbackWork > 0, "459: conflict-heavy accumulated callback work > 0")
-    assertTrue(callbackWork < callbackBudget,
-        "459: conflict-heavy accumulated callback work bounded got="
-            .. tostring(callbackWork) .. " budget=" .. tostring(callbackBudget)
-            .. " work1=" .. tostring(work1)
-            .. " promoted=" .. tostring(promoted) .. " attempts=" .. tostring(attempts)
-            .. " floorVisits=" .. tostring(floorVisits))
+    GS._creditProjectionWorkBudgetOverride = tightBudget
+    local sliceWorks = {}
+    local realRedrive = GS.RedrivePendingContributorCorrections
+    GS.RedrivePendingContributorCorrections = function(...)
+        local promoted, attempts, work = realRedrive(...)
+        sliceWorks[#sliceWorks + 1] = {
+            promoted = tonumber(promoted) or 0,
+            attempts = tonumber(attempts) or 0,
+            work = tonumber(work) or 0,
+        }
+        return promoted, attempts, work
+    end
+    local pendingBefore = 0
+    for _ in pairs(record.operations.pending or {}) do
+        pendingBefore = pendingBefore + 1
+    end
+    assertTrue(pendingBefore > 1,
+        "459: conflict-heavy pending backlog > 1 got=" .. tostring(pendingBefore))
+    assertEq(pendingBefore, #pendingIds, "459: conflict-heavy pending count matches")
+    realRedrive(record, { itemId = 9340, maxAttempts = 64 })
+    local drainGuard = 0
+    while #timers > 0 and drainGuard < 400 do
+        assertTrue(runOneDueTimer(), "459: redrive slice timer fired")
+        drainGuard = drainGuard + 1
+    end
+    GS.RedrivePendingContributorCorrections = realRedrive
+    GS._creditProjectionWorkBudgetOverride = nil
+    assertTrue(#sliceWorks >= 2,
+        "459: redrive used multiple callbacks got=" .. tostring(#sliceWorks))
+    local productive = 0
+    for si = 1, #sliceWorks do
+        local sw = sliceWorks[si]
+        if sw.work > 0 or sw.attempts > 0 then
+            productive = productive + 1
+            -- Within budget, or a single unit that crossed while making progress.
+            assertTrue(sw.work <= tightBudget or sw.attempts <= 1,
+                "459: redrive slice respects independent budget si="
+                    .. tostring(si) .. " work=" .. tostring(sw.work)
+                    .. " attempts=" .. tostring(sw.attempts)
+                    .. " budget=" .. tostring(tightBudget))
+        end
+    end
+    assertTrue(productive >= 2,
+        "459: redrive had >=2 productive slices got=" .. tostring(productive))
+    for pi = 1, #pendingIds do
+        local id = pendingIds[pi]
+        assertTrue(record.operations.records[id] ~= nil,
+            "459: pending " .. id .. " eventually accepted")
+        assertTrue(record.operations.pending[id] == nil,
+            "459: pending " .. id .. " cleared from pending")
+    end
     local okFinal, errFinal = GS.EnsureCreditCorrectionProjection(record, nil)
     assertTrue(okFinal, "459: conflict-heavy converges coherent got " .. tostring(errFinal))
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
         "459: conflict-heavy projection available after converge")
+
+    -- Small non-conflict case stays synchronous (no timer).
+    local small = seedLiveCampaignWithItem(9342, 20)
+    injectProductionDonation(small, {
+        id = "small-don", itemId = 9342, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local tSmall = #timers
+    GS.InvalidateCreditCorrectionProjection(small)
+    local okSmall = GS.EnsureCreditCorrectionProjection(small, nil)
+    assertTrue(okSmall, "459: small Ensure completes synchronously")
+    assertEq(#timers, tSmall, "459: small Ensure did not schedule continuation")
 end
 
 do

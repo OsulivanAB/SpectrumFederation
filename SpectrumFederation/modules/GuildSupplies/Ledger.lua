@@ -49,6 +49,13 @@ GS.VERIFICATION = {
 --- Distinct from legitimate Unassigned (nil attribution) and ordinary zero totals.
 GS.CREDIT_UNAVAILABLE = "credit_unavailable"
 
+--- Independent per-callback work ceiling for credit projection rebuild/redrive (#459).
+-- Not derived from measured fixture cost. Ordinary small histories finish in one
+-- slice; conflict-heavy prune and multi-admit catch-up yield via C_Timer.
+-- Sized so a typical maxAttempts=32 wave of light rebuilds fits; tests may lower
+-- via GS._creditProjectionWorkBudgetOverride.
+GS.CREDIT_PROJECTION_WORK_BUDGET = 16384
+
 --- Durable verification label. Unknown values stay on the three-witness mode.
 function GS.CanonicalVerificationMode(mode)
     if mode == GS.VERIFICATION.OFFICER then
@@ -2602,10 +2609,18 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     local promoted = 0
     local attempts = 0
     local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
+    -- Independent callback work ceiling (not derived from measured history cost).
+    local workBudget = tonumber(waveOpts.workBudget)
+        or tonumber(GS._creditProjectionWorkBudgetOverride)
+        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+        or 16384
     creditRedriveDepth = creditRedriveDepth + 1
     local i = startIndex
     while i <= #snapshot do
         if attempts >= maxAttempts then
+            break
+        end
+        if (tonumber(GS._creditProjectionCallbackWork) or 0) >= workBudget then
             break
         end
         attempts = attempts + 1
@@ -2623,7 +2638,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
                 -- Capacity full: leave pending; do not mutate credit.
             elseif type(GS.AdmitRemoteOperation) == "function" then
-                local status = GS:AdmitRemoteOperation(body, {
+                local status, reason = GS:AdmitRemoteOperation(body, {
                     sender = entry.sender,
                     offlineRecord = record,
                     preserveAttribution = true,
@@ -2631,6 +2646,10 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 })
                 if status == "accepted" or status == "duplicate" then
                     promoted = promoted + 1
+                elseif status == "pending" and reason == "work_budget" then
+                    -- Paced rebuild deferred mid-unit; retry this id next slice.
+                    i = i - 1
+                    break
                 end
             end
         end
@@ -5727,6 +5746,7 @@ local function AllPersonalNonNegative(record, activeMap)
 end
 
 local creditProjectionCache = setmetatable({}, { __mode = "k" })
+local creditProjectionContinuation = setmetatable({}, { __mode = "k" })
 
 local function CreditProjectionDependencyStamp(record)
     local opsGen = 0
@@ -5737,10 +5757,82 @@ local function CreditProjectionDependencyStamp(record)
     return tostring(opsGen) .. ":" .. tostring(acctMut) .. ":" .. tostring(record.datasetId or "")
 end
 
+--- Effective per-callback work ceiling (#459). Override is test-only.
+local function CreditProjectionSliceBudget()
+    local override = tonumber(GS._creditProjectionWorkBudgetOverride)
+    if override and override > 0 then
+        return override
+    end
+    return tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+end
+
+local function CreditProjectionWorkNow(rowVisits)
+    return (tonumber(rowVisits) or 0)
+        + (tonumber(GS._creditProjectionBucketVisits) or 0)
+        + (tonumber(GS._creditProjectionFloorVisits) or 0)
+        + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+end
+
+local function AccumulateCreditProjectionCallbackWork(workUnits)
+    if not GS._creditProjectionAccumulating then
+        return
+    end
+    GS._creditProjectionCallbackWork =
+        (tonumber(GS._creditProjectionCallbackWork) or 0) + (tonumber(workUnits) or 0)
+end
+
+local ScheduleCreditProjectionContinuation
+
+ScheduleCreditProjectionContinuation = function(record)
+    if type(record) ~= "table" then
+        return
+    end
+    -- Without a timer, finish inline on the next Rebuild caller instead of
+    -- recursively draining here (keeps one unit of work per callback).
+    if not (C_Timer and C_Timer.After) then
+        return
+    end
+    local cont = creditProjectionContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {}
+        creditProjectionContinuation[record] = cont
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = creditProjectionContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        local cached = creditProjectionCache[record]
+        local extraOp = nil
+        if type(cached) == "table" and type(cached.resume) == "table" then
+            extraOp = cached.resume.extraOp
+        end
+        if GS.RebuildCreditCorrectionProjection then
+            local ok, err = GS.RebuildCreditCorrectionProjection(record, extraOp)
+            -- Rebuild reschedules itself while err == work_budget.
+            if (ok or err ~= "work_budget")
+                and GS.RedrivePendingContributorCorrections then
+                -- Projection settled (ok or terminal failure): drain pending.
+                GS.RedrivePendingContributorCorrections(record, {})
+            end
+        end
+    end
+    C_Timer.After(0, run)
+end
+
 --- Invalidate cached credit projection after dependency mutations (#459).
 function GS.InvalidateCreditCorrectionProjection(record)
     if type(record) == "table" then
         creditProjectionCache[record] = nil
+        local cont = creditProjectionContinuation[record]
+        if type(cont) == "table" then
+            cont.scheduled = false
+        end
     end
 end
 
@@ -5755,6 +5847,8 @@ end
 --   5) Never leave a stale active map; never mark a negative projection ok.
 --      Failed reconstructions cache under the stamp; Resolve returns nil
 --      (unavailable) rather than durable fallback.
+-- Conflict prune yields when projection work reaches CREDIT_PROJECTION_WORK_BUDGET
+-- (independent of fixture cost); resume continues via C_Timer.After(0).
 -- Floor checks use one durable ledger baseline plus O(1) deltas per head.
 -- Alias targets resolve through the baseline id/txn + one linear registry pass.
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
@@ -5770,6 +5864,18 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     GS._creditProjectionFloorVisits = 0
     GS._creditProjectionCandidateTrials = 0
     local ops = record.operations
+    local stampEarly = CreditProjectionDependencyStamp(record)
+    local priorCache = creditProjectionCache[record]
+    local resumeDeactivated = nil
+    -- Resume an interrupted paced rebuild (same dependency stamp).
+    if type(priorCache) == "table" and priorCache.stamp == stampEarly
+        and priorCache.err == "work_budget"
+        and type(priorCache.resume) == "table" then
+        resumeDeactivated = priorCache.resume.deactivatedEventIds
+        if type(extraOp) ~= "table" and type(priorCache.resume.extraOp) == "table" then
+            extraOp = priorCache.resume.extraOp
+        end
+    end
     local candidates = {}
     local function considerOp(op)
         if type(op) ~= "table" or op.kind ~= (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR) then
@@ -5910,6 +6016,66 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             end
         end
     end
+    local deactivatedEventIds = {}
+    local boundByEventId = {}
+    for i = 1, #bound do
+        if bound[i] then
+            boundByEventId[bound[i].event.id] = i
+        end
+    end
+    -- Restore prune progress from a prior work_budget slice.
+    if type(resumeDeactivated) == "table" then
+        for ri = 1, #resumeDeactivated do
+            local eid = resumeDeactivated[ri]
+            local bi = boundByEventId[eid]
+            local entry = bi and bound[bi]
+            if entry and activeMap[eid] then
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, -1, scoreBox)
+                activeMap[eid] = nil
+                activeIds[entry.op.id] = nil
+                bound[bi] = nil
+                deactivatedEventIds[#deactivatedEventIds + 1] = eid
+                GS._creditProjectionDeactivations =
+                    (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+            end
+        end
+    end
+    local stamp = stampEarly
+    local sliceBudget = CreditProjectionSliceBudget()
+    -- Yield only when a timer can return control; otherwise finish this unit.
+    local allowDefer = (C_Timer and C_Timer.After) and true or false
+    local function deferProjection(phase)
+        local workUnits = CreditProjectionWorkNow(rowVisits)
+        AccumulateCreditProjectionCallbackWork(workUnits)
+        -- Do not publish a partial prune; leave any prior coherent map alone.
+        creditProjectionCache[record] = {
+            stamp = stamp,
+            ok = false,
+            err = "work_budget",
+            resume = {
+                deactivatedEventIds = deactivatedEventIds,
+                extraOp = extraOp,
+                phase = phase,
+            },
+        }
+        if not GS._creditProjectionAccumulating then
+            ScheduleCreditProjectionContinuation(record)
+        end
+        return false, "work_budget", {
+            activeIds = activeIds,
+            rowVisits = rowVisits,
+            bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0,
+            floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0,
+            candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0,
+            workUnits = workUnits,
+            deactivations = GS._creditProjectionDeactivations,
+            lookupMisses = lookupMisses,
+            deferred = true,
+            phase = phase,
+        }
+    end
     -- Conflict rule: drop the head whose removal most improves personal floors.
     -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
     while not TotalsAllNonNegative(totals) do
@@ -5956,8 +6122,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         activeMap[entry.event.id] = nil
         activeIds[entry.op.id] = nil
         bound[bestIdx] = nil
+        deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
         GS._creditProjectionDeactivations =
             (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+        -- Bound one expensive rebuild: yield after making prune progress.
+        if allowDefer and CreditProjectionWorkNow(rowVisits) >= sliceBudget then
+            return deferProjection("prune")
+        end
     end
     -- Local empty-set fallback: when single-head prune stalls, drop remaining
     -- heads only for item groups that still have negative floors. Independent
@@ -5975,21 +6146,21 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     activeMap[entry.event.id] = nil
                     activeIds[entry.op.id] = nil
                     bound[i] = nil
+                    deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
                     GS._creditProjectionDeactivations =
                         (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+                    if allowDefer and CreditProjectionWorkNow(rowVisits) >= sliceBudget then
+                        return deferProjection("empty_fallback")
+                    end
                 end
             end
         end
     end
-    local stamp = CreditProjectionDependencyStamp(record)
     local bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0
     local floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0
     local candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0
-    local workUnits = rowVisits + bucketVisits + floorVisits + candidateTrials
-    if GS._creditProjectionAccumulating then
-        GS._creditProjectionCallbackWork =
-            (tonumber(GS._creditProjectionCallbackWork) or 0) + workUnits
-    end
+    local workUnits = CreditProjectionWorkNow(rowVisits)
+    AccumulateCreditProjectionCallbackWork(workUnits)
     -- Final invariant: never leave a stale active map and never mark a negative
     -- projection verified. On failure, clear heads and cache under the stamp;
     -- ResolveEffectiveCreditIdentity returns CREDIT_UNAVAILABLE (not durable).
@@ -6055,6 +6226,7 @@ end
 --- Ensure the credit projection matches current ops/ledger dependency stamps.
 -- Unchanged reads reuse the last verified *or failed* stamp (#459) so a
 -- failed reconstruction does not rebuild on every ResolveEffectiveCreditIdentity.
+-- Incomplete paced rebuilds (work_budget) stay unavailable and resume via timer.
 function GS.EnsureCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
@@ -6068,12 +6240,15 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
         if cached.ok then
             return true
         end
+        if cached.err == "work_budget" then
+            ScheduleCreditProjectionContinuation(record)
+            return false, "work_budget"
+        end
         return false, cached.err or "player_negative"
     end
     return GS.RebuildCreditCorrectionProjection(record, nil)
 end
 
---- Eligibility + binding for a contributor correction prepare/apply.
 -- opts.localPrepare: require current campaign + production credit + expected match.
 -- opts.skipExpected: remote LWW apply (still checks floors against current→new).
 -- opts.allowMissingEvent: return pending_event instead of missing_event.
@@ -6118,7 +6293,9 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
         end
     end
     local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
-    if creditStatus == GS.CREDIT_UNAVAILABLE then
+    -- Remote/skipFloor apply rebuilds projection itself; do not reject while a
+    -- paced work_budget slice has left credit temporarily unavailable (#459).
+    if creditStatus == GS.CREDIT_UNAVAILABLE and not opts.skipFloor then
         return false, GS.CREDIT_UNAVAILABLE
     end
     if opts.localPrepare and not opts.skipExpected then
