@@ -1942,6 +1942,8 @@ local function RebuildExportIndex()
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
         hasBankTab = true,
+        creditEventAliases = {},
+        creditEventAliasCount = 0,
     }
     add("gs:desc:" .. record.datasetId, desc)
 
@@ -2069,6 +2071,31 @@ local function RebuildExportIndex()
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
+        -- Required credit-event alias bindings for adoption replay of
+        -- alias-targeted correction winners/losers (#459 A). Local SavedVariables
+        -- map is not otherwise transferred; export only the required subset.
+        do
+            local aliases = nil
+            if GS.CollectRequiredCreditEventAliases then
+                aliases = GS.CollectRequiredCreditEventAliases(record)
+            end
+            if type(aliases) == "table" then
+                local out, n, maxN = {}, 0, (GS.MAX_CREDIT_EVENT_ALIASES or 2048)
+                for alias, canon in pairs(aliases) do
+                    if type(alias) == "string" and alias ~= ""
+                        and type(canon) == "string" and canon ~= ""
+                        and alias ~= canon and n < maxN then
+                        out[alias] = canon
+                        n = n + 1
+                    end
+                end
+                descEntry.body.creditEventAliases = out
+                descEntry.body.creditEventAliasCount = n
+            else
+                descEntry.body.creditEventAliases = {}
+                descEntry.body.creditEventAliasCount = 0
+            end
+        end
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
@@ -4851,6 +4878,21 @@ function GS.NotifyLocalDurableChange(reason)
         local valuationCount = ResolveValuationExportCount(record)
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
+        local aliasOut, aliasN = {}, 0
+        if GS.CollectRequiredCreditEventAliases then
+            local aliases = GS.CollectRequiredCreditEventAliases(record)
+            if type(aliases) == "table" then
+                local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+                for alias, canon in pairs(aliases) do
+                    if type(alias) == "string" and alias ~= ""
+                        and type(canon) == "string" and canon ~= ""
+                        and alias ~= canon and aliasN < maxN then
+                        aliasOut[alias] = canon
+                        aliasN = aliasN + 1
+                    end
+                end
+            end
+        end
         local desc = {
             kind = "dataset-desc",
             schemaVersion = GS.PROVIDER_SCHEMA,
@@ -4876,6 +4918,8 @@ function GS.NotifyLocalDurableChange(reason)
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,
+            creditEventAliases = aliasOut,
+            creditEventAliasCount = aliasN,
         }
         UpsertExportBody("gs:desc:" .. record.datasetId, desc)
         if not exportState.maintIdle then

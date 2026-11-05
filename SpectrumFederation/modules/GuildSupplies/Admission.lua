@@ -1322,14 +1322,28 @@ local function ClassifyStaleBase(record, op, targetKey)
             and headBody.id == policyNow then
             return "conflict", "divergent_edit"
         end
-        -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
-        if HasAcceptedId(ops, op.basePolicyRevision) then
-            return "obsolete", "stale_policy"
+        -- #459 C: contributor corrections authored under an older accepted policy
+        -- must still converge when the transport sender is currently authorized.
+        -- Do not treat known superseded policy bases as permanent stale_policy
+        -- rejection (mirrors campaign-head exemption). Missing predecessors stay
+        -- pending. Other kinds keep obsolete/stale_policy.
+        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            if not HasAcceptedId(ops, op.basePolicyRevision)
+                and op.basePolicyRevision ~= record.datasetId then
+                return "pending", "missing_policy_predecessor"
+            end
+            -- Known older/current-dataset policy base: fall through to target
+            -- causality (apply / stale_credit / conflict) under current authority.
+        else
+            -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
+            if HasAcceptedId(ops, op.basePolicyRevision) then
+                return "obsolete", "stale_policy"
+            end
+            if op.basePolicyRevision == record.datasetId then
+                return "obsolete", "stale_policy"
+            end
+            return "pending", "missing_policy_predecessor"
         end
-        if op.basePolicyRevision == record.datasetId then
-            return "obsolete", "stale_policy"
-        end
-        return "pending", "missing_policy_predecessor"
     end
     if (op.baseCampaignId or nil) ~= (campaignNow or nil)
         or (op.kind ~= GS.KIND.START_CAMPAIGN
@@ -3165,6 +3179,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                     baselineEstablished = false,
                 },
                 txnRegistry = {},
+                creditEventAliases = {},
             },
             _consumableEvents = {},
             _consumableEventArchive = {},
@@ -3184,6 +3199,56 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
         confirmationRefs = {},
         migration = nil,
     }
+end
+
+--- Install validated credit-event alias bindings from an adoption descriptor onto
+-- a fresh bootstrap record before op replay. Rejects conflicting redirections and
+-- oversized payloads; does not rewrite immutable op bodies (#459 A).
+-- @return boolean ok, string|nil err
+local function InstallCreditEventAliasesFromDesc(temp, desc)
+    if type(temp) ~= "table" or type(temp.accounting) ~= "table" then
+        return false, "invalid_record"
+    end
+    local cfg = temp.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false, "invalid_record"
+    end
+    if type(cfg.creditEventAliases) ~= "table" then
+        cfg.creditEventAliases = {}
+    end
+    local map = cfg.creditEventAliases
+    local incoming = desc and desc.creditEventAliases
+    if incoming == nil then
+        -- Older descriptors omit the field; leave empty (winner heads may still
+        -- reconstruct; losers require the transfer).
+        return true
+    end
+    if type(incoming) ~= "table" then
+        return false, "invalid_credit_event_aliases"
+    end
+    local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+    local n = 0
+    for alias, canon in pairs(incoming) do
+        if type(alias) ~= "string" or alias == ""
+            or type(canon) ~= "string" or canon == ""
+            or alias == canon then
+            return false, "invalid_credit_event_aliases"
+        end
+        n = n + 1
+        if n > maxN then
+            return false, "full"
+        end
+        local prior = map[alias]
+        if type(prior) == "string" and prior ~= "" and prior ~= canon then
+            return false, "alias_conflict"
+        end
+        map[alias] = canon
+    end
+    local declared = tonumber(desc.creditEventAliasCount)
+    if declared ~= nil and declared ~= n then
+        return false, "incomplete_transfer"
+    end
+    return true
 end
 
 --- Persist untrusted/evidence bodies into the offline record so Commit's
@@ -5725,6 +5790,14 @@ function GS:CommitDatasetAdoption()
     bootstrapPos = bootNorm
 
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
+    -- Transfer required credit-event alias bindings before op replay so
+    -- alias-targeted winners/losers resolve on a fresh dataset (#459 A).
+    do
+        local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc)
+        if not aliasOk then
+            return "rejected", aliasErr or "invalid_credit_event_aliases"
+        end
+    end
     -- Active source descriptors install their authenticated liveCutover onto the
     -- temporary record before replay/publish so ledger admissions classify against
     -- the original eligibility boundary and atomic publish cannot demote live
@@ -8072,6 +8145,27 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             stPend, reasonPend = GS._AdmitPendingOrConflict(
                 ops, stored, classReason or "stale_base", admissionCtx.sender)
         end
+        -- Alias-targeted pending corrections must own a durable binding before
+        -- registry eviction + capacity prune can drop it (#459 A).
+        if (stPend == "pending" or stPend == "duplicate")
+            and stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and GS.EnsureContributorCorrectionDurableAliases
+            and GS.FindLedgerEventById then
+            local pendEvent = GS.FindLedgerEventById(record, stored.target
+                or (stored.value and stored.value.eventId))
+            if type(pendEvent) == "table" then
+                local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(
+                    record, stored, pendEvent)
+                if not aliasOk then
+                    -- Capacity cannot retain the binding: drop pending rather than
+                    -- strand an unresolvable alias-targeted body after eviction.
+                    if ops.pending then
+                        ops.pending[stored.id] = nil
+                    end
+                    return "rejected", aliasErr or "full"
+                end
+            end
+        end
         -- Successful durable missing-predecessor / pending evidence must notify
         -- provider maintenance so peers can discover it without a later edit.
         if (stPend == "pending" or stPend == "duplicate")
@@ -8136,6 +8230,24 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         return "rejected", scopeErr or classReason or "stale_credit"
                     end
                     scopeEvent = scopedEvent
+                end
+                -- Event-kind / production-credit eligibility before any accepted
+                -- loser retention (ordinary + adoption). Keep not_credited pending;
+                -- do not apply local freshness or current-campaign authoring
+                -- (#459 review-5792509439 C / discussion_r4486297807).
+                if scopeEvent and GS.ValidateContributorCorrectionEventEligibility then
+                    local eligOk, eligErr = GS.ValidateContributorCorrectionEventEligibility(
+                        record, stored, scopeEvent)
+                    if not eligOk then
+                        if eligErr == "not_credited" then
+                            if GS._AdmitPendingOrConflict then
+                                return GS._AdmitPendingOrConflict(
+                                    ops, stored, eligErr, admissionCtx.sender)
+                            end
+                            return "pending", eligErr
+                        end
+                        return "rejected", eligErr or "invalid_event"
+                    end
                 end
                 -- Durable alias binding before every accepted retention path,
                 -- including LWW losers (#459 G1 / review-5791986976).
@@ -8285,11 +8397,22 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 if stored.kind == GS.KIND.ADJUST_QUANTITY
                     and (err == "item_negative" or err == "player_negative"
                         or err == "adjustment_floor" or err == "item_over_goal"
-                        or err == "invalid_quantity") then
+                        or err == "invalid_quantity" or err == "work_budget") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(
                             ops, stored, err, admissionCtx.sender)
+                    end
+                    -- Genuine transient exhaustion: keep the adjustment and reuse
+                    -- correction redrive/continuation rather than terminal reject
+                    -- (#459 review-5792509439 B).
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingContributorCorrections then
+                        GS.RedrivePendingContributorCorrections(record, {
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
                     end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay

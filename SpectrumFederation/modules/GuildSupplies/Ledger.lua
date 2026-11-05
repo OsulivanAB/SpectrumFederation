@@ -627,6 +627,17 @@ local function EnsureCreditProvenanceIndex(record)
             phase = nextPhase,
             index = nextIndex,
         }
+        -- Fold paced visits into the shared callback total before yielding so a
+        -- later Begin/Redrive cannot see orphaned provenance as "already full"
+        -- while callbackWork was reset (#459 review-5792509439 B).
+        if GS._creditProjectionAccumulating then
+            local visits = tonumber(GS._creditProjectionProvenanceVisits) or 0
+            if visits > 0 then
+                GS._creditProjectionCallbackWork =
+                    (tonumber(GS._creditProjectionCallbackWork) or 0) + visits
+            end
+            GS._creditProjectionProvenanceVisits = 0
+        end
     end
     local order = { "live", "archive" }
     local startLi = (phase == "archive") and 2 or 1
@@ -652,6 +663,11 @@ local function EnsureCreditProvenanceIndex(record)
         map = map,
         complete = true,
     }
+    -- Standalone (non-accumulating) cold builds must not leave visit counters
+    -- that poison later callback budgets after ledger revisions.
+    if not GS._creditProjectionAccumulating then
+        GS._creditProjectionProvenanceVisits = 0
+    end
     return map, nil
 end
 
@@ -2806,6 +2822,15 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             or tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT)
             or 512
         GS._creditProjectionCallbackHardLimit = budget + overshoot
+        -- Match BeginCreditProjectionCallbackBudget(false): orphaned provenance
+        -- must not make SoftExceeded trip at the first Bind of a fresh redrive.
+        GS._creditProjectionRowVisits = 0
+        GS._creditProjectionBucketVisits = 0
+        GS._creditProjectionFloorVisits = 0
+        GS._creditProjectionCandidateTrials = 0
+        GS._creditProjectionStructureCopyVisits = 0
+        GS._creditProjectionTraversalVisits = 0
+        GS._creditProjectionProvenanceVisits = 0
     end
     GS._creditProjectionAccumulating = true
     -- Always merge the incoming wake; never overwrite cont.opts with a narrow
@@ -2820,12 +2845,17 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         local ids = {}
         for id, entry in pairs(ops.pending) do
             local body = entry and entry.body
-            if type(body) == "table"
-                and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
-                and type(body.target) == "string" then
+            if type(body) == "table" then
                 local reason = entry.reason
-                if reason ~= "untrusted_relay" and reason ~= "evidence" then
-                    if CreditRedriveMatch(record, body, waveOpts) then
+                local isCorrection = body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                    and type(body.target) == "string"
+                -- Ordinary adjustments retained for transient work_budget must
+                -- resume through the same bounded redrive (#459 B).
+                local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
+                    and reason == "work_budget"
+                if (isCorrection or isBudgetAdj)
+                    and reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    if isBudgetAdj or CreditRedriveMatch(record, body, waveOpts) then
                         ids[#ids + 1] = id
                     end
                 end
@@ -5269,9 +5299,10 @@ local function CountCreditEventAliasKeys(map)
     return n
 end
 
---- Collect alias→canonical bindings required by retained accepted corrections.
--- Prefers head keys (credit:<canon>) and registry/map-backed accepted bodies so
--- reclaim never drops a binding still needed after registry eviction (#459 G1).
+--- Collect alias→canonical bindings required by retained accepted corrections
+-- and authenticated pending corrections. Prefers head keys (credit:<canon>) and
+-- registry/map-backed bodies so reclaim never drops a binding still needed after
+-- registry eviction (#459 G1 / review-5792509439 A).
 local function CollectRequiredCreditEventAliases(record)
     local required = {}
     if type(record) ~= "table" or type(record.operations) ~= "table" then
@@ -5307,6 +5338,25 @@ local function CollectRequiredCreditEventAliases(record)
         end
         return txnId
     end
+    local function noteCorrectionBody(body)
+        if type(body) ~= "table" or body.kind ~= kindCorrect then
+            return
+        end
+        local tid = body.target
+        local primary = resolvePrimary(tid)
+        if type(primary) == "string" and type(tid) == "string" and primary ~= tid then
+            note(tid, primary)
+        end
+        local ve = body.value and body.value.eventId
+        if type(ve) == "string" and ve ~= "" then
+            local p2 = resolvePrimary(ve)
+            if type(p2) == "string" and p2 ~= ve then
+                note(ve, p2)
+            elseif type(primary) == "string" and ve ~= primary then
+                note(ve, primary)
+            end
+        end
+    end
     if type(ops.heads) == "table" and type(ops.records) == "table" then
         local prefix = "credit:"
         for targetKey, headId in pairs(ops.heads) do
@@ -5329,20 +5379,17 @@ local function CollectRequiredCreditEventAliases(record)
     end
     if type(ops.records) == "table" then
         for _, body in pairs(ops.records) do
-            if type(body) == "table" and body.kind == kindCorrect then
-                local tid = body.target
-                local primary = resolvePrimary(tid)
-                if type(primary) == "string" and type(tid) == "string" and primary ~= tid then
-                    note(tid, primary)
-                end
-                local ve = body.value and body.value.eventId
-                if type(ve) == "string" and ve ~= "" then
-                    local p2 = resolvePrimary(ve)
-                    if type(p2) == "string" and p2 ~= ve then
-                        note(ve, p2)
-                    elseif type(primary) == "string" and ve ~= primary then
-                        note(ve, primary)
-                    end
+            noteCorrectionBody(body)
+        end
+    end
+    -- Authenticated pending corrections also own their alias bindings until they
+    -- settle or are removed (policy-predecessor / work_budget paths).
+    if type(ops.pending) == "table" then
+        for _, entry in pairs(ops.pending) do
+            if type(entry) == "table" then
+                local reason = entry.reason
+                if reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    noteCorrectionBody(entry.body)
                 end
             end
         end
@@ -5350,7 +5397,14 @@ local function CollectRequiredCreditEventAliases(record)
     return required
 end
 
---- Drop durable alias bindings not required by retained accepted corrections.
+--- Public snapshot of required alias→canonical bindings for adoption export.
+-- Bounded copy; never exports the full opportunistic alias map.
+-- @return table alias→canon
+function GS.CollectRequiredCreditEventAliases(record)
+    return CollectRequiredCreditEventAliases(record)
+end
+
+--- Drop durable alias bindings not required by retained accepted/pending corrections.
 -- Optional protectKeys keeps in-flight writes. Returns number of reclaimed keys.
 local function PruneUnusedCreditEventAliases(record, protectKeys)
     local map = EnsureCreditEventAliases(record)
@@ -6524,6 +6578,19 @@ local function CreditProjectionWorkNow(rowVisits)
         + (tonumber(GS._creditProjectionProvenanceVisits) or 0)
 end
 
+--- Clear orphaned local visit counters that are not owned by an open allowance.
+-- Used when opening a fresh callback so prior standalone provenance / slice
+-- work cannot reject a new valid admit as work_budget (#459 B).
+local function ClearCreditProjectionLocalVisitCounters()
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
+    GS._creditProjectionTraversalVisits = 0
+    GS._creditProjectionProvenanceVisits = 0
+end
+
 --- Begin a fresh callback budget, or keep nesting under the parent allowance.
 local function BeginCreditProjectionCallbackBudget(share)
     if not share then
@@ -6531,12 +6598,17 @@ local function BeginCreditProjectionCallbackBudget(share)
         GS._creditProjectionCallbackWork = 0
         GS._creditProjectionCallbackLimit = budget
         GS._creditProjectionCallbackHardLimit = budget + CreditProjectionAtomicOvershoot()
+        -- Fresh outer boundary owns a clean slice; do not carry stale provenance
+        -- from prior callbacks / ledger revisions into SoftExceeded checks.
+        ClearCreditProjectionLocalVisitCounters()
     end
     GS._creditProjectionAccumulating = true
 end
 
 local function EndCreditProjectionCallbackBudget()
     GS._creditProjectionAccumulating = false
+    -- Drop any unfolder leftovers so the next outer Begin starts clean.
+    ClearCreditProjectionLocalVisitCounters()
 end
 
 --- Open an outer callback allowance when none is active (#459).
@@ -8499,6 +8571,32 @@ function GS.EnsureCreditCorrectionProjection(record, extraOp)
     return GS.RebuildCreditCorrectionProjection(record, nil)
 end
 
+--- Event-kind and production-credit eligibility shared by winner apply and
+-- LWW-loser retention. Does not enforce local freshness or current-campaign
+-- authoring (#459 review-5792509439 C).
+-- @return boolean ok, string|nil err
+function GS.ValidateContributorCorrectionEventEligibility(record, op, event)
+    if type(op) ~= "table" or type(op.value) ~= "table" or type(event) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventKind = op.value.eventKind
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if eventKind == "donation" and not isDonation then
+        return false, "invalid_event"
+    end
+    if eventKind == "adjustment" and not isAdjustment then
+        return false, "invalid_event"
+    end
+    if not isDonation and not isAdjustment then
+        return false, "invalid_event"
+    end
+    if event.gsProductionCredit ~= true then
+        return false, "not_credited"
+    end
+    return true
+end
+
 --- Shared acceptance-boundary checks before any path retains a correction as
 -- accepted history (ordinary apply, LWW-loser retention, adoption) (#459 G3/G4).
 -- Does not require local editor freshness, floors, or activation.
@@ -8562,22 +8660,12 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     if not scopeOk then
         return false, scopeErr or "invalid_value"
     end
-    local eventKind = op.value.eventKind
+    local eligOk, eligErr = GS.ValidateContributorCorrectionEventEligibility(record, op, event)
+    if not eligOk then
+        return false, eligErr or "invalid_event"
+    end
     local isDonation = IsDonationLedgerEvent(event)
     local isAdjustment = IsAdjustmentLedgerEvent(event)
-    if eventKind == "donation" and not isDonation then
-        return false, "invalid_event"
-    end
-    if eventKind == "adjustment" and not isAdjustment then
-        return false, "invalid_event"
-    end
-    if not isDonation and not isAdjustment then
-        return false, "invalid_event"
-    end
-    -- Corrections never grant production credit to pending/uncredited/staged rows.
-    if event.gsProductionCredit ~= true then
-        return false, "not_credited"
-    end
     -- Local authoring/commit is current-campaign-only; remote historical replay
     -- uses Scope event-campaign match without this guard (#459 G4).
     if opts.localPrepare then

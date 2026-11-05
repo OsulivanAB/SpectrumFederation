@@ -8057,6 +8057,478 @@ do
     flushTimers()
 end
 
+---------------------------------------------------------------------------
+-- review-5792509439 groups A/B/C
+---------------------------------------------------------------------------
+
+do
+    -- A-pending: alias-targeted correction waits for policy P; registry eviction
+    -- + capacity prune must not drop its durable binding; accepting P settles C.
+    local record = seedLiveCampaignWithItem(9911, 80)
+    local cfg = record.accounting._consumables
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "ctx:ap-canon", itemId = 9911, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don.txnId = "ctx:ap-canon"
+    assertTrue(GS._AddTxnAlias(record, "ctx:ap-canon", "ctx:ap-alias", don),
+        "459-A-pend: registry alias installed")
+    assertEq(cfg.creditEventAliases and cfg.creditEventAliases["ctx:ap-alias"], "ctx:ap-canon",
+        "459-A-pend: durable binding written on AddTxnAlias")
+    local policyNow = record.permission and record.permission.revisionId
+    local predId = "ap-pred-rank"
+    local corrId = "ap-corr-early"
+    local early = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = corrId,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:ap-alias",
+        value = {
+            eventId = "ctx:ap-alias", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9911,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = predId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stC, reasonC = GS:AdmitRemoteOperation(early, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stC, "pending", "459-A-pend: C pending before P got " .. tostring(stC))
+    assertEq(reasonC, "missing_policy_predecessor", "459-A-pend: C reason")
+    assertEq(cfg.creditEventAliases["ctx:ap-alias"], "ctx:ap-canon",
+        "459-A-pend: pending owns durable binding")
+    -- Evict registry alias; fill durable map to capacity with unused junk, then
+    -- force prune via a capacity write. Pending-required binding must survive.
+    cfg.txnRegistry = {}
+    local maxA = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    local aliasCount = 0
+    for _ in pairs(cfg.creditEventAliases) do
+        aliasCount = aliasCount + 1
+    end
+    local i = 1
+    while aliasCount < maxA do
+        local junk = string.format("ctx:ap-junk-%04d", i)
+        if cfg.creditEventAliases[junk] == nil then
+            cfg.creditEventAliases[junk] = string.format("ctx:ap-junk-canon-%04d", i)
+            aliasCount = aliasCount + 1
+        end
+        i = i + 1
+    end
+    local wrote = GS.RememberCreditEventAlias(record, "ctx:ap-extra", "ctx:ap-extra-canon")
+    assertTrue(wrote == true, "459-A-pend: capacity write reclaims unused junk")
+    assertEq(cfg.creditEventAliases["ctx:ap-alias"], "ctx:ap-canon",
+        "459-A-pend: pending binding survives capacity prune")
+    assertEq(cfg.creditEventAliases["ctx:ap-extra"], "ctx:ap-extra-canon",
+        "459-A-pend: new unused binding stored after reclaim")
+    local pred = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = predId,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.SET_EDITOR_RANK,
+        target = "editorRankPosition",
+        value = 2,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 2,
+        baseTargetRevision = policyNow,
+        basePolicyRevision = policyNow,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stP, reasonP = GS:AdmitRemoteOperation(pred, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stP, "accepted",
+        "459-A-pend: predecessor accepted got " .. tostring(stP) .. "/" .. tostring(reasonP))
+    local guard = 0
+    while (not record.operations.records[corrId]) and guard < 64 do
+        if not runOneDueTimer() then break end
+        guard = guard + 1
+    end
+    flushTimers()
+    assertTrue(record.operations.records[corrId] ~= nil,
+        "459-A-pend: C accepted after P without redelivery")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459-A-pend: credit Bob after settle")
+    assertEq(#timers, 0, "459-A-pend: idle")
+end
+
+do
+    -- A-adopt: real provider export → fresh dataset → CommitDatasetAdoption must
+    -- transfer required alias bindings for alias-targeted winner + loser.
+    local record = seedLiveCampaignWithItem(9912, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "ctx:aa-canon", itemId = 9912, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don.txnId = "ctx:aa-canon"
+    assertTrue(GS._AddTxnAlias(record, "ctx:aa-canon", "ctx:aa-alias", don),
+        "459-A-adopt: alias installed")
+    local lose = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "aa-lose",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:aa-alias",
+        value = {
+            eventId = "ctx:aa-alias", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9912,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 10,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local win = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "aa-win",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:aa-alias",
+        value = {
+            eventId = "ctx:aa-alias", eventKind = "donation",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9912,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 20,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local function admitSettle(op)
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        local g = 0
+        while st == "pending" and g < 64 do
+            if not runOneDueTimer() then break end
+            st, r = GS:AdmitRemoteOperation(op, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+            g = g + 1
+        end
+        return st, r
+    end
+    local stL, rL = admitSettle(lose)
+    assertTrue(stL == "accepted" or stL == "duplicate",
+        "459-A-adopt: loser accepted st=" .. tostring(stL) .. "/" .. tostring(rL))
+    local stW, rW = admitSettle(win)
+    assertTrue(stW == "accepted" or stW == "duplicate",
+        "459-A-adopt: winner accepted st=" .. tostring(stW) .. "/" .. tostring(rW))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Carol-Garona",
+        "459-A-adopt: source credit Carol")
+    assertTrue(record.operations.records["aa-lose"] ~= nil, "459-A-adopt: loser retained")
+    assertEq(record.accounting._consumables.creditEventAliases["ctx:aa-alias"], "ctx:aa-canon",
+        "459-A-adopt: source durable binding present")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "459-A-adopt: export bodies collected n=" .. tostring(#exportBodies))
+    local descBody = nil
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "dataset-desc" then
+            descBody = exportBodies[i].body
+            break
+        end
+    end
+    assertTrue(type(descBody) == "table", "459-A-adopt: dataset-desc exported")
+    assertEq(type(descBody.creditEventAliases), "table", "459-A-adopt: desc carries aliases")
+    assertEq(descBody.creditEventAliases["ctx:aa-alias"], "ctx:aa-canon",
+        "459-A-adopt: required alias exported on desc")
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "459-A-adopt: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local ready = GS:GetPendingAdoption() and GS:GetPendingAdoption().ready
+    assertTrue(ready, "459-A-adopt: transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while stAdopt == "pending" and gAdopt < 128 do
+        if not runOneDueTimer() then
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        else
+            -- sync drain may complete inside timer
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(stAdopt, "accepted",
+        "459-A-adopt: commit accepted got " .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "459-A-adopt: adopted record")
+    assertEq(adopted.accounting._consumables.creditEventAliases["ctx:aa-alias"], "ctx:aa-canon",
+        "459-A-adopt: binding installed on fresh dataset")
+    assertTrue(adopted.operations.records["aa-win"] ~= nil, "459-A-adopt: winner on adopter")
+    assertTrue(adopted.operations.records["aa-lose"] ~= nil, "459-A-adopt: loser on adopter")
+    local adoptedDon = GS.FindLedgerEventById(adopted, "ctx:aa-alias")
+    assertTrue(type(adoptedDon) == "table", "459-A-adopt: alias resolves after adopt")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(adopted, adoptedDon)), "Carol-Garona",
+        "459-A-adopt: adopter credit Carol")
+end
+
+do
+    -- B: stale provenance visits across ledger revisions must not reject a fresh
+    -- ordinary adjustment as terminal work_budget.
+    local record = seedLiveCampaignWithItem(9913, 200)
+    injectProductionDonation(record, {
+        id = "ctx:b-alice", itemId = 9913, quantity = 20,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    for i = 1, 40 do
+        injectProductionDonation(record, {
+            id = string.format("ctx:b-don-%03d", i), itemId = 9913, quantity = 1,
+            actor = "Retired-Garona", actorGuid = "Player-1-Retired",
+            timestamp = world.time + i,
+        })
+    end
+    GS._creditProjectionAccumulating = false
+    for _ = 1, 3 do
+        record.accounting._consumables.generation =
+            (tonumber(record.accounting._consumables.generation) or 1) + 1
+        GS.BindCharacterIdentity(record, "Retired-Garona", "Player-1-Retired", nil)
+    end
+    -- Positive attributed adjust avoids item_negative against progress totals that
+    -- may not yet include injected ledger rows; sticky provenance is under test.
+    local adjOp, adjSt, adjErr = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, {
+        itemId = 9913,
+    }, {
+        itemId = 9913,
+        quantity = 1,
+        attributed = "Alice-Garona",
+        attributedGuid = "Player-1-Alice",
+    })
+    assertEq(adjSt, "accepted", "459-B: adjustment prepared got " .. tostring(adjErr))
+    assertTrue(type(adjOp) == "table", "459-B: adjustment op present")
+    -- Inject sticky visits after prepare (prepare may open/close an allowance).
+    GS._creditProjectionProvenanceVisits = 24006
+    GS._creditProjectionCallbackWork = 0
+    GS._creditProjectionAccumulating = false
+    assertTrue((tonumber(GS._creditProjectionProvenanceVisits) or 0) >= 24006,
+        "459-B: sticky provenance present before admit")
+    local stAdj, reasonAdj = GS:AdmitRemoteOperation(adjOp, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    local gB = 0
+    while stAdj == "pending" and reasonAdj == "work_budget" and gB < 32 do
+        if not runOneDueTimer() then break end
+        stAdj, reasonAdj = GS:AdmitRemoteOperation(adjOp, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        gB = gB + 1
+    end
+    flushTimers()
+    assertTrue(stAdj == "accepted" or stAdj == "duplicate",
+        "459-B: ordinary adjustment accepted after sticky provenance st="
+            .. tostring(stAdj) .. "/" .. tostring(reasonAdj))
+    assertTrue(record.operations.records[adjOp.id] ~= nil,
+        "459-B: adjustment retained")
+    assertTrue(not (record.operations.pending and record.operations.pending[adjOp.id]),
+        "459-B: not left pending")
+    assertEq(#timers, 0, "459-B: idle")
+end
+
+do
+    -- C-policy: receiver gets newer SET_EDITOR_RANK first, then earlier
+    -- source-accepted correction; must converge under current authority.
+    local record = seedLiveCampaignWithItem(9914, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "cpol-don", itemId = 9914, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local policy0 = record.permission and record.permission.revisionId
+    local corr = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "cpol-corr",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "cpol-don",
+        value = {
+            eventId = "cpol-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9914,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = policy0,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local rank = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "cpol-rank",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.SET_EDITOR_RANK,
+        target = "editorRankPosition",
+        value = 2,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 2,
+        baseTargetRevision = policy0,
+        basePolicyRevision = policy0,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stRank, rRank = GS:AdmitRemoteOperation(rank, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stRank, "accepted",
+        "459-C-pol: rank first accepted got " .. tostring(stRank) .. "/" .. tostring(rRank))
+    local stCorr, rCorr = GS:AdmitRemoteOperation(corr, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    local gC = 0
+    while stCorr == "pending" and gC < 64 do
+        if not runOneDueTimer() then break end
+        stCorr, rCorr = GS:AdmitRemoteOperation(corr, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        gC = gC + 1
+    end
+    flushTimers()
+    assertTrue(stCorr == "accepted" or stCorr == "duplicate",
+        "459-C-pol: historical correction after newer policy st="
+            .. tostring(stCorr) .. "/" .. tostring(rCorr))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459-C-pol: credit converges to Bob")
+    -- Missing predecessor still pending.
+    local missing = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "cpol-missing",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "cpol-don",
+        value = {
+            eventId = "cpol-don", eventKind = "donation",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Bob-Garona", baseAttributedGuid = "Player-1-Bob",
+            itemId = 9914,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 3,
+        baseTargetRevision = "cpol-corr",
+        basePolicyRevision = "never-seen-policy",
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stMiss, rMiss = GS:AdmitRemoteOperation(missing, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stMiss, "pending", "459-C-pol: missing policy predecessor pending")
+    assertEq(rMiss, "missing_policy_predecessor", "459-C-pol: missing reason")
+end
+
+do
+    -- C-elig: older same-event correction with wrong eventKind must not retain.
+    local record = seedLiveCampaignWithItem(9915, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "celig-don", itemId = 9915, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local win = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "celig-win",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "celig-don",
+        value = {
+            eventId = "celig-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9915,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 30,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stW, rW = GS:AdmitRemoteOperation(win, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    local gW = 0
+    while stW == "pending" and gW < 64 do
+        if not runOneDueTimer() then break end
+        stW, rW = GS:AdmitRemoteOperation(win, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        gW = gW + 1
+    end
+    assertTrue(stW == "accepted" or stW == "duplicate",
+        "459-C-elig: winner accepted st=" .. tostring(stW) .. "/" .. tostring(rW))
+    local badLose = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "celig-bad-lose",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "celig-don",
+        value = {
+            eventId = "celig-don", eventKind = "adjustment",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9915,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 10,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stBad, rBad = GS:AdmitRemoteOperation(badLose, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(stBad, "rejected",
+        "459-C-elig: wrong eventKind loser rejected st=" .. tostring(stBad))
+    assertEq(rBad, "invalid_event", "459-C-elig: invalid_event reason got " .. tostring(rBad))
+    assertNil(record.operations.records["celig-bad-lose"],
+        "459-C-elig: bad loser body absent")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459-C-elig: winner credit unchanged")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
