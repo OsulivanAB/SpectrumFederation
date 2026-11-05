@@ -46696,7 +46696,8 @@ do
 
     -- Force recipe/item paging under wire budget; pack the real retained archive.
     local savedWire = GS.MAX_WIRE_RECORD_BYTES
-    GS.MAX_WIRE_RECORD_BYTES = math.min(tonumber(savedWire) or 12000, 3500)
+    local packWire = math.min(tonumber(savedWire) or 12000, 3500)
+    GS.MAX_WIRE_RECORD_BYTES = packWire
     local parts = GS._BuildArchiveExportBodiesForTest(campId, archive, packRecord)
     GS.MAX_WIRE_RECORD_BYTES = savedWire
     assertTrue(type(parts) == "table" and #parts >= 2,
@@ -46707,8 +46708,9 @@ do
         local nbytes = GS._EstimateWireRecordBytesForTest(parts[i].id, b)
         assertTrue(type(nbytes) == "number" and nbytes > 0,
             "3B43E: packed archive part serialized")
-        assertTrue(nbytes <= (savedWire or 2048) or nbytes <= 3500,
-            "3B43E: packed archive part within wire estimate")
+        assertTrue(nbytes <= packWire,
+            "3B43E: packed archive part within tightened wire budget bytes="
+                .. tostring(nbytes) .. " budget=" .. tostring(packWire))
         if b.kind == "campaign-archive" then
             metaBody = b
         elseif b.kind == "campaign-archive-page" then
