@@ -106,8 +106,14 @@ PR. This policy removes **automatic review monitoring**, not review quality.
 When the owner explicitly authorizes a repair batch (for example, “fix the
 current review findings”), use the repair-batch procedure below: refresh,
 investigate as needed, consolidate by root cause, repair, validate, push/update
-the existing PR as needed, reply/update as appropriate when authorized, then
-stop.
+the existing PR as needed, post disposition replies on the addressed threads
+after delivery (default; see below), then stop.
+
+An authorized repair batch **includes** posting a concise disposition reply on
+each addressed review thread after delivery, unless the owner explicitly opts
+out (for example, “fix without replying” or “code only”). Name the fixing
+commit when one exists. Thread **resolution** remains separately authorized and
+is not implied by the repair batch or by posting a reply.
 
 Do not require approval for every edit or debugging step inside that explicitly
 authorized batch. Conversely, the agent’s own recommendation that a finding
@@ -186,8 +192,10 @@ When the owner issues a request, choose one:
   disposition replies unless the request reasonably includes that action.
 - **Repair one batch:** investigate and fix the findings named or clearly
   included by the request and their directly affected behavior; validate,
-  deliver, and stop. Straightforward edits and debugging inside that batch
-  need no redundant approval.
+  deliver, post disposition replies on the addressed threads after delivery
+  unless the owner opted out of replies, and stop. Straightforward edits and
+  debugging inside that batch need no redundant approval. Resolution is not
+  included unless the owner also authorized it.
 - **Request a review:** initiate only the explicitly named reviewer or
   checkpoint, once, through an authorized available tool. This operation
   does not authorize later repairs, waiting, or another request.
@@ -284,10 +292,12 @@ refresh -> investigate -> classify -> consolidate -> repair -> validate -> inspe
 
 When delivery is authorized, prefer coherent/batched pushes for the repair.
 Allow additional pushes needed to finish the currently authorized repair
-correctly. Do not create an artificial commit when nothing changed. Thread
-replies and resolutions remain governed by
-`.cursor/skills/pr-review-comments/SKILL.md` and require authorization for
-external writes. Do not wait for or act on reviews or CI triggered by the push
+correctly. Do not create an artificial commit when nothing changed. After
+delivery, post disposition replies on the addressed review threads by default
+(repair authorization covers those replies unless the owner opted out). Thread
+resolution and pure assessment replies remain governed by
+`.cursor/skills/pr-review-comments/SKILL.md` and still require their own
+authorization. Do not wait for or act on reviews or CI triggered by the push
 as if they renewed repair or review authorization. Completing a repair does not
 authorize another review.
 
