@@ -263,6 +263,40 @@ do
     assertEq(#pruned, 1, "expired batch ambiguity dropped with batch")
     assertEq(pruned[1].id, "b", "surviving batch remains")
     assertEq(pruned[1].ambiguous["10"], 1, "surviving ambiguity intact")
+
+    -- R4: consumption skips paused/ambiguous batch amounts (oldest-first on eligible only)
+    local ambBatches = {
+        {
+            id = "paused",
+            completedAt = 1,
+            expiresAt = 5000,
+            amounts = { ["10"] = 5 },
+            ambiguous = { ["10"] = 5 },
+        },
+        {
+            id = "eligible",
+            completedAt = 2,
+            expiresAt = 5000,
+            amounts = { ["10"] = 5 },
+        },
+    }
+    local remElig, consumedElig = W.ConsumeTradeBatches(ambBatches, { ["10"] = 5 }, 100)
+    assertEq(consumedElig["10"], 5, "R4: deliver 5 consumes eligible batch only")
+    assertEq(#remElig, 1, "R4: paused batch remains")
+    assertEq(remElig[1].id, "paused", "R4: ambiguous batch untouched")
+    assertEq(remElig[1].amounts["10"], 5, "R4: paused amounts remain")
+    assertEq(remElig[1].ambiguous["10"], 5, "R4: paused ambiguity remains")
+    local eligiblePending = 0
+    for i = 1, #remElig do
+        local b = remElig[i]
+        local amounts = b.amounts or {}
+        local amb = b.ambiguous or {}
+        for k, v in pairs(amounts) do
+            local left = (tonumber(v) or 0) - (tonumber(amb[k] or amb[tonumber(k)]) or 0)
+            if left > 0 then eligiblePending = eligiblePending + left end
+        end
+    end
+    assertEq(eligiblePending, 0, "R4: next trade must not re-offer consumed eligible batch")
 end
 
 -- Receipt validation / accounting isolation helpers
@@ -415,6 +449,87 @@ do
     assertEq(IsAccepted(0), false, "0 not accepted")
     assertEq(IsAccepted(1), true, "1 accepted")
     assertEq(IsAccepted(true), false, "boolean true not accepted without tonumber 1")
+end
+
+-- R5: guild-update scoping + partial prefill status (handoff runtime)
+do
+    local guildKey = "club:handoff-test"
+    _G.UIParent = _G.UIParent or {}
+    _G.GetServerTime = function() return 1000 end
+    _G.UnitGUID = function() return "Player-1-HANDOFF" end
+    SF.ConsumablesWithdrawRuntime = {
+        CurrentContext = function() return { guildKey = guildKey } end,
+        IsBusy = function() return false end,
+    }
+    _G.CreateFrame = function(_, _, _, template)
+        local f = { scripts = {} }
+        function f:RegisterEvent() end
+        function f:SetScript(kind, fn) f.scripts[kind] = fn end
+        function f:Hide() end
+        function f:Show() end
+        function f:SetSize() end
+        function f:SetPoint() end
+        function f:SetBackdrop() end
+        function f:CreateFontString() return { SetPoint = function() end, SetJustifyH = function() end, SetWordWrap = function() end, SetText = function() end } end
+        if template == "UIPanelButtonTemplate" then
+            return { SetSize = function() end, SetPoint = function() end, SetText = function() end, SetScript = function() end, Enable = function() end }
+        end
+        if template == "UIPanelCloseButton" then
+            return { SetPoint = function() end, SetScript = function() end }
+        end
+        return f
+    end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesTradeHandoff.lua")
+    local H = SF.ConsumablesTradeHandoff
+    local batch = H.EnqueueConfirmed({ ["10"] = 3 }, { operationId = "op-handoff" })
+    assertTrue(batch ~= nil, "handoff enqueue for guild tests")
+    H.EnsureListeners()
+    local st = H.GetState()
+    local onEvent = st.frame and st.frame.scripts and st.frame.scripts.OnEvent
+    assertTrue(type(onEvent) == "function", "handoff listener attached")
+    onEvent(st.frame, "PLAYER_GUILD_UPDATE", "target")
+    assertEq(#st.batches, 1, "R5: unrelated unit guild update preserves batches")
+    onEvent(st.frame, "PLAYER_GUILD_UPDATE", "player")
+    assertEq(#st.batches, 1, "R5: player guild update with stable context preserves batches")
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = "club:other" } end
+    onEvent(st.frame, "PLAYER_GUILD_UPDATE", "player")
+    assertEq(#st.batches, 0, "R5: context loss clears handoff")
+    H.Reset()
+
+    -- Partial status when deferred remain after some placements (seven stacks, six slots).
+    st.batches = {
+        { id = "p", completedAt = 1, expiresAt = 5000, amounts = { ["10"] = 7 } },
+    }
+    st.context = { playerGuid = "Player-1-HANDOFF", guildKey = guildKey }
+    st.tradeLifecycleId = 1
+    st.prefillAttemptedFor = nil
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = guildKey } end
+    _G.GetCursorInfo = function() return nil end
+    _G.GetTradePlayerItemInfo = function() return nil end
+    _G.GetItemCount = function() return 20 end
+    SF.ConsumablesRouting = { IsCarriedBag = function() return true end }
+    C_Container = {
+        GetContainerNumSlots = function() return 7 end,
+        GetContainerItemInfo = function(_, slot)
+            if slot >= 1 and slot <= 7 then
+                return { itemID = 10, stackCount = 1, isLocked = false }
+            end
+        end,
+        SplitContainerItem = function() end,
+        PickupContainerItem = function() end,
+    }
+    _G.ClickTradeButton = function() end
+    _G.ClearCursor = function() end
+    local placedSlots = 0
+    _G.GetTradePlayerItemInfo = function(slot)
+        if slot <= placedSlots then return "item", nil, 1 end
+        return nil
+    end
+    _G.ClickTradeButton = function()
+        placedSlots = placedSlots + 1
+    end
+    H.TryPrefillTrade()
+    assertEq(st.status, "partial", "R5: partial when deferred remain after successful offers")
 end
 
 if failures > 0 then

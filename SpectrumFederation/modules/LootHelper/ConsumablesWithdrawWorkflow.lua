@@ -211,15 +211,57 @@ function W.SourcePlanIncomplete(remainingUnfilled)
     return FloorQty(remainingUnfilled) > 0
 end
 
---- @param carriedBags { { bag=number, slots={ {slot, empty?, itemId?, count?, locked?}... } }... }
+--- Blizzard bag/item family compatibility (bit flags). Nil/0 = unrestricted.
+function W.SlotAcceptsItemFamily(slotFamily, itemFamily)
+    slotFamily = tonumber(slotFamily) or 0
+    itemFamily = tonumber(itemFamily) or 0
+    if itemFamily == 0 then return true end
+    if slotFamily == 0 then return true end
+    if bit and bit.band then
+        return bit.band(slotFamily, itemFamily) ~= 0
+    end
+    return false
+end
+
+--- Live or snapshot slot still matches a planned destination row.
+-- @param slotState { empty?, itemId?, count?, locked?, family? }
+-- @param dest { count, merge }
+function W.DestinationStillValid(slotState, dest, itemId, stackLimit)
+    if type(dest) ~= "table" or type(slotState) ~= "table" then
+        return false, "invalid"
+    end
+    itemId = tonumber(itemId)
+    if not itemId then return false, "invalid" end
+    local need = FloorQty(dest.count)
+    if need < 1 then return false, "invalid" end
+    local itemFamily = tonumber(dest.itemFamily) or tonumber(slotState.expectedItemFamily) or 0
+    local slotFamily = tonumber(slotState.family) or 0
+    if not W.SlotAcceptsItemFamily(slotFamily, itemFamily) then
+        return false, "family"
+    end
+    if slotState.empty then
+        if dest.merge then return false, "not_merge" end
+        return true
+    end
+    if slotState.locked then return false, "locked" end
+    if tonumber(slotState.itemId) ~= itemId then return false, "occupied" end
+    if not dest.merge then return false, "not_empty" end
+    local maxStack = FloorQty(stackLimit)
+    if maxStack < 1 then maxStack = 1 end
+    local room = maxStack - FloorQty(slotState.count)
+    if room < need then return false, "no_room" end
+    return true
+end
+
+--- @param carriedBags { { bag=number, slots={ {slot, empty?, itemId?, count?, locked?, family?}... } }... }
 -- @param take {[itemKey]=qty}
 -- @param stackLimitForItem fun(itemId:number):number
+-- @param itemFamilyForItem fun(itemId:number):number|nil optional family resolver
 -- @return ok, err, plan { destinations, freeCompatibleSlots, requiredNewStacks }
-function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
+function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, itemFamilyForItem)
     take = type(take) == "table" and take or {}
     carriedBags = type(carriedBags) == "table" and carriedBags or {}
     local grid = {}
-    local freeCompatibleSlots = 0
     for i = 1, #carriedBags do
         local bagRow = carriedBags[i]
         local bagId = tonumber(bagRow and bagRow.bag)
@@ -230,14 +272,18 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                 local row = slots[s]
                 if type(row) == "table" then
                     if row.empty then
-                        copySlots[s] = { slot = row.slot or s, empty = true }
-                        freeCompatibleSlots = freeCompatibleSlots + 1
+                        copySlots[s] = {
+                            slot = row.slot or s,
+                            empty = true,
+                            family = tonumber(row.family) or 0,
+                        }
                     else
                         copySlots[s] = {
                             slot = row.slot or s,
                             itemId = tonumber(row.itemId),
                             count = FloorQty(row.count),
                             locked = row.locked and true or false,
+                            family = tonumber(row.family) or 0,
                         }
                     end
                 end
@@ -258,13 +304,21 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
     local destinations = {}
     local requiredNewStacks = 0
 
-    local function findFirstEmpty()
+    local function itemFamily(itemId)
+        if type(itemFamilyForItem) == "function" then
+            return tonumber(itemFamilyForItem(itemId)) or 0
+        end
+        return 0
+    end
+
+    local function findFirstEmpty(family)
         for gi = 1, #grid do
             local bagId = grid[gi].bag
             local slots = grid[gi].slots
             for si = 1, #slots do
-                if slots[si].empty then
-                    return gi, si, bagId, slots[si].slot or si
+                local slot = slots[si]
+                if slot.empty and W.SlotAcceptsItemFamily(slot.family, family) then
+                    return gi, si, bagId, slot.slot or si
                 end
             end
         end
@@ -281,6 +335,7 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                 maxStack = FloorQty(stackLimitForItem(itemId))
                 if maxStack < 1 then maxStack = 1 end
             end
+            local family = itemFamily(itemId)
             local remaining = qty
             for gi = 1, #grid do
                 if remaining < 1 then break end
@@ -299,6 +354,7 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                                 slot = slot.slot or si,
                                 count = put,
                                 merge = true,
+                                itemFamily = family,
                             }
                             slot.count = FloorQty(slot.count) + put
                             remaining = remaining - put
@@ -307,11 +363,11 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                 end
             end
             while remaining > 0 do
-                local gi, si, bagId, slotNum = findFirstEmpty()
+                local gi, si, bagId, slotNum = findFirstEmpty(family)
                 if not gi then
                     return false, "bag_capacity", {
                         destinations = destinations,
-                        freeCompatibleSlots = freeCompatibleSlots,
+                        freeCompatibleSlots = 0,
                         requiredNewStacks = requiredNewStacks,
                     }
                 end
@@ -323,6 +379,7 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                     slot = slotNum,
                     count = put,
                     merge = false,
+                    itemFamily = family,
                 }
                 slot.empty = nil
                 slot.itemId = itemId
@@ -330,6 +387,15 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem)
                 slot.locked = false
                 requiredNewStacks = requiredNewStacks + 1
                 remaining = remaining - put
+            end
+        end
+    end
+    local freeCompatibleSlots = 0
+    for gi = 1, #grid do
+        local slots = grid[gi].slots
+        for si = 1, #slots do
+            if slots[si].empty then
+                freeCompatibleSlots = freeCompatibleSlots + 1
             end
         end
     end
@@ -398,13 +464,17 @@ function W.ConsumeTradeBatches(batches, delivered, now)
             -- expired: drop
         else
             local amounts = type(batch.amounts) == "table" and batch.amounts or {}
+            local amb = type(batch.ambiguous) == "table" and batch.ambiguous or {}
             local nextAmounts = {}
             for key, qty in pairs(amounts) do
                 local have = FloorQty(qty)
                 local k = tostring(key)
+                local paused = FloorQty(amb[k] or amb[tonumber(key)])
+                local eligible = have - paused
+                if eligible < 0 then eligible = 0 end
                 local need = remainingNeed[k] or 0
-                if need > 0 and have > 0 then
-                    local take = math.min(have, need)
+                if need > 0 and eligible > 0 then
+                    local take = math.min(eligible, need)
                     consumed[k] = (consumed[k] or 0) + take
                     remainingNeed[k] = need - take
                     have = have - take

@@ -460,14 +460,14 @@ function H.TryPrefillTrade()
         end
     end
     state.prefillActive = false
-    if placed > 0 then
-        state.status = "offered"
-        state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_OFFERED",
-            "Offered pending reagents in the trade window. Accept/cancel remains a player action.")
-    elseif next(deferred) then
+    if next(deferred) then
         state.status = "partial"
         state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_PARTIAL",
             "Some pending reagents could not be offered yet (slots, locks, or inventory).")
+    elseif placed > 0 then
+        state.status = "offered"
+        state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_OFFERED",
+            "Offered pending reagents in the trade window. Accept/cancel remains a player action.")
     else
         state.status = "blocked"
         state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_BLOCKED",
@@ -592,6 +592,7 @@ function H.EnsureListeners()
         playerAccepted = false,
         targetAccepted = false,
         closedHandled = false,
+        active = false,
     }
 
     local function SnapshotPendingBags()
@@ -605,14 +606,32 @@ function H.EnsureListeners()
 
     local function CaptureOfferSnapshot()
         local snap = AlreadyOfferedCounts()
+        if tradeSession.active then
+            local copy = {}
+            for k, v in pairs(snap) do
+                copy[tostring(k)] = FloorQty(v)
+            end
+            tradeSession.offeredSnapshot = copy
+            return
+        end
         if next(snap) then
             tradeSession.offeredSnapshot = snap
         end
     end
 
     frame:SetScript("OnEvent", function(_, event, ...)
-        if event == "PLAYER_LOGOUT" or event == "PLAYER_GUILD_UPDATE" then
+        if event == "PLAYER_LOGOUT" then
             H.Reset()
+            return
+        end
+        if event == "PLAYER_GUILD_UPDATE" then
+            local unit = ...
+            if unit and unit ~= "player" then
+                return
+            end
+            if not ContextMatches() then
+                H.Reset()
+            end
             return
         end
         if not EnsureContextOrClear() then
@@ -625,6 +644,7 @@ function H.EnsureListeners()
             tradeSession.playerAccepted = false
             tradeSession.targetAccepted = false
             tradeSession.offeredSnapshot = nil
+            tradeSession.active = true
             tradeSession.bagBefore = SnapshotPendingBags()
             local totals = AggregatePending()
             local anyPending = false
@@ -653,13 +673,18 @@ function H.EnsureListeners()
                 return
             end
             tradeSession.closedHandled = true
+            tradeSession.active = false
             local offered = tradeSession.offeredSnapshot
-            if type(offered) ~= "table" or not next(offered) then
+            if type(offered) ~= "table" then
                 local live = AlreadyOfferedCounts()
                 if next(live) then
                     offered = live
+                else
+                    offered = {}
                 end
             end
+            -- Keep explicit {} from an active trade (player cleared all offers).
+            -- Do not replace a prior non-empty snapshot with empty live reads after slots clear.
             offered = type(offered) == "table" and offered or {}
             local before = tradeSession.bagBefore or {}
             local bothAccepted = tradeSession.playerAccepted and tradeSession.targetAccepted
