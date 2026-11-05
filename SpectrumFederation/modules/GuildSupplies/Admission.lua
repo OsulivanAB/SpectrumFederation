@@ -10,12 +10,14 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- Wire schema for the Guild Supplies Gossip provider.
 -- 2: valuation-aware wire (#397). 3: Guild Info witness/attribution (#427).
 -- 4: attributed adjustment unitCopper on ledger events (#447 rankings).
--- 5: officer contributor credit corrections (#459) and Quick Withdraw
--- recipes/withdrawal receipts (#457). Older schema-4 peers reject/ignore
--- unknown correction/recipe/withdrawal shapes while still appearing
--- synchronized under Guild Gossip's strict equality; they are incompatible.
--- Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 5
+-- 5: Quick Withdraw recipes/withdrawal receipts (#457) on released beta.
+-- 6: combined #457 + officer correct-contributor (#459). Schema 5 peers do
+-- not understand corrections; advertising 5 for the combined protocol would
+-- let them pass Guild Gossip's strict equality and then reject
+-- correct-contributor as unsupported_kind while computing stale credit.
+-- Older schemas are incompatible under GG equality and must update before
+-- sync/adoption resumes. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 6
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16

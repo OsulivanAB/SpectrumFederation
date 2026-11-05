@@ -1132,8 +1132,82 @@ local function injectProductionAdjustment(record, opts)
     return event
 end
 
-assertEq(GS.PROVIDER_SCHEMA, 5, "459: PROVIDER_SCHEMA is 5")
+assertEq(GS.PROVIDER_SCHEMA, 6, "459: PROVIDER_SCHEMA is 6")
 assertTrue(GS.KIND.CORRECT_CONTRIBUTOR == "correct-contributor", "459: correction kind registered")
+
+do
+    -- Combined protocol schema 6: released schema-5 peers are excluded by GG
+    -- equality; two schema-6 peers transfer a correction and agree on credit
+    -- (discussion_r4483753485).
+    assertEq(GS.PROVIDER_SCHEMA, 6, "459-schema6: wire schema is 6")
+    assertEq(GS.SCHEMA_VERSION, 1, "459-schema6: persisted root schema unchanged")
+    GS:EnsureGossipProvider()
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(type(prov) == "table", "459-schema6: provider registered")
+    assertEq(tonumber(prov.schema), 6, "459-schema6: registered schema 6")
+    local caps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
+    assertTrue(type(caps) == "table", "459-schema6: capabilities")
+    assertEq(tonumber(caps.schema), 6, "459-schema6: advertised schema 6")
+    -- Strict equality gate (GuildGossip compatibleProviders / handleView).
+    local function schemaMatches(remoteSchema)
+        return tonumber(remoteSchema) == tonumber(prov.schema)
+    end
+    assertTrue(not schemaMatches(5),
+        "459-schema6: released schema-5 peer incompatible")
+    assertTrue(not schemaMatches(4),
+        "459-schema6: schema-4 peer incompatible")
+    assertTrue(schemaMatches(6),
+        "459-schema6: new-protocol peers match")
+    -- VIEW payload with released schema 5 must not equal local provider schema.
+    assertTrue(tonumber(5) ~= tonumber(prov.schema),
+        "459-schema6: VIEW schema 5 rejected by equality")
+
+    local peerA = seedLiveCampaignWithItem(91001, 40)
+    injectProductionDonation(peerA, {
+        id = "s6-don", itemId = 91001, quantity = 7,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "s6-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "459-schema6: peerA prepare")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "459-schema6: peerA apply")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerA, GS.FindLedgerEventById(peerA, "s6-don"))), "Bob-Garona",
+        "459-schema6: peerA credit Bob")
+    local snap = select(1, GS._SnapshotPublicOp(corr))
+    assertTrue(type(snap) == "table", "459-schema6: public snap")
+
+    local peerB = seedLiveCampaignWithItem(91001, 40)
+    injectProductionDonation(peerB, {
+        id = "s6-don", itemId = 91001, quantity = 7,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local body = {}
+    for k, v in pairs(snap) do body[k] = v end
+    body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+    body.datasetId = peerB.datasetId
+    body.campaignId = peerB.currentCampaignId
+    body.baseCampaignId = peerB.currentCampaignId
+    body.basePolicyRevision = peerB.permission and peerB.permission.revisionId
+    body.baseTargetRevision = peerB.datasetId
+    local stB, reasonB = GS:AdmitRemoteOperation(body, {
+        sender = "Alice-Garona", offlineRecord = peerB, preserveAttribution = true,
+    })
+    assertEq(stB, "accepted",
+        "459-schema6: peerB admits correction got "
+            .. tostring(stB) .. "/" .. tostring(reasonB))
+    flushTimers()
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        peerB, GS.FindLedgerEventById(peerB, "s6-don"))), "Bob-Garona",
+        "459-schema6: peerB credit Bob")
+    assertEq(GS.PersonalContributorItemTotal(peerA, "Bob-Garona", "Player-1-Bob", 91001),
+        GS.PersonalContributorItemTotal(peerB, "Bob-Garona", "Player-1-Bob", 91001),
+        "459-schema6: peers agree Bob personal total")
+    assertEq(GS.PersonalContributorItemTotal(peerA, "Alice-Garona", "Player-1-Alice", 91001),
+        0, "459-schema6: peerA Alice emptied")
+    assertEq(GS.PersonalContributorItemTotal(peerB, "Alice-Garona", "Player-1-Alice", 91001),
+        0, "459-schema6: peerB Alice emptied")
+end
 
 do
     -- Donation A → B moves credit once; durable actor unchanged; rankings follow effective.
@@ -6599,6 +6673,13 @@ do
             end
             return ok, err, det
         end
+        local function sumWork(fromIdx, toIdx)
+            local total = 0
+            for i = fromIdx, toIdx do
+                total = total + (tonumber(slices[i].work) or 0)
+            end
+            return total
+        end
 
         local adjOp, adjSt, adjReason = GS:NewAdjustmentOperation(
             itemId, -1, "Bob-Garona")
@@ -6608,17 +6689,15 @@ do
         local st, reason = GS:ApplyStagedConfigOperation(adjOp)
         assertEq(st, "accepted", "459-B3-adj: adjust accepted got "
             .. tostring(st) .. "/" .. tostring(reason))
-        local applyMaxOuter = 0
-        for i = applySliceStart + 1, #slices do
-            local outer = tonumber(slices[i].outer) or 0
-            if outer > applyMaxOuter then applyMaxOuter = outer end
-            assertTrue(outer <= hard,
-                "459-B3-adj: Apply callback outer within soft+atomic i="
-                    .. tostring(i) .. " outer=" .. tostring(outer)
-                    .. " hard=" .. tostring(hard))
-        end
         assertTrue(#slices > applySliceStart,
             "459-B3-adj: Apply invoked Rebuild under shared allowance")
+        -- Sum independent per-rebuild workUnits across the whole Apply callback
+        -- (discussion_r4483730933) — not each outer counter in isolation.
+        local applyWorkSum = sumWork(applySliceStart + 1, #slices)
+        assertTrue(applyWorkSum <= hard,
+            "459-B3-adj: Apply complete-callback workSum within soft+atomic got="
+                .. tostring(applyWorkSum) .. " hard=" .. tostring(hard)
+                .. " slices=" .. tostring(#slices - applySliceStart))
         -- Incomplete credit must stay unavailable until timer-only completion.
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record) == false,
             "459-B3-adj: unfinished adjust leaves credit unavailable")
@@ -6628,25 +6707,23 @@ do
             "459-B3-adj: Resolve unavailable before drain")
         assertTrue(#timers >= 1, "459-B3-adj: continuation queued after Apply")
 
-        local timerSliceStart = #slices
         local g3 = 0
         while (not GS.IsCreditCorrectionProjectionAvailable(record)) and g3 < 8000 do
+            local timerStart = #slices
             if not runOneDueTimer() then
                 break
             end
+            local timerWork = sumWork(timerStart + 1, #slices)
+            assertTrue(timerWork <= hard,
+                "459-B3-adj: timer callback workSum within soft+atomic tick="
+                    .. tostring(g3 + 1) .. " work=" .. tostring(timerWork)
+                    .. " hard=" .. tostring(hard))
             g3 = g3 + 1
         end
         flushTimers()
         GS.RebuildCreditCorrectionProjection = realRebuild
         assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
             "459-B3-adj: timers complete reconstruction")
-        for i = timerSliceStart + 1, #slices do
-            local outer = tonumber(slices[i].outer) or 0
-            assertTrue(outer <= hard,
-                "459-B3-adj: timer callback outer within soft+atomic i="
-                    .. tostring(i) .. " outer=" .. tostring(outer)
-                    .. " hard=" .. tostring(hard))
-        end
         assertTrue(g3 >= 1, "459-B3-adj: timer-only completion got ticks="
             .. tostring(g3))
         assertEq(#timers, 0, "459-B3-adj: idle after timers")
@@ -6689,6 +6766,93 @@ do
             record, "Bob-Garona", "Player-1-Bob", itemId), bobBal,
             "459-B3-adj: natural==fresh Bob balance")
         assertEq(#timers, 0, "459-B3-adj: idle")
+
+        -- Behavioral fail without the outer-ownership repair: two nested
+        -- EnsureThenRedrive opens each reset the allowance, so summed
+        -- per-rebuild work across one Apply exceeds soft+atomic.
+        do
+            local broken = seedLiveCampaignWithItem(itemId + 1, nHeads + 40)
+            local ctxB = select(1, GS:GetCurrentContext())
+            local tB = world.time
+            for i = 1, nHeads do
+                local id = "b3b-don-" .. i
+                injectProductionDonation(broken, {
+                    id = id, itemId = itemId + 1, quantity = 1, timestamp = tB + i,
+                })
+                local op = {
+                    schemaVersion = GS.OP_SCHEMA_VERSION,
+                    id = "b3b-op-" .. i,
+                    guildKey = ctxB.guildKey,
+                    datasetId = broken.datasetId,
+                    campaignId = broken.currentCampaignId,
+                    kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                    target = id,
+                    value = {
+                        eventId = id, eventKind = "donation",
+                        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                        baseAttributed = "Alice-Garona",
+                        baseAttributedGuid = "Player-1-Alice",
+                        itemId = itemId + 1,
+                    },
+                    actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                    timestamp = tB + nHeads + i,
+                    baseTargetRevision = broken.datasetId,
+                    basePolicyRevision = broken.permission
+                        and broken.permission.revisionId,
+                    baseCampaignId = broken.currentCampaignId,
+                }
+                GS._StoreAccepted(broken.operations, op,
+                    GS.CorrectionTargetKey(broken, id))
+            end
+            GS.InvalidateCreditCorrectionProjection(broken)
+            local warmB = GS.EnsureCreditCorrectionProjection(broken, nil)
+            local gw = 0
+            while warmB == false and gw < 8000 do
+                if not runOneDueTimer() then
+                    warmB = GS.EnsureCreditCorrectionProjection(broken, nil)
+                else
+                    warmB = GS.IsCreditCorrectionProjectionAvailable(broken)
+                end
+                gw = gw + 1
+            end
+            flushTimers()
+            assertTrue(GS.IsCreditCorrectionProjectionAvailable(broken),
+                "459-B3-adj: broken-case warm available")
+
+            local brokenSlices = {}
+            GS.RebuildCreditCorrectionProjection = function(...)
+                local ok, err, det = realRebuild(...)
+                local work = tonumber(det and det.workUnits) or 0
+                if err == "work_budget" or ok then
+                    brokenSlices[#brokenSlices + 1] = { work = work }
+                end
+                return ok, err, det
+            end
+            local realBegin = GS.BeginOuterCreditProjectionCallbackBudget
+            -- Disable outer ownership without removing symbols: Begin reports
+            -- unowned and never opens an allowance, so each EnsureThenRedrive
+            -- opens/closes its own full soft slice inside Apply.
+            GS.BeginOuterCreditProjectionCallbackBudget = function()
+                return false
+            end
+            local adjBroken = select(1, GS:NewAdjustmentOperation(
+                itemId + 1, -1, "Bob-Garona"))
+            assertTrue(adjBroken ~= nil, "459-B3-adj: broken-case prepare")
+            local beforeBroken = #brokenSlices
+            local stBroken = GS:ApplyStagedConfigOperation(adjBroken)
+            assertEq(stBroken, "accepted", "459-B3-adj: broken-case adjust accepted")
+            local brokenSum = 0
+            for i = beforeBroken + 1, #brokenSlices do
+                brokenSum = brokenSum + (tonumber(brokenSlices[i].work) or 0)
+            end
+            GS.BeginOuterCreditProjectionCallbackBudget = realBegin
+            GS.RebuildCreditCorrectionProjection = realRebuild
+            flushTimers()
+            assertTrue(brokenSum > hard,
+                "459-B3-adj: without outer repair Apply workSum exceeds hard got="
+                    .. tostring(brokenSum) .. " hard=" .. tostring(hard)
+                    .. " slices=" .. tostring(#brokenSlices - beforeBroken))
+        end
     end
 end
 

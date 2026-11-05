@@ -133,7 +133,7 @@ def test_guild_supplies_contributor_corrections_459():
             f"stderr:\n{result.stderr}"
         )
     assert "0 failed" in result.stdout
-    assert "459: PROVIDER_SCHEMA is 5" in result.stdout
+    assert "459: PROVIDER_SCHEMA is 6" in result.stdout
     assert "459: effective credit is Bob" in result.stdout
     assert "459: floor reason player_negative" in result.stdout
     assert "459: LWW effective Carol" in result.stdout

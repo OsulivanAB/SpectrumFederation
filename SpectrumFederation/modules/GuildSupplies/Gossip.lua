@@ -12,7 +12,7 @@ GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
 -- Wire schema for sf.guildsupplies.config. Schema 4 (#447) carries attributed
 -- adjustment unitCopper on ledger events; schema-3 peers drop that field.
 -- Guild Gossip matches by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 5
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 6
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then

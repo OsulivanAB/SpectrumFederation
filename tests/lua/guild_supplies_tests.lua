@@ -35901,16 +35901,16 @@ do
 end
 
 do
-    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#459 bumps to 5).
-    assertEq(GS.PROVIDER_SCHEMA, 5, "val: B1 PROVIDER_SCHEMA is 5 (#459)")
+    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#459 combined → 6).
+    assertEq(GS.PROVIDER_SCHEMA, 6, "val: B1 PROVIDER_SCHEMA is 6 (#459)")
     local record = activateValuationGuild(9903)
     assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
     assertTrue(type(prov) == "table", "val: B1 provider registered")
-    assertEq(tonumber(prov.schema), 5, "val: B1 registered schema 5 (#459)")
+    assertEq(tonumber(prov.schema), 6, "val: B1 registered schema 6 (#459)")
     local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
     assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
-    assertEq(tonumber(wireCaps.schema), 5, "val: B1 wire capabilities schema 5 (#459)")
+    assertEq(tonumber(wireCaps.schema), 6, "val: B1 wire capabilities schema 6 (#459)")
     drainExportMaint(32)
     local descSchema = nil
     for _, row in ipairs(collectAllExportBodies()) do
@@ -35919,14 +35919,15 @@ do
             descSchema = row.body.schemaVersion
         end
     end
-    assertEq(descSchema, 5, "val: B1 descriptor schemaVersion 5 (#459)")
-    -- Strict GG equality: older schemas are incompatible with local schema 5.
+    assertEq(descSchema, 6, "val: B1 descriptor schemaVersion 6 (#459)")
+    -- Strict GG equality: older schemas are incompatible with local schema 6.
     local localSchema = tonumber(prov.schema)
-    assertEq(localSchema, 5, "val: B1 local schema 5 (#459)")
-    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 5")
-    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 5")
-    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 5")
-    assertEq(tonumber(5) == localSchema, true, "val: B1 new/new compatible")
+    assertEq(localSchema, 6, "val: B1 local schema 6 (#459)")
+    assertTrue(localSchema ~= 5, "val: B1 old schema 5 incompatible with local 6")
+    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 6")
+    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 6")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 6")
+    assertEq(tonumber(6) == localSchema, true, "val: B1 new/new compatible")
     -- Persisted local schema stays 1 across the wire bump.
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
         "val: B1 persisted root schema unchanged")
@@ -40170,7 +40171,7 @@ do
     local camp1Id = record.currentCampaignId
     assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
         "424: new campaign falls back to ID")
-    assertEq(GS.PROVIDER_SCHEMA, 5, "424: provider schema is 5 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 6, "424: provider schema is 6 (#459)")
 
     -- Ordinary member cannot rename.
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
@@ -40508,7 +40509,7 @@ do
 end
 
 -- #424 multi-rename adoption newest-first retains losers; projects LWW winner
--- #424 adoption carries names; wrong dataset rejected; provider schema is 5 (#459)
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 6 (#459)
 do
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
@@ -40565,7 +40566,7 @@ do
     assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
-    assertEq(GS.PROVIDER_SCHEMA, 5, "424-adopt: schema is 5 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 6, "424-adopt: schema is 6 (#459)")
 end
 
 local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
@@ -41899,7 +41900,7 @@ do
     assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "427-legacy: links valid")
     assertEq(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"), false,
         "427-legacy: links do not drive witness identity")
-    assertEq(GS.PROVIDER_SCHEMA, 5, "427-schema: provider schema 5 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 6, "427-schema: provider schema 6 (#459)")
     assertEq(GS.SCHEMA_VERSION, 1, "427-schema: durable root schema unchanged")
 end
 
@@ -43423,15 +43424,15 @@ do
 end
 
 do
-    -- 447-r1) Provider schema tracks wire gate (#459 → 5); SV schema unchanged.
-    assertEq(GS.PROVIDER_SCHEMA, 5, "447-r1: PROVIDER_SCHEMA is 5 (#459)")
+    -- 447-r1) Provider schema tracks wire gate (#459 → 6); SV schema unchanged.
+    assertEq(GS.PROVIDER_SCHEMA, 6, "447-r1: PROVIDER_SCHEMA is 6 (#459)")
     assertEq(GS.SCHEMA_VERSION, 1, "447-r1: SCHEMA_VERSION stays 1")
     local record = activateValuationGuild(9452)
     assertEq(GS:EnsureGossipProvider(), true, "447-r1: provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
-    assertEq(tonumber(prov.schema), 5, "447-r1: registered schema 5 (#459)")
+    assertEq(tonumber(prov.schema), 6, "447-r1: registered schema 6 (#459)")
     local caps = prov.api.GetCapabilities()
-    assertEq(tonumber(caps.schema), 5, "447-r1: wire caps schema 5 (#459)")
+    assertEq(tonumber(caps.schema), 6, "447-r1: wire caps schema 6 (#459)")
     assertTrue(tonumber(prov.schema) ~= 3, "447-r1: schema-3 incompatible")
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 1,
         "447-r1: persisted root schema preserved")
@@ -46057,9 +46058,10 @@ do
     -- Real GI provider/bridge: readiness/identity changes invalidate accepted
     -- projection + owner scratch, then bounded Ensure/redrive. No witness
     -- promotion and no GS ledger/ops mutation from the bridge itself.
-    -- Binding/floor-result change via real AssignAlt NotifyLocalDurableChange;
-    -- mid-slice keeps queued callbacks; compare against independent rebuild
-    -- (discussion_r4483108265).
+    -- Corrections credit Eve; AssignAlt Eve Dave→Carol changes resolved
+    -- display binding (history/rankings main rollup) while effective stays Eve.
+    -- Mid-slice keeps queued callbacks; natural vs independent rebuild
+    -- (discussion_r4483730933).
     ensureNonOfficerRoster()
     local record = seedStagedCampaignWithItem(98459, 200)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -46085,9 +46087,9 @@ do
             txnId = id,
             itemId = 98459,
             quantity = 1,
-            actor = "Eve-Garona",
-            actorGuid = "Player-1-Eve",
-            donorGuid = "Player-1-Eve",
+            actor = "Alice-Garona",
+            actorGuid = "Player-1-Alice",
+            donorGuid = "Player-1-Alice",
             generation = gen,
             timestamp = (world.time or 0) + i,
             source = "guildbank",
@@ -46108,8 +46110,9 @@ do
             target = id,
             value = {
                 eventId = id, eventKind = "donation",
-                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
-                baseAttributed = "Eve-Garona", baseAttributedGuid = "Player-1-Eve",
+                -- Credit Eve so GI main/alt binding changes resolved display.
+                attributed = "Eve-Garona", attributedGuid = "Player-1-Eve",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
                 itemId = 98459,
             },
             actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
@@ -46120,7 +46123,6 @@ do
         }
         GS._StoreAccepted(record.operations, op, GS.CorrectionTargetKey(record, id))
     end
-    -- Non-vacuous binding: Eve rolls under Dave via GI; floors use that identity.
     GS.InvalidateCreditCorrectionProjection(record)
     local warmOk = GS.EnsureCreditCorrectionProjection(record, nil)
     local warmGuard = 0
@@ -46132,20 +46134,28 @@ do
     flushTimers()
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
         "459-GI: warm available")
+    local function displayFor(name, guid)
+        if GS.ResolveDisplayContributor then
+            return select(1, GS.ResolveDisplayContributor(record, name, guid))
+        end
+        return name
+    end
     local function creditFp()
         local parts = {}
         local active = 0
         for i = 1, nHeads do
             local ev = GS.FindLedgerEventById(record, "gi-don-" .. tostring(i))
             local name, guid = GS.ResolveEffectiveCreditIdentity(record, ev)
+            local display = displayFor(name, guid)
             parts[#parts + 1] = tostring(name) .. "|" .. tostring(guid)
+                .. "|" .. tostring(display)
             if type(record.creditCorrections) == "table"
                 and type(record.creditCorrections[ev.id]) == "table" then
                 active = active + 1
             end
         end
-        local bobBal = GS.PersonalContributorItemTotal
-            and GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 98459)
+        local eveBal = GS.PersonalContributorItemTotal
+            and GS.PersonalContributorItemTotal(record, "Eve-Garona", "Player-1-Eve", 98459)
             or 0
         local daveBal = GS.PersonalContributorItemTotal
             and GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 98459)
@@ -46154,7 +46164,7 @@ do
             and GS.PersonalContributorItemTotal(record, "Carol-Garona", "Player-1-Carol", 98459)
             or 0
         return table.concat(parts, ",") .. "#a=" .. tostring(active)
-            .. "#bob=" .. tostring(bobBal) .. "#dave=" .. tostring(daveBal)
+            .. "#eve=" .. tostring(eveBal) .. "#dave=" .. tostring(daveBal)
             .. "#carol=" .. tostring(carolBal)
     end
     local function independentlyRebuildTruth()
@@ -46173,8 +46183,11 @@ do
         return creditFp()
     end
     local natural = creditFp()
-    assertTrue(natural:find("Bob%-Garona|Player%-1%-Bob", 1),
-        "459-GI: natural has Bob name+GUID credit")
+    assertTrue(natural:find("Eve%-Garona|Player%-1%-Eve|Dave%-Garona", 1),
+        "459-GI: natural Eve effective rolls display to Dave")
+    local beforeDisplay = displayFor("Eve-Garona", "Player-1-Eve")
+    assertEq(beforeDisplay, "Dave-Garona",
+        "459-GI: before binding display is Dave got=" .. tostring(beforeDisplay))
 
     local opsOrderBefore = #(record.operations.order or {})
     local ledgerBefore = #(record.accounting._consumableEvents or {})
@@ -46195,14 +46208,12 @@ do
     giRec.baseline.complete = false
     GI.NotifyLocalDurableChange("baseline-incomplete")
     drainExportMaint(16)
-    -- not-ready path invalidates without Ensure/redrive.
     assertEq(ensureCalls, 0, "459-GI: no Ensure on out-of-readiness")
     assertEq(#(record.operations.order or {}), opsOrderBefore,
         "459-GI: no ops mutation on not-ready")
     assertEq(#(record.accounting._consumableEvents or {}), ledgerBefore,
         "459-GI: no ledger mutation on not-ready")
 
-    -- Back to ready: Invalidate + Ensure/redrive via durable notify.
     ensureCalls = 0
     giRec.baseline.complete = true
     GI.NotifyLocalDurableChange("baseline-complete")
@@ -46236,14 +46247,14 @@ do
     end
     assertEq(witnessAfter, witnessBefore, "459-GI: no witness promotion")
 
-    -- Mid-slice identity binding change via real AssignAlt (move Eve→Carol).
-    -- Keep queued callbacks; do not wipe the timer queue.
+    -- Mid-slice: real AssignAlt moves Eve Dave→Carol so display binding changes.
     GS._creditProjectionWorkBudgetOverride = 48
     GS.InvalidateCreditCorrectionProjection(record)
     local midOk = GS.EnsureCreditCorrectionProjection(record, nil)
     assertTrue(midOk == false, "459-GI: paced yield before binding change")
     assertTrue(#timers >= 1, "459-GI: continuation queued")
     local queuedBefore = #timers
+    local fpBeforeBind = natural
     ensureCalls = 0
     GS.EnsureCreditCorrectionProjection = function(...)
         ensureCalls = ensureCalls + 1
@@ -46270,7 +46281,6 @@ do
             .. tostring(moveSt) .. "/" .. tostring(moveReason))
     assertTrue(ensureCalls >= 1, "459-GI: binding change Ensure got="
         .. tostring(ensureCalls))
-    -- Queued callbacks retained (may grow with redrive; never cleared).
     assertTrue(#timers >= 1,
         "459-GI: queued callbacks retained after binding change had="
             .. tostring(queuedBefore) .. " now=" .. tostring(#timers))
@@ -46287,8 +46297,13 @@ do
     assertTrue(GS.IsCreditCorrectionProjectionAvailable(record),
         "459-GI: recovered after mid-slice binding change")
     local liveAfterBind = creditFp()
-    assertTrue(liveAfterBind:find("Bob%-Garona|Player%-1%-Bob", 1),
-        "459-GI: Bob credit retained after binding change")
+    local afterDisplay = displayFor("Eve-Garona", "Player-1-Eve")
+    assertEq(afterDisplay, "Carol-Garona",
+        "459-GI: after binding display is Carol got=" .. tostring(afterDisplay))
+    assertTrue(liveAfterBind ~= fpBeforeBind,
+        "459-GI: binding change alters credit fingerprint")
+    assertTrue(liveAfterBind:find("Eve%-Garona|Player%-1%-Eve|Carol%-Garona", 1),
+        "459-GI: Eve effective rolls display to Carol")
     local rebuiltAfterBind = independentlyRebuildTruth()
     assertEq(rebuiltAfterBind, liveAfterBind,
         "459-GI: independent rebuild matches live after binding change")
