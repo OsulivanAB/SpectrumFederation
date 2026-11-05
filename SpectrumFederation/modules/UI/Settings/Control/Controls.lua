@@ -8,6 +8,7 @@ local Controls = UI.Controls
 
 local Store = SF.SettingsStore
 local Style = UI.Style or {}
+local OpaqueMenu = UI.OpaqueMenu or {}
 local R = Style.Row or {}
 
 local LABEL_WIDTH   = R.labelWidth or 220
@@ -15,6 +16,12 @@ local GUTTER        = R.gutter or 16
 local CONTROL_WIDTH = R.controlWidth or 240
 local ADMIN_ONLY_SUFFIX = "|cffff4040(Admin Only)|r"
 local OWNER_ONLY_SUFFIX = "|cffff4040(Owner Only)|r"
+
+local function ApplyOpaqueDropdownMenuStyle(dropdown)
+	if OpaqueMenu.ApplyDropdownMenuStyle then
+		OpaqueMenu.ApplyDropdownMenuStyle(dropdown)
+	end
+end
 
 -- Evaluate a value or thunk to a boolean with default
 -- @param v any Boolean, function returning boolean, or nil
@@ -490,6 +497,7 @@ end
 				local dropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
 				dropdown:SetWidth(def.width or 180)
 				dropdown:SetDefaultText(def.defaultText or "Select...")
+				ApplyOpaqueDropdownMenuStyle(dropdown)
 
 				if previous then
 					dropdown:SetPoint("LEFT", previous, "RIGHT", spacing, 0)
@@ -522,17 +530,37 @@ end
 					for _, option in ipairs(GetOptions()) do
 						local value
 						local label
+						local tip
 
 						if type(option) == "table" then
 							value = option.value
 							label = option.label
+							tip = option.tooltip
 						else
 							value = option
 							label = tostring(option)
 						end
 
 						if value ~= nil then
-							rootDescription:CreateRadio(tostring(label or value), IsSelected, SetSelected, value)
+							local radio = rootDescription:CreateRadio(
+								tostring(label or value), IsSelected, SetSelected, value)
+							if radio and tip and type(tip) == "string" and tip ~= ""
+								and type(radio.SetTooltip) == "function" then
+								local tipText = tip
+								local tipTitle = tostring(label or value)
+								radio:SetTooltip(function(tooltip)
+									if type(GameTooltip_SetTitle) == "function" then
+										GameTooltip_SetTitle(tooltip, tipTitle)
+									elseif tooltip and tooltip.SetText then
+										tooltip:SetText(tipTitle, 1, 1, 1)
+									end
+									if type(GameTooltip_AddNormalLine) == "function" then
+										GameTooltip_AddNormalLine(tooltip, tipText, true)
+									elseif tooltip and tooltip.AddLine then
+										tooltip:AddLine(tipText, nil, nil, nil, true)
+									end
+								end)
+							end
 						end
 					end
 				end)
@@ -1183,6 +1211,7 @@ function Controls:AddDropdown(section, opts)
 		local dropdown = CreateFrame("DropdownButton", nil, control, "WowStyle1DropdownTemplate")
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth(opts.width or CONTROL_WIDTH)
+		ApplyOpaqueDropdownMenuStyle(dropdown)
 
 		local function ResolveDefaultText()
 			local d = opts.defaultText
@@ -1215,18 +1244,37 @@ function Controls:AddDropdown(section, opts)
 
 		local function Generator(owner, rootDescription)
 			for _, opt in ipairs(GetOptions()) do
-				local value, label
+				local value, label, tip
 
 				if type(opt) == "table" then
 					value = opt.value
 					label = opt.label
+					tip = opt.tooltip
 				else
 					value = opt
 					label = tostring(opt)
 				end
 
 				if value ~= nil then
-					rootDescription:CreateRadio(tostring(label or value), IsSelected, SetSelected, value)
+					local radio = rootDescription:CreateRadio(
+						tostring(label or value), IsSelected, SetSelected, value)
+					if radio and tip and type(tip) == "string" and tip ~= ""
+						and type(radio.SetTooltip) == "function" then
+						local tipText = tip
+						local tipTitle = tostring(label or value)
+						radio:SetTooltip(function(tooltip)
+							if type(GameTooltip_SetTitle) == "function" then
+								GameTooltip_SetTitle(tooltip, tipTitle)
+							elseif tooltip and tooltip.SetText then
+								tooltip:SetText(tipTitle, 1, 1, 1)
+							end
+							if type(GameTooltip_AddNormalLine) == "function" then
+								GameTooltip_AddNormalLine(tooltip, tipText, true)
+							elseif tooltip and tooltip.AddLine then
+								tooltip:AddLine(tipText, nil, nil, nil, true)
+							end
+						end)
+					end
 				end
 			end
 		end
@@ -1443,6 +1491,7 @@ function Controls:AddDropdownWithIconButton(section, opts)
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth((opts.width or CONTROL_WIDTH) - iconSize - gap)
 		dropdown:SetDefaultText(opts.defaultText or "Select...")
+		ApplyOpaqueDropdownMenuStyle(dropdown)
 
 		local iconBtn = CreateIconButton(control, opts.iconAtlas or "common-icon-trash", iconSize)
 		iconBtn:SetPoint("LEFT", dropdown, "RIGHT", gap, 0)
@@ -2668,6 +2717,426 @@ function Controls:AddOverallProgressBar(section, opts)
 	end)
 end
 
+--- Horizontally proportional contribution ranking chart (#447/#450).
+-- Names on the left, bars fill plotting width relative to maxPositive, amount
+-- labels sit above the bar with BOTTOMRIGHT at the bar's TOPRIGHT. Short, zero,
+-- and negative bars clamp amount text into the plot area so names stay clear.
+-- Omitting opts.label skips InitRow's reserved label column and uses full row
+-- width. Vertically scrolls; does not shrink rows to fit.
+-- @param section table Section to add into
+-- @param opts table getRankings() → { rows, maxPositive, emptyReason, emptyText }
+-- @return Frame The created row
+function Controls:AddContributionRankingChart(section, opts)
+	opts = opts or {}
+
+	local getRankings = opts.getRankings
+	if type(getRankings) ~= "function" then
+		getRankings = function() return nil end
+	end
+
+	local rowHeight = opts.rowHeight or 28
+	local nameWidth = opts.nameWidth or 140
+	-- Amounts sit above bars (#450); keep a small end pad for scrollbar/clipping
+	-- instead of the prior large right label gutter.
+	local endPad = opts.endPad or opts.labelGutter or 8
+	local barHeight = opts.barHeight or 12
+	local minHeight = opts.minHeight or opts.height or 280
+	local nameGap = opts.nameGap or 8
+	local coinIconHeight = opts.coinIconHeight or 12
+	-- Amount BOTTOMRIGHT sits on the bar top and draws upward. Without a top
+	-- inset the first row's coin value is clipped by the ScrollFrame at y=0.
+	-- Include the same inset in scroll content height so the last row stays
+	-- reachable after the shift.
+	local amountTopPad = opts.amountTopPad
+	if amountTopPad == nil then
+		amountTopPad = coinIconHeight + 2
+	end
+	amountTopPad = math.max(0, tonumber(amountTopPad) or 0)
+	local hasLabel = opts.label and opts.label ~= ""
+
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
+
+	--- Prefer Retail C_CurrencyInfo coin icons; legacy GetCoinTextureString was
+	-- removed in 12.1.5. Scope this formatter to Rankings only (#450).
+	local function FormatSignedCopper(copper)
+		copper = math.floor(tonumber(copper) or 0)
+		local negative = copper < 0
+		local absCopper = negative and -copper or copper
+		local text
+		local currency = C_CurrencyInfo
+		if currency and type(currency.GetCoinTextureString) == "function" then
+			text = currency.GetCoinTextureString(absCopper, coinIconHeight)
+		elseif GetCoinTextureString then
+			text = GetCoinTextureString(absCopper, coinIconHeight)
+		else
+			local gold = math.floor(absCopper / 10000)
+			local remain = absCopper - (gold * 10000)
+			local silver = math.floor(remain / 100)
+			remain = remain - (silver * 100)
+			text = string.format("%dg %ds %dc", gold, silver, remain)
+		end
+		if negative then
+			return "-" .. tostring(text)
+		end
+		return text
+	end
+
+	return section:AddRow(minHeight, function(row)
+		local control
+		if hasLabel then
+			local _
+			_, control = self:InitRow(row, opts)
+		else
+			-- Full-width chart: reclaim InitRow's reserved label column (#450).
+			control = CreateFrame("Frame", nil, row)
+			control:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			control:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			row.Control = control
+		end
+
+		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		emptyText:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		emptyText:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, 0)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetWordWrap(true)
+
+		local scroll = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		scroll:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", -24, 0)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetWidth(1)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		-- Viewport-sized reusable row pool (#447). Pool slots are reused across
+		-- scroll/resize; allocation stays O(viewport), not O(contributor count).
+		local pool = {}
+		local ROW_OVERSCAN = 2
+		-- Ephemeral display model from the last authoritative Refresh only.
+		-- OnSizeChanged / OnVerticalScroll recalculate geometry against this
+		-- cache without rebuilding aggregation (#447).
+		local cachedRankings = nil
+		local layoutPass = 0
+		local dataPass = 0
+
+		local function AcquirePoolSlot(index)
+			local entry = pool[index]
+			if entry then
+				entry.frame:Show()
+				return entry
+			end
+			local frame = CreateFrame("Frame", nil, content)
+			frame:SetHeight(rowHeight)
+			local nameFS = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+			nameFS:SetPoint("LEFT", frame, "LEFT", 0, 0)
+			nameFS:SetWidth(nameWidth)
+			nameFS:SetJustifyH("LEFT")
+			nameFS:SetWordWrap(false)
+			if nameFS.SetMaxLines then
+				nameFS:SetMaxLines(1)
+			end
+			local bar = CreateFrame("StatusBar", nil, frame)
+			bar:SetHeight(barHeight)
+			bar:SetPoint("LEFT", nameFS, "RIGHT", nameGap, -2)
+			if bar.SetMinMaxValues then bar:SetMinMaxValues(0, 1) end
+			if bar.SetValue then bar:SetValue(0) end
+			if bar.SetStatusBarTexture then
+				bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+			end
+			if bar.SetStatusBarColor then
+				bar:SetStatusBarColor(0.25, 0.55, 0.9, 1)
+			end
+			local barBg = bar:CreateTexture(nil, "BACKGROUND")
+			if barBg.SetAllPoints then barBg:SetAllPoints(bar) end
+			if barBg.SetTexture then barBg:SetTexture("Interface\\Buttons\\WHITE8x8") end
+			if barBg.SetVertexColor then barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8) end
+			local amountFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+			-- BOTTOMRIGHT of the amount at the bar's TOPRIGHT (#450). Short bars
+			-- re-anchor in BindRow so text stays in the plot area.
+			amountFS:SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT", 0, 0)
+			amountFS:SetJustifyH("RIGHT")
+			entry = {
+				frame = frame,
+				name = nameFS,
+				bar = bar,
+				amount = amountFS,
+			}
+			pool[index] = entry
+			return entry
+		end
+
+		local function HideUnused(fromIndex)
+			for i = fromIndex, #pool do
+				if pool[i] and pool[i].frame then
+					pool[i].frame:Hide()
+				end
+			end
+		end
+
+		local function ViewportHeight()
+			local h = 0
+			if scroll.GetHeight then
+				h = scroll:GetHeight() or 0
+			end
+			if h < 1 and control.GetHeight then
+				h = control:GetHeight() or 0
+			end
+			if h < 1 then
+				h = minHeight
+			end
+			return h
+		end
+
+		local function ComputePlotWidth()
+			local width = control:GetWidth() or 0
+			if width < 1 and row.GetWidth then
+				width = row:GetWidth() or 0
+			end
+			local plotWidth = width - nameWidth - nameGap - endPad - 24
+			if plotWidth < 40 then
+				plotWidth = 40
+			end
+			content:SetWidth(math.max(1, width - 24))
+			return plotWidth
+		end
+
+		local function BindRow(entry, rowData, y, plotWidth, maxPositive)
+			local total = tonumber(rowData.totalCopper) or 0
+			entry.frame:ClearAllPoints()
+			entry.frame:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+			entry.frame:SetPoint("RIGHT", content, "RIGHT", 0, 0)
+			entry.name:SetText(tostring(rowData.name or ""))
+			entry.amount:SetText(FormatSignedCopper(total))
+			local frac = 0
+			if maxPositive > 0 and total > 0 then
+				frac = total / maxPositive
+				if frac > 1 then frac = 1 end
+				if frac < 0 then frac = 0 end
+			end
+			local barW = math.floor(plotWidth * frac + 0.5)
+			if barW < 0 then barW = 0 end
+			-- Keep a measurable bar edge for amount anchoring on nonpositive rows.
+			local drawnBarW = math.max(barW, 0.001)
+			entry.bar:SetWidth(drawnBarW)
+			if entry.bar.SetValue then
+				entry.bar:SetValue(frac > 0 and 1 or 0)
+			end
+			entry.bar:Show()
+
+			-- Place amount above the bar end; clamp short/zero/negative bars so
+			-- the label stays inside the plot and clear of contributor names.
+			local textW = 0
+			if entry.amount.GetStringWidth then
+				textW = tonumber(entry.amount:GetStringWidth()) or 0
+			end
+			local anchorX = math.max(drawnBarW, textW)
+			entry.amount:ClearAllPoints()
+			entry.amount:SetPoint("BOTTOMRIGHT", entry.bar, "TOPLEFT", anchorX, 0)
+			entry.amount:SetJustifyH("RIGHT")
+			entry._sfAmountAnchorX = anchorX
+			entry._sfBarWidth = drawnBarW
+			entry._sfAmountText = entry.amount:GetText()
+			entry.frame:Show()
+		end
+
+		local function LayoutBars(rankings, plotWidth)
+			layoutPass = layoutPass + 1
+			local rows = type(rankings) == "table" and rankings.rows or nil
+			if type(rows) ~= "table" or #rows == 0 then
+				HideUnused(1)
+				content:SetHeight(1)
+				if scroll.SetVerticalScroll then
+					scroll:SetVerticalScroll(0)
+				end
+				return
+			end
+			local totalRows = #rows
+			local contentHeight = math.max(1, amountTopPad + totalRows * rowHeight)
+			content:SetHeight(contentHeight)
+
+			local viewportH = ViewportHeight()
+			local scrollY = 0
+			if scroll.GetVerticalScroll then
+				scrollY = tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			local maxScroll = math.max(0, contentHeight - viewportH)
+			if scrollY < 0 then
+				scrollY = 0
+			elseif scrollY > maxScroll then
+				scrollY = maxScroll
+			end
+			if scroll.SetVerticalScroll and (scroll.GetVerticalScroll == nil
+					or (tonumber(scroll:GetVerticalScroll()) or 0) ~= scrollY) then
+				-- Clamp without re-entering LayoutBars via OnVerticalScroll.
+				local priorBusy = row.__sfRankingLayoutBusy
+				row.__sfRankingLayoutBusy = true
+				scroll:SetVerticalScroll(scrollY)
+				row.__sfRankingLayoutBusy = priorBusy
+			end
+
+			local firstIdx = math.floor(math.max(0, scrollY - amountTopPad) / rowHeight)
+				+ 1 - ROW_OVERSCAN
+			if firstIdx < 1 then
+				firstIdx = 1
+			end
+			local visibleSlots = math.ceil(viewportH / rowHeight) + (ROW_OVERSCAN * 2)
+			if visibleSlots < 1 then
+				visibleSlots = 1
+			end
+			local lastIdx = firstIdx + visibleSlots - 1
+			if lastIdx > totalRows then
+				lastIdx = totalRows
+			end
+			if firstIdx > totalRows then
+				HideUnused(1)
+				return
+			end
+
+			local maxPositive = tonumber(rankings.maxPositive) or 0
+			local poolIdx = 1
+			for i = firstIdx, lastIdx do
+				local entry = AcquirePoolSlot(poolIdx)
+				BindRow(entry, rows[i], amountTopPad + (i - 1) * rowHeight, plotWidth, maxPositive)
+				poolIdx = poolIdx + 1
+			end
+			HideUnused(poolIdx)
+		end
+
+		local function ApplyEmptyOrBars(rankings)
+			local rows = type(rankings) == "table" and rankings.rows or {}
+			local emptyReason = rankings and rankings.emptyReason
+			local customEmpty = rankings and rankings.emptyText
+			local plotWidth = ComputePlotWidth()
+
+			if type(customEmpty) == "string" and customEmpty ~= "" then
+				scroll:Hide()
+				emptyText:Show()
+				emptyText:SetText(customEmpty)
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
+			-- No active campaign: blank content area; retain page navigation (#450).
+			if emptyReason == "no_campaign" then
+				scroll:Hide()
+				emptyText:Hide()
+				emptyText:SetText("")
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
+			if #rows == 0 and emptyReason == "no_contributions" then
+				scroll:Hide()
+				emptyText:Show()
+				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_NO_HISTORY",
+					"No credited contributions are recorded for this campaign yet."))
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
+			if #rows == 0 then
+				scroll:Hide()
+				emptyText:Show()
+				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_NO_HISTORY",
+					"No credited contributions are recorded for this campaign yet."))
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
+			emptyText:Hide()
+			scroll:Show()
+			LayoutBars(rankings, plotWidth)
+		end
+
+		--- Authoritative data refresh (section RegisterRefresh / initial build).
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, { scroll, emptyText })
+			dataPass = dataPass + 1
+			local rankings = getRankings() or {}
+			cachedRankings = rankings
+			ApplyEmptyOrBars(rankings)
+		end
+
+		--- Resize/scroll layout against the cached ephemeral model. Never walks
+		-- the ledger again outside a page render pass (#447).
+		local function LayoutOnly()
+			if row.__sfRankingLayoutBusy then
+				return
+			end
+			row.__sfRankingLayoutBusy = true
+			local ok, err = pcall(function()
+				self:_ApplyRowState(row, section, opts, { scroll, emptyText })
+				ApplyEmptyOrBars(cachedRankings or {})
+			end)
+			row.__sfRankingLayoutBusy = false
+			if not ok then
+				error(tostring(err or "ranking layout failed"), 0)
+			end
+		end
+
+		-- Test hooks (nil in production consumers).
+		control.__sfRankingDataPass = function() return dataPass end
+		control.__sfRankingLayoutPass = function() return layoutPass end
+		control.__sfRankingPoolCount = function() return #pool end
+		control.__sfRankingScroll = scroll
+		control.__sfRankingContent = content
+		control.__sfRankingEmptyText = emptyText
+		control.__sfRankingHasLabel = hasLabel and true or false
+		control.__sfRankingAmountTopPad = amountTopPad
+		control.__sfRankingFormatCopper = FormatSignedCopper
+		control.__sfRankingVisibleNames = function()
+			local names = {}
+			for i = 1, #pool do
+				local entry = pool[i]
+				if entry and entry.frame and entry.frame:IsShown() and entry.name then
+					names[#names + 1] = entry.name:GetText()
+				end
+			end
+			return names
+		end
+		control.__sfRankingVisibleAmounts = function()
+			local amounts = {}
+			for i = 1, #pool do
+				local entry = pool[i]
+				if entry and entry.frame and entry.frame:IsShown() then
+					amounts[#amounts + 1] = {
+						text = entry._sfAmountText or (entry.amount and entry.amount:GetText()) or "",
+						anchorX = entry._sfAmountAnchorX,
+						barWidth = entry._sfBarWidth,
+					}
+				end
+			end
+			return amounts
+		end
+
+		if control.HookScript and not control.__sfRankingSizeHook then
+			control.__sfRankingSizeHook = true
+			control:HookScript("OnSizeChanged", function()
+				LayoutOnly()
+			end)
+		end
+		-- Hook rather than SetScript so UIPanelScrollFrameTemplate's inherited
+		-- ScrollFrame_OnVerticalScroll still syncs ScrollBar value and arrow
+		-- button enabled state (#447).
+		if scroll.HookScript and not scroll.__sfRankingScrollHook then
+			scroll.__sfRankingScrollHook = true
+			scroll:HookScript("OnVerticalScroll", function()
+				LayoutOnly()
+			end)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end, { fillHeight = opts.fillHeight })
+end
+
 function Controls:AddLogTable(section, opts)
 	opts = opts or {}
 
@@ -2712,8 +3181,26 @@ function Controls:AddLogTable(section, opts)
 		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
 		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
 		emptyText:SetJustifyH("LEFT")
-		emptyText:SetText(opts.emptyText or "No logs found matching the selected filters.")
 		emptyText:Hide()
+
+		--- Resolve opts.emptyText whether it is a string or a callable (#453).
+		-- Must run before the first SetText so FontString never receives a function.
+		local function ResolveEmptyText()
+			local empty = opts.emptyText
+			if type(empty) == "function" then
+				local ok, value = pcall(empty)
+				if ok then
+					empty = value
+				else
+					empty = nil
+				end
+			end
+			if type(empty) ~= "string" or empty == "" then
+				empty = "No logs found matching the selected filters."
+			end
+			return empty
+		end
+		emptyText:SetText(ResolveEmptyText())
 
 		local headerCells = {}
 		for index, column in ipairs(columns) do
@@ -2731,6 +3218,15 @@ function Controls:AddLogTable(section, opts)
 		end
 
 		local rows = {}
+		-- When virtualize is set, only a bounded pool of row frames is created and
+		-- rebound to the visible scroll window. Full-history access remains via scroll.
+		local virtualize = opts.virtualize and true or false
+		local stride = rowHeight + rowSpacing
+		local cachedDataRows = {}
+		local cachedEnabled = true
+		local lastAvailableWidth = 0
+		-- Scroll identity for campaign/dataset/filter changes (#453).
+		local lastScrollContextKey = nil
 
 		local function LayoutCells(parent, cells, availableWidth)
 			local fixedWidth = 0
@@ -2763,6 +3259,19 @@ function Controls:AddLogTable(section, opts)
 			end
 		end
 
+		local function ShowRowTooltip(dataRow)
+			local tip = dataRow.__sfTooltip
+			if type(tip) ~= "string" or tip == "" then
+				return
+			end
+			if not GameTooltip then
+				return
+			end
+			GameTooltip:SetOwner(dataRow, "ANCHOR_RIGHT")
+			GameTooltip:SetText(tip, 1, 1, 1, 1, true)
+			GameTooltip:Show()
+		end
+
 		local function EnsureRow(index)
 			if rows[index] then
 				return rows[index]
@@ -2780,9 +3289,13 @@ function Controls:AddLogTable(section, opts)
 
 			dataRow:SetScript("OnEnter", function(self)
 				self.Hover:Show()
+				ShowRowTooltip(self)
 			end)
 			dataRow:SetScript("OnLeave", function(self)
 				self.Hover:Hide()
+				if GameTooltip and GameTooltip.Hide then
+					GameTooltip:Hide()
+				end
 			end)
 
 			dataRow.Cells = {}
@@ -2806,6 +3319,8 @@ function Controls:AddLogTable(section, opts)
 						GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
 						GameTooltip:SetHyperlink(cell.hyperlink)
 						GameTooltip:Show()
+					elseif dataRow.__sfTooltip then
+						ShowRowTooltip(dataRow)
 					end
 				end)
 				cell:SetScript("OnLeave", function()
@@ -2830,6 +3345,31 @@ function Controls:AddLogTable(section, opts)
 			return dataRow
 		end
 
+		local function BindRow(dataRow, rowData, enabled, availableWidth)
+			dataRow:SetAlpha(enabled and 1 or 0.45)
+			dataRow.__sfTooltip = type(rowData) == "table" and rowData.tooltip or nil
+			for columnIndex, column in ipairs(columns) do
+				local value = rowData and rowData[column.key]
+				local cell = dataRow.Cells[columnIndex]
+				cell.Text:SetText(value or "")
+				local hyperlink
+				local itemRef
+				if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+					hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+				end
+				if SF.LootLog and SF.LootLog.ExtractItemRef then
+					itemRef = SF.LootLog.ExtractItemRef(value)
+				end
+				cell.hyperlink = hyperlink
+				cell.itemRef = itemRef
+				cell.itemLinkText = hyperlink and value or nil
+			end
+			if availableWidth and availableWidth > 0 then
+				LayoutCells(dataRow, dataRow.Cells, availableWidth)
+			end
+			dataRow:Show()
+		end
+
 		local function SetScrollBarShown(show)
 			local scrollBar = scroll.ScrollBar
 			if not scrollBar then return 0 end
@@ -2852,6 +3392,107 @@ function Controls:AddLogTable(section, opts)
 			return scrollBar:GetWidth() or 20
 		end
 
+		local function ResolveScrollContextKey()
+			local keyFn = opts.getScrollContextKey
+			if type(keyFn) ~= "function" then
+				return nil
+			end
+			local ok, value = pcall(keyFn)
+			if not ok or type(value) ~= "string" then
+				return ""
+			end
+			return value
+		end
+
+		--- Reset scroll on context change; otherwise clamp to the valid range.
+		-- Ordinary refreshes with an unchanged context keep the user's offset.
+		local function SyncScrollOffset(contentHeight, forceReset)
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local maxScroll = math.max(0, (tonumber(contentHeight) or 0) - visibleHeight)
+			local scrollOffset = 0
+			if not forceReset and scroll.GetVerticalScroll then
+				scrollOffset = tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			if scrollOffset < 0 then
+				scrollOffset = 0
+			elseif scrollOffset > maxScroll then
+				scrollOffset = maxScroll
+			end
+			if scroll.SetVerticalScroll then
+				local current = scroll.GetVerticalScroll and (tonumber(scroll:GetVerticalScroll()) or 0) or nil
+				if current == nil or current ~= scrollOffset then
+					scroll:SetVerticalScroll(scrollOffset)
+				end
+			end
+			local scrollBar = scroll.ScrollBar
+			if scrollBar and scrollBar.SetValue and (forceReset or scrollOffset == 0 or scrollOffset == maxScroll) then
+				local barValue = scrollBar.GetValue and tonumber(scrollBar:GetValue()) or nil
+				if barValue == nil or barValue ~= scrollOffset then
+					scrollBar:SetValue(scrollOffset)
+				end
+			end
+			return scrollOffset
+		end
+
+		local function RenderVirtualWindow(availableWidth)
+			local dataRows = cachedDataRows
+			local total = #dataRows
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local contentHeight = (total > 0) and (total * stride - rowSpacing) or 1
+			local scrollOffset = SyncScrollOffset(contentHeight, false)
+			local firstIndex = 1
+			if stride > 0 then
+				firstIndex = math.floor(scrollOffset / stride) + 1
+			end
+			if firstIndex < 1 then
+				firstIndex = 1
+			end
+			-- One extra row above/below so scrolling stays continuous.
+			local visibleCount = math.ceil(visibleHeight / math.max(1, stride)) + 2
+			if visibleCount < 4 then
+				visibleCount = 4
+			end
+			-- Hard cap so repeated refreshes cannot allocate unbounded frames.
+			local maxPool = opts.maxVirtualRows or 48
+			if visibleCount > maxPool then
+				visibleCount = maxPool
+			end
+			if firstIndex > total then
+				firstIndex = math.max(1, total - visibleCount + 1)
+			end
+			local lastIndex = math.min(total, firstIndex + visibleCount - 1)
+			local poolIndex = 0
+			for dataIndex = firstIndex, lastIndex do
+				poolIndex = poolIndex + 1
+				local dataRow = EnsureRow(poolIndex)
+				local yOffset = (dataIndex - 1) * stride
+				dataRow:ClearAllPoints()
+				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+				BindRow(dataRow, dataRows[dataIndex], cachedEnabled, availableWidth)
+			end
+			for index = poolIndex + 1, #rows do
+				rows[index]:Hide()
+			end
+		end
+
+		local function RefreshVirtualWindowOnly()
+			if row.__sfLogTableRefreshing then
+				return
+			end
+			if not virtualize then
+				return
+			end
+			row.__sfLogTableRefreshing = true
+			local ok, err = pcall(function()
+				RenderVirtualWindow(lastAvailableWidth)
+			end)
+			row.__sfLogTableRefreshing = false
+			if not ok then
+				error(tostring(err or "AddLogTable virtual window failed"), 0)
+			end
+		end
+
 		local function Refresh()
 			if row.__sfLogTableRefreshing then
 				return
@@ -2860,42 +3501,44 @@ function Controls:AddLogTable(section, opts)
 			local ok, err = pcall(function()
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 			local dataRows = getRows() or {}
-			local yOffset = 0
+			cachedDataRows = dataRows
+			cachedEnabled = enabled and true or false
 
-			for index, rowData in ipairs(dataRows) do
-				local dataRow = EnsureRow(index)
-				dataRow:ClearAllPoints()
-				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
-				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
-				dataRow:SetAlpha(enabled and 1 or 0.45)
-
-				for columnIndex, column in ipairs(columns) do
-					local value = rowData[column.key]
-					local cell = dataRow.Cells[columnIndex]
-					cell.Text:SetText(value or "")
-					local hyperlink
-					local itemRef
-					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
-						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
-					end
-					if SF.LootLog and SF.LootLog.ExtractItemRef then
-						itemRef = SF.LootLog.ExtractItemRef(value)
-					end
-					cell.hyperlink = hyperlink
-					cell.itemRef = itemRef
-					cell.itemLinkText = hyperlink and value or nil
+			local contentHeight
+			if virtualize then
+				local total = #dataRows
+				contentHeight = (total > 0) and (total * stride - rowSpacing) or 1
+				content:SetHeight(math.max(1, contentHeight))
+			else
+				local yOffset = 0
+				for index, rowData in ipairs(dataRows) do
+					local dataRow = EnsureRow(index)
+					dataRow:ClearAllPoints()
+					dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+					dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+					BindRow(dataRow, rowData, enabled, nil)
+					yOffset = yOffset + stride
 				end
-
-				dataRow:Show()
-				yOffset = yOffset + rowHeight + rowSpacing
+				for index = #dataRows + 1, #rows do
+					rows[index]:Hide()
+				end
+				contentHeight = (#dataRows > 0) and (yOffset - rowSpacing) or 1
+				content:SetHeight(math.max(1, contentHeight))
 			end
 
-			for index = #dataRows + 1, #rows do
-				rows[index]:Hide()
+			-- Campaign/dataset/filter identity changes reset scroll; shrinking
+			-- results only clamp. Unchanged-context refreshes keep the offset.
+			local ctxKey = ResolveScrollContextKey()
+			local forceReset = (#dataRows == 0)
+			if ctxKey ~= nil then
+				if lastScrollContextKey ~= nil and ctxKey ~= lastScrollContextKey then
+					forceReset = true
+				end
+				lastScrollContextKey = ctxKey
 			end
+			SyncScrollOffset(contentHeight, forceReset)
 
-			local contentHeight = (#dataRows > 0) and (yOffset - rowSpacing) or 1
-			content:SetHeight(math.max(1, contentHeight))
+			emptyText:SetText(ResolveEmptyText())
 			emptyText:SetShown(#dataRows == 0)
 
 			local function ApplyScrollAndColumns()
@@ -2910,12 +3553,17 @@ function Controls:AddLogTable(section, opts)
 
 				local availableWidth = math.max(1, tableArea:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
 				content:SetWidth(availableWidth)
+				lastAvailableWidth = availableWidth
 
 				LayoutCells(header, headerCells, availableWidth)
-				for index = 1, #dataRows do
-					local dataRow = rows[index]
-					if dataRow and dataRow:IsShown() then
-						LayoutCells(dataRow, dataRow.Cells, availableWidth)
+				if virtualize then
+					RenderVirtualWindow(availableWidth)
+				else
+					for index = 1, #dataRows do
+						local dataRow = rows[index]
+						if dataRow and dataRow:IsShown() then
+							LayoutCells(dataRow, dataRow.Cells, availableWidth)
+						end
 					end
 				end
 			end
@@ -2935,6 +3583,41 @@ function Controls:AddLogTable(section, opts)
 		RegisterRefresh(section, Refresh)
 		row:HookScript("OnSizeChanged", Refresh)
 		scroll:HookScript("OnSizeChanged", Refresh)
+		if virtualize then
+			-- Rebind the pooled rows as the user scrolls without rebuilding getRows().
+			if scroll.HookScript then
+				scroll:HookScript("OnVerticalScroll", function()
+					RefreshVirtualWindowOnly()
+				end)
+			end
+			local scrollBar = scroll.ScrollBar
+			if scrollBar and scrollBar.HookScript then
+				scrollBar:HookScript("OnValueChanged", function()
+					RefreshVirtualWindowOnly()
+				end)
+			end
+		end
+		-- Expose pool/scroll hooks for lifecycle and #453 behavioral tests.
+		row.__sfLogTableRowCount = function()
+			return #rows
+		end
+		row.__sfLogTableVirtualize = virtualize
+		row.__sfLogTableScroll = scroll
+		row.__sfLogTableGetVerticalScroll = function()
+			if scroll.GetVerticalScroll then
+				return tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			return 0
+		end
+		row.__sfLogTableSetVerticalScroll = function(offset)
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(tonumber(offset) or 0)
+			end
+			if virtualize then
+				RefreshVirtualWindowOnly()
+			end
+		end
+		row.__sfLogTableRefresh = Refresh
 	end, { fillHeight = opts.fillHeight })
 end
 
@@ -3602,16 +4285,19 @@ function Controls:AddAutocomplete(section, opts)
 			drop:SetClampedToScreen(true)
 		end
 		drop:Hide()
-		if drop.SetBackdrop then
+		-- Fully opaque WHITE8X8 backing; dialog-box textures stay translucent.
+		if OpaqueMenu.ApplyAutocompleteBackdrop then
+			OpaqueMenu.ApplyAutocompleteBackdrop(drop)
+		elseif drop.SetBackdrop then
 			drop:SetBackdrop({
-				bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+				bgFile = "Interface\\Buttons\\WHITE8X8",
 				edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 				tile = true,
 				tileSize = 8,
 				edgeSize = 12,
 				insets = { left = 3, right = 3, top = 3, bottom = 3 },
 			})
-			drop:SetBackdropColor(0, 0, 0, 0.92)
+			drop:SetBackdropColor(0, 0, 0, 1)
 			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 		end
 

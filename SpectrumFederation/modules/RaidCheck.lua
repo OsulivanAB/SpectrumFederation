@@ -1127,11 +1127,18 @@ function RC:_GetInspectState()
 		adhocRun = nil,
 		preflightOpen = false,
 		adhocTickerStarted = false,
+		-- Settings Session status: generation scopes lastUiStatus to the current
+		-- BeginCheck invocation so a failed new attempt cannot reuse prior success.
+		uiStatusGeneration = 0,
+		uiStatusListeners = {},
+		lastUiStatus = nil,
 	}
 	self._inspectState.lastGood = self._inspectState.lastGood or {}
 	self._inspectState.lastIssuedGeneration = self._inspectState.lastIssuedGeneration or 0
 	self._inspectState.equipmentAuthorityByKey = self._inspectState.equipmentAuthorityByKey or {}
 	self._inspectState.backgroundInspectConsumers = self._inspectState.backgroundInspectConsumers or {}
+	self._inspectState.uiStatusListeners = self._inspectState.uiStatusListeners or {}
+	self._inspectState.uiStatusGeneration = self._inspectState.uiStatusGeneration or 0
 	return self._inspectState
 end
 
@@ -4517,6 +4524,149 @@ local function EmitAdminDebug(message)
 	end
 end
 
+local function CopyUiStatus(ui)
+	if type(ui) ~= "table" then
+		return nil
+	end
+	return {
+		status = ui.status,
+		message = ui.message,
+		kind = ui.kind,
+		generation = ui.generation,
+		seq = ui.seq,
+		mode = ui.mode,
+		profileId = ui.profileId,
+		runId = ui.runId,
+	}
+end
+
+local function NotifyUiStatusListeners()
+	local state = RC:_GetInspectState()
+	local ui = CopyUiStatus(state.lastUiStatus)
+	for _, callback in pairs(state.uiStatusListeners or {}) do
+		if type(callback) == "function" then
+			pcall(callback, ui)
+		end
+	end
+end
+
+-- Monotonic sequence shared by Raid Check status transitions and Session row
+-- writes. Generation scopes an invocation; seq distinguishes started→completed
+-- (and Session Control feedback) within or across invocations for refresh ordering.
+local function NextSharedMessageSeq(state)
+	state = state or RC:_GetInspectState()
+	state.sharedMessageSeq = (state.sharedMessageSeq or 0) + 1
+	return state.sharedMessageSeq
+end
+
+-- Begin a new Settings-visible attempt. Busy/in-flight returns must not call this:
+-- only paths that attempt a new check. Clears prior success so error returns cannot
+-- prefer a stale completed summary (Codex #458).
+local function BeginUiStatusInvocation(mode, profileId)
+	local state = RC:_GetInspectState()
+	state.uiStatusGeneration = (state.uiStatusGeneration or 0) + 1
+	state.lastUiStatus = {
+		status = "pending",
+		message = nil,
+		kind = "info",
+		generation = state.uiStatusGeneration,
+		seq = NextSharedMessageSeq(state),
+		mode = mode,
+		profileId = profileId,
+		runId = nil,
+	}
+	return state.uiStatusGeneration
+end
+
+local function SetLastUiStatus(status, message, kind, opts)
+	opts = opts or {}
+	local state = RC:_GetInspectState()
+	local generation = opts.generation or state.uiStatusGeneration or 0
+	local previous = state.lastUiStatus
+	state.lastUiStatus = {
+		status = status,
+		message = message,
+		kind = kind or "info",
+		generation = generation,
+		seq = NextSharedMessageSeq(state),
+		mode = opts.mode or (previous and previous.mode) or nil,
+		profileId = opts.profileId or (previous and previous.profileId) or nil,
+		runId = opts.runId or (previous and previous.runId) or nil,
+	}
+	NotifyUiStatusListeners()
+end
+
+function RC:GetLastUiStatus()
+	local state = self:_GetInspectState()
+	return CopyUiStatus(state.lastUiStatus)
+end
+
+function RC:GetUiStatusGeneration()
+	local state = self:_GetInspectState()
+	return state.uiStatusGeneration or 0
+end
+
+function RC:NextSharedMessageSeq()
+	return NextSharedMessageSeq(self:_GetInspectState())
+end
+
+function RC:GetSharedMessageSeq()
+	local state = self:_GetInspectState()
+	return state.sharedMessageSeq or 0
+end
+
+function RC:RegisterUiStatusListener(key, callback)
+	if not key or type(callback) ~= "function" then
+		return
+	end
+	local state = self:_GetInspectState()
+	state.uiStatusListeners = state.uiStatusListeners or {}
+	state.uiStatusListeners[key] = callback
+end
+
+function RC:UnregisterUiStatusListener(key)
+	if not key then
+		return
+	end
+	local state = self:_GetInspectState()
+	if state.uiStatusListeners then
+		state.uiStatusListeners[key] = nil
+	end
+end
+
+function RC:CountUiStatusListeners()
+	local state = self:_GetInspectState()
+	local count = 0
+	for _ in pairs(state.uiStatusListeners or {}) do
+		count = count + 1
+	end
+	return count
+end
+
+local function EmitAdminCompletionSummary(modeLabel, results, run)
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun or not CheckRun.FormatCompletionSummary then
+		return nil
+	end
+	local prepared, unprepared, inspectionFailed = 0, 0, 0
+	if CheckRun.CountClassifiedResults then
+		prepared, unprepared, inspectionFailed = CheckRun.CountClassifiedResults(results)
+	end
+	local message = CheckRun.FormatCompletionSummary(modeLabel, prepared, unprepared, inspectionFailed)
+	if type(message) ~= "string" or message == "" then
+		return nil
+	end
+	-- Always local chat for the initiating admin: not gated on debug logging or
+	-- player whispers. PrintSuccess matches the historical Complete notification.
+	SF:PrintSuccess(message)
+	SetLastUiStatus("completed", message, "success", {
+		mode = run and run.mode or nil,
+		profileId = run and run.profileId or nil,
+		runId = run and run.id or nil,
+	})
+	return message
+end
+
 local function EmitAdminMissingSummary(modeLabel, summaryMissing)
 	if type(summaryMissing) ~= "table" or #summaryMissing == 0 then
 		return
@@ -4654,6 +4804,15 @@ local function ModeLabel(mode)
 	return "Raid Check"
 end
 
+-- Localized mode name for Settings-visible status and the initiating-admin
+-- completion summary. Legacy debug/sync diagnostics keep ModeLabel() English.
+local function LocalizedModeLabel(mode)
+	if mode == "pre" then
+		return (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_PRE", "Pre-Raid Check")) or "Pre-Raid Check"
+	end
+	return (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_RAID", "Raid Check")) or "Raid Check"
+end
+
 local function QueueFrozenInspectTargets(self, run)
 	local now = GetTime and GetTime() or 0
 	for _, memberId in ipairs(run.targetIds or {}) do
@@ -4786,7 +4945,13 @@ function RC:_ApplyCheckConsequences(run)
 	local profile = GetProfileById(run.profileId)
 	if not profile then
 		run.consequencesApplied = true
-		SF:PrintError(string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode)))
+		local err = string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode))
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", {
+			mode = run.mode,
+			profileId = run.profileId,
+			runId = run.id,
+		})
 		return
 	end
 
@@ -4794,11 +4959,18 @@ function RC:_ApplyCheckConsequences(run)
 	-- awards, Reward Pot writes, logs, and admin whispers as a unit.
 	if not IsCurrentUserAdmin(profile) then
 		run.consequencesApplied = true
+		local err
 		if SF.LootHelperImpersonation and SF.LootHelperImpersonation.IsActive and SF.LootHelperImpersonation:IsActive() then
-			SF:PrintError("Raid Check results were not applied because you are viewing the profile as a non-admin.")
+			err = "Raid Check results were not applied because you are viewing the profile as a non-admin."
 		else
-			SF:PrintError("Raid Check results were not applied because you are not an admin of this profile.")
+			err = "Raid Check results were not applied because you are not an admin of this profile."
 		end
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", {
+			mode = run.mode,
+			profileId = run.profileId,
+			runId = run.id,
+		})
 		return
 	end
 
@@ -5083,6 +5255,9 @@ function RC:_ApplyCheckConsequences(run)
 	end
 
 	run.consequencesApplied = true
+	-- One initiating-admin completion line. consequencesApplied above prevents
+	-- repeats from ticks, announce callbacks, or a second Apply call.
+	EmitAdminCompletionSummary(LocalizedModeLabel(mode), results, run)
 	if SF.Debug then
 		SF.Debug:Info("RAID_CHECK", "%s consequences applied (missing=%d failed=%d skipBroadcast=%s reason=%s)",
 			label, #summaryMissing, #summaryFailed, tostring(skipBroadcast), tostring(reason))
@@ -5312,8 +5487,18 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	end
 
 	local label = ModeLabel(mode)
+	-- Settings status + listener path prefer lastUiStatus; localize the stored
+	-- started message so translated clients are not stuck with hard-coded English.
+	local startedTemplate = (SF.LocaleText and SF.LocaleText("RAID_CHECK_UI_STARTED", "%s started.")) or "%s started."
+	local startedMessage = startedTemplate:format(LocalizedModeLabel(mode))
+	-- Record started before inspection work so an immediate settle can replace it.
+	SetLastUiStatus("started", startedMessage, "info", {
+		mode = mode,
+		profileId = run.profileId,
+		runId = run.id,
+	})
 	if SF.SystemMessage then
-		SF:SystemMessage(label .. " started.")
+		SF:SystemMessage(startedMessage)
 	else
 		SF:PrintInfo(string.format("[%s] Initiated.", label))
 	end
@@ -5330,18 +5515,36 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 
 	self:_EnsureAdhocTicker()
 	self:_TickAdhocRun()
+	-- Immediate settle (including zero targets / already-complete) must not leave
+	-- callers thinking the check is still in progress.
+	if run.consequencesApplied then
+		return "completed"
+	end
 	return "started"
 end
 
 function RC:BeginCheck(mode)
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default
+	end
+
 	if mode ~= "pre" and mode ~= "raid" then
-		SF:PrintError("Invalid Raid Check mode.")
+		BeginUiStatusInvocation(mode, nil)
+		local err = "Invalid Raid Check mode."
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", { mode = mode })
 		return "error"
 	end
 
 	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 	if not CheckRun then
-		SF:PrintError("Raid Equipment check runtime is unavailable.")
+		BeginUiStatusInvocation(mode, nil)
+		local err = "Raid Equipment check runtime is unavailable."
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", { mode = mode })
 		return "error"
 	end
 
@@ -5358,27 +5561,48 @@ function RC:BeginCheck(mode)
 		selectedProfileId = profile and profile.GetProfileId and profile:GetProfileId() or nil,
 	})
 
-	if decision.action == "busy" then
+	-- Busy must not invalidate the in-flight run's Settings status.
+	if decision.action == "busy" or state.preflightOpen then
 		SF:PrintInfo("A Raid Check is already in progress.")
 		return "busy"
 	end
+
+	local profileId = profile and profile.GetProfileId and profile:GetProfileId() or nil
+	-- New attempt: scope/clear prior success before validation or prompt work.
+	local generation = BeginUiStatusInvocation(mode, profileId)
+	local label = ModeLabel(mode)
+	local uiLabel = LocalizedModeLabel(mode)
+
 	if decision.action == "error" then
 		ValidateCanRun(mode)
+		SetLastUiStatus(
+			"error",
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(uiLabel),
+			"error",
+			{ generation = generation, mode = mode, profileId = profileId }
+		)
 		return "error"
 	end
 
 	local profileObj, cfg = ValidateCanRun(mode)
 	if not profileObj then
+		SetLastUiStatus(
+			"error",
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(uiLabel),
+			"error",
+			{ generation = generation, mode = mode, profileId = profileId }
+		)
 		return "error"
 	end
 	profile = profileObj
+	profileId = profile:GetProfileId()
 
 	if decision.action == "start" then
 		if decision.warnMismatch then
 			SF:PrintWarning("This check uses the selected profile. Its consequences will not synchronize through the unrelated active session.")
 		end
 		return self:_StartAdhocRun(mode, profile, cfg, {
-			profileId = profile:GetProfileId(),
+			profileId = profileId,
 			sessionMismatch = decision.warnMismatch and true or false,
 			expectedSessionId = (not decision.warnMismatch) and session.sessionId or nil,
 			expectedSessionProfileId = (not decision.warnMismatch) and session.profileId or nil,
@@ -5387,16 +5611,28 @@ function RC:BeginCheck(mode)
 	end
 
 	-- No active session: three-outcome prompt. Do not start inspect work until answered.
-	if state.preflightOpen then
-		return "busy"
-	end
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 	if not (dialogs and dialogs.ConfirmChoice) then
-		SF:PrintError("Session preflight dialog is unavailable.")
+		local err = Loc("RAID_CHECK_UI_PREFLIGHT_UNAVAILABLE", "Session preflight dialog is unavailable.")
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", {
+			generation = generation,
+			mode = mode,
+			profileId = profileId,
+		})
 		return "error"
 	end
 
 	state.preflightOpen = true
+	local promptMessage = Loc(
+		"RAID_CHECK_UI_PROMPT",
+		"Choose Yes to start a session, No to run without one, or Cancel to abort."
+	)
+	SetLastUiStatus("prompt", promptMessage, "info", {
+		generation = generation,
+		mode = mode,
+		profileId = profileId,
+	})
 	local shown = dialogs:ConfirmChoice(
 		"No Loot Helper session is active. Start a session for this check?",
 		YES or "Yes",
@@ -5410,7 +5646,16 @@ function RC:BeginCheck(mode)
 				liveProfile = profile
 			end
 			if not (SF.LootHelperSync and SF.LootHelperSync.StartSession) then
-				SF:PrintError("Loot Helper Sync is unavailable. The check was not started.")
+				local err = Loc(
+					"RAID_CHECK_UI_SESSION_UNAVAILABLE",
+					"Loot Helper Sync is unavailable. The check was not started."
+				)
+				SF:PrintError(err)
+				SetLastUiStatus("error", err, "error", {
+					generation = generation,
+					mode = mode,
+					profileId = profileId,
+				})
 				return
 			end
 			-- StartSession prints the specific failure reason when chat is warranted.
@@ -5420,6 +5665,15 @@ function RC:BeginCheck(mode)
 				if SF.Debug then
 					SF.Debug:Warn("RaidCheck", "Session preflight Yes-path StartSession failed; check was not started")
 				end
+				SetLastUiStatus(
+					"error",
+					Loc(
+						"RAID_CHECK_UI_SESSION_START_FAILED",
+						"Could not start a Loot Helper session. The check was not started."
+					),
+					"error",
+					{ generation = generation, mode = mode, profileId = profileId }
+				)
 				return
 			end
 			local liveCfg = cfg
@@ -5446,12 +5700,27 @@ function RC:BeginCheck(mode)
 		function()
 			local current = self:_GetInspectState()
 			current.preflightOpen = false
-			SF:PrintInfo(string.format("[%s] Cancelled.", ModeLabel(mode)))
+			local cancelled = Loc("RAID_CHECK_UI_CANCELLED", "%s cancelled."):format(uiLabel)
+			SF:PrintInfo(string.format("[%s] Cancelled.", label))
+			SetLastUiStatus("cancelled", cancelled, "info", {
+				generation = generation,
+				mode = mode,
+				profileId = profileId,
+			})
 		end
 	)
 	if not shown then
 		state.preflightOpen = false
-		SF:PrintError("Could not show the session prompt. The check was not started.")
+		local err = Loc(
+			"RAID_CHECK_UI_PREFLIGHT_SHOW_FAILED",
+			"Could not show the session prompt. The check was not started."
+		)
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error", {
+			generation = generation,
+			mode = mode,
+			profileId = profileId,
+		})
 		return "error"
 	end
 	return "prompt"

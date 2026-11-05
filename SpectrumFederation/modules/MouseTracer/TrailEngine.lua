@@ -49,6 +49,20 @@ function Engine.StampTextureForEdgeSoftness(softness)
 	return string.format(C.SOFT_CIRCLE_TEXTURE_FMT, softness)
 end
 
+-- Resolve texture, mask, and blend for a softness step.
+-- Softness 0 preserves the original ADD + circular portrait mask appearance.
+-- Softness 10–100 uses SoftCircle + BLEND and CLEARED_MASK (SetMask("")) so a
+-- prior circular mask cannot remain active. Retail (#454): WHITE8X8 masks turn
+-- soft stamps into hard squares; SetTexture alone does not clear SetMask.
+function Engine.StampAppearanceForEdgeSoftness(softness)
+	softness = Engine.NormalizeEdgeSoftness(softness)
+	local texture = Engine.StampTextureForEdgeSoftness(softness)
+	if softness <= 0 then
+		return softness, texture, C.CIRCLE_TEXTURE, "ADD"
+	end
+	return softness, texture, C.CLEARED_MASK, "BLEND"
+end
+
 function Engine.HSVToRGB(h, s, v)
 	if h ~= h then
 		return v, v, v

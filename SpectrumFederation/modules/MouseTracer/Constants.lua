@@ -29,8 +29,9 @@ SF.MouseTracer.Constants = {
 	DEFAULT_THICKNESS = 16,
 	DEFAULT_RAINBOW_SPEED = 0.25,
 	DEFAULT_OPACITY = 0.70,
-	-- 0% keeps TempPortraitAlphaMask; soft TGA stamps feather inward only.
-	DEFAULT_EDGE_SOFTNESS = 0,
+	-- Default SoftCircle_50 + BLEND with cleared mask. Explicit 0% still keeps
+	-- TempPortraitAlphaMask + ADD. Existing saved values are not migrated.
+	DEFAULT_EDGE_SOFTNESS = 50,
 	TAPER_MIN_RATIO = 0.40,
 
 	MIN_SPACING = MIN_SPACING_FLOOR,
@@ -51,6 +52,11 @@ SF.MouseTracer.Constants = {
 
 	HUE_PER_PIXEL = 1 / 200,
 	CIRCLE_TEXTURE = "Interface\\CharacterFrame\\TempPortraitAlphaMask",
+	-- Softness 10–100 clears any legacy SetMask via SetMask(""). Retail (#454)
+	-- showed WHITE8X8 as a mask forces hard squares, and SetTexture does not
+	-- remove an active mask. Empty string is distinct from an uninitialized
+	-- per-slot cache entry (nil).
+	CLEARED_MASK = "",
 	-- Softness steps 10–100 map to precomputed 64x64 TGA stamps. 0% uses CIRCLE_TEXTURE.
 	SOFT_CIRCLE_TEXTURE_FMT = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_%d.tga",
 

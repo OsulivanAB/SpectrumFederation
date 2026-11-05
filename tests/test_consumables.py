@@ -80,14 +80,27 @@ def test_consumables_verification_production_lua():
 
 
 def test_consumables_runtime_is_guild_bank_deposit_only():
+    """Deposit assistant stays trade-free. #457 Quick Withdraw trade handoff is
+    isolated in ConsumablesTradeHandoff / ConsumablesWithdraw* modules."""
     root = REPO_ROOT / "SpectrumFederation" / "modules"
-    paths = list(root.rglob("Consumables*.lua")) + [SYNC_TRANSPORT]
+    # Exclude #457 withdraw/trade modules from the deposit-only guard.
+    excluded = {
+        "ConsumablesTradeHandoff.lua",
+        "ConsumablesWithdrawRuntime.lua",
+        "ConsumablesWithdrawWorkflow.lua",
+    }
+    paths = [
+        path for path in root.rglob("Consumables*.lua")
+        if path.name not in excluded
+    ] + [SYNC_TRANSPORT]
     combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
     for removed in (
         "AcceptTrade",
         "InitiateTrade",
         "ClickTradeButton",
-        "TRADE_",
+        "TRADE_SHOW",
+        "TRADE_CLOSED",
+        "TRADE_ACCEPT_UPDATE",
         "OnUpdate",
         "NewTicker",
         "AddCrafter",
@@ -97,6 +110,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
         "WithdrawEvents",
     ):
         assert removed not in combined, removed
+    # Trade handoff must never auto-accept or initiate trades (#457).
+    handoff = (root / "LootHelper" / "ConsumablesTradeHandoff.lua").read_text(encoding="utf-8")
+    assert "AcceptTrade" not in handoff
+    assert "InitiateTrade" not in handoff
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "function W.DepositEvents" in workflow
     runtime = RUNTIME.read_text(encoding="utf-8")
@@ -158,7 +175,17 @@ def test_consumables_goal_editor_guards_are_present():
     controls = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Control" / "Controls.lua"
     ).read_text(encoding="utf-8")
-    page = (
+    # #453: requested-item goal editing lives on Manage, not Configuration.
+    manage_page = (
+        REPO_ROOT
+        / "SpectrumFederation"
+        / "modules"
+        / "UI"
+        / "Settings"
+        / "Pages"
+        / "GuildSuppliesManage.lua"
+    ).read_text(encoding="utf-8")
+    config_page = (
         REPO_ROOT
         / "SpectrumFederation"
         / "modules"
@@ -180,8 +207,9 @@ def test_consumables_goal_editor_guards_are_present():
     assert "LayoutRowColumns" in controls
     assert "ApplyScrollAndColumns" in controls
     assert "nameColumnWidth" in controls
-    assert "C.ValidGoal" in page
-    assert 'type = "consumableRequestedList"' in page
+    assert "C.ValidGoal" in manage_page
+    assert 'type = "consumableRequestedList"' in manage_page
+    assert 'type = "consumableRequestedList"' not in config_page
     # Enter must clear focus only; focus-loss is the sole goal-commit path.
     enter_at = controls.find('r.GoalEdit:SetScript("OnEnterPressed"')
     lost_at = controls.find('r.GoalEdit:SetScript("OnEditFocusLost"')
@@ -319,10 +347,13 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     assert "PROTO_VERSION = 9" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
-    # Raid Supplies Logs keeps dynamic help text. DefinitionRenderer:Refresh does
-    # not rebuild the page, and AddHelpText only updates via getText.
-    assert "getText = MembershipHelpText" in supplies_logs
-    assert "getText = HistoryHelpText" in supplies_logs
+    # #453: Logs empty-state guidance is the virtualized table's callable emptyText.
+    assert "emptyText = EmptyLogsText" in supplies_logs
+    assert "local function EmptyLogsText" in supplies_logs
+    assert "GUILD_SUPPLIES_LOGS_EMPTY_HISTORY" in supplies_logs
+    assert "GUILD_SUPPLIES_LOGS_EMPTY_FILTERED" in supplies_logs
+    assert "getText = MembershipHelpText" not in supplies_logs
+    assert "getText = HistoryHelpText" not in supplies_logs
     # Roster-driven refreshes must use effective visibility while the standalone
     # settings parent is hidden.
     assert "local function PanelVisible" in supplies_logs

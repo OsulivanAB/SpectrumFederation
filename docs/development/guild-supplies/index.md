@@ -17,7 +17,8 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
-| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 3`) via Guild Gossip API |
+| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 5`) via Guild Gossip API |
+| Quick Withdraw recipes + informational withdrawal receipts (#457) | Campaign `recipes` map + `set-recipe` ops; `withdrawal` ledger events (separately capped); runtime-only trade handoff |
 | Campaign display names (#424) | `rename-campaign` ops + `campaignNames` projection; LWW by `(timestamp, op.id)`; no Troubleshooting conflict |
 | Donation evidence / officer or three-witness ledger | `Ledger` |
 | Witness identity + contribution attribution (#427) | Guild Info main/alt (read-only); durable donor fields unchanged; legacy `identityLinks` inert |
@@ -108,8 +109,9 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 
 | Area | Access |
 | --- | --- |
-| **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, rename target (current/archived), items/goals, adjustments, **Activate Guild Supplies**, and the personal reminder checkbox. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Status/campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
-| **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history (read-only; no rename or personal preferences) |
+| **Raid Supplies → Configuration** | Initialize (first-time only), bank tab, New Campaign, rename target (current/archived), current-campaign goals/progress, **Activate Guild Supplies** (while still staged), and the personal reminder checkbox. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here; opaque status IDs are not shown (#453). Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
+| **Raid Supplies → Manage** | Officer-only (`canEdit` / Preview as Non-Admin). Requested items and quantity adjustments (#453). Mutation authorization is still checked when committing. |
+| **Raid Supplies → Logs** | Current-campaign donation/adjustment table (Contributor / Quantity / Item) with contributor and item filters; archived history retained; goals/progress live on Configuration (#453) |
 | **Raid Supplies → Troubleshooting** | Staged dataset adoption and configuration-conflict resolution (#422). Same editor/authority restrictions as before; ordinary members can navigate. |
 | **Personal preferences** | Account-local reminder checkbox on Configuration only (#428) |
 | **Loot Helper → Consumables / Consumable Logs** | Removed from the packaged addon (#415). They are not registered before or after activation, including across profile switches. Legacy profile writers, SavedVariables, and the #389 eligibility gates stay in place. |

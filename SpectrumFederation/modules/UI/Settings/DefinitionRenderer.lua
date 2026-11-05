@@ -254,6 +254,9 @@ function R:Build(panel, pageDef)
 			elseif t == "overallProgressBar" then
 				controls:AddOverallProgressBar(sec, item)
 
+			elseif t == "contributionRankingChart" then
+				controls:AddContributionRankingChart(sec, item)
+
 			elseif t == "button" then
 				local opts = item
 				if type(opts.onClick) == "function" then

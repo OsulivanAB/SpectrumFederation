@@ -13,9 +13,11 @@ LUA_TESTS = REPO_ROOT / "tests" / "lua" / "settings_window_layout_tests.lua"
 OPACITY_TESTS = REPO_ROOT / "tests" / "lua" / "settings_window_opacity_tests.lua"
 SECTION_LAYOUT_TESTS = REPO_ROOT / "tests" / "lua" / "settings_section_layout_tests.lua"
 LOG_TABLE_TESTS = REPO_ROOT / "tests" / "lua" / "settings_log_table_tests.lua"
+OPAQUE_MENU_TESTS = REPO_ROOT / "tests" / "lua" / "opaque_menu_style_tests.lua"
 WINDOW = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "StandaloneWindow.lua"
 SECTION = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Widgets" / "Section.lua"
 PAGE_BUILDER = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "PageBuilder.lua"
+STYLE = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Style.lua"
 GENERAL_PAGE = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "General.lua"
 SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
 
@@ -100,3 +102,21 @@ def test_settings_log_table_reentrancy_production_lua():
         )
     assert "0 failed" in result.stdout
     assert (REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Control" / "Controls.lua").exists()
+
+
+def test_opaque_menu_style_production_lua():
+    result = subprocess.run(
+        [_lua51(), str(OPAQUE_MENU_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 opaque menu style tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert STYLE.exists()

@@ -5,7 +5,7 @@
   "sites": [
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
-      "line": 64,
+      "line": 79,
       "kind": "PrintSuccess",
       "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logging enabled. Use '/sf debug show' to view logs.\")",
       "enclosing": "<SetScript:OnEvent>",
@@ -14,7 +14,7 @@
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
-      "line": 67,
+      "line": 82,
       "kind": "PrintInfo",
       "signature": "PrintInfo|SF:PrintInfo(\"Debug logging disabled\")",
       "enclosing": "<SetScript:OnEvent>",
@@ -23,7 +23,7 @@
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
-      "line": 73,
+      "line": 88,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Settings Window is not available.\")",
       "enclosing": "<SetScript:OnEvent>",
@@ -32,7 +32,7 @@
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
-      "line": 78,
+      "line": 93,
       "kind": "PrintSuccess",
       "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logs cleared\")",
       "enclosing": "<SetScript:OnEvent>",
@@ -41,7 +41,7 @@
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
-      "line": 81,
+      "line": 96,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Unknown debug command. Use: on, off, show, clear\")",
       "enclosing": "<SetScript:OnEvent>",
@@ -50,7 +50,7 @@
     },
     {
       "path": "SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua",
-      "line": 34,
+      "line": 48,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(text)",
       "enclosing": "Warn",
@@ -365,7 +365,7 @@
     },
     {
       "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
-      "line": 4693,
+      "line": 4764,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(\"Linked characters share equipment history with overlapping slot usage.\")",
       "enclosing": "LootProfile:LinkCharacters",
@@ -626,7 +626,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3004,
+      "line": 4189,
       "kind": "SendChatMessage",
       "signature": "SendChatMessage|SendChatMessage(message, \"WHISPER\", nil, target)",
       "enclosing": "SendWhisper",
@@ -635,7 +635,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3026,
+      "line": 4211,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"No active loot profile selected. Set an active profile before running a raid check.\")",
       "enclosing": "ValidateCanRun",
@@ -644,7 +644,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3031,
+      "line": 4216,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Only admins can run raid checks.\")",
       "enclosing": "ValidateCanRun",
@@ -653,7 +653,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3036,
+      "line": 4221,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Raid Check settings are unavailable for the active profile.\")",
       "enclosing": "ValidateCanRun",
@@ -662,7 +662,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3042,
+      "line": 4227,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Invalid Raid Check mode.\")",
       "enclosing": "ValidateCanRun",
@@ -671,7 +671,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3327,
+      "line": 4512,
       "kind": "SystemMessage",
       "signature": "SystemMessage|SF:SystemMessage(message)",
       "enclosing": "EmitAdminMessage",
@@ -680,7 +680,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3329,
+      "line": 4514,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(message)",
       "enclosing": "EmitAdminMessage",
@@ -689,34 +689,34 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3556,
+      "line": 4640,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(message)",
+      "enclosing": "EmitAdminCompletionSummary",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4919,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(string.format(\"[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.\", ModeLabel(run.mode)))",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:_ApplyCheckConsequences",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3565,
+      "line": 4938,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Raid Check results were not applied because you are viewing the profile as a non-admin.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:_ApplyCheckConsequences",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3567,
-      "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Raid Check results were not applied because you are not an admin of this profile.\")",
-      "enclosing": "RC:_ApplyCheckConsequences",
-      "hotpath_ok": false,
-      "note": ""
-    },
-    {
-      "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3588,
+      "line": 4963,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] The check completed, but Loot Helper session synchronization could not be established. Results were saved locally.\", ModeLab",
       "enclosing": "RC:_ApplyCheckConsequences",
@@ -725,7 +725,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3590,
+      "line": 4965,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] The expected session is no longer active. Results are saved locally and were not synchronized.\", ModeLabel(mode)))",
       "enclosing": "RC:_ApplyCheckConsequences",
@@ -734,7 +734,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3592,
+      "line": 4967,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] Consequences stay on the selected profile and will not synchronize through the unrelated session.\", ModeLabel(mode)))",
       "enclosing": "RC:_ApplyCheckConsequences",
@@ -743,7 +743,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3594,
+      "line": 4969,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] Session-backed synchronization did not complete. Results were saved locally.\", ModeLabel(mode)))",
       "enclosing": "RC:_ApplyCheckConsequences",
@@ -752,7 +752,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 3968,
+      "line": 5393,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Raid Equipment check runtime is unavailable.\")",
       "enclosing": "RC:_StartAdhocRun",
@@ -761,16 +761,16 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4017,
+      "line": 5468,
       "kind": "SystemMessage",
-      "signature": "SystemMessage|SF:SystemMessage(label .. \" started.\")",
+      "signature": "SystemMessage|SF:SystemMessage(startedMessage)",
       "enclosing": "RC:_StartAdhocRun",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4019,
+      "line": 5470,
       "kind": "PrintInfo",
       "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Initiated.\", label))",
       "enclosing": "RC:_StartAdhocRun",
@@ -779,7 +779,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4026,
+      "line": 5477,
       "kind": "PrintInfo",
       "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Paused in combat. Inspection resumes when combat ends.\", label))",
       "enclosing": "RC:_StartAdhocRun",
@@ -788,25 +788,25 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4039,
+      "line": 5504,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Invalid Raid Check mode.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4045,
+      "line": 5513,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Raid Equipment check runtime is unavailable.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4063,
+      "line": 5533,
       "kind": "PrintInfo",
       "signature": "PrintInfo|SF:PrintInfo(\"A Raid Check is already in progress.\")",
       "enclosing": "RC:BeginCheck",
@@ -815,7 +815,7 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4079,
+      "line": 5568,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(\"This check uses the selected profile. Its consequences will not synchronize through the unrelated active session.\")",
       "enclosing": "RC:BeginCheck",
@@ -824,36 +824,36 @@
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4096,
+      "line": 5583,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Session preflight dialog is unavailable.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4114,
+      "line": 5619,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync is unavailable. The check was not started.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4150,
+      "line": 5670,
       "kind": "PrintInfo",
-      "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Cancelled.\", ModeLabel(mode)))",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Cancelled.\", label))",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
     },
     {
       "path": "SpectrumFederation/modules/RaidCheck.lua",
-      "line": 4155,
+      "line": 5684,
       "kind": "PrintError",
-      "signature": "PrintError|SF:PrintError(\"Could not show the session prompt. The check was not started.\")",
+      "signature": "PrintError|SF:PrintError(err)",
       "enclosing": "RC:BeginCheck",
       "hotpath_ok": false,
       "note": ""
