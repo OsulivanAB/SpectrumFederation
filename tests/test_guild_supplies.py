@@ -13,6 +13,7 @@ PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 LUA_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_tests.lua"
 LUA_RENAME_424_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_rename_424_tests.lua"
 LUA_UI_453_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_453_tests.lua"
+LUA_CORRECTION_459_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_459_tests.lua"
 GS_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildSupplies"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-supplies" / "index.md"
 ADAPTER = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip" / "05_GuildAdapter.lua"
@@ -93,6 +94,31 @@ def test_guild_supplies_raid_supply_ui_453():
     assert "453: unassigned adjustment contributor" in result.stdout
     assert "453: all retained entries projected (>25)" in result.stdout
     assert "453: combined filters cover removed-item donations" in result.stdout
+
+
+def test_guild_supplies_contributor_corrections_459():
+    """Focused #459 officer contributor correction admission/projection coverage."""
+    assert LUA_CORRECTION_459_TESTS.exists()
+    result = subprocess.run(
+        [_lua51(), str(LUA_CORRECTION_459_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Supplies #459 correction tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert "459: PROVIDER_SCHEMA is 5" in result.stdout
+    assert "459: effective credit is Bob" in result.stdout
+    assert "459: floor reason player_negative" in result.stdout
+    assert "459: LWW effective Carol" in result.stdout
+    assert "459: credit after redrive" in result.stdout
+    assert "459: preview reason got preview_non_admin" in result.stdout
 
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
