@@ -2299,17 +2299,25 @@ do
         if bag == 0 and slot == 1 and (bagCounts["10"] or 0) > 0 then
             return { itemID = 10, stackCount = bagCounts["10"], isLocked = false }
         end
+        if bag == 0 and slot == 2 and (bagCounts["20"] or 0) > 0 then
+            return { itemID = 20, stackCount = bagCounts["20"], isLocked = false }
+        end
         return nil
     end
     _G.GetTradePlayerItemInfo = function(slot)
-        local qty = tradeOffers["10"]
-        if slot == 1 and qty and qty > 0 then
-            return "item", nil, qty
+        local qty10 = tradeOffers["10"]
+        local qty20 = tradeOffers["20"]
+        if slot == 1 and qty10 and qty10 > 0 then
+            return "item", nil, qty10
+        end
+        if slot == 2 and qty20 and qty20 > 0 then
+            return "item", nil, qty20
         end
         return nil
     end
     _G.GetTradePlayerItemLink = function(slot)
         if slot == 1 and tradeOffers["10"] then return "|Hitem:10:|h" end
+        if slot == 2 and tradeOffers["20"] then return "|Hitem:20:|h" end
         return nil
     end
     local savedCreateFrame = _G.CreateFrame
@@ -2542,6 +2550,141 @@ do
     assertTrue(H.GetState().batches[1].ambiguous == nil
         or next(H.GetState().batches[1].ambiguous) == nil,
         "E: empty offer no ambiguity")
+
+    -- Terminal status from ALL surviving batches: paused A must keep unresolved
+    -- after a later successful B delivery or unrelated cancellation (no Reset).
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 5
+    bagCounts["20"] = 4
+    tradeOffers["10"] = 5
+    tradeOffers["20"] = nil
+    local batchA = H.EnqueueConfirmed({ ["10"] = 5 }, {
+        operationId = "op-amb-A",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    assertTrue(batchA ~= nil, "E: batch A enqueued")
+    local expiryA = nil
+    do
+        local live = H.GetState().batches
+        for i = 1, #live do
+            if live[i].id == batchA.id then expiryA = live[i].expiresAt end
+        end
+    end
+    fire("TRADE_SHOW")
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    -- Ambiguous for A: bags unchanged vs show snapshot.
+    bagCounts["10"] = 5
+    fire("TRADE_CLOSED")
+    assertEq(H.GetState().status, "unresolved", "E: A ambiguous → unresolved")
+    assertTrue(type(H.GetState().statusDetail) == "string"
+        and H.GetState().statusDetail:find("unresolved", 1, true) ~= nil,
+        "E: A unresolved message shown")
+    local afterA = H.GetState().batches
+    local foundA = nil
+    for i = 1, #afterA do
+        if afterA[i].id == batchA.id then foundA = afterA[i] end
+    end
+    assertTrue(foundA ~= nil, "E: A survives ambiguity")
+    assertEq(foundA.amounts["10"], 5, "E: A quantity exact 5")
+    assertEq(foundA.ambiguous and foundA.ambiguous["10"], 5, "E: A ambiguity exact 5")
+    assertEq(foundA.expiresAt, expiryA, "E: A expiry preserved")
+    local offerableAfterA = H._AggregatePending()
+    assertTrue(offerableAfterA["10"] == nil or offerableAfterA["10"] == 0,
+        "E: paused A excluded from offerable totals")
+
+    -- Later successful delivery of B without Reset.
+    bagCounts["20"] = 4
+    tradeOffers["10"] = nil
+    tradeOffers["20"] = 4
+    local batchB = H.EnqueueConfirmed({ ["20"] = 4 }, {
+        operationId = "op-del-B",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    assertTrue(batchB ~= nil, "E: batch B enqueued while A paused")
+    fire("TRADE_SHOW")
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    bagCounts["20"] = 0 -- proven full delivery of B
+    fire("TRADE_CLOSED")
+    assertEq(H.GetState().status, "unresolved",
+        "E: later B complete keeps unresolved while A paused")
+    assertTrue(type(H.GetState().statusDetail) == "string"
+        and H.GetState().statusDetail:find("unresolved", 1, true) ~= nil,
+        "E: unresolved message after B delivery")
+    local afterB = H.GetState().batches
+    local a2, b2 = nil, nil
+    for i = 1, #afterB do
+        if afterB[i].id == batchA.id then a2 = afterB[i] end
+        if afterB[i].id == batchB.id then b2 = afterB[i] end
+    end
+    assertTrue(a2 ~= nil, "E: A still present after B delivery")
+    assertEq(a2.amounts["10"], 5, "E: A quantity unchanged after B")
+    assertEq(a2.ambiguous and a2.ambiguous["10"], 5, "E: A ambiguity unchanged after B")
+    assertEq(a2.expiresAt, expiryA, "E: A expiry unchanged after B")
+    assertEq(b2, nil, "E: B consumed once")
+    local offerableAfterB = H._AggregatePending()
+    assertTrue(offerableAfterB["10"] == nil or offerableAfterB["10"] == 0,
+        "E: A still excluded from offerable after B")
+    assertTrue(offerableAfterB["20"] == nil or offerableAfterB["20"] == 0,
+        "E: B not offerable after consumption")
+
+    -- Companion: ambiguity for A, then cancel empty/unrelated later trade (no Reset).
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 5
+    bagCounts["20"] = 0
+    tradeOffers["10"] = 5
+    tradeOffers["20"] = nil
+    local batchA2 = H.EnqueueConfirmed({ ["10"] = 5 }, {
+        operationId = "op-amb-A2",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    fire("TRADE_SHOW")
+    fire("TRADE_ACCEPT_UPDATE", 1, 1)
+    bagCounts["10"] = 5
+    fire("TRADE_CLOSED")
+    assertEq(H.GetState().status, "unresolved", "E: A2 ambiguous → unresolved")
+    tradeOffers["10"] = nil
+    tradeOffers["20"] = nil
+    fire("TRADE_SHOW")
+    -- Empty/unrelated cancel: no accept, close.
+    fire("TRADE_CLOSED")
+    assertEq(H.GetState().status, "unresolved",
+        "E: later cancel keeps unresolved while A paused")
+    assertTrue(type(H.GetState().statusDetail) == "string"
+        and H.GetState().statusDetail:find("unresolved", 1, true) ~= nil,
+        "E: unresolved message after later cancel")
+    local paused = nil
+    for i = 1, #H.GetState().batches do
+        if H.GetState().batches[i].id == batchA2.id then
+            paused = H.GetState().batches[i]
+        end
+    end
+    assertTrue(paused ~= nil, "E: paused A unchanged after cancel")
+    assertEq(paused.amounts["10"], 5, "E: paused A quantity exact after cancel")
+    assertEq(paused.ambiguous and paused.ambiguous["10"], 5,
+        "E: paused A ambiguity exact after cancel")
+
+    -- Ordinary cancellation control (no live ambiguity) still uses cancelled message.
+    H.Reset()
+    H._state.listenersAttached = false
+    bagCounts["10"] = 3
+    tradeOffers["10"] = 3
+    H.EnqueueConfirmed({ ["10"] = 3 }, {
+        operationId = "op-cancel-plain",
+        guildKey = "club:G1",
+        playerGuid = "Player-1-G1",
+    })
+    fire("TRADE_SHOW")
+    fire("TRADE_CLOSED") -- no accept → cancelled
+    assertEq(H.GetState().status, "pending", "E: ordinary cancel → pending status")
+    assertTrue(type(H.GetState().statusDetail) == "string"
+        and H.GetState().statusDetail:find("cancelled", 1, true) ~= nil,
+        "E: ordinary cancel message")
+    assertEq(#H.GetState().batches, 1, "E: ordinary cancel leaves batch")
 
     if savedCreateFrame then
         _G.CreateFrame = savedCreateFrame
@@ -3238,6 +3381,185 @@ do
     RT:SetQuickWithdrawStatus("stale-unresolved", { visitToken = visitB })
     assertTrue(statusText ~= "stale-unresolved",
         "D: prior visit unresolved cannot overwrite new visit")
+
+    -- Visible unresolved settlement: real BeginQuickWithdraw SettleHandler → Dialogs.Confirm.
+    -- Hidden Status:SetText alone is not delivery (close can settle then hide/clear).
+    local presentedDialogs = {}
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function(_, message, acceptText, _onAccept)
+        presentedDialogs[#presentedDialogs + 1] = {
+            message = tostring(message or ""),
+            acceptText = tostring(acceptText or ""),
+        }
+        return true
+    end
+    SF.SettingsUI.Dialogs.ConfirmChoice = function(_, _msg, _yes, _no, onYes)
+        if type(onYes) == "function" then end
+    end
+    -- Track lifecycle hide independently of CreateFrame/EnsureReview frame identity.
+    local helperLifecycleHidden = false
+    local realHideReview = RT.HideReviewForBankLifecycle
+    RT.HideReviewForBankLifecycle = function(self)
+        helperLifecycleHidden = true
+        return realHideReview(self)
+    end
+    -- Start through real BeginQuickWithdraw without the counting settle spy so
+    -- work.onSettle remains the production SettleHandler (PresentUnresolved path).
+    local function startVisibilityWithdraw(label)
+        if WR.work then WR.StopWork("test_cleanup", true) end
+        C_Timer._clear()
+        settleCount, receiptCount, handoffCount = 0, 0, 0
+        settleReasons = {}
+        pickupCount = 0
+        bagByItem[10] = 0
+        bankBySlot[1] = 5
+        bankAvailable = true
+        WR.craftDrafts = { ["100"] = 1 }
+        installCursorStubs()
+        local visitAtStart = RT._quickWithdrawVisitToken
+        RT:BeginQuickWithdraw()
+        assertTrue(WR.work ~= nil, label .. ": BeginQuickWithdraw attached work")
+        assertEq(WR.work.visitToken, visitAtStart, label .. ": production visit token")
+        assertTrue(type(WR.work.onSettle) == "function", label .. ": production onSettle")
+        assertTrue(WR.work.pendingStep ~= nil, label .. ": pendingStep after PlaceNext")
+        local productionHandler = WR.work.onSettle
+        local opId = WR.work.operationId
+        WR.work.onSettle = function(result)
+            settleCount = settleCount + 1
+            settleReasons[#settleReasons + 1] = result and result.reason
+            return productionHandler(result)
+        end
+        return opId
+    end
+
+    -- 1) Close → delayed unresolved after lifecycle hide.
+    presentedDialogs = {}
+    helperLifecycleHidden = false
+    RT._unresolvedWithdrawPresented = nil
+    RT.bankOpen = false
+    RT._quickWithdrawVisitSeq = 0
+    RT._quickWithdrawVisitToken = nil
+    statusText = ""
+    RT:OnBankOpened()
+    local hiddenOpId = startVisibilityWithdraw("D: unresolved-hidden")
+    bagByItem[10] = 0
+    bankBySlot[1] = 5
+    bankAvailable = true
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    RT:OnBankClosed()
+    assertTrue(helperLifecycleHidden, "D: HideReviewForBankLifecycle ran on close")
+    assertFalse(RT.bankOpen, "D: bankOpen false after close")
+    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
+        "D: unresolved-hidden keeps pending under deadline")
+    assertEq(#presentedDialogs, 0, "D: no dialog before deadline while still pending")
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: unresolved-hidden settles once")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: unresolved-hidden reason")
+    assertEq(receiptCount, 0, "D: unresolved-hidden no receipt")
+    assertEq(handoffCount, 0, "D: unresolved-hidden no handoff")
+    assertEq(#presentedDialogs, 1, "D: unresolved dialog presented after helper lifecycle hide")
+    assertTrue(presentedDialogs[1].message:find("not retried", 1, true) ~= nil
+        or presentedDialogs[1].message:find("unresolved", 1, true) ~= nil,
+        "D: dialog carries unresolved settlement text")
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = hiddenOpId,
+        visitToken = "visit:stale",
+        unresolved = { itemId = 10 },
+        requested = { ["10"] = 5 },
+        authorized = { ["10"] = 5 },
+        confirmed = {},
+        remaining = { ["10"] = 5 },
+    })
+    assertEq(#presentedDialogs, 1, "D: replayed unresolved op does not duplicate dialog")
+
+    -- 2) Synchronous close ordering: settle inside WR.OnBankClosed before bankOpen=false/hide.
+    presentedDialogs = {}
+    helperLifecycleHidden = false
+    RT._unresolvedWithdrawPresented = nil
+    RT:OnBankOpened()
+    local syncOpId = startVisibilityWithdraw("D: unresolved-sync")
+    bagByItem[10] = 0
+    bankBySlot[1] = 5
+    bankAvailable = false -- InterpretWithdrawal bank_unavailable → sync unresolved on close
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    local bankOpenDuringSettle = nil
+    local hideBeforeSettleDone = nil
+    do
+        local actual = WR.work.onSettle
+        WR.work.onSettle = function(result)
+            bankOpenDuringSettle = RT.bankOpen
+            hideBeforeSettleDone = helperLifecycleHidden
+            return actual(result)
+        end
+    end
+    RT:OnBankClosed()
+    assertEq(settleCount, 1, "D: sync unresolved settles inside OnBankClosed")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: sync unresolved reason")
+    assertTrue(bankOpenDuringSettle == true,
+        "D: sync settle runs while bankOpen still true (before hide)")
+    assertTrue(hideBeforeSettleDone == false,
+        "D: HideReview has not run yet when sync settle fires")
+    assertTrue(helperLifecycleHidden, "D: HideReview runs before OnBankClosed returns")
+    assertFalse(RT.bankOpen, "D: bankOpen false after sync close returns")
+    assertEq(#presentedDialogs, 1,
+        "D: sync unresolved presents dialog (momentary IsShown is not delivery)")
+    assertEq(receiptCount, 0, "D: sync unresolved no receipt")
+    assertEq(handoffCount, 0, "D: sync unresolved no handoff")
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = syncOpId,
+        visitToken = RT._quickWithdrawVisitToken,
+        unresolved = { itemId = 10 },
+    })
+    assertEq(#presentedDialogs, 1, "D: sync unresolved deduped by operationId")
+
+    -- 3) Close → reopen → old unresolved while newer-visit feedback exists.
+    presentedDialogs = {}
+    helperLifecycleHidden = false
+    RT._unresolvedWithdrawPresented = nil
+    bankAvailable = true
+    RT:OnBankOpened()
+    local lateOpId = startVisibilityWithdraw("D: unresolved-late")
+    bagByItem[10] = 0
+    bankBySlot[1] = 5
+    settleCount, receiptCount, handoffCount = 0, 0, 0
+    settleReasons = {}
+    local lateVisit = RT._quickWithdrawVisitToken
+    RT:OnBankClosed()
+    assertTrue(helperLifecycleHidden, "D: unresolved-late hide on close")
+    assertTrue(WR.work ~= nil and WR.work.pendingStep ~= nil,
+        "D: unresolved-late pending after close")
+    RT:OnBankOpened()
+    local newerVisit = RT._quickWithdrawVisitToken
+    assertTrue(newerVisit ~= lateVisit, "D: unresolved-late reopen rotates visit")
+    -- Unrelated current-visit draft (not the settled operation's selection key).
+    WR.craftDrafts = { ["200"] = 3 }
+    RT:SetQuickWithdrawStatus("visit2-status", { visitToken = newerVisit })
+    assertEq(statusText, "visit2-status", "D: newer-visit status baseline")
+    C_Timer._drain()
+    assertEq(settleCount, 1, "D: unresolved-late settles once")
+    assertEq(settleReasons[1], "bank_closed_unresolved", "D: unresolved-late reason")
+    assertEq(statusText, "visit2-status",
+        "D: late unresolved does not overwrite newer-visit status")
+    assertEq(WR.craftDrafts["200"], 3,
+        "D: late unresolved presentation leaves current-visit drafts intact")
+    assertEq(#presentedDialogs, 1, "D: late unresolved presents independent dialog")
+    assertTrue(presentedDialogs[1].message:find("not this bank visit", 1, true) ~= nil
+        or presentedDialogs[1].message:find("earlier withdrawal", 1, true) ~= nil
+        or presentedDialogs[1].message:find("Earlier withdrawal", 1, true) ~= nil,
+        "D: late unresolved dialog identifies earlier operation")
+    assertEq(receiptCount, 0, "D: unresolved-late no receipt")
+    assertEq(handoffCount, 0, "D: unresolved-late no handoff")
+    RT:PresentUnresolvedQuickWithdrawSettlement({
+        operationId = lateOpId,
+        visitToken = lateVisit,
+        unresolved = { itemId = 10 },
+    })
+    assertEq(#presentedDialogs, 1, "D: late unresolved deduped")
+    assertEq(WR.craftDrafts["200"], 3, "D: dialog dedupe path does not clear drafts")
+    RT.HideReviewForBankLifecycle = realHideReview
 
     -- Retained shortage confirmation: early visit-guard isolation + same-visit control.
     -- Historical fail-before (Runtime at f42d96cb admits the retained callback into a

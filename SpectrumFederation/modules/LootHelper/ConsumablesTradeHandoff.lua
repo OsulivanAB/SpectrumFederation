@@ -145,6 +145,33 @@ local function AnyBatchAmbiguous(batches)
     return false
 end
 
+--- Drop expired batches in place, then return the surviving live rows.
+local function SurvivingBatchesAfterExpiryPrune()
+    local now = Now()
+    local live = {}
+    for i = 1, #state.batches do
+        local b = state.batches[i]
+        if type(b) == "table" and (not b.expiresAt or now < b.expiresAt) then
+            live[#live + 1] = b
+        end
+    end
+    state.batches = live
+    return live
+end
+
+--- Terminal unresolved feedback when any live paused quantity survives.
+-- Returns true when unresolved status was applied.
+local function ApplyUnresolvedIfLiveAmbiguity(live)
+    if AnyBatchAmbiguous(live) then
+        state.status = "unresolved"
+        state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
+            "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
+        H.RefreshStatusUI()
+        return true
+    end
+    return false
+end
+
 function H.Reset()
     state.batches = {}
     state.status = nil
@@ -578,20 +605,16 @@ function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts, opts)
         working = (W.ConsumeTradeBatches(working, deliveredAmounts, now))
     end
     if next(ambiguousAmounts) then
-        -- Derive unresolved status from surviving relevant obligations only.
-        -- Do not sample ambiguity before expiry pruning (beforeAmbiguous), or
-        -- an all-expired set can leave stale unresolved status.
         working = W.BindTradeAmbiguity(working, ambiguousAmounts, now)
-        state.batches = protected and ConcatBatches(working, protected) or working
-        if AnyBatchAmbiguous(working) then
-            state.status = "unresolved"
-            state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_UNRESOLVED",
-                "Trade completion is unresolved. Automatic re-offering is paused for the affected items.")
-            H.RefreshStatusUI()
-            return
-        end
-    else
-        state.batches = protected and ConcatBatches(working, protected) or working
+    end
+    state.batches = protected and ConcatBatches(working, protected) or working
+    -- After authorized consumption/ambiguity updates, prune expiry and derive
+    -- terminal unresolved from ALL surviving batches (including protected ones
+    -- that were not part of this trade). AggregatePending still excludes paused
+    -- quantities from offerable totals.
+    local live = SurvivingBatchesAfterExpiryPrune()
+    if ApplyUnresolvedIfLiveAmbiguity(live) then
+        return
     end
     local remaining = AggregatePending()
     local anyLeft = false
@@ -609,6 +632,10 @@ function H.OnTradeCompleted(deliveredAmounts, ambiguousAmounts, opts)
 end
 
 function H.OnTradeCancelled()
+    local live = SurvivingBatchesAfterExpiryPrune()
+    if ApplyUnresolvedIfLiveAmbiguity(live) then
+        return
+    end
     state.status = "pending"
     state.statusDetail = Loc("GUILD_SUPPLIES_TRADE_CANCELLED",
         "Trade cancelled. Pending reagents remain available until they expire.")

@@ -1821,6 +1821,46 @@ function Runtime:FormatQuickWithdrawSettlement(result)
     return table.concat(parts, " ")
 end
 
+--- Present unresolved bank-close settlement on a visible dialog surface.
+-- Helper status text alone is not delivery: OnBankClosed can settle while the
+-- review is still briefly shown, then hide/clear it before the player reads it.
+-- Acknowledgement only — no movement, receipt, or handoff side effects.
+function Runtime:PresentUnresolvedQuickWithdrawSettlement(result, text)
+    result = type(result) == "table" and result or {}
+    local opKey = result.operationId ~= nil and tostring(result.operationId) or nil
+    self._unresolvedWithdrawPresented = self._unresolvedWithdrawPresented or {}
+    if opKey and self._unresolvedWithdrawPresented[opKey] then
+        return false
+    end
+    text = type(text) == "string" and text or self:FormatQuickWithdrawSettlement(result)
+    local current = self._quickWithdrawVisitToken
+    local origin = result.visitToken
+    local message = text
+    if origin ~= nil and current ~= nil and tostring(origin) ~= tostring(current) then
+        message = Loc("GUILD_SUPPLIES_WITHDRAW_PRIOR_OP_UNRESOLVED_FMT",
+            "An earlier withdrawal finished with unresolved movement (not this bank visit):\n%s")
+            :format(text)
+    end
+    local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+    if not (Dialogs and Dialogs.Confirm) then
+        return false
+    end
+    -- Bound session-only dedupe so stale/replayed settle callbacks cannot spam.
+    if opKey then
+        self._unresolvedWithdrawPresented[opKey] = true
+    end
+    local shown = Dialogs:Confirm(
+        message,
+        Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED_ACK", "OK"),
+        nil
+    )
+    if not shown and opKey then
+        self._unresolvedWithdrawPresented[opKey] = nil
+        return false
+    end
+    return true
+end
+
 function Runtime:SetQuickWithdrawStatus(text, opts)
     opts = type(opts) == "table" and opts or {}
     -- Scope status to the visit/operation that produced it. A late settlement
@@ -2077,11 +2117,18 @@ function Runtime:BeginQuickWithdraw()
     local boundSelections = WR.CopyCraftSelections and WR.CopyCraftSelections(selections) or selections
     local function SettleHandler(result)
         result = type(result) == "table" and result or {}
-        self:SetQuickWithdrawStatus(self:FormatQuickWithdrawSettlement(result), {
+        local text = self:FormatQuickWithdrawSettlement(result)
+        -- Visit-scoped status may no-op for a prior visit or be cleared on the
+        -- next open. Unresolved outcomes always use an independent visible
+        -- acknowledgement so bank-close hide/clear cannot erase them.
+        self:SetQuickWithdrawStatus(text, {
             visitToken = result.visitToken,
             operationId = result.operationId,
         })
         self:RebuildReview()
+        if result.unresolved then
+            self:PresentUnresolvedQuickWithdrawSettlement(result, text)
+        end
     end
     local function StartWithdraw(opts)
         opts = opts or {}
