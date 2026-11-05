@@ -184,6 +184,9 @@ do
     assertTrue(W.SlotAcceptsItemFamily(0, 8), "general bag accepts restricted item")
     assertTrue(W.SlotAcceptsItemFamily(4, 4), "matching family")
     assertFalse(W.SlotAcceptsItemFamily(4, 8), "mismatched family")
+    assertFalse(W.SlotAcceptsItemFamily(4, 0), "specialty rejects general item")
+    assertFalse(W.SlotAcceptsItemFamily(nil, 4), "unknown slot family fail-closed")
+    assertFalse(W.SlotAcceptsItemFamily(0, nil), "unknown item family fail-closed")
 
     local herbBag = {
         { bag = 4, slots = {
@@ -201,6 +204,31 @@ do
     )
     assertTrue(okHerb, "herb item into herb+general: " .. tostring(errHerb))
     assertEq(planHerb.requiredNewStacks, 1, "uses herb slot not general-only miscount")
+    assertEq(planHerb.destinations[1].bag, 4, "B2: specialty item prefers specialty slot")
+
+    -- Mixed: fam4 + fam8 with one general and one fam4 specialty — constrained alloc.
+    local mixed = {
+        { bag = 0, slots = { { slot = 1, empty = true, family = 0 } } },
+        { bag = 4, slots = { { slot = 1, empty = true, family = 4 } } },
+    }
+    local okMix, errMix, planMix = W.PlanMultiItemBagDestinations(
+        mixed,
+        { ["10"] = 1, ["20"] = 1 },
+        function() return 20 end,
+        function(id)
+            if id == 10 then return 4 end
+            if id == 20 then return 8 end
+            return nil
+        end
+    )
+    assertTrue(okMix, "B2 mixed allocation: " .. tostring(errMix))
+    local byItem = {}
+    for i = 1, #planMix.destinations do
+        local d = planMix.destinations[i]
+        byItem[d.itemId] = d
+    end
+    assertEq(byItem[10].bag, 4, "B2: item10 uses specialty")
+    assertEq(byItem[20].bag, 0, "B2: item20 uses general")
 
     local okOre, errOre = W.PlanMultiItemBagDestinations(
         { { bag = 4, slots = { { slot = 1, empty = true, family = 4 } } } },
@@ -210,6 +238,14 @@ do
     )
     assertFalse(okOre, "ore blocked when only herb bag slots exist")
     assertEq(errOre, "bag_capacity", "capacity error when no compatible slot")
+
+    local okUnknown = select(1, W.PlanMultiItemBagDestinations(
+        { { bag = 0, slots = { { slot = 1, empty = true, family = 0 } } } },
+        { ["300"] = 1 },
+        function() return 20 end,
+        function() return nil end
+    ))
+    assertFalse(okUnknown, "B2: unknown item family rejected before pickup")
 
     local okDest, destErr = W.DestinationStillValid(
         { empty = true, family = 4 },
@@ -596,6 +632,48 @@ do
     assertEq(#st.batches, 0, "R5: context loss clears handoff")
     H.Reset()
 
+    -- D: known guild -> nil must invalidate (nil must not match).
+    st.batches = {
+        { id = "g1", completedAt = 1, expiresAt = 99999, amounts = { ["10"] = 5 } },
+    }
+    st.context = { playerGuid = "Player-1-HANDOFF", guildKey = "club:1" }
+    st.tradeLifecycleId = 1
+    st.prefillAttemptedFor = nil
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = nil } end
+    _G.UnitGUID = function() return "Player-1-HANDOFF" end
+    onEvent(st.frame, "PLAYER_GUILD_UPDATE", "player")
+    assertEq(#st.batches, 0, "D: guild nil clears pending")
+    -- Re-enqueue under club1, then TRADE_SHOW with nil guild must not prefill.
+    H.Reset()
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = "club:1" } end
+    local batchNil = H.EnqueueConfirmed({ ["10"] = 5 }, { operationId = "op-nil-guild" })
+    assertTrue(batchNil ~= nil, "D: enqueue under club1")
+    st = H.GetState()
+    local frame = st.frame
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = nil } end
+    local prefillCalls = 0
+    local origPrefill = H.TryPrefillTrade
+    H.TryPrefillTrade = function(...)
+        prefillCalls = prefillCalls + 1
+        if origPrefill then return origPrefill(...) end
+    end
+    onEvent(frame, "TRADE_SHOW")
+    assertEq(prefillCalls, 0, "D: TRADE_SHOW after guild loss does not prefill")
+    assertEq(#H.GetState().batches, 0, "D: TRADE_SHOW EnsureContext clears queue")
+    H.TryPrefillTrade = origPrefill
+    H.Reset()
+
+    -- Known GUID -> unavailable.
+    SF.ConsumablesWithdrawRuntime.CurrentContext = function() return { guildKey = "club:1" } end
+    H.EnqueueConfirmed({ ["10"] = 2 }, { operationId = "op-guid" })
+    st = H.GetState()
+    st.context = { playerGuid = "Player-1-HANDOFF", guildKey = "club:1" }
+    _G.UnitGUID = function() return nil end
+    onEvent(st.frame, "PLAYER_GUILD_UPDATE", "player")
+    assertEq(#H.GetState().batches, 0, "D: GUID loss clears pending")
+    H.Reset()
+    _G.UnitGUID = function() return "Player-1-HANDOFF" end
+
     -- Partial status when deferred remain after some placements (seven stacks, six slots).
     st.batches = {
         { id = "p", completedAt = 1, expiresAt = 5000, amounts = { ["10"] = 7 } },
@@ -857,12 +935,60 @@ do
     }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
     assertEq(stGen, "rejected", "R6d: future generation rejected")
 
+    local recBump = makeRecord()
+    recBump.accounting._consumables.generation = 3
+    local stOlder = select(1, GS.AdmitWithdrawalEvent(recBump, baseEvent({
+        id = "gsw1:admit:older-under-current",
+        generation = 2,
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stOlder, "rejected", "E2: older gen under current campaign rejected")
+
+    local recHdr = makeRecord()
+    recHdr.currentCampaignId = "camp-live"
+    recHdr.campaigns = { ["camp-hdr"] = { id = "camp-hdr" } }
+    recHdr.campaignArchives = {}
+    local stHdr = select(1, GS.AdmitWithdrawalEvent(recHdr, baseEvent({
+        id = "gsw1:admit:hdr-only",
+        campaignId = "camp-hdr",
+        generation = 7,
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stHdr, "pending", "E2: header without archive generation stays pending")
+
+    local recArch = makeRecord()
+    recArch.currentCampaignId = "camp-live"
+    recArch.campaignArchives = {
+        camp1 = { generation = 2, campaignId = "camp1", requestedItems = {} },
+    }
+    local stArchOk = select(1, GS.AdmitWithdrawalEvent(recArch, baseEvent({
+        id = "gsw1:admit:arch-ok",
+        campaignId = "camp1",
+        generation = 2,
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stArchOk, "accepted", "E2: archived campaign matching generation accepted")
+    local stArchBad = select(1, GS.AdmitWithdrawalEvent(recArch, baseEvent({
+        id = "gsw1:admit:arch-bad",
+        campaignId = "camp1",
+        generation = 9,
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stArchBad, "rejected", "E2: archived generation mismatch rejected")
+
     local missingDs = baseEvent({ id = "gsw1:admit:no-ds" })
     missingDs.datasetId = nil
     local stDs = select(1, GS.AdmitWithdrawalEvent(makeRecord(), missingDs, {
         senderGuid = "Player-1-AAAA", memberAuthenticated = true,
     }))
     assertEq(stDs, "rejected", "R6d: missing datasetId rejected")
+
+    -- E1: exportable bodies converge across ORIGIN vs RELAY.
+    local originBody = GS.ExportableWithdrawalEvent(baseEvent({
+        provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+    }))
+    local relayBody = GS.ExportableWithdrawalEvent(baseEvent({
+        provenance = GS.WITHDRAWAL_PROVENANCE.RELAY,
+    }))
+    assertTrue(originBody ~= nil and relayBody ~= nil, "E1: exportable bodies")
+    assertTrue(GS._DeepEqualOps(originBody, relayBody), "E1: export identity ignores route provenance")
+    assertEq(originBody.provenance, GS.WITHDRAWAL_PROVENANCE.ORIGIN, "E1: wire provenance token stable")
 end
 
 -- R8: recipe-page completeness resumes across real 32-visit budgets
@@ -870,10 +996,10 @@ do
     local Validate = GS._ValidateAdoptionCompletenessForTest
     assertTrue(type(Validate) == "function", "R8: completeness test seam")
     local campId = "camp-arch-r8"
-    -- 40 ordinary pages + 40 recipe pages: first budget=32 yields mid-items;
-    -- a later slice yields mid-recipes so resume of recipePageCursor is covered.
+    -- Supported archive: 40 ordinary pages + 32 recipes (one per page) ≤ MAX_RECIPES.
+    -- First budget=32 yields mid-items; later slice yields mid-recipes.
     local pageCount = 40
-    local recipePageCount = 40
+    local recipePageCount = 32
     local pages, recipePages = {}, {}
     local mergedItems, mergedRecipes = {}, {}
     for p = 1, pageCount do
@@ -1014,44 +1140,64 @@ do
     assertEq(okMiss, false, "R8: missing recipe page fails")
     assertEq(errMiss, "incomplete_archive_pages", "R8: incomplete recipe pages")
 
-    -- IsAdoptionTransferComplete requires declared recipe pages.
-    GS._adoption = {
-        committed = false,
-        descriptor = {
-            acceptedOpCount = 0,
-            transferOpCount = 0,
-            campaignCount = 0,
-            archiveCount = 0,
-        },
-        sourceAcceptedIds = {},
-        _archiveIndex = {
-            [campId] = {
-                meta = meta,
-                pages = pages,
-                recipePages = { [1] = recipePages[1] },
-                pageCount = pageCount,
-                recipePageCount = recipePageCount,
-            },
-        },
-        records = {},
-        order = {},
+    -- IsAdoptionTransferComplete requires declared recipe pages via real descriptor.
+    local descBody = {
+        kind = "dataset-desc",
+        datasetId = "gs1:r8-ready",
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
     }
+    local function adoptionFixture(recipePageTable)
+        return {
+            committed = false,
+            sourceDatasetId = "gs1:r8-ready",
+            sourcePeer = "Alice-Garona",
+            sourceAcceptedIds = {},
+            _archiveIndex = {
+                [campId] = {
+                    meta = meta,
+                    pages = pages,
+                    recipePages = recipePageTable,
+                    pageCount = pageCount,
+                    recipePageCount = recipePageCount,
+                },
+            },
+            records = { ["gs:desc:gs1:r8-ready"] = descBody },
+            order = { "gs:desc:gs1:r8-ready" },
+        }
+    end
+    GS._peerDatasets = {
+        ["Alice-Garona"] = { datasetId = "gs1:r8-ready" },
+    }
+    local incompletePages = {}
+    for rp = 1, recipePageCount - 1 do
+        incompletePages[rp] = recipePages[rp]
+    end
+    GS._adoption = adoptionFixture(incompletePages)
     local ready, why = GS:IsAdoptionTransferComplete()
     assertEq(ready, false, "R8: readiness false without all recipe pages")
     assertEq(why, "incomplete_transfer", "R8: incomplete_transfer for missing recipe pages")
+    -- Adding the one missing page makes the otherwise-identical case ready.
+    incompletePages[recipePageCount] = recipePages[recipePageCount]
+    GS._adoption = adoptionFixture(incompletePages)
+    local ready2, why2 = GS:IsAdoptionTransferComplete()
+    assertEq(ready2, true, "R8: readiness true once all recipe pages present: " .. tostring(why2))
     GS._adoption = nil
+    GS._peerDatasets = {}
 end
 
--- R7: Manage orphan sync after requested-item removal (real editor hooks)
+-- C/R7: Manage Open/edit/Cancel/reopen/switch + Save-before-refresh orphans
 do
     GameTooltip = GameTooltip or {
         Hide = function() end, SetOwner = function() end, SetText = function() end,
         AddLine = function() end, Show = function() end,
     }
     SF.SettingsUI = SF.SettingsUI or {}
-    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
-    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
-    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    SF.SettingsUI.pagesById = {}
+    SF.SettingsUI.pages = {}
+    SF.SettingsUI.categories = {}
     function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
     function SF.SettingsUI:RegisterPage(page)
         self.pagesById[page.id] = page
@@ -1068,12 +1214,12 @@ do
         Describe = function(_, id) return { name = "Item" .. tostring(id), icon = "x" } end,
     }
     _G.UIParent = _G.UIParent or {}
-    _G.CreateFrame = function(_, name)
+    _G.CreateFrame = function(frameType, name, parent, template)
         local f = {
             name = name,
             shown = false,
             scripts = {},
-            children = {},
+            _text = "",
         }
         function f:SetSize() end
         function f:SetPoint() end
@@ -1092,17 +1238,30 @@ do
         function f:RegisterForDrag() end
         function f:SetBackdrop() end
         function f:SetBackdropColor() end
-        function f:SetText() end
+        function f:SetText(t)
+            f._text = tostring(t or "")
+            if f.scripts.OnTextChanged then
+                f.scripts.OnTextChanged(f)
+            end
+        end
+        function f:GetText() return f._text end
         function f:SetShown(v) f.shown = v and true or false end
         function f:Enable() end
         function f:Disable() end
         function f:ClearAllPoints() end
+        function f:SetAutoFocus() end
+        function f:SetNumeric() end
+        function f:SetMaxLetters() end
+        function f:SetHeight() end
+        function f:SetWidth() end
+        function f:SetJustifyH() end
+        function f:HasFocus() return false end
         function f:CreateFontString()
             return {
                 SetPoint = function() end, SetJustifyH = function() end,
                 SetWordWrap = function() end, SetText = function() end,
                 SetFontObject = function() end, SetTextColor = function() end,
-                Show = function() end, Hide = function() end,
+                SetWidth = function() end, Show = function() end, Hide = function() end,
             }
         end
         function f:CreateTexture()
@@ -1111,12 +1270,13 @@ do
                 SetTexture = function() end, Show = function() end, Hide = function() end,
             }
         end
-        function f:CreateScrollFrame() return f end
+        function f:SetScrollChild() end
+        function f:SetParent() end
         return f
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesManage.lua")
     local managePage = SF.SettingsUI.pagesById.guildSuppliesManage
-    assertTrue(managePage and managePage.__sfTest, "R7: Manage page hooks")
+    assertTrue(managePage and managePage.__sfTest, "C: Manage page hooks")
     local hooks = managePage.__sfTest
     local record = {
         datasetId = "gs1:manage",
@@ -1131,64 +1291,228 @@ do
                 },
                 recipes = {
                     ["100"] = { itemId = 100, reagents = { ["10"] = 3, ["20"] = 4 } },
+                    ["200"] = { itemId = 200, reagents = { ["10"] = 9 } },
                 },
             },
         },
     }
     GS.GetCurrentRecord = function() return record end
-    GS.GetCapabilities = function()
-        return { canEdit = true, canRead = true }
-    end
-    GS.GetCurrentContext = function()
-        return { ready = true, guildKey = "club:manage" }
-    end
+    GS.GetCapabilities = function() return { canEdit = true, canRead = true } end
+    GS.GetCurrentContext = function() return { ready = true, guildKey = "club:manage" } end
     GS.RecipeAvailability = function() return true end
-    -- Manage uses AdjustCanEdit → Caps via colon calls; ensure method form works.
+    GS.NormalizeRecipeValue = GS.NormalizeRecipeValue or function(v) return v end
     local _getCaps = GS.GetCapabilities
     GS.GetCapabilities = function(_, ...) return _getCaps(...) end
     local _getRec = GS.GetCurrentRecord
     GS.GetCurrentRecord = function(_, ...) return _getRec(...) end
     local _getCtx = GS.GetCurrentContext
     GS.GetCurrentContext = function(_, ...) return _getCtx(...) end
-    -- Seed editor draft as OpenRecipeEditor would with both reagents requested,
-    -- then apply production requested-item removal for 10 (configSeq unchanged).
+
+    local ctx = {
+        section = {
+            SetMessage = function() end,
+            ClearMessage = function() end,
+        },
+    }
+
+    -- Open A, edit 10:3→7, Cancel, reopen A → still 3 from saved.
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
     local draft = hooks.RecipeEditorDraft()
-    draft.open = true
-    draft.outputItemId = 100
-    draft.isExisting = true
-    draft.reagentTexts = { ["10"] = "3", ["20"] = "4" }
-    draft.orphanReagentIds = {}
-    draft.boundConfigSeq = 1
-    draft.boundRecipeRevision = "10=3;20=4"
-    record.accounting._consumables.requestedItems["10"] = nil
-    hooks.SyncOrphanReagentsFromSavedAndDraft()
+    assertEq(draft.reagentTexts["10"], "3", "C: open A loads saved 3")
+    draft.reagentTexts["10"] = "7"
+    local ui = hooks.RecipeEditorUi()
+    assertTrue(ui and ui.cancel and ui.cancel.scripts.OnClick, "C: cancel bound")
+    ui.cancel.scripts.OnClick(ui.cancel)
+    assertEq(draft.open, false, "C: cancel closes")
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
     draft = hooks.RecipeEditorDraft()
-    assertEq(draft.orphanReagentIds["10"], true, "R7: removed requested item becomes orphan")
-    assertEq(draft.reagentTexts["10"], "3", "R7: orphan quantity preserved")
-    local reagents, bad = hooks.BuildRecipeReagentsFromDraft()
-    assertTrue(reagents ~= nil, "R7: build reagents ok bad=" .. tostring(bad))
-    assertEq(reagents["10"], 3, "R7: save payload keeps orphan 10=3")
-    assertEq(reagents["20"], 4, "R7: save payload keeps 20=4")
-    -- Explicit quantity-zero repair drops the orphan deliberately.
-    draft.reagentTexts["10"] = "0"
-    hooks.SyncOrphanReagentsFromSavedAndDraft()
-    reagents = hooks.BuildRecipeReagentsFromDraft()
-    assertEq(reagents["10"], nil, "R7: explicit zero removes orphan on save payload")
-    assertEq(reagents["20"], 4, "R7: remaining reagent kept after zero repair")
-    -- Re-add requested item 10: orphan clears; quantity still from draft/saved.
-    record.accounting._consumables.requestedItems["10"] = { itemId = 10, goal = 1 }
-    draft.reagentTexts["10"] = "3"
-    hooks.SyncOrphanReagentsFromSavedAndDraft()
-    assertEq(draft.orphanReagentIds["10"], nil, "R7: re-add clears orphan flag")
-    reagents = hooks.BuildRecipeReagentsFromDraft()
-    assertEq(reagents["10"], 3, "R7: re-add keeps quantity")
+    assertEq(draft.reagentTexts["10"], "3", "C: reopen after cancel restores saved 3 not 7")
+
+    -- Open A, Cancel, open B → B uses saved 9, not A's 3.
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    hooks.RecipeEditorDraft().reagentTexts["10"] = "3"
+    hooks.RecipeEditorUi().cancel.scripts.OnClick(hooks.RecipeEditorUi().cancel)
+    hooks.OpenRecipeEditor(ctx, 200, record.accounting._consumables.recipes["200"])
+    draft = hooks.RecipeEditorDraft()
+    assertEq(draft.outputItemId, 200, "C: switched to B")
+    assertEq(draft.reagentTexts["10"], "9", "C: open B loads B's 9 not A's 3")
+    local reagentsB = hooks.BuildRecipeReagentsFromDraft()
+    assertEq(reagentsB["10"], 9, "C: B save payload is 9")
+
+    -- Remove requested 10; Save before deferred refresh keeps orphan 10=3.
+    hooks.OpenRecipeEditor(ctx, 100, record.accounting._consumables.recipes["100"])
+    record.accounting._consumables.requestedItems["10"] = nil
+    -- Do not call RefreshRecipeEditor (deferred). Commit path must still reconcile.
+    local applied
+    GS.NewConfigOperation = function(_, kind, target, value)
+        applied = { kind = kind, target = target, value = value }
+        return { kind = kind, target = target, value = value }, "accepted"
+    end
+    GS.ApplyStagedConfigOperation = function(_, op)
+        return "accepted"
+    end
+    hooks.CommitRecipeEditorSave()
+    assertTrue(applied ~= nil, "C: Save issued set-recipe")
+    assertEq(applied.value.reagents["10"], 3, "C: Save-before-refresh keeps orphan 10=3")
+    assertEq(applied.value.reagents["20"], 4, "C: Save keeps 20=4")
+end
+
+-- A: BeginWithdraw / PreviewWithdrawPlan positive + shortage binding (no global RecipeUnavailable)
+do
+    assertEq(_G.RecipeUnavailable, nil, "A: no compensating RecipeUnavailable global")
+    _G.GetServerTime = function() return 1000 end
+    local cursorItem = nil
+    _G.GetCursorInfo = function()
+        if cursorItem then return "item", cursorItem end
+        return nil
+    end
+    _G.GetItemCount = function() return 0 end
+    _G.GetCurrentGuildBankTab = function() return 1 end
+    _G.GetGuildBankTabInfo = function()
+        return "Tab", "icon", true, true, 0, -1
+    end
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", 10, false end
+        if tab == 1 and slot == 2 then return "tex", 5, false end
+        return nil
+    end
+    _G.GetGuildBankItemLink = function(tab, slot)
+        if tab == 1 and slot == 1 then return "|Hitem:10:|h" end
+        if tab == 1 and slot == 2 then return "|Hitem:10:|h" end
+        return nil
+    end
+    _G.PickupGuildBankItem = function() cursorItem = 10 end
+    _G.SplitGuildBankItem = function() cursorItem = 10 end
+    _G.PutItemInBackpack = function() cursorItem = nil end
+    _G.ClearCursor = function() cursorItem = nil end
+    _G.InCombatLockdown = function() return false end
+    C_Timer = { After = function(_, fn) return { Cancel = function() end } end }
+    C_Container = {
+        GetContainerNumSlots = function(bag)
+            if bag == 0 then return 4 end
+            return 0
+        end,
+        GetContainerNumFreeSlots = function(bag)
+            if bag == 0 then return 4, 0 end
+            return 0, 0
+        end,
+        GetContainerItemInfo = function() return nil end,
+        PickupContainerItem = function() cursorItem = nil end,
+    }
+    C_Item = {
+        GetItemFamily = function() return 0 end,
+    }
+    SF.Consumables = SF.Consumables or {}
+    SF.Consumables.ItemIdFromText = function(link)
+        local id = tostring(link or ""):match("item:(%d+)")
+        return tonumber(id)
+    end
+    SF.ConsumablesRouting = { IsCarriedBag = function() return true end }
+    -- WithdrawAccess requires Runtime:BankIsOpen().
+    SF.ConsumablesRuntime = SF.ConsumablesRuntime or {}
+    SF.ConsumablesRuntime.BankIsOpen = function() return true end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    local WR = SF.ConsumablesWithdrawRuntime
+    local record = {
+        datasetId = "gs1:wd",
+        _guildKey = "club:wd",
+        currentCampaignId = "camp1",
+        accounting = {
+            _consumables = {
+                bankTab = 1,
+                generation = 1,
+                configSeq = 1,
+                recipes = {
+                    ["100"] = { itemId = 100, reagents = { ["10"] = 5 } },
+                },
+            },
+        },
+    }
+    GS.IsLiveActiveForCurrentGuild = function() return true end
+    GS.GetCurrentRecord = function() return record end
+    GS.RecipeAvailability = function() return true end
+    GS.WithdrawalReceiptCapacityOk = function() return true end
+    GS.AggregateRecipeWithdrawal = GS.AggregateRecipeWithdrawal
+
+    -- Positive: sufficient stock begins movement (queue attached).
+    local okFull, errFull = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okFull, true, "A: sufficient BeginWithdraw ok: " .. tostring(errFull))
+    assertTrue(WR.work ~= nil, "A: work attached")
+    assertTrue(#(WR.work.queue or {}) >= 1, "A: movement queue non-empty")
+    WR.StopWork("test_cleanup", true)
+
+    -- Shortage: Preview preserves multi-return preview table (not collapsed).
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", 2, false end
+        return nil
+    end
+    local okPrev, errPrev, preview = WR.PreviewWithdrawPlan({ ["100"] = 2 }, {})
+    assertEq(okPrev, false, "A: shortage preview false")
+    assertEq(errPrev, "shortage", "A: shortage reason")
+    assertTrue(type(preview) == "table" and preview.plan ~= nil, "A: preview table preserved")
+    assertTrue(preview.ctx ~= nil, "A: preview.ctx bound")
+    assertEq(preview.plan.take["10"], 2, "A: approved take is available 2")
+
+    local okShort, errShort, detail = WR.BeginWithdraw({ ["100"] = 2 }, {})
+    assertEq(okShort, false, "A: BeginWithdraw shortage")
+    assertEq(errShort, "shortage", "A: shortage err")
+    assertTrue(type(detail) == "table" and detail.plan ~= nil, "A: shortage returns full preview")
+    assertTrue(detail.ctx and detail.ctx.guildKey == "club:wd", "A: shortage preview ctx")
+
+    -- Accept partial with acceptedTake ceiling.
+    local okPartial, errPartial = WR.BeginWithdraw({ ["100"] = 2 }, {
+        allowPartial = true,
+        acceptedTake = { ["10"] = 2 },
+    })
+    assertEq(okPartial, true, "A: approved partial starts: " .. tostring(errPartial))
+    assertEq(WR.work.take["10"], 2, "A: take capped to approved")
+    WR.StopWork("test_cleanup", true)
+
+    -- B3: two source stacks of 5 into one empty dest of capacity 10 → second merge.
+    _G.GetGuildBankItemInfo = function(tab, slot)
+        if tab == 1 and slot == 1 then return "tex", 5, false end
+        if tab == 1 and slot == 2 then return "tex", 5, false end
+        return nil
+    end
+    _G.GetGuildBankItemLink = function(tab, slot)
+        if tab == 1 and (slot == 1 or slot == 2) then return "|Hitem:10:|h" end
+        return nil
+    end
+    record.accounting._consumables.recipes["100"] = { itemId = 100, reagents = { ["10"] = 10 } }
+    local okSeq, errSeq = WR.BeginWithdraw({ ["100"] = 1 }, {})
+    assertEq(okSeq, true, "B3: BeginWithdraw for split dest: " .. tostring(errSeq))
+    local q = WR.work.queue
+    assertEq(#q, 2, "B3: two bank pickups")
+    assertEq(q[1].destMerge, false, "B3: first into empty")
+    assertEq(q[2].destMerge, true, "B3: second merges into prior placement")
+    assertEq(q[1].destBag, q[2].destBag, "B3: same dest bag")
+    assertEq(q[1].destSlot, q[2].destSlot, "B3: same dest slot")
+    -- Revalidate after first fill: second step must still be valid as merge.
+    local slotAfter = { itemId = 10, count = 5, locked = false, family = 0, empty = false }
+    local okDest2, destWhy2 = W.DestinationStillValid(
+        slotAfter,
+        { count = q[2].count, merge = q[2].destMerge, itemFamily = 0 },
+        10,
+        20
+    )
+    assertTrue(okDest2, "B3: second dest valid after first fill: " .. tostring(destWhy2))
+    local okForeign = select(1, W.DestinationStillValid(
+        { itemId = 99, count = 1, locked = false, family = 0 },
+        { count = 5, merge = true, itemFamily = 0 },
+        10,
+        20
+    ))
+    assertFalse(okForeign, "B3: foreign occupancy still rejected")
+    WR.StopWork("test_cleanup", true)
 end
 
 -- R9: ClearProcessedDrafts preserves unrelated recipe inputs; remaining uses request
 do
     _G.GetServerTime = _G.GetServerTime or function() return 1000 end
     _G.GetCursorInfo = function() return nil end
-    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    if not SF.ConsumablesWithdrawRuntime then
+        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    end
     local WR = SF.ConsumablesWithdrawRuntime
     WR.craftDrafts = { ["900"] = 3, ["901"] = 2 }
     WR.ClearProcessedDrafts({ ["900"] = 3 })

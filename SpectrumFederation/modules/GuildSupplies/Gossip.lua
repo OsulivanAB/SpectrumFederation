@@ -2251,18 +2251,30 @@ local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker
     if type(exportId) ~= "string" or exportId == "" or type(event) ~= "table" then
         return
     end
+    local exportEvent = event
+    if (event.type == "withdrawal"
+            or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL))
+        and GS.ExportableWithdrawalEvent then
+        exportEvent = GS.ExportableWithdrawalEvent(event) or event
+    end
     local existing = exportState.byId[exportId]
     local prev = existing and existing.body
     if prev and prev.kind == "gs-ledger-event"
         and prev.cutoverMarker == cutoverMarker
-        and prev.datasetId == datasetId
-        and prev.event == event then
-        return
+        and prev.datasetId == datasetId then
+        -- Withdrawals compare by value: stored ORIGIN vs RELAY must not diverge.
+        if prev.event == exportEvent then
+            return
+        end
+        if type(prev.event) == "table" and type(exportEvent) == "table"
+            and GS._DeepEqualOps and GS._DeepEqualOps(prev.event, exportEvent) then
+            return
+        end
     end
     UpsertExportBody(exportId, {
         kind = "gs-ledger-event",
         datasetId = datasetId,
-        event = event,
+        event = exportEvent,
         cutoverMarker = cutoverMarker,
     })
 end
@@ -2297,10 +2309,16 @@ function GS.RefreshLedgerEventExport(record, event)
         liveMarker = record.liveCutover.cutoverMarker
     end
     local cutoverMarker = ExportCutoverMarkerForEvent(event, liveMarker)
+    local exportEvent = event
+    if (event.type == "withdrawal"
+            or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL))
+        and GS.ExportableWithdrawalEvent then
+        exportEvent = GS.ExportableWithdrawalEvent(event) or event
+    end
     local body = {
         kind = "gs-ledger-event",
         datasetId = record.datasetId,
-        event = event,
+        event = exportEvent,
         cutoverMarker = cutoverMarker,
     }
     if not providerRegistered then

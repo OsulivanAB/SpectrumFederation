@@ -182,6 +182,19 @@ function GS.CanonicalWithdrawalEventIdentity(event)
     }
 end
 
+--- Provider export body for withdrawals: route-independent fingerprint identity.
+-- Always publishes ORIGIN as the wire provenance token; admission re-derives
+-- RELAY from sender≠actor. Peers storing ORIGIN vs RELAY therefore export equal
+-- versionFp values for the same logical receipt.
+function GS.ExportableWithdrawalEvent(event)
+    local identity = GS.CanonicalWithdrawalEventIdentity(event)
+    if not identity then
+        return nil
+    end
+    identity.provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN
+    return identity
+end
+
 local function FindLedgerEventById(record, id)
     if type(record) ~= "table" or type(id) ~= "string" or id == "" then
         return nil
@@ -457,33 +470,42 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
         canon.guildKey = record._guildKey
     end
     local campaignId = canon.campaignId
-    local campaignOk = false
-    if record.currentCampaignId == campaignId then
-        campaignOk = true
+    local isCurrent = record.currentCampaignId == campaignId
+    local archive = type(record.campaignArchives) == "table"
+        and record.campaignArchives[campaignId] or nil
+    if isCurrent then
+        -- Live campaign is represented.
+    elseif type(archive) == "table" then
+        -- Represented archived campaign.
     elseif type(record.campaigns) == "table" and record.campaigns[campaignId] then
-        campaignOk = true
-    elseif type(record.campaignArchives) == "table" and record.campaignArchives[campaignId] then
-        campaignOk = true
-    end
-    if not campaignOk then
+        -- Header without archive generation data: wait for represented scope.
+        return "pending", "missing_campaign"
+    else
         return "pending", "missing_campaign"
     end
     local cfg = record.accounting and record.accounting._consumables
     local liveGen = tonumber(cfg and cfg.generation)
     local eventGen = tonumber(canon.generation)
-    if liveGen and eventGen then
-        if record.currentCampaignId == campaignId then
-            -- Live campaign: allow current generation and represented prior gens
-            -- that settle into archive; reject unrelated future generations.
-            if eventGen > liveGen then
-                return "rejected", "generation_mismatch"
-            end
-        else
-            local archive = record.campaignArchives and record.campaignArchives[campaignId]
-            local archGen = archive and tonumber(archive.generation)
-            if archGen and eventGen ~= archGen then
-                return "rejected", "generation_mismatch"
-            end
+    if not eventGen then
+        return "rejected", "invalid_generation"
+    end
+    if isCurrent then
+        -- Live campaign receipts must match the live generation exactly.
+        -- Older gens under the current ID must not transplant into another
+        -- archived campaign's history projection.
+        if not liveGen then
+            return "pending", "missing_generation"
+        end
+        if eventGen ~= liveGen then
+            return "rejected", "generation_mismatch"
+        end
+    else
+        local archGen = archive and tonumber(archive.generation)
+        if not archGen then
+            return "pending", "missing_campaign"
+        end
+        if eventGen ~= archGen then
+            return "rejected", "generation_mismatch"
         end
     end
 
@@ -502,6 +524,9 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
             if existing.provenance ~= GS.WITHDRAWAL_PROVENANCE.ORIGIN
                 and canon.provenance == GS.WITHDRAWAL_PROVENANCE.ORIGIN then
                 existing.provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN
+                if GS.RefreshLedgerEventExport then
+                    GS.RefreshLedgerEventExport(record, existing)
+                end
             end
             return "duplicate", "duplicate"
         end

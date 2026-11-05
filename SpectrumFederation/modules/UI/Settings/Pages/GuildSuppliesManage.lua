@@ -931,14 +931,45 @@ local function CaptureRecipeEditorDraftFromUi()
 	if not recipeEditorUi or not recipeEditorUi.reagentEdits then
 		return
 	end
+	-- Only read widgets bound to the active editor session. Stale EditBoxes from
+	-- a previous open/recipe retain text until rebound and must not overwrite
+	-- the freshly initialized draft.
+	local session = recipeEditorDraft.sessionId
+	if session == nil then
+		return
+	end
 	local texts = recipeEditorDraft.reagentTexts or {}
 	for itemId, edit in pairs(recipeEditorUi.reagentEdits) do
-		if edit and edit.GetText then
+		if edit and edit.GetText and edit._sfRecipeSession == session then
 			texts[tostring(itemId)] = edit:GetText() or ""
 		end
 	end
 	recipeEditorDraft.reagentTexts = texts
 end
+
+local function ClearRecipeEditorWidgetOwnership()
+	if not recipeEditorUi then
+		return
+	end
+	recipeEditorUi.reagentEdits = {}
+	local rows = recipeEditorUi.reagentRows
+	if type(rows) ~= "table" then
+		return
+	end
+	for i = 1, #rows do
+		local row = rows[i]
+		if row then
+			row._boundItemId = nil
+			if row.Edit then
+				row.Edit._sfRecipeSession = nil
+				row.Edit:SetScript("OnTextChanged", nil)
+			end
+		end
+	end
+end
+
+-- Forward declaration: EnsureRecipeEditorUi Cancel binds CloseRecipeEditor.
+local CloseRecipeEditor
 
 local function BuildRecipeReagentsFromDraft()
 	CaptureRecipeEditorDraftFromUi()
@@ -1056,9 +1087,8 @@ local function EnsureRecipeEditorUi()
 	ui.delete = delete
 
 	cancel:SetScript("OnClick", function()
-		recipeEditorDraft.open = false
-		recipeEditorDraft.reagentTexts = {}
-		frame:Hide()
+		-- Discard canceled edits and widget ownership; reopen must load saved.
+		CloseRecipeEditor(true)
 	end)
 
 	ui.frame = frame
@@ -1097,11 +1127,14 @@ local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText
 	return 28
 end
 
-local function SyncOrphanReagentsFromSavedAndDraft()
+local function SyncOrphanReagentsFromSavedAndDraft(opts)
+	opts = opts or {}
 	-- Requested-item mutations often leave configSeq unchanged. Rebuild orphans
-	-- from the saved recipe + current draft texts whenever the editor refreshes
-	-- so Save cannot silently drop unavailable ingredients.
-	CaptureRecipeEditorDraftFromUi()
+	-- from the saved recipe + current draft texts so Save cannot silently drop
+	-- unavailable ingredients even before a deferred refresh runs.
+	if opts.captureUi ~= false then
+		CaptureRecipeEditorDraftFromUi()
+	end
 	local outputId = tonumber(recipeEditorDraft.outputItemId)
 	local saved = FindSavedRecipe(outputId)
 	local reagentMap = saved and saved.reagents
@@ -1121,6 +1154,8 @@ local function SyncOrphanReagentsFromSavedAndDraft()
 			local qty = tonumber(v) or 0
 			if rid and qty > 0 and not requested[rid] then
 				orphans[tostring(rid)] = true
+				-- Preserve an explicit draft edit (including deliberate 0). Only
+				-- fill from saved when the draft has no entry for this orphan.
 				if texts[tostring(rid)] == nil then
 					texts[tostring(rid)] = tostring(qty)
 				end
@@ -1205,7 +1240,11 @@ local function RefreshRecipeEditor()
 			local row = ui.reagentRows[i]
 			row._boundItemId = itemId
 			-- Rebind OnTextChanged to the currently displayed item ID every layout.
+			row.Edit._sfRecipeSession = recipeEditorDraft.sessionId
 			row.Edit:SetScript("OnTextChanged", function(self)
+				if self._sfRecipeSession ~= recipeEditorDraft.sessionId then
+					return
+				end
 				local boundId = row._boundItemId
 				if boundId then
 					recipeEditorDraft.reagentTexts[tostring(boundId)] = self:GetText() or ""
@@ -1234,6 +1273,7 @@ local function RefreshRecipeEditor()
 		if stale then
 			stale._boundItemId = nil
 			if stale.Edit then
+				stale.Edit._sfRecipeSession = nil
 				stale.Edit:SetScript("OnTextChanged", nil)
 			end
 			stale:Hide()
@@ -1242,9 +1282,15 @@ local function RefreshRecipeEditor()
 	ui.content:SetHeight(math.max(1, y))
 end
 
-local function CloseRecipeEditor(discardDraft)
+function CloseRecipeEditor(discardDraft)
 	if discardDraft then
 		recipeEditorDraft.reagentTexts = {}
+		recipeEditorDraft.orphanReagentIds = {}
+		recipeEditorDraft.outputItemId = nil
+		recipeEditorDraft.isExisting = false
+		recipeEditorDraft.boundRecipeRevision = nil
+		recipeEditorDraft.sessionId = nil
+		ClearRecipeEditorWidgetOwnership()
 	end
 	recipeEditorDraft.open = false
 	if recipeEditorUi and recipeEditorUi.frame then
@@ -1259,6 +1305,8 @@ local function CommitRecipeEditorSave()
 	end
 	SyncRecipeEditorContext()
 	CaptureRecipeEditorDraftFromUi()
+	-- Reconcile orphans from the live requested set even if refresh was deferred.
+	SyncOrphanReagentsFromSavedAndDraft({ captureUi = false })
 	local outputId = tonumber(recipeEditorDraft.outputItemId)
 	local bound = {
 		contextKey = recipeEditorDraft.contextKey,
@@ -1417,11 +1465,15 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
 		return
 	end
+	-- Drop prior widget ownership before initializing a new draft so SyncOrphan
+	-- cannot capture stale EditBox text from a canceled or switched recipe.
+	ClearRecipeEditorWidgetOwnership()
 	local rec = CurrentRecord()
 	local cfg = rec and rec.accounting and rec.accounting._consumables
 	local g = GS()
 	local ctxInfo = g and g.GetCurrentContext and g:GetCurrentContext()
 	recipeEditorSection = ctx
+	recipeEditorDraft.sessionId = (tonumber(recipeEditorDraft.sessionId) or 0) + 1
 	recipeEditorDraft.open = true
 	recipeEditorDraft.contextKey = RecipeDraftContextKey()
 	recipeEditorDraft.outputItemId = itemId
@@ -1468,6 +1520,8 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 	ui.save:SetScript("OnClick", CommitRecipeEditorSave)
 	ui.delete:SetScript("OnClick", CommitRecipeEditorDelete)
 	ui.frame:Show()
+	-- Skip UI capture: widgets are unbound until Refresh rebinds this session.
+	SyncOrphanReagentsFromSavedAndDraft({ captureUi = false })
 	RefreshRecipeEditor()
 	ctx.section:ClearMessage()
 end
@@ -2265,8 +2319,13 @@ Page.__sfTest = {
 	BuildRecipeReagentsFromDraft = BuildRecipeReagentsFromDraft,
 	SyncOrphanReagentsFromSavedAndDraft = SyncOrphanReagentsFromSavedAndDraft,
 	RefreshRecipeEditor = RefreshRecipeEditor,
+	CommitRecipeEditorSave = CommitRecipeEditorSave,
+	ClearRecipeEditorWidgetOwnership = ClearRecipeEditorWidgetOwnership,
 	RecipeEditorDraft = function()
 		return recipeEditorDraft
+	end,
+	RecipeEditorUi = function()
+		return recipeEditorUi
 	end,
 }
 

@@ -253,26 +253,38 @@ function WR.BagCount(itemId)
     return FloorQty(GetItemCount(itemId, false, false, false))
 end
 
+--- Bag family bitmask from Retail free-slot API.
+-- Returns nil when the family cannot be observed (unknown), not "general (0)".
+-- Do not use GetBagSlotFlag — that API is a boolean bag-filter setter/getter.
 local function BagSlotFamily(bag)
     bag = tonumber(bag)
-    if bag == nil then return 0 end
-    if C_Container and C_Container.GetBagSlotFlag then
-        return tonumber(C_Container.GetBagSlotFlag(bag)) or 0
-    end
+    if bag == nil then return nil end
     if C_Container and C_Container.GetContainerNumFreeSlots then
         local _, bagFamily = C_Container.GetContainerNumFreeSlots(bag)
+        if bagFamily == nil then
+            return nil
+        end
         return tonumber(bagFamily) or 0
     end
-    return 0
+    return nil
 end
 
+--- Item family bitmask. nil = uncached/unknown (not unrestricted general).
 function WR.ItemFamily(itemId)
     itemId = tonumber(itemId)
-    if not itemId then return 0 end
-    if C_Container and C_Container.GetItemFamily then
-        return tonumber(C_Container.GetItemFamily(itemId)) or 0
+    if not itemId then return nil end
+    if C_Item and C_Item.GetItemFamily then
+        local fam = C_Item.GetItemFamily(itemId)
+        if fam == nil then return nil end
+        return tonumber(fam) or 0
     end
-    return 0
+    -- Deprecated global still present on some clients; preserve nil-unknown.
+    if GetItemFamily then
+        local fam = GetItemFamily(itemId)
+        if fam == nil then return nil end
+        return tonumber(fam) or 0
+    end
+    return nil
 end
 
 function WR.ReadCarriedSlot(bag, slot)
@@ -558,6 +570,18 @@ WR.EnforceAcceptedTakeCeiling = EnforceAcceptedTakeCeiling
 WR.CopyStringKeyQtyMap = CopyStringKeyQtyMap
 WR.CopyCraftSelections = CopyCraftSelections
 
+-- Must be a local before BuildWithdrawPreview: Lua 5.1 resolves locals at parse
+-- time, so a later local definition would otherwise leave a nil global here.
+local function RecipeUnavailable(record, recipe)
+    local GS = SF.GuildSupplies
+    if not recipe then return true end
+    if GS and GS.RecipeAvailability then
+        local ok = GS.RecipeAvailability(record, recipe)
+        return not ok
+    end
+    return false
+end
+
 local function BuildWithdrawPreview(selections, opts)
     opts = opts or {}
     local ctx, err = WR.CurrentContext()
@@ -725,16 +749,6 @@ local function PlaceCursorToDestination(dest)
     return CursorEmpty()
 end
 
-local function RecipeUnavailable(record, recipe)
-    local GS = SF.GuildSupplies
-    if not recipe then return true end
-    if GS and GS.RecipeAvailability then
-        local ok = GS.RecipeAvailability(record, recipe)
-        return not ok
-    end
-    return false
-end
-
 local function ReceiptCapacityBlocked(record, take)
     local GS = SF.GuildSupplies
     if not GS or not GS.WithdrawalReceiptCapacityOk then return false end
@@ -874,10 +888,11 @@ function WR.BeginWithdraw(selections, opts)
     local preview, previewErr = BuildWithdrawPreview(selections, opts)
     if not preview then return false, previewErr end
     if preview.err == "shortage" then
-        return false, "shortage", preview.plan
+        -- Third return is the full preview (ctx/take/fingerprints), not only plan.
+        return false, "shortage", preview
     end
     if preview.err then
-        return false, preview.err, preview.plan
+        return false, preview.err, preview
     end
     local plan = preview.plan
     local authorized = preview.authorized
@@ -954,6 +969,9 @@ function WR.BeginWithdraw(selections, opts)
         end
         local itemDests = destByItem[tostring(itemId)] or {}
         local di = 1
+        -- Track destinations already receiving a pickup in this operation so later
+        -- chunks to the same bag/slot merge into the filled stack (not not_empty).
+        local destUsed = {}
         for mi = 1, #moves do
             local move = moves[mi]
             local remaining = FloorQty(move.count)
@@ -964,6 +982,12 @@ function WR.BeginWithdraw(selections, opts)
                 end
                 local chunk = math.min(remaining, FloorQty(dest.count))
                 local splitPick = chunk < remaining or move.split or chunk < FloorQty(move.count)
+                local destKey = tostring(dest.bag) .. ":" .. tostring(dest.slot)
+                local destMerge = dest.merge and true or false
+                if destUsed[destKey] then
+                    destMerge = true
+                end
+                destUsed[destKey] = true
                 queue[#queue + 1] = {
                     itemId = itemId,
                     slot = move.slot,
@@ -971,7 +995,7 @@ function WR.BeginWithdraw(selections, opts)
                     split = splitPick,
                     destBag = dest.bag,
                     destSlot = dest.slot,
-                    destMerge = dest.merge,
+                    destMerge = destMerge,
                 }
                 dest.count = FloorQty(dest.count) - chunk
                 if dest.count < 1 then

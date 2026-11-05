@@ -232,10 +232,19 @@ local function BandFlags(a, b)
 end
 
 function W.SlotAcceptsItemFamily(slotFamily, itemFamily)
-    slotFamily = tonumber(slotFamily) or 0
-    itemFamily = tonumber(itemFamily) or 0
-    if itemFamily == 0 then return true end
+    -- nil = unknown/unavailable metadata — never treat as unrestricted general.
+    if slotFamily == nil or itemFamily == nil then
+        return false
+    end
+    slotFamily = tonumber(slotFamily)
+    itemFamily = tonumber(itemFamily)
+    if slotFamily == nil or itemFamily == nil then
+        return false
+    end
+    -- General bag (0) accepts any known item family.
     if slotFamily == 0 then return true end
+    -- Specialty bags reject general-purpose items (family 0).
+    if itemFamily == 0 then return false end
     return BandFlags(slotFamily, itemFamily) ~= 0
 end
 
@@ -315,30 +324,68 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, it
     for k in pairs(take) do
         keys[#keys + 1] = tostring(k)
     end
-    table.sort(keys)
 
     local destinations = {}
     local requiredNewStacks = 0
 
     local function itemFamily(itemId)
         if type(itemFamilyForItem) == "function" then
-            return tonumber(itemFamilyForItem(itemId)) or 0
+            local fam = itemFamilyForItem(itemId)
+            -- Explicit nil from the resolver means uncached/unknown — fail closed.
+            if fam == nil then return nil end
+            return tonumber(fam)
         end
+        -- No resolver provided: treat as general-purpose (0), not unknown.
         return 0
     end
 
-    local function findFirstEmpty(family)
+    local function countCompatibleEmpty(family)
+        local n = 0
+        for gi = 1, #grid do
+            local slots = grid[gi].slots
+            for si = 1, #slots do
+                local slot = slots[si]
+                if slot.empty and W.SlotAcceptsItemFamily(slot.family, family) then
+                    n = n + 1
+                end
+            end
+        end
+        return n
+    end
+
+    -- Most-constrained items first so specialty-only stacks do not consume the
+    -- last general slot needed by a non-specialty item.
+    table.sort(keys, function(a, b)
+        local famA = itemFamily(tonumber(a))
+        local famB = itemFamily(tonumber(b))
+        local ca = countCompatibleEmpty(famA)
+        local cb = countCompatibleEmpty(famB)
+        if ca ~= cb then return ca < cb end
+        return tostring(a) < tostring(b)
+    end)
+
+    --- Prefer matching specialty empties over general for specialty items.
+    local function findBestEmpty(family)
+        local bestGi, bestSi, bestBag, bestSlot, bestScore
         for gi = 1, #grid do
             local bagId = grid[gi].bag
             local slots = grid[gi].slots
             for si = 1, #slots do
                 local slot = slots[si]
                 if slot.empty and W.SlotAcceptsItemFamily(slot.family, family) then
-                    return gi, si, bagId, slot.slot or si
+                    local score = 1
+                    local slotFam = tonumber(slot.family)
+                    if family and family ~= 0 and slotFam and slotFam ~= 0 then
+                        score = 2
+                    end
+                    if not bestScore or score > bestScore then
+                        bestGi, bestSi, bestBag, bestSlot, bestScore =
+                            gi, si, bagId, slot.slot or si, score
+                    end
                 end
             end
         end
-        return nil
+        return bestGi, bestSi, bestBag, bestSlot
     end
 
     for ki = 1, #keys do
@@ -352,6 +399,13 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, it
                 if maxStack < 1 then maxStack = 1 end
             end
             local family = itemFamily(itemId)
+            if family == nil then
+                return false, "bag_capacity", {
+                    destinations = destinations,
+                    freeCompatibleSlots = 0,
+                    requiredNewStacks = requiredNewStacks,
+                }
+            end
             local remaining = qty
             for gi = 1, #grid do
                 if remaining < 1 then break end
@@ -379,7 +433,7 @@ function W.PlanMultiItemBagDestinations(carriedBags, take, stackLimitForItem, it
                 end
             end
             while remaining > 0 do
-                local gi, si, bagId, slotNum = findFirstEmpty(family)
+                local gi, si, bagId, slotNum = findBestEmpty(family)
                 if not gi then
                     return false, "bag_capacity", {
                         destinations = destinations,

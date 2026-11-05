@@ -82,13 +82,24 @@ local function ContextMatches()
         return true
     end
     local cur = CaptureContext()
-    if state.context.playerGuid and cur.playerGuid
-        and tostring(state.context.playerGuid) ~= tostring(cur.playerGuid) then
-        return false
+    -- Loss of a previously established identity is invalid (nil must not match).
+    local boundGuid = state.context.playerGuid
+    if boundGuid ~= nil and boundGuid ~= "" then
+        if cur.playerGuid == nil or cur.playerGuid == "" then
+            return false
+        end
+        if tostring(boundGuid) ~= tostring(cur.playerGuid) then
+            return false
+        end
     end
-    if state.context.guildKey and cur.guildKey
-        and tostring(state.context.guildKey) ~= tostring(cur.guildKey) then
-        return false
+    local boundGuild = state.context.guildKey
+    if boundGuild ~= nil and boundGuild ~= "" then
+        if cur.guildKey == nil or cur.guildKey == "" then
+            return false
+        end
+        if tostring(boundGuild) ~= tostring(cur.guildKey) then
+            return false
+        end
     end
     return true
 end

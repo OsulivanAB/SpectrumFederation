@@ -2076,16 +2076,22 @@ function Runtime:BeginQuickWithdraw()
         end
         return false, err, plan
     end
-    local ok, err, plan = StartWithdraw({})
+    local ok, err, detail = StartWithdraw({})
     if ok then
         return
     end
-    if err == "shortage" and plan and SF.SettingsUI and SF.SettingsUI.Dialogs then
+    if err == "shortage" and detail and SF.SettingsUI and SF.SettingsUI.Dialogs then
         local Dialogs = SF.SettingsUI.Dialogs
-        local _, _, preview = WR.PreviewWithdrawPlan and WR.PreviewWithdrawPlan(boundSelections, {})
-        if preview and preview.plan then
-            plan = preview.plan
+        -- BeginWithdraw returns the full preview on shortage. Do not use
+        -- `fn and fn(...)` — that collapses multi-returns so preview becomes nil.
+        local preview = detail
+        if type(detail) == "table" and detail.plan == nil and WR.PreviewWithdrawPlan then
+            local _, _, refreshed = WR.PreviewWithdrawPlan(boundSelections, {})
+            if type(refreshed) == "table" then
+                preview = refreshed
+            end
         end
+        local plan = (preview and preview.plan) or detail
         local ctx = preview and preview.ctx
         local lines = {
             Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
@@ -2098,6 +2104,7 @@ function Runtime:BeginQuickWithdraw()
                 name, s.available, s.requested, s.missing)
         end
         local shortageFingerprint = table.concat(lines, "\n")
+        local takeMap = (plan and plan.take) or {}
         local bound = {
             guildKey = ctx and ctx.guildKey,
             datasetId = ctx and ctx.datasetId,
@@ -2108,7 +2115,7 @@ function Runtime:BeginQuickWithdraw()
             recipeFingerprints = (preview and preview.recipeFingerprints) or {},
             requested = (preview and preview.requested and WR.CopyStringKeyQtyMap)
                 and WR.CopyStringKeyQtyMap(preview.requested) or {},
-            take = WR.CopyStringKeyQtyMap and WR.CopyStringKeyQtyMap(plan.take) or plan.take,
+            take = WR.CopyStringKeyQtyMap and WR.CopyStringKeyQtyMap(takeMap) or takeMap,
             shortagesFingerprint = shortageFingerprint,
         }
         if Dialogs.ConfirmChoice then
