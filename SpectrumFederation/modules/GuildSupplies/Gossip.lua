@@ -112,6 +112,11 @@ local function ClearArchivePageBuffer(campaignId)
             pages = pages + 1
         end
     end
+    if type(buf.recipePages) == "table" then
+        for _ in pairs(buf.recipePages) do
+            pages = pages + 1
+        end
+    end
     archivePageBuffer[campaignId] = nil
     archivePageBufferCount = math.max(0, (archivePageBufferCount or 0) - 1)
     archivePageBufferPages = math.max(0, (archivePageBufferPages or 0) - pages)
@@ -269,6 +274,11 @@ local function ArchivePageBufferIsEmpty(buf)
     end
     if type(buf.pages) == "table" then
         for _ in pairs(buf.pages) do
+            return false
+        end
+    end
+    if type(buf.recipePages) == "table" then
+        for _ in pairs(buf.recipePages) do
             return false
         end
     end
@@ -477,14 +487,9 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     table.sort(pageKeys, function(a, b)
         return tostring(a) < tostring(b)
     end)
-    if #pageKeys < 1 then
+    if #pageKeys < 1 and #recipeIds < 1 then
         local emptyElig = EligibilityScalars(false)
-        local emptyRecipes = (#recipeIds > 0) and recipes or {}
-        local emptyBody = MetaBody(1, {}, emptyElig, emptyRecipes, nil)
-        if EstimateWireRecordBytes(exportId, emptyBody) > budget then
-            -- Try recipes on dedicated pages with empty items meta.
-            emptyBody = MetaBody(1, {}, emptyElig, nil, nil)
-        end
+        local emptyBody = MetaBody(1, {}, emptyElig, nil, nil)
         if EstimateWireRecordBytes(exportId, emptyBody) > budget then
             DebugWarn("archive export %s: empty meta exceeds wire budget", tostring(campaignId))
             return {}
@@ -572,8 +577,16 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             tostring(campaignId))
         return {}
     end
+    if #pageKeys < 1 and #recipeIds > 0 and #pageSlices < 1 then
+        pageSlices[1] = { items = {}, elig = {} }
+    end
     local pageCount = #pageSlices
-    if pageCount < 1 or pageCount > maxPages then
+    if pageCount > maxPages then
+        DebugWarn("archive export %s: pageCount=%s exceeds ceiling",
+            tostring(campaignId), tostring(pageCount))
+        return {}
+    end
+    if pageCount < 1 and #recipeIds < 1 then
         DebugWarn("archive export %s: pageCount=%s exceeds ceiling",
             tostring(campaignId), tostring(pageCount))
         return {}

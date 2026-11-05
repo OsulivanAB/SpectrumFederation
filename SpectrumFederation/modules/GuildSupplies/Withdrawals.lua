@@ -156,11 +156,14 @@ local function FindLedgerEventById(record, id)
     if type(record) ~= "table" or type(id) ~= "string" or id == "" then
         return nil
     end
-    local function scan(list)
+    local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+    local function scan(list, maxScan)
         if type(list) ~= "table" then
             return nil
         end
-        for i = 1, #list do
+        local limit = math.min(#list, maxScan)
+        for i = 1, limit do
             local event = list[i]
             if type(event) == "table" and event.id == id then
                 return event
@@ -168,8 +171,8 @@ local function FindLedgerEventById(record, id)
         end
         return nil
     end
-    return scan(record.accounting and record.accounting._consumableEvents)
-        or scan(record.accounting and record.accounting._consumableEventArchive)
+    return scan(record.accounting and record.accounting._consumableEvents, maxLive)
+        or scan(record.accounting and record.accounting._consumableEventArchive, maxArch)
 end
 
 local function WithdrawalCapacityAvailable(record)
@@ -197,8 +200,9 @@ local function AppendWithdrawalEvent(record, event)
             record.accounting._consumableEventArchive = {}
             archive = record.accounting._consumableEventArchive
         end
-        -- Protect total archive array bound as well.
-        if #archive >= (GS.MAX_ARCHIVED_EVENTS or 4096) then
+        local maxCombinedArch = (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+        if #archive >= maxCombinedArch then
             return false, "full"
         end
         archive[#archive + 1] = event
@@ -215,10 +219,6 @@ local function AppendWithdrawalEvent(record, event)
         record.accounting._consumableEvents = {}
         list = record.accounting._consumableEvents
     end
-    -- Protect shared array ceiling: withdrawals may use leftover slots beyond
-    -- donation occupancy up to MAX_LEDGER_EVENTS + reserved withdrawal headroom
-    -- is not available; instead require both the withdrawal count and the
-    -- combined list length stay within MAX_LEDGER_EVENTS + MAX_WITHDRAWAL_EVENTS.
     local maxCombined = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
     if #list >= maxCombined then
         return false, "full"
@@ -304,27 +304,47 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
     if not meta then
         return "rejected", "invalid_meta"
     end
-    -- Bind actor to the actual local player; UI cannot nominate another character.
     local ctx = GS:GetCurrentContext()
     if not ctx or not ctx.ready then
         return "rejected", (ctx and ctx.reason) or "not_ready"
     end
+    -- Bind actor to the actual local player; UI cannot nominate another character.
     meta.actorGuid = ctx.actorGuid
     meta.actor = ctx.actorName or meta.actor
-    meta.guildKey = ctx.guildKey
-    meta.datasetId = record.datasetId
-    if type(record.currentCampaignId) == "string" then
-        -- Prefer captured original campaign from the withdrawal operation.
-        meta.campaignId = meta.campaignId or record.currentCampaignId
+    -- Preserve captured operation scope from movement start; do not rewrite with
+    -- current record context when meta already carries immutable fields.
+    local capturedDataset = BoundedString(meta.datasetId)
+    if capturedDataset and capturedDataset ~= record.datasetId then
+        return "rejected", "dataset_mismatch"
+    end
+    if not capturedDataset then
+        meta.datasetId = record.datasetId
+    end
+    if not BoundedString(meta.guildKey) then
+        meta.guildKey = ctx.guildKey
+    end
+    if not BoundedString(meta.campaignId) and type(record.currentCampaignId) == "string" then
+        meta.campaignId = record.currentCampaignId
+    end
+    local campaignId = BoundedString(meta.campaignId)
+    if not campaignId then
+        return "rejected", "invalid_campaign"
+    end
+    local campaignKnown = (record.currentCampaignId == campaignId)
+        or (type(record.campaigns) == "table" and record.campaigns[campaignId] ~= nil)
+        or (type(record.campaignArchives) == "table" and record.campaignArchives[campaignId] ~= nil)
+    if not campaignKnown then
+        return "rejected", "invalid_campaign"
+    end
+    if not tonumber(meta.generation) then
+        local cfg = record.accounting and record.accounting._consumables
+        meta.generation = tonumber(cfg and cfg.generation) or 1
     end
     local events, buildErr = GS.BuildWithdrawalReceipts(amounts, meta)
     if not events then
         return "rejected", buildErr or "invalid_amounts"
     end
-    -- Capacity preflight before mutating.
-    local need = #events
-    local liveOk, _, liveCount = WithdrawalCapacityAvailable(record)
-    if (not liveOk) or ((liveCount or 0) + need > (GS.MAX_WITHDRAWAL_EVENTS or 1024)) then
+    if not GS.WithdrawalReceiptCapacityOk(record, #events, meta) then
         return "rejected", "full"
     end
     local accepted = 0
@@ -349,26 +369,26 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
                 return "rejected", err or "full"
             end
             accepted = accepted + 1
-            if GS.ExportLedgerEvent then
-                -- Optional paced export hook shared with donations.
-                pcall(GS.ExportLedgerEvent, record, event)
+            if GS.RefreshLedgerEventExport then
+                pcall(GS.RefreshLedgerEventExport, record, event)
             end
         end
     end
-    if accepted > 0 and GS.NotifyLocalDurableChange then
-        GS.NotifyLocalDurableChange("withdrawal-receipt")
-    end
-    if GS.NotifyProviderChanged then
-        GS.NotifyProviderChanged("withdrawal-receipt")
+    if accepted > 0 then
+        if GS.RefreshLedgerEventExport then
+            -- per-event refresh above; no batch hook required
+        elseif GS.NotifyLocalDurableChange then
+            GS.NotifyLocalDurableChange("ledger")
+        end
     end
     return "accepted", accepted
 end
 
 --- Admit a remote/relayed withdrawal receipt at informational trust.
 -- Requires authenticated same-guild sender. Does not require editor authority.
--- Origin path: sender GUID must equal actorGuid. Relay path: any authenticated
--- same-guild member may forward an already-formed origin/relay body without
--- rewriting actor fields.
+-- Informational trust limit: any authenticated same-guild member may relay a
+-- well-formed receipt; transport sender GUID is not cryptographic proof the
+-- actor performed the bank move. When sender ~= actorGuid, provenance is RELAY.
 function GS.AdmitWithdrawalEvent(record, event, opts)
     opts = opts or {}
     if type(record) ~= "table" then
@@ -399,16 +419,8 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
             return "rejected", "unauthorized"
         end
     end
-    if canon.provenance == GS.WITHDRAWAL_PROVENANCE.ORIGIN then
-        if sender ~= canon.actorGuid and not opts.allowRelayOfOrigin then
-            -- Treat mismatched origin claims as relay only when explicitly allowed;
-            -- otherwise reject spoofed origin attribution.
-            if opts.forceRelay then
-                canon.provenance = GS.WITHDRAWAL_PROVENANCE.RELAY
-            else
-                return "rejected", "actor_mismatch"
-            end
-        end
+    if type(sender) == "string" and sender ~= "" and sender ~= canon.actorGuid then
+        canon.provenance = GS.WITHDRAWAL_PROVENANCE.RELAY
     end
 
     local existing = FindLedgerEventById(record, canon.id)
@@ -430,15 +442,33 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
     return "accepted", nil
 end
 
---- True when withdrawal history still has room for `need` new live receipts.
-function GS.WithdrawalReceiptCapacityOk(record, need)
+--- True when withdrawal history still has room for `need` new receipts at the
+-- settlement destination implied by meta.generation (live vs archived).
+function GS.WithdrawalReceiptCapacityOk(record, need, meta)
     need = tonumber(need) or 1
     if need < 1 then
         return true
     end
-    local liveOk, _, liveCount = WithdrawalCapacityAvailable(record)
+    local cfg = record.accounting and record.accounting._consumables
+    local curGen = tonumber(cfg and cfg.generation) or 1
+    local eventGen = meta and tonumber(meta.generation) or curGen
+    local liveOk, archOk, liveCount, archCount = WithdrawalCapacityAvailable(record)
+    local maxLive = GS.MAX_WITHDRAWAL_EVENTS or 1024
+    local maxArch = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024
+    if eventGen and eventGen < curGen then
+        if not archOk then
+            return false
+        end
+        return (archCount or 0) + need <= maxArch
+    end
     if not liveOk then
         return false
     end
-    return (liveCount or 0) + need <= (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    if (liveCount or 0) + need > maxLive then
+        return false
+    end
+    local list = record.accounting and record.accounting._consumableEvents
+    local total = type(list) == "table" and #list or 0
+    local maxCombined = (GS.MAX_LEDGER_EVENTS or 4096) + maxLive
+    return total + need <= maxCombined
 end

@@ -1733,7 +1733,9 @@ local function CountBufferedKinds(adop)
             archivePages[cid] = {
                 meta = info.meta,
                 pages = info.pages or {},
+                recipePages = info.recipePages or {},
                 pageCount = info.pageCount or 1,
+                recipePageCount = info.recipePageCount,
             }
             if type(info.meta) == "table" and not desc and info.meta.kind == "dataset-desc" then
                 -- no-op; archives are not descriptors
@@ -1754,7 +1756,7 @@ local function CountBufferedKinds(adop)
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
-local function AssemblePagedArchive(meta, pagesByIndex)
+local function AssemblePagedArchive(meta, pagesByIndex, recipePagesByIndex)
     if type(meta) ~= "table" then
         return nil, "invalid_campaign_archive"
     end
@@ -1778,24 +1780,43 @@ local function AssemblePagedArchive(meta, pagesByIndex)
     end
     local function AssembleRecipesFromMeta()
         if type(meta.recipes) == "table" then
-            return meta.recipes
+            return meta.recipes, nil
         end
         local recipePageCount = tonumber(meta.recipePageCount)
         if not recipePageCount or recipePageCount < 1 then
-            return {}
+            return {}, nil
         end
-        -- Adoption assembly currently pages items only; recipe pages arrive via
-        -- Gossip live admission. Absent recipe pages → empty map (fail soft).
-        return {}
+        if type(recipePagesByIndex) ~= "table" then
+            return nil, "incomplete_archive_pages"
+        end
+        local merged, got = {}, 0
+        for page = 1, recipePageCount do
+            local p = recipePagesByIndex[page]
+            if type(p) ~= "table" or type(p.recipes) ~= "table" then
+                return nil, "incomplete_archive_pages"
+            end
+            for k, v in pairs(p.recipes) do
+                merged[k] = v
+                got = got + 1
+            end
+        end
+        if type(meta.recipeCount) == "number" and got ~= meta.recipeCount then
+            return nil, "invalid_campaign_archive"
+        end
+        return merged, nil
     end
     if type(meta.requestedItems) == "table" then
+        local recipes, rerr = AssembleRecipesFromMeta()
+        if rerr then
+            return nil, rerr
+        end
         -- Inline small archive (no pages required).
         return {
             schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
             campaignId = meta.campaignId,
             datasetId = meta.datasetId,
             requestedItems = meta.requestedItems,
-            recipes = AssembleRecipesFromMeta(),
+            recipes = recipes or {},
             generation = meta.generation,
             archivedAt = meta.archivedAt,
             bankTab = tonumber(meta.bankTab),
@@ -1839,12 +1860,16 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             items = eligMerged,
         }
     end
+    local recipes, rerr = AssembleRecipesFromMeta()
+    if rerr then
+        return nil, rerr
+    end
     return {
         schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
         campaignId = meta.campaignId,
         datasetId = meta.datasetId,
         requestedItems = merged,
-        recipes = AssembleRecipesFromMeta(),
+        recipes = recipes or {},
         generation = meta.generation,
         archivedAt = meta.archivedAt,
         bankTab = tonumber(meta.bankTab),
@@ -2891,9 +2916,18 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         adop._archiveIndex = adop._archiveIndex or {}
         local info = adop._archiveIndex[body.campaignId]
-            or { meta = nil, pages = {} }
+            or { meta = nil, pages = {}, recipePages = {} }
         if info.pageCount and archivePc and info.pageCount ~= archivePc then
             return "rejected", "invalid_operation"
+        end
+        if type(body.recipePageCount) == "number" then
+            local rpc = tonumber(body.recipePageCount)
+            if rpc and rpc >= 1 then
+                if info.recipePageCount and info.recipePageCount ~= rpc then
+                    return "rejected", "invalid_operation"
+                end
+                info.recipePageCount = info.recipePageCount or rpc
+            end
         end
         info.meta = body
         if archivePc then
@@ -2916,7 +2950,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         adop._archiveIndex = adop._archiveIndex or {}
         local info = adop._archiveIndex[body.campaignId]
-            or { meta = nil, pages = {} }
+            or { meta = nil, pages = {}, recipePages = {} }
         if info.pageCount and info.pageCount ~= pc then
             return "rejected", "invalid_operation"
         end
@@ -2929,6 +2963,34 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
+        adop._archiveIndex[body.campaignId] = info
+    elseif body.kind == "campaign-archive-recipe-page" and type(body.campaignId) == "string" then
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxArchivePages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._archiveIndex = adop._archiveIndex or {}
+        local info = adop._archiveIndex[body.campaignId]
+            or { meta = nil, pages = {}, recipePages = {} }
+        if info.recipePageCount and info.recipePageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.meta) == "table" and info.meta.recipePageCount ~= nil then
+            local metaRpc = tonumber(info.meta.recipePageCount)
+            if metaRpc and metaRpc ~= pc then
+                return "rejected", "invalid_operation"
+            end
+        end
+        info.recipePages = info.recipePages or {}
+        info.recipePages[page] = body
+        info.recipePageCount = info.recipePageCount or pc
         adop._archiveIndex[body.campaignId] = info
     end
 
@@ -3560,10 +3622,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             local needsPages = (not body.requestedItems) and pageCount >= 1
             if temp.campaignArchives[body.campaignId] == nil then
                 if temp.currentCampaignId ~= body.campaignId and temp.campaigns[body.campaignId] then
+                    local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                     local pages = {}
                     if needsPages then
                         sliceUsed = sliceUsed + 1
-                        local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                         if type(info) == "table" and type(info.pages) == "table" then
                             for p, pb in pairs(info.pages) do
                                 pages[p] = pb
@@ -3572,7 +3634,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             end
                         end
                     end
-                    local archive, aerr = AssemblePagedArchive(body, pages)
+                    local archive, aerr = AssemblePagedArchive(body, pages,
+                        info and info.recipePages)
                     if not archive then
                         if aerr == "incomplete_archive_pages" then
                             unsettledSeen = true
@@ -3591,10 +3654,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                 end
             else
+                local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                 local pages = {}
                 if needsPages then
                     sliceUsed = sliceUsed + 1
-                    local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
                     if type(info) == "table" and type(info.pages) == "table" then
                         for p, pb in pairs(info.pages) do
                             pages[p] = pb
@@ -3603,7 +3666,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         end
                     end
                 end
-                local archive, aerr = AssemblePagedArchive(body, pages)
+                local archive, aerr = AssemblePagedArchive(body, pages,
+                    info and info.recipePages)
                 if not archive then
                     if aerr == "incomplete_archive_pages" then
                         -- Generated presence alone is insufficient for advertised pages.
@@ -4596,7 +4660,32 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 if opts.archivePageCursor then
                     opts.archivePageCursor[body.campaignId] = nil
                 end
-                local archive, aerr = AssemblePagedArchive(body, info.pages)
+                local recipePageCount = tonumber(body.recipePageCount)
+                    or (type(info.meta) == "table" and tonumber(info.meta.recipePageCount))
+                    or tonumber(info.recipePageCount)
+                if recipePageCount and recipePageCount >= 1 then
+                    info.recipePages = info.recipePages or {}
+                    for rp = 1, recipePageCount do
+                        if visited >= budget then
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false, "budget"
+                        end
+                        visited = visited + 1
+                        archiveVisitedCall = archiveVisitedCall + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        adop._workStats.archiveVisited =
+                            (adop._workStats.archiveVisited or 0) + 1
+                        if type(info.recipePages[rp]) ~= "table" then
+                            opts.cursor = nil
+                            publishCompletenessStats()
+                            return false, "incomplete_archive_pages"
+                        end
+                    end
+                end
+                local archive, aerr = AssemblePagedArchive(body, info.pages, info.recipePages)
                 if not archive then
                     opts.cursor = nil
                     publishCompletenessStats()

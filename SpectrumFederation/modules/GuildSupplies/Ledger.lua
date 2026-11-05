@@ -79,6 +79,35 @@ local function Now()
     return math.floor(time() or 0)
 end
 
+local function IsWithdrawalLedgerEvent(event)
+    if type(event) ~= "table" then
+        return false
+    end
+    local t = event.type
+    return t == GS.LEDGER_EVENT.WITHDRAWAL or t == "withdrawal"
+end
+
+local function CountNonWithdrawalEvents(list)
+    local n = 0
+    if type(list) ~= "table" then
+        return 0
+    end
+    for i = 1, #list do
+        if not IsWithdrawalLedgerEvent(list[i]) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function MaxLiveLedgerScan()
+    return (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+end
+
+local function MaxArchivedLedgerScan()
+    return (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+end
+
 local function FloorNonNeg(n)
     n = tonumber(n) or 0
     if n < 0 then return 0 end
@@ -1229,7 +1258,8 @@ local function FindLedgerDonationOccurrence(record, evidence)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, GS.MAX_LEDGER_EVENTS or 4096)
+            local maxScan = (li == 1) and MaxLiveLedgerScan() or MaxArchivedLedgerScan()
+            local limit = math.min(#list, maxScan)
             for i = 1, limit do
                 local event = list[i]
                 if type(event) == "table"
@@ -1846,6 +1876,8 @@ local function BumpAccountingMutation(record)
     end
 end
 
+GS._BumpAccountingMutation = BumpAccountingMutation
+
 function GS.GetAccountingMutationSeq(record)
     if type(record) ~= "table" or type(record.accounting) ~= "table" then
         return 0
@@ -1961,7 +1993,8 @@ local function FindLedgerEventByTxnId(record, txnId)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, GS.MAX_LEDGER_EVENTS or 4096)
+            local maxScan = (li == 1) and MaxLiveLedgerScan() or MaxArchivedLedgerScan()
+            local limit = math.min(#list, maxScan)
             for i = 1, limit do
                 local event = list[i]
                 if type(event) == "table"
@@ -2219,30 +2252,61 @@ local function TrimEventArchive(record)
     if type(archive) ~= "table" then
         return false
     end
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
-    local overflow = #archive - maxArch
-    if overflow <= 0 then
-        return false
-    end
+    local maxDon = GS.MAX_ARCHIVED_EVENTS or 4096
+    local maxWd = GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024
+    local maxTotal = maxDon + maxWd
     local removedIds = {}
     local removedTxn = {}
-    for i = 1, overflow do
-        local ev = archive[i]
-        if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+    local function noteRemoved(ev)
+        if type(ev) ~= "table" then
+            return
+        end
+        if type(ev.id) == "string" and ev.id ~= "" then
             removedIds[#removedIds + 1] = "gs:le:" .. ev.id
         end
-        if type(ev) == "table" then
-            local txn = ev.txnId or ev.id
-            if type(txn) == "string" and txn ~= "" then
-                removedTxn[#removedTxn + 1] = txn
-            end
+        local txn = ev.txnId or ev.id
+        if type(txn) == "string" and txn ~= "" then
+            removedTxn[#removedTxn + 1] = txn
         end
     end
-    local kept = {}
-    for i = overflow + 1, #archive do
-        kept[#kept + 1] = archive[i]
+    local function removeAt(idx)
+        noteRemoved(archive[idx])
+        table.remove(archive, idx)
     end
-    record.accounting._consumableEventArchive = kept
+    local trimmed = false
+    while true do
+        local total = #archive
+        local nonWithdraw = CountNonWithdrawalEvents(archive)
+        if total <= maxTotal and nonWithdraw <= maxDon then
+            break
+        end
+        local removeIdx = nil
+        if total > maxTotal then
+            for i = 1, total do
+                if IsWithdrawalLedgerEvent(archive[i]) then
+                    removeIdx = i
+                    break
+                end
+            end
+        end
+        if not removeIdx and nonWithdraw > maxDon then
+            for i = 1, total do
+                if not IsWithdrawalLedgerEvent(archive[i]) then
+                    removeIdx = i
+                    break
+                end
+            end
+        end
+        if not removeIdx then
+            removeIdx = 1
+        end
+        removeAt(removeIdx)
+        trimmed = true
+    end
+    if not trimmed then
+        return false
+    end
+    record.accounting._consumableEventArchive = archive
     BumpAccountingMutation(record)
     -- Coalesce ledger + valuation export drops into one order compaction and
     -- one provider/manifest notification for this trusted retention trim.
@@ -2308,9 +2372,19 @@ local function AppendArchivedLedgerEvent(record, event)
     if type(archive) ~= "table" then
         return false, "invalid_accounting"
     end
-    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
-    if #archive >= maxArch then
-        return false, "full"
+    local maxDon = GS.MAX_ARCHIVED_EVENTS or 4096
+    local maxTotal = maxDon + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+    if IsWithdrawalLedgerEvent(event) then
+        if #archive >= maxTotal then
+            return false, "full"
+        end
+    else
+        if CountNonWithdrawalEvents(archive) >= maxDon then
+            return false, "full"
+        end
+        if #archive >= maxTotal then
+            return false, "full"
+        end
     end
     archive[#archive + 1] = event
     BumpAccountingMutation(record)
@@ -2335,9 +2409,10 @@ local function AppendLedgerEvent(record, event)
         record.accounting._consumableEvents = {}
         list = record.accounting._consumableEvents
     end
-    if #list >= (GS.MAX_LEDGER_EVENTS or 4096) then
+    local maxDonLive = GS.MAX_LEDGER_EVENTS or 4096
+    if CountNonWithdrawalEvents(list) >= maxDonLive then
         if GS.ShelvePriorGenerationsOnRecord(record)
-            and #(record.accounting._consumableEvents or {}) < (GS.MAX_LEDGER_EVENTS or 4096) then
+            and CountNonWithdrawalEvents(record.accounting._consumableEvents or {}) < maxDonLive then
             list = record.accounting._consumableEvents
         else
             return false, "full"
@@ -3642,12 +3717,12 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         end
         local senderGuid = member and member.guid
             or (admissionCtx.sender and tostring(admissionCtx.sender))
+        -- Informational trust: same-guild authenticated relay is allowed; actor
+        -- mismatch is relabeled RELAY inside AdmitWithdrawalEvent (not ORIGIN).
         return GS.AdmitWithdrawalEvent(record, event, {
             senderGuid = senderGuid,
             memberAuthenticated = member ~= nil,
             allowRelayOfOrigin = true,
-            forceRelay = member and senderGuid and event.actorGuid
-                and senderGuid ~= event.actorGuid,
         })
     end
 
