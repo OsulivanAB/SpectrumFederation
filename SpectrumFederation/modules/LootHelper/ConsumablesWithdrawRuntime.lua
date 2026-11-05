@@ -9,6 +9,8 @@ local Workflow = nil -- resolved lazily
 
 local MAX_LOCK_WAITS = 20
 local SETTLE_SECONDS = 1.5
+local OBSERVE_INITIAL = 0.05
+local OBSERVE_MAX = 0.25
 
 local function Loc(key, default)
     if SF.LocaleText then
@@ -61,9 +63,12 @@ function WR.WithdrawAccess(bankTab)
     local name, icon, isViewable, canDeposit, numWithdrawals, remainingWithdrawals =
         GetGuildBankTabInfo(bankTab)
     -- View permission is required to see stock; withdraw uses remainingWithdrawals.
-    -- remainingWithdrawals: -1 often means unlimited on Retail.
-    local unlimited = remainingWithdrawals == nil or remainingWithdrawals < 0
-    local remaining = unlimited and nil or FloorQty(remainingWithdrawals)
+    -- remainingWithdrawals: -1 = unlimited; nil = unknown; >=0 finite allowance.
+    local unlimited = remainingWithdrawals == -1
+    local remaining = nil
+    if remainingWithdrawals ~= nil and remainingWithdrawals >= 0 then
+        remaining = FloorQty(remainingWithdrawals)
+    end
     local canWithdraw = false
     if isViewable then
         if unlimited then
@@ -76,7 +81,13 @@ function WR.WithdrawAccess(bankTab)
     if not isViewable then
         reason = "no_view"
     elseif not canWithdraw then
-        reason = unlimited and "no_withdraw" or "allowance_exhausted"
+        if remainingWithdrawals == nil then
+            reason = "unknown_allowance"
+        elseif remaining == 0 then
+            reason = "allowance_exhausted"
+        else
+            reason = "no_withdraw"
+        end
     end
     return {
         bankOpen = true,
@@ -173,8 +184,8 @@ function WR.ScanBankStock(bankTab, itemIds)
     bankTab = tonumber(bankTab)
     local wanted = {}
     if type(itemIds) == "table" then
-        for _, id in pairs(itemIds) do
-            local n = tonumber(id)
+        for k, v in pairs(itemIds) do
+            local n = tonumber(k) or tonumber(v)
             if n then wanted[n] = true end
         end
     end
@@ -232,41 +243,58 @@ function WR.BagCount(itemId)
     return FloorQty(GetItemCount(itemId, false, false, false))
 end
 
-function WR.EstimateBagCapacity(itemId, qty)
-    -- Conservative: count free bag slots that can hold the item + partial merge room.
-    itemId = tonumber(itemId)
-    qty = FloorQty(qty)
-    if qty < 1 then return true, 0 end
-    local maxStack = 1000
-    if C_Item and C_Item.GetItemInfo then
-        -- stack size may be unavailable; keep conservative.
-    end
+function WR.BuildCarriedBagSnapshot()
+    local Routing = SF.ConsumablesRouting
     local Runtime = Host()
-    if Runtime and Runtime.ItemStackLimit then
-        maxStack = Runtime:ItemStackLimit(itemId) or maxStack
+    local rows = {}
+    if not C_Container or not C_Container.GetContainerNumSlots then
+        return rows
     end
-    local mergeRoom = 0
-    local freeSlots = 0
-    if C_Container and C_Container.GetContainerNumSlots then
-        for bag = 0, NUM_BAG_SLOTS or 4 do
+    for bag = 0, 5 do
+        if not Routing or Routing.IsCarriedBag(bag) then
             local slots = C_Container.GetContainerNumSlots(bag) or 0
+            local bagRow = { bag = bag, slots = {} }
             for slot = 1, slots do
                 local info = C_Container.GetContainerItemInfo(bag, slot)
                 if not info then
-                    freeSlots = freeSlots + 1
-                elseif tonumber(info.itemID) == itemId and not info.isLocked then
-                    local room = maxStack - FloorQty(info.stackCount)
-                    if room > 0 then mergeRoom = mergeRoom + room end
+                    bagRow.slots[#bagRow.slots + 1] = { slot = slot, empty = true }
+                else
+                    bagRow.slots[#bagRow.slots + 1] = {
+                        slot = slot,
+                        itemId = tonumber(info.itemID),
+                        count = FloorQty(info.stackCount),
+                        locked = info.isLocked and true or false,
+                    }
                 end
             end
+            rows[#rows + 1] = bagRow
         end
     end
-    local afterMerge = math.max(0, qty - mergeRoom)
-    local stacksNeeded = 0
-    if afterMerge > 0 then
-        stacksNeeded = math.ceil(afterMerge / maxStack)
+    return rows
+end
+
+function WR.EstimateBagCapacity(itemId, qty)
+    itemId = tonumber(itemId)
+    qty = FloorQty(qty)
+    if qty < 1 then return true, 0, 0, 0 end
+    Workflow = WR.ResolveWorkflow()
+    local Runtime = Host()
+    local take = { [tostring(itemId)] = qty }
+    local ok, err, plan = Workflow.PlanMultiItemBagDestinations(
+        WR.BuildCarriedBagSnapshot(),
+        take,
+        function(id)
+            if Runtime and Runtime.ItemStackLimit then
+                return Runtime:ItemStackLimit(id)
+            end
+            return 1000
+        end
+    )
+    if not ok then
+        return false, plan and plan.requiredNewStacks or 0,
+            plan and plan.freeCompatibleSlots or 0, 0
     end
-    return stacksNeeded <= freeSlots, stacksNeeded, freeSlots, mergeRoom
+    return true, plan.requiredNewStacks, plan.freeCompatibleSlots, qty
 end
 
 --- Session craft-count drafts keyed by output item id (cleared on bank close).
@@ -284,7 +312,89 @@ function WR.IsBusy()
 end
 
 local function CursorEmpty()
-    return not GetCursorInfo or GetCursorInfo() == nil
+    return type(GetCursorInfo) == "function" and GetCursorInfo() == nil
+end
+
+local function CursorItemId()
+    if type(GetCursorInfo) ~= "function" then return nil end
+    local kind, itemId, link = GetCursorInfo()
+    if kind ~= "item" then return nil end
+    local C = SF.Consumables
+    return tonumber(itemId) or (C and C.ItemIdFromText and C.ItemIdFromText(link))
+end
+
+local function RecipeFingerprint(recipe)
+    local GS = SF.GuildSupplies
+    if not GS or not GS.CanonicalRecipeValue then return nil end
+    local canon = GS.CanonicalRecipeValue(recipe)
+    if not canon then return nil end
+    local keys = {}
+    for k in pairs(canon.reagents or {}) do
+        keys[#keys + 1] = tostring(k)
+    end
+    table.sort(keys)
+    local parts = { tostring(canon.itemId or "") }
+    for i = 1, #keys do
+        parts[#parts + 1] = keys[i] .. "=" .. tostring(canon.reagents[keys[i]])
+    end
+    return table.concat(parts, ";")
+end
+
+local function BankSlotCount(bankTab, slot)
+    if not GetGuildBankItemInfo then return 0 end
+    local texture, count = GetGuildBankItemInfo(bankTab, slot)
+    if not texture then return 0 end
+    return FloorQty(count)
+end
+
+local function AttachWithdrawWork(work)
+    WR.work = work
+    local Runtime = Host()
+    if Runtime then Runtime._withdrawWork = work end
+end
+
+local function DetachWithdrawWork()
+    local Runtime = Host()
+    if Runtime then Runtime._withdrawWork = nil end
+    WR.work = nil
+end
+
+local function CancelObserveTimer(work)
+    if work and work.observeTimer and work.observeTimer.Cancel then
+        work.observeTimer:Cancel()
+        work.observeTimer = nil
+    end
+end
+
+local function ScheduleObserve(work, delay)
+    if not work or not C_Timer or not C_Timer.After then return end
+    CancelObserveTimer(work)
+    delay = tonumber(delay) or OBSERVE_INITIAL
+    work.observeTimer = C_Timer.After(delay, function()
+        if WR.work == work then
+            WR.ObservePending()
+        end
+    end)
+end
+
+local function PlaceCursorToDestination(dest)
+    if type(dest) ~= "table" then return false end
+    local bag = tonumber(dest.bag)
+    local slot = tonumber(dest.slot)
+    if bag == 0 then
+        if dest.merge and C_Container and C_Container.PickupContainerItem and slot then
+            C_Container.PickupContainerItem(0, slot)
+        elseif PutItemInBackpack then
+            PutItemInBackpack()
+        else
+            return false
+        end
+    elseif C_Container and C_Container.PickupContainerItem and bag and slot then
+        C_Container.PickupContainerItem(bag, slot)
+    else
+        return false
+    end
+    return CursorEmpty()
 end
 
 local function RecipeUnavailable(record, recipe)
@@ -319,17 +429,32 @@ end
 
 local function StopWork(reason, partial)
     local work = WR.work
-    WR.work = nil
+    DetachWithdrawWork()
+    CancelObserveTimer(work)
     if work and work.timer and work.timer.Cancel then
         work.timer:Cancel()
     end
     Debug("Info", "withdraw stop reason=%s confirmed=%s",
         tostring(reason), tostring(work and work.confirmedTotal or 0))
+    if work and work.movementStarted then
+        WR.ClearDrafts()
+    end
     if work and type(work.onSettle) == "function" then
+        local remaining = {}
+        for k, want in pairs(work.take or {}) do
+            local got = FloorQty((work.confirmed or {})[k])
+            local left = FloorQty(want) - got
+            if left > 0 then
+                remaining[k] = left
+            end
+        end
         pcall(work.onSettle, {
             reason = reason,
             confirmed = work.confirmed or {},
             requested = work.requested or {},
+            remaining = remaining,
+            unresolved = work.unresolved,
+            receiptError = work.receiptError,
             partial = partial,
         })
     end
@@ -430,15 +555,30 @@ function WR.BeginWithdraw(selections, opts)
         qty = FloorQty(qty)
         units = units + qty
         local stacks = WR.ListSourceStacks(ctx.bankTab, tonumber(itemKey))
-        local moves = Workflow.PlanSourceMoves(stacks, qty)
-        plannedStacks = plannedStacks + #moves
-        local okCap = WR.EstimateBagCapacity(tonumber(itemKey), qty)
-        if not okCap then
-            return false, "bag_capacity", plan
+        local moves, unfilled = Workflow.PlanSourceMoves(stacks, qty)
+        if Workflow.SourcePlanIncomplete(unfilled) then
+            return false, "source_blocked", plan
         end
+        plannedStacks = plannedStacks + #moves
+    end
+    local okDest, destErr, destPlan = Workflow.PlanMultiItemBagDestinations(
+        WR.BuildCarriedBagSnapshot(),
+        authorized.take,
+        function(id)
+            if Runtime and Runtime.ItemStackLimit then
+                return Runtime:ItemStackLimit(id)
+            end
+            return 1000
+        end
+    )
+    if not okDest then
+        return false, destErr or "bag_capacity", plan
     end
     if Workflow.AllowanceBlocksPlan(access.remaining, plannedStacks) then
         return false, "allowance", plan
+    end
+    if H and H.PendingSnapshot then
+        H.PendingSnapshot()
     end
     if H and H.CanAcceptUnits then
         local okH, hErr = H.CanAcceptUnits(units)
@@ -451,24 +591,78 @@ function WR.BeginWithdraw(selections, opts)
     local operationId = AllocateOpId()
         or string.format("qw:%d:%d", GetServerTime and GetServerTime() or time(), math.random(1, 1e6))
 
+    local destRows = {}
+    for i = 1, #(destPlan.destinations or {}) do
+        local row = destPlan.destinations[i]
+        destRows[#destRows + 1] = {
+            itemId = row.itemId,
+            bag = row.bag,
+            slot = row.slot,
+            count = row.count,
+            merge = row.merge,
+        }
+    end
+    local destByItem = {}
+    for i = 1, #destRows do
+        local row = destRows[i]
+        local key = tostring(row.itemId)
+        destByItem[key] = destByItem[key] or {}
+        destByItem[key][#destByItem[key] + 1] = row
+    end
+
     local queue = {}
     for itemKey, qty in pairs(authorized.take) do
-        local stacks = WR.ListSourceStacks(ctx.bankTab, tonumber(itemKey))
-        local moves = Workflow.PlanSourceMoves(stacks, FloorQty(qty))
-        for i = 1, #moves do
-            queue[#queue + 1] = {
-                itemId = tonumber(itemKey),
-                slot = moves[i].slot,
-                count = moves[i].count,
-                split = moves[i].split,
-            }
+        local itemId = tonumber(itemKey)
+        local stacks = WR.ListSourceStacks(ctx.bankTab, itemId)
+        local moves, unfilled = Workflow.PlanSourceMoves(stacks, FloorQty(qty))
+        if Workflow.SourcePlanIncomplete(unfilled) then
+            return false, "source_blocked", plan
+        end
+        local itemDests = destByItem[tostring(itemId)] or {}
+        local di = 1
+        for mi = 1, #moves do
+            local move = moves[mi]
+            local remaining = FloorQty(move.count)
+            while remaining > 0 do
+                local dest = itemDests[di]
+                if not dest or FloorQty(dest.count) < 1 then
+                    return false, "destination_plan", plan
+                end
+                local chunk = math.min(remaining, FloorQty(dest.count))
+                local splitPick = chunk < remaining or move.split or chunk < FloorQty(move.count)
+                queue[#queue + 1] = {
+                    itemId = itemId,
+                    slot = move.slot,
+                    count = chunk,
+                    split = splitPick,
+                    destBag = dest.bag,
+                    destSlot = dest.slot,
+                    destMerge = dest.merge,
+                }
+                dest.count = FloorQty(dest.count) - chunk
+                if dest.count < 1 then
+                    di = di + 1
+                end
+                remaining = remaining - chunk
+            end
+        end
+        if di <= #itemDests then
+            return false, "destination_plan", plan
         end
     end
     if #queue < 1 then
         return false, "nothing_available", plan
     end
 
-    WR.work = {
+    local recipeFingerprints = {}
+    for outputKey, crafts in pairs(selections) do
+        if FloorQty(crafts) > 0 then
+            local recipe = ctx.recipes[tostring(outputKey)]
+            recipeFingerprints[tostring(outputKey)] = RecipeFingerprint(recipe)
+        end
+    end
+
+    AttachWithdrawWork({
         operationId = operationId,
         campaignId = ctx.campaignId,
         datasetId = ctx.datasetId,
@@ -478,15 +672,18 @@ function WR.BeginWithdraw(selections, opts)
         guildKey = ctx.guildKey,
         requested = requested,
         take = authorized.take,
+        selections = selections,
+        recipeFingerprints = recipeFingerprints,
         confirmed = {},
         confirmedTotal = 0,
         queue = queue,
         index = 1,
         lockWaits = 0,
+        movementStarted = false,
         startedAt = GetServerTime and GetServerTime() or time(),
         places = {},
         onSettle = opts.onSettle,
-    }
+    })
     Debug("Info", "withdraw begin op=%s moves=%d", operationId, #queue)
     WR.PlaceNext()
     return true, nil, plan
@@ -495,12 +692,36 @@ end
 function WR.ContextStillValid(work)
     local ctx = WR.CurrentContext()
     if not ctx then return false, "context_lost" end
+    if ctx.guildKey ~= work.guildKey then return false, "guild_changed" end
     if ctx.datasetId ~= work.datasetId then return false, "dataset_changed" end
     if ctx.campaignId ~= work.campaignId then return false, "campaign_changed" end
     if ctx.generation ~= work.generation then return false, "generation_changed" end
+    if ctx.configSeq ~= work.configSeq then return false, "config_changed" end
     if ctx.bankTab ~= work.bankTab then return false, "tab_changed" end
     if GetCurrentGuildBankTab and GetCurrentGuildBankTab() ~= work.bankTab then
         return false, "wrong_tab"
+    end
+    Workflow = WR.ResolveWorkflow()
+    for outputKey, fp in pairs(work.recipeFingerprints or {}) do
+        local recipe = ctx.recipes[outputKey]
+        if not recipe or RecipeFingerprint(recipe) ~= fp then
+            return false, "recipe_changed"
+        end
+        if RecipeUnavailable(ctx.record, recipe) then
+            return false, "recipe_unavailable"
+        end
+    end
+    if work.selections and Workflow.AggregateCrafts then
+        local requested2, aggErr = Workflow.AggregateCrafts(work.selections, ctx.recipes)
+        if not requested2 then return false, aggErr or "request_invalid" end
+        for k, qty in pairs(work.requested or {}) do
+            local key = tostring(k)
+            local want = FloorQty(qty)
+            local have = FloorQty(requested2[key] or requested2[tonumber(key)])
+            if have ~= want then
+                return false, "request_changed"
+            end
+        end
     end
     local access = WR.WithdrawAccess(work.bankTab)
     if not access.canWithdraw then return false, access.reason or "no_withdraw" end
@@ -511,6 +732,7 @@ end
 function WR.PlaceNext()
     local work = WR.work
     if not work then return end
+    if work.pendingStep then return end
     local okCtx, why = WR.ContextStillValid(work)
     if not okCtx then
         CommitConfirmed(work)
@@ -522,7 +744,6 @@ function WR.PlaceNext()
         return
     end
     if not CursorEmpty() then
-        -- Foreign cursor: stop without clearing.
         CommitConfirmed(work)
         StopWork("foreign_cursor", true)
         return
@@ -537,8 +758,8 @@ function WR.PlaceNext()
         end
     end
     if not found then
-        work.index = work.index + 1
-        WR.PlaceNext()
+        CommitConfirmed(work)
+        StopWork("source_missing", true)
         return
     end
     if found.locked then
@@ -550,7 +771,7 @@ function WR.PlaceNext()
         end
         if C_Timer and C_Timer.After then
             C_Timer.After(0.1, function()
-                if WR.work == work then WR.PlaceNext() end
+                if WR.work == work and not work.pendingStep then WR.PlaceNext() end
             end)
         end
         return
@@ -560,11 +781,11 @@ function WR.PlaceNext()
     local beforeSlot = found.count
     local take = math.min(step.count, found.count)
     if take < 1 then
-        work.index = work.index + 1
-        WR.PlaceNext()
+        CommitConfirmed(work)
+        StopWork("source_empty", true)
         return
     end
-    -- Exact split when needed.
+    work.movementStarted = true
     if take < found.count then
         if SplitGuildBankItem then
             SplitGuildBankItem(work.bankTab, step.slot, take)
@@ -582,43 +803,21 @@ function WR.PlaceNext()
             return
         end
     end
-    -- Cursor should now hold our item.
-    local cursorType, itemIdOrLink = GetCursorInfo and GetCursorInfo()
-    local cursorId = nil
-    if cursorType == "item" then
-        cursorId = tonumber(itemIdOrLink) or (type(itemIdOrLink) == "string"
-            and tonumber(itemIdOrLink:match("item:(%d+)")))
-    end
+    local cursorId = CursorItemId()
     if cursorId ~= step.itemId then
-        if ClearCursor and cursorType then
-            -- Only clear if we own it; if foreign, stop without clearing.
-            if cursorId == nil or cursorId == step.itemId then
-                ClearCursor()
-            end
-        end
         CommitConfirmed(work)
-        StopWork("cursor_mismatch", true)
+        StopWork((cursorId and cursorId ~= step.itemId) and "foreign_cursor" or "cursor_mismatch", true)
         return
     end
-    -- Auto-store into bags.
-    if AutoStoreGuildBankItem and take == found.count and not step.split then
-        -- Already picked up; use PutItemInBackpack / Deposit.
-    end
-    if PutItemInBackpack then
-        PutItemInBackpack()
-    elseif C_Container and C_Container.PickupContainerItem then
-        -- Try first free bag slot via UseContainerItem pattern — PutItemInBag preferred.
-        for bag = 0, NUM_BAG_SLOTS or 4 do
-            -- PutItemInBag(bagIndex) exists on Retail.
-            if PutItemInBag then
-                PutItemInBag(bag)
-                break
-            end
+    local dest = {
+        bag = step.destBag,
+        slot = step.destSlot,
+        merge = step.destMerge,
+    }
+    if not PlaceCursorToDestination(dest) then
+        if ClearCursor and CursorItemId() == step.itemId then
+            ClearCursor()
         end
-    end
-    if not CursorEmpty() then
-        -- Placement failed; recover owned cursor.
-        if ClearCursor then ClearCursor() end
         CommitConfirmed(work)
         StopWork("bag_place_failed", true)
         return
@@ -630,51 +829,101 @@ function WR.PlaceNext()
         beforeBags = beforeBags,
         beforeSlot = beforeSlot,
     }
-    work.pendingStep = step
-    work.pendingBeforeBags = beforeBags
+    work.pendingStep = {
+        itemId = step.itemId,
+        slot = step.slot,
+        count = take,
+        beforeBags = beforeBags,
+        beforeSlot = beforeSlot,
+        observeStartedAt = GetServerTime and GetServerTime() or time(),
+        observeDelay = OBSERVE_INITIAL,
+    }
     work.index = work.index + 1
-    -- Observe via bag/bank events; also schedule settle continuation.
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0.05, function()
-            if WR.work == work then
-                WR.ObservePending()
-                WR.PlaceNext()
-            end
-        end)
-    else
-        WR.ObservePending()
-        WR.PlaceNext()
-    end
+    ScheduleObserve(work, OBSERVE_INITIAL)
 end
 
 function WR.ObservePending()
     local work = WR.work
     if not work or not work.pendingStep then return end
-    local step = work.pendingStep
+    Workflow = WR.ResolveWorkflow()
+    local pending = work.pendingStep
+    local step = pending
     local afterBags = WR.BagCount(step.itemId)
-    local gain = math.max(0, afterBags - FloorQty(work.pendingBeforeBags))
-    if gain > 0 then
+    local afterSlot = BankSlotCount(work.bankTab, step.slot)
+    local actual = Workflow.InterpretWithdrawal({
+        guildOk = true,
+        observedTab = work.bankTab,
+        configuredTab = work.bankTab,
+        intendedQty = step.count,
+        beforeBags = pending.beforeBags,
+        afterBags = afterBags,
+        placedSlots = { { before = pending.beforeSlot, after = afterSlot } },
+    })
+    local now = GetServerTime and GetServerTime() or time()
+    local elapsed = now - (pending.observeStartedAt or now)
+    local fromTimer = elapsed >= SETTLE_SECONDS
+    local uncertain = fromTimer and actual < FloorQty(step.count)
+    local disposition = Workflow.WithdrawalDisposition(actual, step.count, fromTimer, uncertain)
+    if disposition == "commit" and actual >= FloorQty(step.count) then
+        CancelObserveTimer(work)
         local key = tostring(step.itemId)
-        local add = math.min(gain, FloorQty(step.count))
-        work.confirmed[key] = (work.confirmed[key] or 0) + add
-        work.confirmedTotal = (work.confirmedTotal or 0) + add
+        work.confirmed[key] = (work.confirmed[key] or 0) + actual
+        work.confirmedTotal = (work.confirmedTotal or 0) + actual
         work.pendingStep = nil
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, function()
+                if WR.work == work then WR.PlaceNext() end
+            end)
+        else
+            WR.PlaceNext()
+        end
+        return
     end
+    if disposition == "unresolved" or (fromTimer and actual <= 0) then
+        CancelObserveTimer(work)
+        work.unresolved = {
+            itemId = step.itemId,
+            slot = step.slot,
+            intended = step.count,
+            actual = actual,
+        }
+        work.pendingStep = nil
+        CommitConfirmed(work)
+        StopWork("unresolved", true)
+        return
+    end
+    if disposition == "drop" and fromTimer then
+        CancelObserveTimer(work)
+        work.pendingStep = nil
+        CommitConfirmed(work)
+        StopWork("unresolved", true)
+        return
+    end
+    local nextDelay = math.min(OBSERVE_MAX, (pending.observeDelay or OBSERVE_INITIAL) * 2)
+    pending.observeDelay = nextDelay
+    ScheduleObserve(work, nextDelay)
 end
 
 function WR.FinalizeWork()
     local work = WR.work
     if not work then return end
+    if work.pendingStep then return end
     WR.ObservePending()
-    -- Short settle window for late bag events.
+    if work.pendingStep then return end
     if work.settling then return end
     work.settling = true
     local function finish()
         if WR.work ~= work then return end
+        if work.pendingStep then
+            work.settling = nil
+            return
+        end
         WR.ObservePending()
+        if work.pendingStep then
+            work.settling = nil
+            return
+        end
         CommitConfirmed(work)
-        -- Reset craft drafts for processed recipes on settlement.
-        WR.ClearDrafts()
         local partial = false
         for k, want in pairs(work.take or {}) do
             if FloorQty(work.confirmed[k]) < FloorQty(want) then
