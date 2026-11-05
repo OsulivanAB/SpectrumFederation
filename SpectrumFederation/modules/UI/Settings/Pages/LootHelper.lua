@@ -241,6 +241,282 @@ local function GetRaidCheckConfig()
 	return nil
 end
 
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default
+end
+
+local function RaidCheckModeLabel(mode)
+	if mode == "pre" then
+		return Loc("RAID_CHECK_MODE_PRE", "Pre-Raid Check")
+	end
+	return Loc("RAID_CHECK_MODE_RAID", "Raid Check")
+end
+
+local function ActiveLootHelperProfileId()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.GetProfileId then
+		local id = profile:GetProfileId()
+		if type(id) == "string" and id ~= "" then
+			return id
+		end
+	end
+	return nil
+end
+
+-- Display only when the status belongs to both the current BeginCheck generation
+-- and the profile currently shown in Settings. Nil profileId is allowed only while
+-- no active profile is selected, so missing-profile attempt errors still show.
+local function UiStatusBelongsToCurrentInvocation(ui)
+	if type(ui) ~= "table" then
+		return false
+	end
+	if type(ui.message) ~= "string" or ui.message == "" then
+		return false
+	end
+	if SF.RaidCheck and SF.RaidCheck.GetUiStatusGeneration then
+		if ui.generation ~= SF.RaidCheck:GetUiStatusGeneration() then
+			return false
+		end
+	end
+	local activeId = ActiveLootHelperProfileId()
+	local statusProfileId = ui.profileId
+	if type(statusProfileId) == "string" and statusProfileId ~= "" then
+		return activeId == statusProfileId
+	end
+	return activeId == nil
+end
+
+-- Session controls share one section message row. Track Raid Check ownership and a
+-- shared monotonic seq so refresh can tell whether Session Control feedback is
+-- newer than a cached Raid Check transition (started vs completed need distinct seq).
+local function SectionMessageText(section)
+	if not section then
+		return nil
+	end
+	if section.MessageText and section.MessageText.GetText then
+		local text = section.MessageText:GetText()
+		if type(text) == "string" then
+			return text
+		end
+	end
+	local messages = section.messages
+	if type(messages) == "table" and #messages > 0 then
+		local last = messages[#messages]
+		if type(last) == "table" then
+			return last[1]
+		end
+	end
+	return nil
+end
+
+local function NextSessionRowSeq()
+	if SF.RaidCheck and SF.RaidCheck.NextSharedMessageSeq then
+		return SF.RaidCheck:NextSharedMessageSeq()
+	end
+	return nil
+end
+
+-- Stamp non-Raid-Check SetMessage/ClearMessage so OnShow can compare age to lastUiStatus.seq.
+local function EnsureSessionMessageOrdering(section)
+	if not section or section.__sfRaidCheckMessageOrdering then
+		return
+	end
+	section.__sfRaidCheckMessageOrdering = true
+	local origSetMessage = section.SetMessage
+	local origClearMessage = section.ClearMessage
+	if type(origSetMessage) == "function" then
+		function section:SetMessage(text, kind)
+			local result = origSetMessage(self, text, kind)
+			if not self.__sfRaidCheckSettingMessage then
+				self.__sfRaidCheckOwnedMessage = nil
+				self.__sfRaidCheckOwnedSeq = nil
+				self.__sfSessionMessageSeq = NextSessionRowSeq()
+			end
+			return result
+		end
+	end
+	if type(origClearMessage) == "function" then
+		function section:ClearMessage()
+			local result = origClearMessage(self)
+			if not self.__sfRaidCheckSettingMessage then
+				self.__sfRaidCheckOwnedMessage = nil
+				self.__sfRaidCheckOwnedSeq = nil
+				self.__sfSessionMessageSeq = NextSessionRowSeq()
+			end
+			return result
+		end
+	end
+end
+
+local function SetRaidCheckSectionMessage(section, message, kind, seq)
+	if not section or not section.SetMessage then
+		return false
+	end
+	EnsureSessionMessageOrdering(section)
+	if seq == nil then
+		seq = NextSessionRowSeq()
+	end
+	section.__sfRaidCheckSettingMessage = true
+	section:SetMessage(message, kind)
+	section.__sfRaidCheckSettingMessage = nil
+	section.__sfRaidCheckOwnedMessage = message
+	section.__sfRaidCheckOwnedSeq = seq
+	return true
+end
+
+local function ClearOwnedRaidCheckSectionMessage(section)
+	if not section then
+		return false
+	end
+	EnsureSessionMessageOrdering(section)
+	local owned = section.__sfRaidCheckOwnedMessage
+	if type(owned) ~= "string" or owned == "" then
+		return false
+	end
+	local current = SectionMessageText(section)
+	-- Another Session control replaced the row; drop ownership and leave their text.
+	if type(current) == "string" and current ~= "" and current ~= owned then
+		section.__sfRaidCheckOwnedMessage = nil
+		section.__sfRaidCheckOwnedSeq = nil
+		return false
+	end
+	section.__sfRaidCheckSettingMessage = true
+	if section.ClearMessage then
+		section:ClearMessage()
+	end
+	section.__sfRaidCheckSettingMessage = nil
+	section.__sfRaidCheckOwnedMessage = nil
+	section.__sfRaidCheckOwnedSeq = nil
+	return true
+end
+
+local function SectionHasUnrelatedMessage(section)
+	local current = SectionMessageText(section)
+	if type(current) ~= "string" or current == "" then
+		return false
+	end
+	local owned = section.__sfRaidCheckOwnedMessage
+	return not (type(owned) == "string" and owned ~= "" and current == owned)
+end
+
+local function UnrelatedMessageIsNewerThanUi(section, ui)
+	local foreignSeq = tonumber(section and section.__sfSessionMessageSeq) or 0
+	local uiSeq = tonumber(ui and ui.seq) or 0
+	return foreignSeq >= uiSeq
+end
+
+-- opts.preserveUnrelated: OnShow/Refresh keep Session Control feedback only when it
+-- is at least as new as the cached Raid Check status. A same-profile completion that
+-- landed while the page was hidden (higher seq) still replaces older row text.
+local function ApplyUiStatusToSection(section, ui, opts)
+	if not section then
+		return false
+	end
+	EnsureSessionMessageOrdering(section)
+	opts = opts or {}
+	if not UiStatusBelongsToCurrentInvocation(ui) then
+		ClearOwnedRaidCheckSectionMessage(section)
+		return false
+	end
+	if opts.preserveUnrelated and SectionHasUnrelatedMessage(section) and UnrelatedMessageIsNewerThanUi(section, ui) then
+		return false
+	end
+	local kind = ui.kind
+		or ((ui.status == "completed") and "success")
+		or ((ui.status == "error") and "error")
+		or ((ui.status == "busy") and "warn")
+		or "info"
+	return SetRaidCheckSectionMessage(section, ui.message, kind, ui.seq)
+end
+
+-- Prefer RaidCheck's current-invocation UI status so an immediately completed run
+-- cannot be overwritten by a late "started" SetMessage, and a failed new attempt
+-- cannot reuse a prior success (Codex #458).
+local function ApplyRaidCheckButtonStatus(ctx, status, mode)
+	if not ctx or not ctx.section or not ctx.section.SetMessage then
+		return
+	end
+	EnsureSessionMessageOrdering(ctx.section)
+	local label = RaidCheckModeLabel(mode)
+	if status == "busy" then
+		SetRaidCheckSectionMessage(
+			ctx.section,
+			Loc("RAID_CHECK_UI_BUSY", "A Raid Check is already in progress."),
+			"warn"
+		)
+		return
+	end
+	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
+	if ApplyUiStatusToSection(ctx.section, ui) then
+		return
+	end
+	if status == "prompt" then
+		SetRaidCheckSectionMessage(
+			ctx.section,
+			Loc("RAID_CHECK_UI_PROMPT", "Choose Yes to start a session, No to run without one, or Cancel to abort."),
+			"info"
+		)
+		return
+	end
+	if status == "completed" then
+		SetRaidCheckSectionMessage(
+			ctx.section,
+			Loc("RAID_CHECK_UI_COMPLETE_FALLBACK", "%s complete."):format(label),
+			"success"
+		)
+		return
+	end
+	if status == "started" then
+		SetRaidCheckSectionMessage(
+			ctx.section,
+			Loc("RAID_CHECK_UI_STARTED", "%s started."):format(label),
+			"info"
+		)
+		return
+	end
+	if status == "error" then
+		SetRaidCheckSectionMessage(
+			ctx.section,
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(label),
+			"error"
+		)
+	end
+end
+
+local function EnsureRaidCheckUiStatusListener(panel)
+	if not panel or panel.__sfRaidCheckUiStatusRegistered then
+		return
+	end
+	if not (SF.RaidCheck and SF.RaidCheck.RegisterUiStatusListener) then
+		return
+	end
+	panel.__sfRaidCheckUiStatusKey = panel.__sfRaidCheckUiStatusKey or panel
+	SF.RaidCheck:RegisterUiStatusListener(panel.__sfRaidCheckUiStatusKey, function(ui)
+		if not panel.IsShown or not panel:IsShown() then
+			return
+		end
+		local section = panel.__sfSections and panel.__sfSections.session
+		EnsureSessionMessageOrdering(section)
+		-- Live updates for the displayed profile may replace the row; rejected
+		-- statuses only clear text still owned by Raid Check.
+		ApplyUiStatusToSection(section, ui)
+	end)
+	panel.__sfRaidCheckUiStatusRegistered = true
+end
+
+local function ClearRaidCheckUiStatusListener(panel)
+	if not panel or not panel.__sfRaidCheckUiStatusRegistered then
+		return
+	end
+	if SF.RaidCheck and SF.RaidCheck.UnregisterUiStatusListener then
+		SF.RaidCheck:UnregisterUiStatusListener(panel.__sfRaidCheckUiStatusKey or panel)
+	end
+	panel.__sfRaidCheckUiStatusRegistered = false
+end
+
 local function GetRaidCheckPointsAwardPerCheck()
 	local cfg = GetRaidCheckConfig()
 	if cfg ~= nil then
@@ -1366,7 +1642,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "checkbox", label = "Require Minimum Item Level", adminOnly = true, tooltip = "When enabled, a player whose overall equipped item level is below the minimum is Unprepared. The value is Blizzard's equipped item level. The requirement starts off and stays off until an admin enables it.", visible = function() return HasActiveProfile() end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.requireMinimumItemLevel or false end, set = function(value) SetRaidCheckMinimumItemLevelRequired(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
 				{ type = "editbox", label = "Minimum Item Level", adminOnly = true, tooltip = "Whole-number overall equipped item level required to pass Raid Check. A player exactly at this value passes. Leave this blank to keep the requirement from failing anyone until a number is set.", visible = function() local cfg = GetRaidCheckConfig() return HasActiveProfile() and cfg and cfg.requireMinimumItemLevel or false end, enabled = function() return ProfileActionsEnabled() end, maxLetters = 5, get = function() local cfg = GetRaidCheckConfig() if cfg and cfg.minimumItemLevel ~= nil then return tostring(cfg.minimumItemLevel) end return "" end, set = function(value) SetRaidCheckMinimumItemLevel(value) end },
 				{ type = "text", text = "Raid Checks..." },
-					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Pre-Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end } },
+					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() ApplyRaidCheckButtonStatus(ctx, status, "pre") end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() ApplyRaidCheckButtonStatus(ctx, status, "raid") end } },
 					{ type = "text", text = "Enable Whispers During..." },
 					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing equipment requirements.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
 					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point in Point Based mode, or an Attendance point in Reward Pot mode.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
@@ -1724,12 +2000,43 @@ function ProfilePage:Refresh(panel)
 	RefreshPage(panel)
 end
 
+local function SyncRaidCheckUiStatusToPanel(panel)
+	if not panel then
+		return
+	end
+	local section = panel.__sfSections and panel.__sfSections.session
+	EnsureSessionMessageOrdering(section)
+	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
+	-- Reopen/refresh: clear stale wrong-profile Raid Check text; keep Session
+	-- Control feedback only when it is newer than the cached status seq.
+	ApplyUiStatusToSection(section, ui, { preserveUnrelated = true })
+end
+
 function SessionPage:Build(panel)
 	BuildPage(panel, self.id, { "session" })
+	if panel and panel.HookScript and not panel.__sfRaidCheckUiStatusHooked then
+		panel.__sfRaidCheckUiStatusHooked = true
+		panel:HookScript("OnShow", function()
+			EnsureRaidCheckUiStatusListener(panel)
+			SyncRaidCheckUiStatusToPanel(panel)
+		end)
+		panel:HookScript("OnHide", function()
+			ClearRaidCheckUiStatusListener(panel)
+		end)
+	end
+	if panel and panel.IsShown and panel:IsShown() then
+		EnsureRaidCheckUiStatusListener(panel)
+		SyncRaidCheckUiStatusToPanel(panel)
+	else
+		ClearRaidCheckUiStatusListener(panel)
+	end
 end
 
 function SessionPage:Refresh(panel)
 	RefreshPage(panel)
+	if panel and panel.IsShown and panel:IsShown() then
+		SyncRaidCheckUiStatusToPanel(panel)
+	end
 end
 
 function AdminPage:Build(panel)

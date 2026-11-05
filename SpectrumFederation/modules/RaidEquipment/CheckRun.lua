@@ -305,6 +305,54 @@ function CheckRun.FormatPresenceLogSummary(presentCount, eligibleCount, prepared
 	)
 end
 
+-- Count classified targets for the admin completion summary. UNPREPARED and
+-- UNPREPARED_AVAILABILITY both count as Unprepared. Unknown/nil classes are
+-- ignored rather than guessed.
+function CheckRun.CountClassifiedResults(results)
+	local prepared = 0
+	local unprepared = 0
+	local inspectionFailed = 0
+	if type(results) ~= "table" then
+		return prepared, unprepared, inspectionFailed
+	end
+	for _, entry in pairs(results) do
+		local classId = entry and entry.class or nil
+		if classId == CheckRun.CLASS.PREPARED then
+			prepared = prepared + 1
+		elseif classId == CheckRun.CLASS.UNPREPARED or classId == CheckRun.CLASS.UNPREPARED_AVAILABILITY then
+			unprepared = unprepared + 1
+		elseif classId == CheckRun.CLASS.INSPECTION_FAILED then
+			inspectionFailed = inspectionFailed + 1
+		end
+	end
+	return prepared, unprepared, inspectionFailed
+end
+
+-- One-line admin completion summary. Distinguishes Prepared, Unprepared, and
+-- Inspection Failed so a finished check never implies every inspect succeeded.
+function CheckRun.FormatCompletionSummary(modeLabel, preparedCount, unpreparedCount, inspectionFailedCount)
+	local function text(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default
+	end
+	modeLabel = tostring(modeLabel or "Raid Check")
+	preparedCount = tonumber(preparedCount) or 0
+	unpreparedCount = tonumber(unpreparedCount) or 0
+	inspectionFailedCount = tonumber(inspectionFailedCount) or 0
+	return string.format(
+		text(
+			"RAID_CHECK_COMPLETION_SUMMARY",
+			"[%s] Complete: %d Prepared · %d Unprepared · %d Inspection Failed"
+		),
+		modeLabel,
+		preparedCount,
+		unpreparedCount,
+		inspectionFailedCount
+	)
+end
+
 function CheckRun.NewPlayer(memberId)
 	return {
 		id = memberId,
