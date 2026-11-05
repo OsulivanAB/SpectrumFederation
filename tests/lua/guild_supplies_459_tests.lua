@@ -2533,7 +2533,8 @@ do
                     },
                     actorGuid = "Player-1-Alice",
                     actorName = "Alice-Garona",
-                    timestamp = world.time + 2000 + i,
+                    -- Within production skew; do not plant multi-hour futures.
+                    timestamp = world.time + 100 + i,
                     baseTargetRevision = record.datasetId,
                     basePolicyRevision = record.permission and record.permission.revisionId,
                     baseCampaignId = record.currentCampaignId,
@@ -2568,7 +2569,7 @@ do
             },
             actorGuid = "Player-1-Alice",
             actorName = "Alice-Garona",
-            timestamp = world.time + 3000,
+            timestamp = world.time + 180,
             baseTargetRevision = record.datasetId,
             basePolicyRevision = record.permission and record.permission.revisionId,
             baseCampaignId = record.currentCampaignId,
@@ -2588,7 +2589,7 @@ do
     injectProductionDonation(record, {
         id = bDonId, itemId = itemB, quantity = 1,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
-        timestamp = world.time + 4000,
+        timestamp = world.time + 200,
     })
     GS.RedrivePendingContributorCorrections(record, {
         itemId = itemB, eventId = bDonId, maxAttempts = 32,
