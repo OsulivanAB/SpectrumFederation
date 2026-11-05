@@ -3145,8 +3145,14 @@ do
     assertTrue(ok1 == false, "459: paced Ensure first slice incomplete")
     assertEq(err1, "work_budget", "459: paced Ensure yields work_budget")
     assertTrue(det1 and det1.deferred == true, "459: paced Ensure deferred flag")
-    assertTrue((tonumber(det1 and det1.workUnits) or 0) >= tightBudget,
+    local ensureWork = tonumber(det1 and det1.workUnits) or 0
+    local hardCeilingEnsure = tightBudget
+        + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
+    assertTrue(ensureWork >= tightBudget,
         "459: paced Ensure slice reached independent budget")
+    assertTrue(ensureWork <= hardCeilingEnsure,
+        "459: paced Ensure first callback within soft+atomic ceiling got="
+            .. tostring(ensureWork) .. " hard=" .. tostring(hardCeilingEnsure))
     assertTrue(#timers > timersBeforeEnsure,
         "459: paced Ensure scheduled continuation (control returns)")
     local ensureSlices = 1
@@ -3254,16 +3260,19 @@ do
     assertTrue(#sliceWorks >= 2,
         "459: redrive used multiple callbacks got=" .. tostring(#sliceWorks))
     local productive = 0
+    local hardCeiling = tightBudget
+        + (tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512)
     for si = 1, #sliceWorks do
         local sw = sliceWorks[si]
         if sw.work > 0 or sw.attempts > 0 then
             productive = productive + 1
-            -- Within budget, or a single unit that crossed while making progress.
-            assertTrue(sw.work <= tightBudget or sw.attempts <= 1,
-                "459: redrive slice respects independent budget si="
+            -- Soft budget + explicit atomic overshoot only — no attempt exemption.
+            assertTrue(sw.work <= hardCeiling,
+                "459: redrive slice within soft+atomic ceiling si="
                     .. tostring(si) .. " work=" .. tostring(sw.work)
                     .. " attempts=" .. tostring(sw.attempts)
-                    .. " budget=" .. tostring(tightBudget))
+                    .. " soft=" .. tostring(tightBudget)
+                    .. " hard=" .. tostring(hardCeiling))
         end
     end
     assertTrue(productive >= 2,
@@ -3291,6 +3300,125 @@ do
     local okSmall = GS.EnsureCreditCorrectionProjection(small, nil)
     assertTrue(okSmall, "459: small Ensure completes synchronously")
     assertEq(#timers, tSmall, "459: small Ensure did not schedule continuation")
+end
+
+do
+    -- Rejected local preview must not publish via background resume (#459
+    -- discussion_r4476590692). Public prepare/apply → rejected/work_budget;
+    -- after every timer and an accepted-history rebuild, credit stays original.
+    local record = seedLiveCampaignWithItem(9360, 400)
+    local donors = {
+        { name = "Alice-Garona", guid = "Player-1-Alice" },
+        { name = "Bob-Garona", guid = "Player-1-Bob" },
+        { name = "Carol-Garona", guid = "Player-1-Carol" },
+        { name = "Dave-Garona", guid = "Player-1-Dave" },
+    }
+    local nDon = 40
+    for i = 1, nDon do
+        injectProductionDonation(record, {
+            id = "rej-don-" .. i, itemId = 9360, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = 21000 + i,
+        })
+    end
+    injectProductionAdjustment(record, {
+        id = "rej-adj-alice", itemId = 9360, quantity = -20,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        timestamp = 21100,
+    })
+    for di = 2, #donors do
+        local d = donors[di]
+        injectProductionDonation(record, {
+            id = "rej-seed-" .. di, itemId = 9360, quantity = 3,
+            actor = d.name, actorGuid = d.guid,
+            timestamp = 21110 + di,
+        })
+    end
+    local ctx = select(1, GS:GetCurrentContext())
+    for i = 1, 24 do
+        local target = donors[(i % (#donors - 1)) + 2]
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = "rej-corr-" .. i,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "rej-don-" .. i,
+            value = {
+                eventId = "rej-don-" .. i,
+                eventKind = "donation",
+                attributed = target.name,
+                attributedGuid = target.guid,
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = 9360,
+            },
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            timestamp = 21200 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[op.id] = op
+        record.operations.order[#record.operations.order + 1] = op.id
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    assertTrue(select(1, GS.RebuildCreditCorrectionProjection(record, nil)),
+        "459: rejected-edit settle existing projection")
+    flushTimers()
+
+    -- Independent item Y: Alice +10; prepare Alice→Bob; apply under tight budget.
+    local yOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 9361 }, {
+        itemId = 9361, goal = 20, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(yOp), "accepted", "459: rejected-edit add item Y")
+    injectProductionDonation(record, {
+        id = "rej-y-don", itemId = 9361, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = 21300,
+    })
+    local preview = select(1, GS:NewContributorCorrectionOperation(
+        "rej-y-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(type(preview) == "table" and type(preview.id) == "string",
+        "459: rejected-edit prepared Alice→Bob on Y")
+    GS._creditProjectionWorkBudgetOverride = 80
+    local status, reason = GS:ApplyStagedConfigOperation(preview)
+    GS._creditProjectionWorkBudgetOverride = nil
+    assertEq(status, "rejected", "459: rejected-edit apply status rejected")
+    assertEq(reason, "work_budget", "459: rejected-edit apply reason work_budget")
+    assertTrue(record.operations.records[preview.id] == nil,
+        "459: rejected-edit not accepted")
+    assertTrue(not record.operations.pending or record.operations.pending[preview.id] == nil,
+        "459: rejected-edit not pending")
+
+    local timersBefore = #timers
+    for _ = 1, 200 do
+        if not runOneDueTimer() then break end
+    end
+    flushTimers()
+    local yEv = GS.FindLedgerEventById(record, "rej-y-don")
+    local name1, _, _, st1 = GS.ResolveEffectiveCreditIdentity(record, yEv)
+    assertEq(name1, "Alice-Garona",
+        "459: rejected-edit Y credit stays Alice after timers got " .. tostring(name1))
+    assertTrue(st1 ~= GS.CREDIT_UNAVAILABLE or name1 == "Alice-Garona",
+        "459: rejected-edit Y not published as Bob")
+    assertTrue(record.operations.records[preview.id] == nil,
+        "459: rejected-edit still not accepted after timers")
+    assertTrue(select(1, GS.ResolveEffectiveCreditIdentity(record, yEv)) ~= "Bob-Garona",
+        "459: rejected-edit Y is not Bob after timers")
+
+    GS.InvalidateCreditCorrectionProjection(record)
+    assertTrue(select(1, GS.RebuildCreditCorrectionProjection(record, nil)),
+        "459: rejected-edit rebuild from accepted history")
+    flushTimers()
+    local name2 = select(1, GS.ResolveEffectiveCreditIdentity(record, yEv))
+    assertEq(name2, "Alice-Garona",
+        "459: rejected-edit Y Alice after accepted-history rebuild")
+    assertTrue(record.creditCorrections == nil
+        or record.creditCorrections["rej-y-don"] == nil,
+        "459: rejected-edit no Y head in creditCorrections")
 end
 
 do

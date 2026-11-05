@@ -55,6 +55,9 @@ GS.CREDIT_UNAVAILABLE = "credit_unavailable"
 -- Sized so a typical maxAttempts=32 wave of light rebuilds fits; tests may lower
 -- via GS._creditProjectionWorkBudgetOverride.
 GS.CREDIT_PROJECTION_WORK_BUDGET = 16384
+--- Max measured work a single atomic prune/baseline step may exceed the soft
+-- callback ceiling by before yielding (#459). Not an exemption for a full rebuild.
+GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT = 512
 
 --- Durable verification label. Unknown values stay on the three-witness mode.
 function GS.CanonicalVerificationMode(mode)
@@ -2573,7 +2576,20 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         return 0, 0
     end
     -- Accumulate rebuild work across nested AdmitRemoteOperation callbacks.
-    GS._creditProjectionCallbackWork = 0
+    -- Nested callers (projection continuation) share the remaining allowance.
+    local shareBudget = type(opts) == "table" and opts._shareCallbackBudget == true
+    if not shareBudget then
+        local budget = tonumber(opts and opts.workBudget)
+            or tonumber(GS._creditProjectionWorkBudgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+            or 16384
+        GS._creditProjectionCallbackWork = 0
+        GS._creditProjectionCallbackLimit = budget
+        local overshoot = tonumber(GS._creditProjectionAtomicOvershootOverride)
+            or tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT)
+            or 512
+        GS._creditProjectionCallbackHardLimit = budget + overshoot
+    end
     GS._creditProjectionAccumulating = true
     -- Always merge the incoming wake; never overwrite cont.opts with a narrow
     -- filter while an existing snapshot drains (A/B/C interleaving).
@@ -2620,7 +2636,8 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         if attempts >= maxAttempts then
             break
         end
-        if (tonumber(GS._creditProjectionCallbackWork) or 0) >= workBudget then
+        local softLimit = tonumber(GS._creditProjectionCallbackLimit) or workBudget
+        if (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit then
             break
         end
         attempts = attempts + 1
@@ -5766,11 +5783,52 @@ local function CreditProjectionSliceBudget()
     return tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
 end
 
+local function CreditProjectionAtomicOvershoot()
+    local override = tonumber(GS._creditProjectionAtomicOvershootOverride)
+    if override and override >= 0 then
+        return override
+    end
+    return tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512
+end
+
 local function CreditProjectionWorkNow(rowVisits)
     return (tonumber(rowVisits) or 0)
         + (tonumber(GS._creditProjectionBucketVisits) or 0)
         + (tonumber(GS._creditProjectionFloorVisits) or 0)
         + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+end
+
+--- Begin a fresh callback budget, or keep nesting under the parent allowance.
+local function BeginCreditProjectionCallbackBudget(share)
+    if not share then
+        local budget = CreditProjectionSliceBudget()
+        GS._creditProjectionCallbackWork = 0
+        GS._creditProjectionCallbackLimit = budget
+        GS._creditProjectionCallbackHardLimit = budget + CreditProjectionAtomicOvershoot()
+    end
+    GS._creditProjectionAccumulating = true
+end
+
+local function EndCreditProjectionCallbackBudget()
+    GS._creditProjectionAccumulating = false
+end
+
+--- Work already charged this callback plus in-progress local rebuild units.
+local function CreditProjectionCallbackWorkTotal(localWork)
+    local base = 0
+    if GS._creditProjectionAccumulating then
+        base = tonumber(GS._creditProjectionCallbackWork) or 0
+    end
+    return base + (tonumber(localWork) or 0)
+end
+
+local function CreditProjectionSoftLimit()
+    return tonumber(GS._creditProjectionCallbackLimit) or CreditProjectionSliceBudget()
+end
+
+local function CreditProjectionHardLimit()
+    return tonumber(GS._creditProjectionCallbackHardLimit)
+        or (CreditProjectionSoftLimit() + CreditProjectionAtomicOvershoot())
 end
 
 local function AccumulateCreditProjectionCallbackWork(workUnits)
@@ -5779,6 +5837,53 @@ local function AccumulateCreditProjectionCallbackWork(workUnits)
     end
     GS._creditProjectionCallbackWork =
         (tonumber(GS._creditProjectionCallbackWork) or 0) + (tonumber(workUnits) or 0)
+end
+
+-- Ephemeral paced-rebuild scratch (not durable / not another ledger authority).
+local creditProjectionScratch = setmetatable({}, { __mode = "k" })
+
+local function ClearCreditProjectionScratch(record)
+    if type(record) == "table" then
+        creditProjectionScratch[record] = nil
+    end
+end
+
+local function CloneCreditProjectionTotals(totals)
+    local copy = {}
+    if type(totals) ~= "table" then
+        return copy
+    end
+    for k, v in pairs(totals) do
+        copy[k] = v
+    end
+    return copy
+end
+
+--- Drop a speculative preview resume so timers cannot publish a rejected edit.
+local function DiscardSpeculativeCreditProjectionResume(record, op)
+    if type(record) ~= "table" then
+        return
+    end
+    local cached = creditProjectionCache[record]
+    if type(cached) ~= "table" or type(cached.resume) ~= "table" then
+        return
+    end
+    local resume = cached.resume
+    if not resume.speculative then
+        return
+    end
+    local opId = type(op) == "table" and op.id or nil
+    if type(resume.extraOpId) == "string"
+        and type(opId) == "string"
+        and resume.extraOpId ~= opId then
+        return
+    end
+    creditProjectionCache[record] = nil
+    ClearCreditProjectionScratch(record)
+    local cont = creditProjectionContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
 end
 
 local ScheduleCreditProjectionContinuation
@@ -5790,6 +5895,12 @@ ScheduleCreditProjectionContinuation = function(record)
     -- Without a timer, finish inline on the next Rebuild caller instead of
     -- recursively draining here (keeps one unit of work per callback).
     if not (C_Timer and C_Timer.After) then
+        return
+    end
+    -- Never background-resume a speculative preview op; only accepted history.
+    local cached = creditProjectionCache[record]
+    if type(cached) == "table" and type(cached.resume) == "table"
+        and cached.resume.speculative then
         return
     end
     local cont = creditProjectionContinuation[record]
@@ -5807,20 +5918,20 @@ ScheduleCreditProjectionContinuation = function(record)
             return
         end
         state.scheduled = false
-        local cached = creditProjectionCache[record]
-        local extraOp = nil
-        if type(cached) == "table" and type(cached.resume) == "table" then
-            extraOp = cached.resume.extraOp
-        end
+        BeginCreditProjectionCallbackBudget(false)
+        local ok, err = false, nil
         if GS.RebuildCreditCorrectionProjection then
-            local ok, err = GS.RebuildCreditCorrectionProjection(record, extraOp)
-            -- Rebuild reschedules itself while err == work_budget.
-            if (ok or err ~= "work_budget")
-                and GS.RedrivePendingContributorCorrections then
-                -- Projection settled (ok or terminal failure): drain pending.
-                GS.RedrivePendingContributorCorrections(record, {})
-            end
+            -- Accepted-history only — never pass resume.extraOp here.
+            ok, err = GS.RebuildCreditCorrectionProjection(record, nil)
         end
+        if (ok or err ~= "work_budget")
+            and GS.RedrivePendingContributorCorrections then
+            -- Share remaining callback allowance with nested redrive.
+            GS.RedrivePendingContributorCorrections(record, {
+                _shareCallbackBudget = true,
+            })
+        end
+        EndCreditProjectionCallbackBudget()
     end
     C_Timer.After(0, run)
 end
@@ -5829,6 +5940,7 @@ end
 function GS.InvalidateCreditCorrectionProjection(record)
     if type(record) == "table" then
         creditProjectionCache[record] = nil
+        ClearCreditProjectionScratch(record)
         local cont = creditProjectionContinuation[record]
         if type(cont) == "table" then
             cont.scheduled = false
@@ -5867,14 +5979,33 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local stampEarly = CreditProjectionDependencyStamp(record)
     local priorCache = creditProjectionCache[record]
     local resumeDeactivated = nil
+    local resumePhase = nil
     -- Resume an interrupted paced rebuild (same dependency stamp).
+    -- Speculative extraOp resumes only when the caller re-supplies that exact op
+    -- (Apply/Admit). Accepted-history Rebuild(nil) never adopts a preview op.
     if type(priorCache) == "table" and priorCache.stamp == stampEarly
         and priorCache.err == "work_budget"
         and type(priorCache.resume) == "table" then
-        resumeDeactivated = priorCache.resume.deactivatedEventIds
-        if type(extraOp) ~= "table" and type(priorCache.resume.extraOp) == "table" then
-            extraOp = priorCache.resume.extraOp
+        local resume = priorCache.resume
+        resumePhase = resume.phase
+        if type(extraOp) == "table" and resume.speculative
+            and type(resume.extraOp) == "table"
+            and resume.extraOp.id == extraOp.id then
+            resumeDeactivated = resume.deactivatedEventIds
+        elseif type(extraOp) ~= "table" and not resume.speculative then
+            resumeDeactivated = resume.deactivatedEventIds
+        elseif type(extraOp) ~= "table" and resume.speculative then
+            -- Stale speculative pause must not affect accepted-history rebuild.
+            resumeDeactivated = nil
+            resumePhase = nil
         end
+    end
+    -- Top-level Rebuild/Ensure opens a callback budget when not nested.
+    if not GS._creditProjectionAccumulating then
+        BeginCreditProjectionCallbackBudget(false)
+        GS._creditProjectionOwnedCallbackBudget = true
+    else
+        GS._creditProjectionOwnedCallbackBudget = false
     end
     local candidates = {}
     local function considerOp(op)
@@ -5917,6 +6048,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             stamp = CreditProjectionDependencyStamp(record),
             ok = true,
         }
+        ClearCreditProjectionScratch(record)
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
         return true, nil, {
             activeIds = {},
             rowVisits = 0,
@@ -5925,13 +6061,30 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             lookupMisses = 0,
         }
     end
-    local totals, byId, rowVisits, relationshipsReady = BuildDurableCreditFloorBaseline(record)
+    -- Reuse scratch baseline/ordered when resuming the same dependency stamp.
+    -- Prior callbacks already paid baseline/index cost — this slice's budget
+    -- starts at zero visits so prune can make progress under the soft limit.
+    local totals, byId, rowVisits, relationshipsReady, ordered, lookupMisses
+    local scratch = creditProjectionScratch[record]
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.ordered) == "table"
+        and type(scratch.baselineTotals) == "table" then
+        -- Always restart activate from the immutable post-baseline totals.
+        totals = CloneCreditProjectionTotals(scratch.baselineTotals)
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        GS._creditProjectionRowVisits = 0
+    else
+    totals, byId, rowVisits, relationshipsReady = BuildDurableCreditFloorBaseline(record)
     GS._creditProjectionRowVisits = rowVisits
     -- Group by canonical event id; keep LWW winner. Resolve via baseline index
     -- (id + txnId + trusted aliases). Fall back to FindLedgerEventById only on
     -- true miss, caching both canonical and the immutable alias target.
     local winners = {}
-    local lookupMisses = 0
+    lookupMisses = 0
     for i = 1, #candidates do
         local op = candidates[i]
         local event = byId[op.target]
@@ -5973,7 +6126,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
     end
     GS._creditProjectionLookupMisses = lookupMisses
-    local ordered = {}
+    ordered = {}
     for canonical, entry in pairs(winners) do
         ordered[#ordered + 1] = {
             canonical = canonical,
@@ -5989,6 +6142,54 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
         return tostring(a.op.id) < tostring(b.op.id)
     end)
+    end -- scratch miss: built baseline+ordered
+    local baselineTotals = CloneCreditProjectionTotals(totals)
+    -- Soft yield after baseline/indexing before activation when allowance spent.
+    do
+        local softLimit = CreditProjectionSoftLimit()
+        local allowDefer = (C_Timer and C_Timer.After) and true or false
+        if allowDefer and CreditProjectionCallbackWorkTotal(rowVisits or 0) >= softLimit then
+            creditProjectionScratch[record] = {
+                stamp = stampEarly,
+                baselineTotals = baselineTotals,
+                byId = byId,
+                rowVisits = rowVisits,
+                relationshipsReady = relationshipsReady,
+                ordered = ordered,
+                lookupMisses = lookupMisses,
+            }
+            local speculative = type(extraOp) == "table"
+                and not (type(ops) == "table" and type(ops.records) == "table"
+                    and ops.records[extraOp.id])
+            creditProjectionCache[record] = {
+                stamp = stampEarly,
+                ok = false,
+                err = "work_budget",
+                resume = {
+                    deactivatedEventIds = {},
+                    phase = "post_baseline",
+                    speculative = speculative and true or false,
+                    extraOp = speculative and extraOp or nil,
+                    extraOpId = speculative and extraOp.id or nil,
+                },
+            }
+            AccumulateCreditProjectionCallbackWork(rowVisits or 0)
+            if not speculative then
+                ScheduleCreditProjectionContinuation(record)
+            end
+            if GS._creditProjectionOwnedCallbackBudget then
+                EndCreditProjectionCallbackBudget()
+                GS._creditProjectionOwnedCallbackBudget = false
+            end
+            return false, "work_budget", {
+                rowVisits = rowVisits,
+                workUnits = rowVisits,
+                deferred = true,
+                phase = "post_baseline",
+                speculative = speculative and true or false,
+            }
+        end
+    end
     local activeMap = {}
     local activeIds = {}
     local bound = {}
@@ -6042,13 +6243,49 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             end
         end
     end
+    -- Activate(+restore) re-establishes prior slice state; charge only new prune
+    -- work in this callback so progress can continue under the soft limit.
+    if type(scratch) == "table" and scratch.stamp == stampEarly then
+        GS._creditProjectionBucketVisits = 0
+        GS._creditProjectionFloorVisits = 0
+        GS._creditProjectionCandidateTrials = 0
+        rowVisits = 0
+        GS._creditProjectionRowVisits = 0
+    end
     local stamp = stampEarly
-    local sliceBudget = CreditProjectionSliceBudget()
+    local softLimit = CreditProjectionSoftLimit()
+    local hardLimit = CreditProjectionHardLimit()
     -- Yield only when a timer can return control; otherwise finish this unit.
     local allowDefer = (C_Timer and C_Timer.After) and true or false
+    -- Speculative preview: proposed op not yet in accepted history.
+    local speculative = type(extraOp) == "table"
+        and not (type(ops) == "table" and type(ops.records) == "table"
+            and ops.records[extraOp.id])
+    local function finishOwnedBudget()
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
+    end
     local function deferProjection(phase)
         local workUnits = CreditProjectionWorkNow(rowVisits)
         AccumulateCreditProjectionCallbackWork(workUnits)
+        -- Persist scratch so the next slice need not rebuild baseline/ordered.
+        -- baselineTotals stays the immutable post-baseline floor snapshot.
+        local priorScratch = creditProjectionScratch[record]
+        local baseSnap = baselineTotals
+        if type(priorScratch) == "table" and type(priorScratch.baselineTotals) == "table" then
+            baseSnap = priorScratch.baselineTotals
+        end
+        creditProjectionScratch[record] = {
+            stamp = stamp,
+            baselineTotals = baseSnap,
+            byId = byId,
+            rowVisits = rowVisits,
+            relationshipsReady = relationshipsReady,
+            ordered = ordered,
+            lookupMisses = lookupMisses,
+        }
         -- Do not publish a partial prune; leave any prior coherent map alone.
         creditProjectionCache[record] = {
             stamp = stamp,
@@ -6056,13 +6293,21 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             err = "work_budget",
             resume = {
                 deactivatedEventIds = deactivatedEventIds,
-                extraOp = extraOp,
                 phase = phase,
+                speculative = speculative and true or false,
+                extraOp = speculative and extraOp or nil,
+                extraOpId = speculative and extraOp.id or nil,
             },
         }
-        if not GS._creditProjectionAccumulating then
-            ScheduleCreditProjectionContinuation(record)
+        -- Background continuation is accepted-history only — never speculative.
+        if not speculative then
+            -- Nested accumulating redrive schedules its own continuation.
+            if not GS._creditProjectionAccumulating
+                or GS._creditProjectionOwnedCallbackBudget then
+                ScheduleCreditProjectionContinuation(record)
+            end
         end
+        finishOwnedBudget()
         return false, "work_budget", {
             activeIds = activeIds,
             rowVisits = rowVisits,
@@ -6070,20 +6315,39 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0,
             candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0,
             workUnits = workUnits,
+            callbackWork = CreditProjectionCallbackWorkTotal(0),
             deactivations = GS._creditProjectionDeactivations,
             lookupMisses = lookupMisses,
             deferred = true,
             phase = phase,
+            speculative = speculative and true or false,
         }
+    end
+    local function shouldYield(localWork)
+        return allowDefer
+            and CreditProjectionCallbackWorkTotal(localWork) >= softLimit
+    end
+    -- Soft yield before prune when baseline/activate already spent the allowance.
+    if shouldYield(CreditProjectionWorkNow(rowVisits))
+        and not TotalsAllNonNegative(totals) then
+        return deferProjection("pre_prune")
     end
     -- Conflict rule: drop the head whose removal most improves personal floors.
     -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
     while not TotalsAllNonNegative(totals) do
+        -- Checkpoint before a full candidate-trial pass.
+        if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+            return deferProjection("prune")
+        end
         local currentScore = scoreBox[1]
         local bestIdx, bestScore, bestTs, bestId = nil, nil, nil, nil
         for i = 1, #bound do
             local entry = bound[i]
             if entry and activeMap[entry.event.id] then
+                -- Stop before another trial when already at/over soft limit.
+                if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                    break
+                end
                 GS._creditProjectionCandidateTrials =
                     (tonumber(GS._creditProjectionCandidateTrials) or 0) + 1
                 ApplyCorrectionFloorDelta(
@@ -6110,9 +6374,18 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                         bestIdx, bestScore, bestTs, bestId = i, score, ts, id
                     end
                 end
+                -- Hard ceiling: one atomic trial may overshoot soft by at most
+                -- CREDIT_PROJECTION_ATOMIC_OVERSHOOT, then must yield.
+                if CreditProjectionCallbackWorkTotal(CreditProjectionWorkNow(rowVisits))
+                    >= hardLimit then
+                    break
+                end
             end
         end
         if not bestIdx then
+            if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                return deferProjection("prune")
+            end
             break
         end
         local entry = bound[bestIdx]
@@ -6125,8 +6398,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
         GS._creditProjectionDeactivations =
             (tonumber(GS._creditProjectionDeactivations) or 0) + 1
-        -- Bound one expensive rebuild: yield after making prune progress.
-        if allowDefer and CreditProjectionWorkNow(rowVisits) >= sliceBudget then
+        if shouldYield(CreditProjectionWorkNow(rowVisits)) then
             return deferProjection("prune")
         end
     end
@@ -6149,7 +6421,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
                     GS._creditProjectionDeactivations =
                         (tonumber(GS._creditProjectionDeactivations) or 0) + 1
-                    if allowDefer and CreditProjectionWorkNow(rowVisits) >= sliceBudget then
+                    if shouldYield(CreditProjectionWorkNow(rowVisits)) then
                         return deferProjection("empty_fallback")
                     end
                 end
@@ -6161,6 +6433,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0
     local workUnits = CreditProjectionWorkNow(rowVisits)
     AccumulateCreditProjectionCallbackWork(workUnits)
+    ClearCreditProjectionScratch(record)
+    finishOwnedBudget()
     -- Final invariant: never leave a stale active map and never mark a negative
     -- projection verified. On failure, clear heads and cache under the stamp;
     -- ResolveEffectiveCreditIdentity returns CREDIT_UNAVAILABLE (not durable).
@@ -6440,11 +6714,18 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
     -- Preview rebuild including this op; local prepare must activate.
     local rebuilt, rebuildErr, rebuildDetails = GS.RebuildCreditCorrectionProjection(record, op)
     if not rebuilt then
+        -- Local rejected/paused preview must not stay queued for background
+        -- publication via resume.extraOp (#459 / discussion_r4476590692).
+        -- Remote redrive keeps speculative resume so the next Admit can continue.
+        if rebuildErr == "work_budget" and isLocal then
+            DiscardSpeculativeCreditProjectionResume(record, op)
+        end
         return false, rebuildErr or "invalid_value"
     end
     if isLocal then
         local activeIds = rebuildDetails and rebuildDetails.activeIds
         if type(activeIds) ~= "table" or not activeIds[op.id] then
+            DiscardSpeculativeCreditProjectionResume(record, op)
             -- Roll back projection without this op.
             GS.RebuildCreditCorrectionProjection(record, nil)
             return false, "player_negative"
