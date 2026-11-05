@@ -645,6 +645,653 @@ local function AdjustApplyButtonEnabled(text)
 	return AdjustQuantityValid(text or adjustDraft.quantityText or "")
 end
 
+---------------------------------------------------------------------------
+-- Quick Withdraw recipes (#457). Session-local editor draft; campaign scoped.
+---------------------------------------------------------------------------
+local recipeEditorDraft = {
+	open = false,
+	contextKey = nil,
+	outputItemId = nil,
+	isExisting = false,
+	reagentTexts = {},
+}
+local recipeEditorUi = nil
+local recipeEditorSection = nil
+
+local function RecipeDraftContextKey()
+	return AdjustDraftContextKey()
+end
+
+local function SyncRecipeEditorContext()
+	local key = RecipeDraftContextKey()
+	if not recipeEditorDraft.open then
+		recipeEditorDraft.contextKey = key
+		return
+	end
+	if recipeEditorDraft.contextKey ~= key then
+		recipeEditorDraft.open = false
+		recipeEditorDraft.outputItemId = nil
+		recipeEditorDraft.isExisting = false
+		recipeEditorDraft.reagentTexts = {}
+		recipeEditorDraft.contextKey = key
+		if recipeEditorUi and recipeEditorUi.frame then
+			recipeEditorUi.frame:Hide()
+		end
+	end
+end
+
+local function RecipeCanEdit()
+	return AdjustCanEdit()
+end
+
+local function RecipeHasRequestedReagents()
+	return #RequestedItemRows() > 0
+end
+
+local function FindSavedRecipe(outputItemId)
+	local id = tonumber(outputItemId)
+	if not id then
+		return nil
+	end
+	local record = CurrentRecord()
+	local cfg = record and record.accounting and record.accounting._consumables
+	local recipes = cfg and cfg.recipes
+	if type(recipes) ~= "table" then
+		return nil
+	end
+	return recipes[tostring(id)]
+end
+
+local function RecipeAvailabilityWarning(record, recipe)
+	local g = GS()
+	if not g or not g.RecipeAvailability or type(recipe) ~= "table" then
+		return nil
+	end
+	local ok, err, missing = g:RecipeAvailability(record, recipe)
+	if ok then
+		return nil
+	end
+	if err == "reagent_not_requested" and type(missing) == "table" and #missing > 0 then
+		local names = {}
+		for i = 1, math.min(#missing, 4) do
+			local itemId = tonumber(missing[i])
+			if itemId then
+				names[#names + 1] = DescribeItem(itemId).name
+			end
+		end
+		if #names > 0 then
+			return Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE_FMT",
+				"Missing requested reagents: %s"):format(table.concat(names, ", "))
+		end
+	end
+	return Loc("GUILD_SUPPLIES_RECIPE_UNAVAILABLE",
+		"This recipe is not fully available for Quick Withdraw.")
+end
+
+local function RecipeRows()
+	local rows = {}
+	if not Caps().canRead then
+		return rows
+	end
+	local record = CurrentRecord()
+	if not record or type(record.currentCampaignId) ~= "string" then
+		return rows
+	end
+	local g = GS()
+	if not g or not g.ListCampaignRecipes then
+		return rows
+	end
+	local list = g:ListCampaignRecipes(record)
+	for i = 1, #list do
+		local entry = list[i]
+		local itemId = tonumber(entry and entry.itemId)
+		if itemId then
+			local described = DescribeItem(itemId)
+			local recipe = {
+				itemId = itemId,
+				reagents = entry.reagents,
+			}
+			rows[#rows + 1] = {
+				text = described.name,
+				icon = described.icon,
+				itemId = itemId,
+				key = itemId,
+				leadingText = Loc("GUILD_SUPPLIES_RECIPE_EDIT", "Edit"),
+				tooltip = RecipeAvailabilityWarning(record, recipe),
+			}
+		end
+	end
+	return rows
+end
+
+local function RecipesHelpText()
+	if not Caps().canRead then
+		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+	end
+	local record = CurrentRecord()
+	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
+	if not hasCampaign then
+		return Loc("GUILD_SUPPLIES_RECIPES_NEED_CAMPAIGN",
+			"Start a New Campaign before configuring Quick Withdraw recipes.")
+	end
+	if RecipeHasRequestedReagents() then
+		return Loc("GUILD_SUPPLIES_RECIPES_HELP",
+			"Define how many of each requested reagent is consumed to craft one output item for Quick Withdraw.")
+	end
+	return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+		"Add requested items to the current campaign before configuring recipes.")
+end
+
+local function ParseRecipeReagentQty(text)
+	local raw = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	if raw == "" then
+		return 0
+	end
+	local n = tonumber(raw)
+	if not n or n ~= math.floor(n) or n < 0 then
+		return nil
+	end
+	local g = GS()
+	local maxPer = (g and tonumber(g.MAX_RECIPE_PER_CRAFT)) or 10000
+	if n > maxPer then
+		return nil
+	end
+	return n
+end
+
+local function CaptureRecipeEditorDraftFromUi()
+	if not recipeEditorUi or not recipeEditorUi.reagentEdits then
+		return
+	end
+	local texts = recipeEditorDraft.reagentTexts or {}
+	for itemId, edit in pairs(recipeEditorUi.reagentEdits) do
+		if edit and edit.GetText then
+			texts[tostring(itemId)] = edit:GetText() or ""
+		end
+	end
+	recipeEditorDraft.reagentTexts = texts
+end
+
+local function BuildRecipeReagentsFromDraft()
+	CaptureRecipeEditorDraftFromUi()
+	local reagents = {}
+	local rows = RequestedItemRows()
+	for i = 1, #rows do
+		local itemId = tonumber(rows[i] and rows[i].itemId)
+		if itemId then
+			local qty = ParseRecipeReagentQty(recipeEditorDraft.reagentTexts[tostring(itemId)])
+			if qty == nil then
+				return nil, itemId
+			end
+			if qty > 0 then
+				reagents[tostring(itemId)] = qty
+			end
+		end
+	end
+	return reagents, nil
+end
+
+local function EnsureRecipeEditorUi()
+	if recipeEditorUi and recipeEditorUi.frame then
+		return recipeEditorUi
+	end
+	if type(CreateFrame) ~= "function" then
+		return nil
+	end
+	local ui = {}
+	local frame = CreateFrame("Frame", "SFGuildSuppliesRecipeEditor", UIParent, "BackdropTemplate")
+	frame:SetSize(440, 460)
+	frame:SetPoint("CENTER")
+	frame:SetFrameStrata("DIALOG")
+	frame:SetFrameLevel(200)
+	frame:Hide()
+	if frame.SetBackdrop then
+		frame:SetBackdrop({
+			bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+			tile = true,
+			tileSize = 16,
+			edgeSize = 16,
+			insets = { left = 4, right = 4, top = 4, bottom = 4 },
+		})
+		frame:SetBackdropColor(0, 0, 0, 0.92)
+	end
+	frame:SetMovable(true)
+	frame:EnableMouse(true)
+	frame:RegisterForDrag("LeftButton")
+	frame:SetScript("OnDragStart", frame.StartMoving)
+	frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
+
+	local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+	close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
+	close:SetScript("OnClick", function()
+		CaptureRecipeEditorDraftFromUi()
+		recipeEditorDraft.open = false
+		recipeEditorDraft.reagentTexts = {}
+		frame:Hide()
+	end)
+
+	local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+	title:SetPoint("TOP", frame, "TOP", 0, -12)
+	ui.title = title
+
+	local outputIcon = frame:CreateTexture(nil, "ARTWORK")
+	outputIcon:SetSize(20, 20)
+	outputIcon:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -36)
+	ui.outputIcon = outputIcon
+
+	local outputText = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+	outputText:SetPoint("LEFT", outputIcon, "RIGHT", 6, 0)
+	outputText:SetPoint("RIGHT", frame, "RIGHT", -16, 0)
+	outputText:SetJustifyH("LEFT")
+	if outputText.SetWordWrap then
+		outputText:SetWordWrap(true)
+	end
+	ui.outputText = outputText
+
+	local help = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	help:SetPoint("TOPLEFT", outputIcon, "BOTTOMLEFT", 0, -8)
+	help:SetPoint("RIGHT", frame, "RIGHT", -16, 0)
+	help:SetJustifyH("LEFT")
+	help:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_HELP",
+		"How many of each reagent are needed for one craft? Enter 0 when a reagent is unused."))
+	ui.help = help
+
+	local scroll = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
+	scroll:SetPoint("TOPLEFT", help, "BOTTOMLEFT", 0, -10)
+	scroll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -28, 52)
+	local content = CreateFrame("Frame", nil, scroll)
+	content:SetSize(380, 1)
+	scroll:SetScrollChild(content)
+	ui.scroll = scroll
+	ui.content = content
+	ui.reagentRows = {}
+	ui.reagentEdits = {}
+	ui.warnings = {}
+
+	local save = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	save:SetSize(90, 22)
+	save:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 16, 16)
+	save:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_SAVE", "Save"))
+	ui.save = save
+
+	local cancel = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	cancel:SetSize(90, 22)
+	cancel:SetPoint("LEFT", save, "RIGHT", 8, 0)
+	cancel:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_CANCEL", "Cancel"))
+	ui.cancel = cancel
+
+	local delete = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	delete:SetSize(90, 22)
+	delete:SetPoint("LEFT", cancel, "RIGHT", 8, 0)
+	delete:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_DELETE", "Delete"))
+	ui.delete = delete
+
+	cancel:SetScript("OnClick", function()
+		recipeEditorDraft.open = false
+		recipeEditorDraft.reagentTexts = {}
+		frame:Hide()
+	end)
+
+	ui.frame = frame
+	recipeEditorUi = ui
+	return ui
+end
+
+local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText)
+	local described = DescribeItem(itemId)
+	if row.Icon then
+		if described.icon then
+			row.Icon:SetTexture(described.icon)
+			row.Icon:Show()
+		else
+			row.Icon:Hide()
+		end
+	end
+	row.Name:SetText(described.name or Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item"))
+	if row.Warning then
+		if type(warningText) == "string" and warningText ~= "" then
+			row.Warning:SetText("|cffff2020" .. warningText .. "|r")
+			row.Warning:Show()
+		else
+			row.Warning:SetText("")
+			row.Warning:Hide()
+		end
+	end
+	local editing = row.Edit and row.Edit.HasFocus and row.Edit:HasFocus()
+	if not editing then
+		row.Edit:SetText(qtyText or "0")
+	end
+	row:ClearAllPoints()
+	row:SetPoint("TOPLEFT", recipeEditorUi.content, "TOPLEFT", 0, -y)
+	row:SetPoint("TOPRIGHT", recipeEditorUi.content, "TOPRIGHT", 0, -y)
+	row:Show()
+	return 28
+end
+
+local function RefreshRecipeEditor()
+	SyncRecipeEditorContext()
+	local ui = EnsureRecipeEditorUi()
+	if not ui or not recipeEditorDraft.open or not ui.frame:IsShown() then
+		return
+	end
+	local outputId = tonumber(recipeEditorDraft.outputItemId)
+	if not outputId then
+		return
+	end
+	local described = DescribeItem(outputId)
+	if ui.outputIcon and described.icon then
+		ui.outputIcon:SetTexture(described.icon)
+		ui.outputIcon:Show()
+	else
+		ui.outputIcon:Hide()
+	end
+	ui.outputText:SetText(described.name or FormatAdjustItemLabel(outputId))
+	if recipeEditorDraft.isExisting then
+		ui.title:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_TITLE_EDIT",
+			"Edit Quick Withdraw recipe"))
+	else
+		ui.title:SetText(Loc("GUILD_SUPPLIES_RECIPE_EDITOR_TITLE_NEW",
+			"New Quick Withdraw recipe"))
+	end
+	ui.delete:SetShown(recipeEditorDraft.isExisting == true)
+
+	local record = CurrentRecord()
+	local rows = RequestedItemRows()
+	local y = 0
+	for i = 1, #rows do
+		local itemId = tonumber(rows[i].itemId)
+		if itemId then
+			if not ui.reagentRows[i] then
+				local r = CreateFrame("Frame", nil, ui.content)
+				r:SetHeight(26)
+				local icon = r:CreateTexture(nil, "ARTWORK")
+				icon:SetSize(16, 16)
+				icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+				r.Icon = icon
+				local name = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+				name:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+				name:SetWidth(210)
+				name:SetJustifyH("LEFT")
+				if name.SetWordWrap then name:SetWordWrap(false) end
+				r.Name = name
+				local edit = CreateFrame("EditBox", nil, r, "InputBoxTemplate")
+				edit:SetAutoFocus(false)
+				edit:SetSize(56, 20)
+				edit:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+				edit:SetNumeric(true)
+				edit:SetMaxLetters(5)
+				edit:SetScript("OnTextChanged", function(self)
+					recipeEditorDraft.reagentTexts[tostring(itemId)] = self:GetText() or ""
+				end)
+				r.Edit = edit
+				local warn = r:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+				warn:SetPoint("TOPLEFT", name, "BOTTOMLEFT", 0, -2)
+				warn:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+				warn:SetJustifyH("LEFT")
+				r.Warning = warn
+				ui.reagentRows[i] = r
+				ui.reagentEdits[itemId] = edit
+			end
+			local qtyText = recipeEditorDraft.reagentTexts[tostring(itemId)]
+			if qtyText == nil then
+				qtyText = "0"
+			end
+			local perCraft = ParseRecipeReagentQty(qtyText) or 0
+			local rowRecipe = { itemId = outputId, reagents = { [tostring(itemId)] = perCraft } }
+			local warnText = nil
+			if perCraft > 0 then
+				warnText = RecipeAvailabilityWarning(record, rowRecipe)
+			end
+			y = y + LayoutRecipeEditorReagentRow(ui.reagentRows[i], y, itemId, qtyText, warnText)
+		end
+	end
+	for j = #rows + 1, #ui.reagentRows do
+		ui.reagentRows[j]:Hide()
+	end
+	ui.content:SetHeight(math.max(1, y))
+end
+
+local function CloseRecipeEditor(discardDraft)
+	if discardDraft then
+		recipeEditorDraft.reagentTexts = {}
+	end
+	recipeEditorDraft.open = false
+	if recipeEditorUi and recipeEditorUi.frame then
+		recipeEditorUi.frame:Hide()
+	end
+end
+
+local function CommitRecipeEditorSave()
+	local ctx = recipeEditorSection
+	if not ctx or not ctx.section then
+		return
+	end
+	SyncRecipeEditorContext()
+	CaptureRecipeEditorDraftFromUi()
+	local outputId = tonumber(recipeEditorDraft.outputItemId)
+	if not outputId or not RecipeCanEdit() or not RecipeHasRequestedReagents() then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+				"the page is out of date — refresh and try again"),
+			"error")
+		CloseRecipeEditor(true)
+		RefreshPageControls()
+		return
+	end
+	local boundContext = recipeEditorDraft.contextKey
+	local reagents, badId = BuildRecipeReagentsFromDraft()
+	if reagents == nil then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_REAGENT_QTY",
+				"Enter a whole-number reagent quantity from 0 to %d for each requested item.")
+				:format((GS() and tonumber(GS().MAX_RECIPE_PER_CRAFT)) or 10000),
+			"error")
+		return
+	end
+	local g = GS()
+	if g and g.NormalizeRecipeValue then
+		local normalized, normErr = g:NormalizeRecipeValue({
+			itemId = outputId,
+			reagents = reagents,
+		})
+		if not normalized then
+			if normErr == "empty_reagents" then
+				ctx.section:SetMessage(
+					Loc("GUILD_SUPPLIES_ERR_RECIPE_REAGENTS_EMPTY",
+						"Enter at least one reagent quantity of 1 or higher."),
+					"error")
+			else
+				ctx.section:SetMessage(
+					Loc("GUILD_SUPPLIES_ERR_RECIPE_REAGENT_QTY",
+						"Enter a whole-number reagent quantity from 0 to %d for each requested item.")
+						:format((g and tonumber(g.MAX_RECIPE_PER_CRAFT)) or 10000),
+					"error")
+			end
+			return
+		end
+		reagents = normalized.reagents
+	end
+	local live = g and select(1, g:GetCurrentRecord())
+	if not live or RecipeDraftContextKey() ~= boundContext or not RecipeCanEdit() then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+				"the page is out of date — refresh and try again"),
+			"error")
+		CloseRecipeEditor(true)
+		RefreshPageControls()
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewConfigOperation("set-recipe", { itemId = outputId }, {
+		itemId = outputId,
+		reagents = reagents,
+		removed = false,
+	})
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	if status == "accepted" or status == "duplicate" then
+		CloseRecipeEditor(true)
+	end
+	ReportStatus(ctx, status, reason)
+end
+
+local function CommitRecipeEditorDelete()
+	local ctx = recipeEditorSection
+	if not ctx or not ctx.section then
+		return
+	end
+	local outputId = tonumber(recipeEditorDraft.outputItemId)
+	if not outputId or not recipeEditorDraft.isExisting then
+		return
+	end
+	local boundContext = recipeEditorDraft.contextKey
+	local accept = function()
+		SyncRecipeEditorContext()
+		if RecipeDraftContextKey() ~= boundContext or not RecipeCanEdit() then
+			ctx.section:SetMessage(
+				Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+					"the page is out of date — refresh and try again"),
+				"error")
+			CloseRecipeEditor(true)
+			RefreshPageControls()
+			return
+		end
+		CloseRecipeEditor(true)
+		CommitConfig(ctx, "set-recipe", { itemId = outputId }, { removed = true })
+	end
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local msg = Loc("GUILD_SUPPLIES_RECIPE_DELETE_CONFIRM",
+		"Delete this Quick Withdraw recipe for %s?"):format(FormatAdjustItemLabel(outputId))
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(msg, Loc("GUILD_SUPPLIES_RECIPE_EDITOR_DELETE", "Delete"), accept)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
+	SyncRecipeEditorContext()
+	local itemId = tonumber(outputItemId)
+	if not itemId then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_OUTPUT",
+				"Enter a valid output item ID or paste an item link."),
+			"error")
+		return
+	end
+	if not RecipeCanEdit() or not RecipeHasRequestedReagents() then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+				"Add requested items to the current campaign before configuring recipes."),
+			"warn")
+		return
+	end
+	local ui = EnsureRecipeEditorUi()
+	if not ui then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	recipeEditorSection = ctx
+	recipeEditorDraft.open = true
+	recipeEditorDraft.contextKey = RecipeDraftContextKey()
+	recipeEditorDraft.outputItemId = itemId
+	recipeEditorDraft.isExisting = type(existingRecipe) == "table"
+	local texts = {}
+	local saved = existingRecipe
+	if type(saved) ~= "table" then
+		saved = FindSavedRecipe(itemId)
+		recipeEditorDraft.isExisting = type(saved) == "table"
+	end
+	local reagentMap = saved and saved.reagents
+	local rows = RequestedItemRows()
+	for i = 1, #rows do
+		local rid = tonumber(rows[i].itemId)
+		if rid then
+			local qty = 0
+			if type(reagentMap) == "table" then
+				qty = tonumber(reagentMap[tostring(rid)]) or 0
+			end
+			texts[tostring(rid)] = tostring(qty)
+		end
+	end
+	recipeEditorDraft.reagentTexts = texts
+	ui.save:SetScript("OnClick", CommitRecipeEditorSave)
+	ui.delete:SetScript("OnClick", CommitRecipeEditorDelete)
+	ui.frame:Show()
+	RefreshRecipeEditor()
+	ctx.section:ClearMessage()
+end
+
+local function ResolveAddRecipeOutputId(ctx, text)
+	local C = SF.Consumables
+	local itemId = C and C.ItemIdFromText and C.ItemIdFromText(text) or tonumber(text)
+	if not itemId then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_OUTPUT",
+				"Enter a valid output item ID or paste an item link."),
+			"error")
+		return nil
+	end
+	local existing = FindSavedRecipe(itemId)
+	if existing then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_EXISTS",
+				"That output item already has a recipe. Edit it in the list below."),
+			"warn")
+		OpenRecipeEditor(ctx, itemId, existing)
+		return nil
+	end
+	return itemId
+end
+
+local function AddRecipeFromCursor(ctx)
+	if not RecipeCanEdit() or not RecipeHasRequestedReagents() then
+		return
+	end
+	if type(GetCursorInfo) ~= "function" then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	local kind, payload = GetCursorInfo()
+	if kind ~= "item" then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_CURSOR",
+				"Pick up an item, then click Use item on cursor without placing it in a bag."),
+			"error")
+		return
+	end
+	local C = SF.Consumables
+	local itemId = tonumber(payload)
+	if not itemId and C and C.ItemIdFromText and type(payload) == "string" then
+		itemId = C.ItemIdFromText(payload)
+	end
+	if not itemId then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_OUTPUT",
+				"Enter a valid output item ID or paste an item link."),
+			"error")
+		return
+	end
+	local existing = FindSavedRecipe(itemId)
+	if existing then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_RECIPE_EXISTS",
+				"That output item already has a recipe. Edit it in the list below."),
+			"warn")
+		OpenRecipeEditor(ctx, itemId, existing)
+		return
+	end
+	OpenRecipeEditor(ctx, itemId, nil)
+end
+
 local function ItemsHelpText()
 	if not Caps().canRead then
 		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
@@ -1126,6 +1773,109 @@ local function Definition()
 					},
 				},
 			},
+			{
+				id = "gsRecipes",
+				title = Loc("GUILD_SUPPLIES_RECIPES_TITLE", "Quick Withdraw recipes"),
+				tooltip = Loc("GUILD_SUPPLIES_RECIPES_TIP",
+					"Campaign-owned craft recipes for Quick Withdraw. Each output item can have one recipe."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = RecipesHelpText,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_RECIPES_ADD", "Add recipe output"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_RECIPES_ADD_HINT", "Output item ID or link"),
+						buttonText = Loc("GUILD_SUPPLIES_RECIPES_ADD_BUTTON", "Add"),
+						buttonWidth = 90,
+						editWidth = 170,
+						enabled = function()
+							return RecipeCanEdit() and RecipeHasRequestedReagents()
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RECIPES", "editing Quick Withdraw recipes"))
+							if tip then
+								return tip
+							end
+							if not RecipeHasRequestedReagents() then
+								return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+									"Add requested items to the current campaign before configuring recipes.")
+							end
+							return nil
+						end,
+						onSubmit = function(ctx, text)
+							local itemId = ResolveAddRecipeOutputId(ctx, text)
+							if not itemId then
+								return
+							end
+							OpenRecipeEditor(ctx, itemId, nil)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_RECIPES_CURSOR", "Use item on cursor"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_RECIPES_CURSOR_BUTTON", "Use cursor item"),
+						width = 140,
+						tooltip = Loc("GUILD_SUPPLIES_RECIPES_CURSOR_TIP",
+							"Reads the item on your cursor without moving it. Pick up an output item first."),
+						enabled = function()
+							return RecipeCanEdit() and RecipeHasRequestedReagents()
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RECIPES", "editing Quick Withdraw recipes"))
+							if tip then
+								return tip
+							end
+							if not RecipeHasRequestedReagents() then
+								return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+									"Add requested items to the current campaign before configuring recipes.")
+							end
+							return nil
+						end,
+						onClick = function(ctx)
+							AddRecipeFromCursor(ctx)
+						end,
+					},
+					{
+						type = "scrollList",
+						label = Loc("GUILD_SUPPLIES_RECIPES_LIST", "Saved recipes"),
+						adminOnly = true,
+						height = 160,
+						showItemIcons = true,
+						leadingColumn = true,
+						showDetailTooltip = true,
+						getItems = RecipeRows,
+						enabled = function()
+							return RecipeCanEdit() and RecipeHasRequestedReagents()
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RECIPES", "editing Quick Withdraw recipes"))
+							if tip then
+								return tip
+							end
+							if not RecipeHasRequestedReagents() then
+								return Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+									"Add requested items to the current campaign before configuring recipes.")
+							end
+							return nil
+						end,
+						onSelect = function(ctx, item)
+							if not item or not item.itemId then
+								return
+							end
+							local existing = FindSavedRecipe(item.itemId)
+							OpenRecipeEditor(ctx, item.itemId, existing)
+						end,
+					},
+				},
+			},
 
 		},
 	}
@@ -1167,6 +1917,9 @@ local function EnsureItemDisplayListener()
 		return
 	end
 	display.RegisterRefresh("guildSuppliesManage", function()
+		if recipeEditorDraft.open then
+			RefreshRecipeEditor()
+		end
 		QueueRefresh()
 	end)
 end
@@ -1251,15 +2004,26 @@ function Page:Refresh(panel)
 		renderer:Refresh(panel)
 		EndRenderPass()
 	end
+	if recipeEditorDraft.open then
+		RefreshRecipeEditor()
+	end
 end
 
 function Page:OnHide()
 	refreshQueued = false
+	CloseRecipeEditor(true)
 end
 
--- Test hooks for behavioral coverage (#453).
+-- Test hooks for behavioral coverage (#453 / #457).
 Page.__sfTest = {
 	Definition = Definition,
+	RecipeRows = RecipeRows,
+	OpenRecipeEditor = OpenRecipeEditor,
+	CloseRecipeEditor = CloseRecipeEditor,
+	BuildRecipeReagentsFromDraft = BuildRecipeReagentsFromDraft,
+	RecipeEditorDraft = function()
+		return recipeEditorDraft
+	end,
 }
 
 EnsureRosterListener()
