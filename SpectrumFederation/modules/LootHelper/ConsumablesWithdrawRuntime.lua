@@ -391,6 +391,20 @@ function WR.ClearDrafts()
     end
 end
 
+--- Clear only craft drafts that this operation actually processed.
+-- Unrelated recipe inputs typed while a withdraw was running must survive.
+function WR.ClearProcessedDrafts(selections)
+    if type(selections) ~= "table" then
+        return
+    end
+    WR.craftDrafts = WR.craftDrafts or {}
+    for k, v in pairs(selections) do
+        if FloorQty(v) > 0 then
+            WR.craftDrafts[tostring(k)] = nil
+        end
+    end
+end
+
 function WR.IsBusy()
     return WR.work ~= nil
 end
@@ -754,22 +768,34 @@ local function StopWork(reason, partial)
     Debug("Info", "withdraw stop reason=%s confirmed=%s",
         tostring(reason), tostring(work and work.confirmedTotal or 0))
     if work and work.movementStarted then
-        WR.ClearDrafts()
+        WR.ClearProcessedDrafts(work.selections)
     end
     if work and type(work.onSettle) == "function" then
-        local remaining = {}
-        for k, want in pairs(work.take or {}) do
+        local authorized = work.take or {}
+        local remainingAuthorized = {}
+        for k, want in pairs(authorized) do
             local got = FloorQty((work.confirmed or {})[k])
             local left = FloorQty(want) - got
             if left > 0 then
-                remaining[k] = left
+                remainingAuthorized[k] = left
+            end
+        end
+        -- Unfilled portion of the original request (not just authorized shortfall).
+        local remainingRequested = {}
+        for k, want in pairs(work.requested or {}) do
+            local got = FloorQty((work.confirmed or {})[k])
+            local left = FloorQty(want) - got
+            if left > 0 then
+                remainingRequested[k] = left
             end
         end
         pcall(work.onSettle, {
             reason = reason,
             confirmed = work.confirmed or {},
             requested = work.requested or {},
-            remaining = remaining,
+            authorized = authorized,
+            remaining = remainingRequested,
+            remainingAuthorized = remainingAuthorized,
             unresolved = work.unresolved,
             receiptError = work.receiptError,
             partial = partial,
@@ -1274,10 +1300,11 @@ function WR.OnBankClosed()
         WR.ObservePending()
         if WR.work then
             CommitConfirmed(work)
+            -- StopWork clears only processed craft drafts when movement started;
+            -- do not wipe unrelated unprocessed recipe inputs on bank close.
             StopWork("bank_closed", true)
         end
     end
-    WR.ClearDrafts()
 end
 
 function WR.OnBagOrBankUpdate()

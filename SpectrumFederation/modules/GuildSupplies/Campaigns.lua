@@ -896,8 +896,12 @@ local function ForEachCampaignLedgerEvent(record, generation, visitor)
         end
     end
     -- Archive first, then live list — shared identities count once.
-    walk(record.accounting and record.accounting._consumableEventArchive, 4096)
-    walk(record.accounting and record.accounting._consumableEvents, 4096)
+    -- Mixed donation+withdrawal capacity: scan the supported combined ceilings
+    -- so informational withdrawals and donation rows past 4096 remain visible.
+    local maxLive = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    local maxArch = (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+    walk(record.accounting and record.accounting._consumableEventArchive, maxArch)
+    walk(record.accounting and record.accounting._consumableEvents, maxLive)
 end
 
 local function ResolveCampaignGeneration(record, campaignId)

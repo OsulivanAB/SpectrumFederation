@@ -632,6 +632,611 @@ do
     assertEq(st.status, "partial", "R5: partial when deferred remain after successful offers")
 end
 
+
+-- R6: provenance identity ignores ORIGIN vs RELAY for duplicate detection
+do
+    local base = {
+        type = "withdrawal",
+        id = "gsw1:relay:10:1",
+        datasetId = "gs1:test",
+        campaignId = "camp1",
+        generation = 1,
+        itemId = 10,
+        quantity = 5,
+        actor = "Alice-Realm",
+        actorGuid = "Player-1-AAAA",
+        bankTab = 1,
+        timestamp = 1000,
+        provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+        operationId = "op1",
+        guildKey = "club:1",
+        gsProductionCredit = false,
+    }
+    local originId = GS.CanonicalWithdrawalEventIdentity(base)
+    local relay = {}
+    for k, v in pairs(base) do relay[k] = v end
+    relay.provenance = GS.WITHDRAWAL_PROVENANCE.RELAY
+    local relayId = GS.CanonicalWithdrawalEventIdentity(relay)
+    assertTrue(originId ~= nil and relayId ~= nil, "identity bodies")
+    assertTrue(GS._DeepEqualOps(originId, relayId), "provenance identity ignores ORIGIN vs RELAY")
+    local fullOrigin = GS.CanonicalWithdrawalEvent(base)
+    local fullRelay = GS.CanonicalWithdrawalEvent(relay)
+    assertTrue(fullOrigin.provenance ~= fullRelay.provenance, "presentation provenance still differs")
+end
+
+-- R4: ConsumeTradeBatches skips ambiguous paused quantities
+do
+    local batches = {
+        { id = "a", completedAt = 1, expiresAt = 99999, amounts = { ["10"] = 5 }, ambiguous = { ["10"] = 5 } },
+        { id = "b", completedAt = 2, expiresAt = 99999, amounts = { ["10"] = 5 } },
+    }
+    local rem, consumed = W.ConsumeTradeBatches(batches, { ["10"] = 5 }, 100)
+    assertEq(consumed["10"], 5, "consumed eligible only")
+    assertEq(#rem, 1, "one batch remains")
+    assertEq(rem[1].id, "a", "ambiguous batch preserved")
+    assertEq(rem[1].amounts["10"], 5, "paused qty intact")
+    assertEq(rem[1].ambiguous["10"], 5, "ambiguity intact")
+end
+
+-- R6a: mixed-capacity projection sees donation past the old 4096 scan bound
+do
+    local record = {
+        datasetId = "gs1:proj",
+        currentCampaignId = "camp1",
+        activation = "staged",
+        accounting = {
+            _consumables = { generation = 1 },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+    }
+    local live = record.accounting._consumableEvents
+    for i = 1, 3072 do
+        live[#live + 1] = {
+            type = "CONSUMABLE_DONATION",
+            id = "don-p:" .. i,
+            quantity = 1,
+            itemId = 99,
+            generation = 1,
+            timestamp = i,
+            actor = "Alice-Realm",
+        }
+    end
+    for i = 1, 1024 do
+        live[#live + 1] = {
+            type = "withdrawal",
+            id = "wd-p:" .. i,
+            datasetId = "gs1:proj",
+            campaignId = "camp1",
+            generation = 1,
+            itemId = 10,
+            quantity = 1,
+            actor = "Alice-Realm",
+            actorGuid = "Player-1-A",
+            bankTab = 1,
+            timestamp = 4000 + i,
+            provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+            operationId = "op-p",
+            guildKey = "club:1",
+            gsProductionCredit = false,
+        }
+    end
+    live[#live + 1] = {
+        type = "CONSUMABLE_DONATION",
+        id = "don-p:4097",
+        quantity = 1,
+        itemId = 99,
+        generation = 1,
+        timestamp = 9000,
+        actor = "Alice-Realm",
+    }
+    assertEq(#live, 4097, "R6a: live length includes row 4097")
+    local progress, perr = GS.ProjectCampaignProgressOnRecord(record, "camp1")
+    assertTrue(progress ~= nil, "R6a progress: " .. tostring(perr))
+    assertEq(progress.itemTotals[99], 3073, "R6a: progress includes donation past 4096")
+end
+
+-- R6b: archive withdrawal retention cap is separate and enforced on shelve
+do
+    local record = {
+        datasetId = "gs1:trim",
+        currentCampaignId = "camp1",
+        accounting = {
+            _mutationSeq = 0,
+            _consumables = { generation = 2 },
+            _consumableEvents = {
+                {
+                    type = "withdrawal",
+                    id = "wd-live-old",
+                    generation = 1,
+                    itemId = 10,
+                    quantity = 1,
+                },
+            },
+            _consumableEventArchive = {},
+        },
+    }
+    local arch = record.accounting._consumableEventArchive
+    for i = 1, 1200 do
+        arch[#arch + 1] = {
+            type = "withdrawal",
+            id = "wd-arch:" .. i,
+            generation = 1,
+            itemId = 10,
+            quantity = 1,
+            timestamp = i,
+        }
+    end
+    assertEq(#arch, 1200, "R6b: seeded over-cap archive withdrawals")
+    assertTrue(GS.ShelvePriorGenerationsOnRecord(record), "R6b: shelve triggers trim")
+    local after = record.accounting._consumableEventArchive
+    local wd = 0
+    for i = 1, #after do
+        if after[i].type == "withdrawal" then
+            wd = wd + 1
+        end
+    end
+    assertTrue(wd <= (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024),
+        "R6b: archive withdrawals capped at maxWd")
+    assertTrue(#after <= (GS.MAX_ARCHIVED_EVENTS or 4096) + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024),
+        "R6b: combined archive length within maxTotal")
+end
+
+-- R6c/R6d: admission scope + provenance-stable identity via real AdmitWithdrawalEvent
+do
+    loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+    local function baseEvent(overrides)
+        local e = {
+            type = "withdrawal",
+            id = "gsw1:admit:10:1",
+            datasetId = "gs1:admit",
+            campaignId = "camp1",
+            generation = 1,
+            itemId = 10,
+            quantity = 5,
+            actor = "Alice-Realm",
+            actorGuid = "Player-1-AAAA",
+            bankTab = 1,
+            timestamp = 1000,
+            provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+            operationId = "op-admit",
+            guildKey = "club:admit",
+            gsProductionCredit = false,
+        }
+        if overrides then
+            for k, v in pairs(overrides) do e[k] = v end
+        end
+        return e
+    end
+    local function makeRecord()
+        return {
+            datasetId = "gs1:admit",
+            _guildKey = "club:admit",
+            currentCampaignId = "camp1",
+            campaigns = { camp1 = { id = "camp1" } },
+            campaignArchives = {},
+            accounting = {
+                _mutationSeq = 0,
+                _consumables = { generation = 1, eventSeq = 0, bankTab = 1 },
+                _consumableEvents = {},
+                _consumableEventArchive = {},
+            },
+        }
+    end
+    local record = makeRecord()
+    local st, err = GS.AdmitWithdrawalEvent(record, baseEvent(), {
+        senderGuid = "Player-1-AAAA",
+        memberAuthenticated = true,
+    })
+    assertEq(st, "accepted", "R6c: origin admit: " .. tostring(err))
+    local st2, err2 = GS.AdmitWithdrawalEvent(record, baseEvent({
+        provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+    }), {
+        senderGuid = "Player-1-RELAY",
+        memberAuthenticated = true,
+    })
+    assertEq(st2, "duplicate", "R6c: relay of same body is duplicate not conflict: " .. tostring(err2))
+    local stored = record.accounting._consumableEvents[#record.accounting._consumableEvents]
+    assertEq(stored.provenance, GS.WITHDRAWAL_PROVENANCE.ORIGIN, "R6c: ORIGIN provenance retained")
+
+    local stGuild = select(1, GS.AdmitWithdrawalEvent(makeRecord(), baseEvent({
+        id = "gsw1:admit:wrong-guild",
+        guildKey = "club:other",
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stGuild, "rejected", "R6d: wrong guild rejected")
+
+    local stCamp = select(1, GS.AdmitWithdrawalEvent(makeRecord(), baseEvent({
+        id = "gsw1:admit:no-camp",
+        campaignId = "missing-camp",
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stCamp, "pending", "R6d: unknown campaign pending")
+
+    local stGen = select(1, GS.AdmitWithdrawalEvent(makeRecord(), baseEvent({
+        id = "gsw1:admit:future-gen",
+        generation = 9,
+    }), { senderGuid = "Player-1-AAAA", memberAuthenticated = true }))
+    assertEq(stGen, "rejected", "R6d: future generation rejected")
+
+    local missingDs = baseEvent({ id = "gsw1:admit:no-ds" })
+    missingDs.datasetId = nil
+    local stDs = select(1, GS.AdmitWithdrawalEvent(makeRecord(), missingDs, {
+        senderGuid = "Player-1-AAAA", memberAuthenticated = true,
+    }))
+    assertEq(stDs, "rejected", "R6d: missing datasetId rejected")
+end
+
+-- R8: recipe-page completeness resumes across real 32-visit budgets
+do
+    local Validate = GS._ValidateAdoptionCompletenessForTest
+    assertTrue(type(Validate) == "function", "R8: completeness test seam")
+    local campId = "camp-arch-r8"
+    -- 40 ordinary pages + 40 recipe pages: first budget=32 yields mid-items;
+    -- a later slice yields mid-recipes so resume of recipePageCursor is covered.
+    local pageCount = 40
+    local recipePageCount = 40
+    local pages, recipePages = {}, {}
+    local mergedItems, mergedRecipes = {}, {}
+    for p = 1, pageCount do
+        local key = tostring(p)
+        local row = { itemId = p, goal = 1 }
+        pages[p] = { page = p, requestedItems = { [key] = row } }
+        mergedItems[key] = row
+    end
+    for rp = 1, recipePageCount do
+        local rid = tostring(1000 + rp)
+        local recipe = { itemId = 1000 + rp, reagents = { ["10"] = 1 } }
+        recipePages[rp] = { page = rp, recipes = { [rid] = recipe } }
+        mergedRecipes[rid] = recipe
+    end
+    local meta = {
+        kind = "campaign-archive",
+        campaignId = campId,
+        datasetId = "gs1:r8",
+        generation = 1,
+        pageCount = pageCount,
+        recipePageCount = recipePageCount,
+        recipeCount = recipePageCount,
+        itemCount = pageCount,
+        schemaVersion = GS.SCHEMA_VERSION or 1,
+        archivedAt = 1,
+    }
+    local assembledCore = {
+        schemaVersion = meta.schemaVersion,
+        campaignId = campId,
+        datasetId = meta.datasetId,
+        generation = 1,
+        archivedAt = 1,
+        requestedItems = mergedItems,
+        recipes = mergedRecipes,
+    }
+    local function makeAdop(recipePageTable)
+        return {
+            _archiveIndex = {
+                [campId] = {
+                    meta = meta,
+                    pages = pages,
+                    recipePages = recipePageTable,
+                    pageCount = pageCount,
+                    recipePageCount = recipePageCount,
+                },
+            },
+            _workStats = {},
+            order = { "arch-meta" },
+            records = { ["arch-meta"] = meta },
+        }
+    end
+    local adop = makeAdop(recipePages)
+    local temp = {
+        currentCampaignId = "live-other",
+        campaignArchives = {
+            -- Seed matches assembled core so PreferArchiveHistoricalContext succeeds.
+            [campId] = {
+                schemaVersion = assembledCore.schemaVersion,
+                campaignId = campId,
+                datasetId = assembledCore.datasetId,
+                generation = 1,
+                archivedAt = 1,
+                requestedItems = mergedItems,
+                recipes = mergedRecipes,
+            },
+        },
+    }
+    local opts = { budget = 32, cursor = 1 }
+    local ok1, err1 = Validate(temp, adop, {}, opts)
+    assertEq(ok1, false, "R8: first slice yields")
+    assertEq(err1, "budget", "R8: budget reason")
+    assertEq(opts.archivePhase[campId], "items", "R8: still in items phase after first budget")
+    assertTrue(tonumber(opts.archivePageCursor[campId]) ~= nil, "R8: item page cursor persisted")
+    local firstCursor = tonumber(opts.archivePageCursor[campId])
+    assertTrue(firstCursor > 1 and firstCursor <= pageCount, "R8: cursor advanced into pages")
+    local sawRecipePhase = false
+    local advanced = false
+    for _ = 1, 12 do
+        opts.budget = 32
+        opts.budgetExhausted = nil
+        local prevPhase = opts.archivePhase and opts.archivePhase[campId]
+        local prevCursor = opts.archivePageCursor and opts.archivePageCursor[campId]
+        local prevRp = opts.archiveRecipePageCursor and opts.archiveRecipePageCursor[campId]
+        local ok, err = Validate(temp, adop, {}, opts)
+        if ok then
+            advanced = true
+            break
+        end
+        assertEq(err, "budget", "R8: intermediate yield is budget got=" .. tostring(err))
+        if opts.archivePhase and opts.archivePhase[campId] == "recipes" then
+            sawRecipePhase = true
+            assertTrue(
+                tonumber(opts.archiveRecipePageCursor[campId]) ~= nil
+                    or prevPhase == "items",
+                "R8: recipe phase persists cursor or just entered from items"
+            )
+        end
+        -- Resume must advance phase or page cursor rather than stall.
+        local curPhase = opts.archivePhase and opts.archivePhase[campId]
+        local curCursor = opts.archivePageCursor and opts.archivePageCursor[campId]
+        local curRp = opts.archiveRecipePageCursor and opts.archiveRecipePageCursor[campId]
+        assertTrue(
+            curPhase ~= prevPhase
+                or curCursor ~= prevCursor
+                or curRp ~= prevRp,
+            "R8: each resume advances phase or page cursor"
+        )
+    end
+    assertTrue(advanced, "R8: repeated resumes eventually complete under budget 32")
+    assertTrue(sawRecipePhase, "R8: recipe phase yielded under budget before completion")
+    assertTrue(temp.campaignArchives[campId].recipes ~= nil, "R8: assembled recipes published")
+    local recipeKeys = 0
+    for _ in pairs(temp.campaignArchives[campId].recipes) do
+        recipeKeys = recipeKeys + 1
+    end
+    assertEq(recipeKeys, recipePageCount, "R8: all recipes present after completeness")
+
+    -- Missing recipe page keeps completeness false.
+    local adopMiss = makeAdop({
+        [1] = recipePages[1],
+        [2] = recipePages[2],
+        -- remaining recipe pages absent
+    })
+    local okMiss, errMiss = Validate({
+        currentCampaignId = "live-other",
+        campaignArchives = {
+            [campId] = {
+                schemaVersion = assembledCore.schemaVersion,
+                campaignId = campId,
+                datasetId = assembledCore.datasetId,
+                generation = 1,
+                archivedAt = 1,
+                requestedItems = mergedItems,
+                recipes = mergedRecipes,
+            },
+        },
+    }, adopMiss, {}, { budget = 10000, cursor = 1 })
+    assertEq(okMiss, false, "R8: missing recipe page fails")
+    assertEq(errMiss, "incomplete_archive_pages", "R8: incomplete recipe pages")
+
+    -- IsAdoptionTransferComplete requires declared recipe pages.
+    GS._adoption = {
+        committed = false,
+        descriptor = {
+            acceptedOpCount = 0,
+            transferOpCount = 0,
+            campaignCount = 0,
+            archiveCount = 0,
+        },
+        sourceAcceptedIds = {},
+        _archiveIndex = {
+            [campId] = {
+                meta = meta,
+                pages = pages,
+                recipePages = { [1] = recipePages[1] },
+                pageCount = pageCount,
+                recipePageCount = recipePageCount,
+            },
+        },
+        records = {},
+        order = {},
+    }
+    local ready, why = GS:IsAdoptionTransferComplete()
+    assertEq(ready, false, "R8: readiness false without all recipe pages")
+    assertEq(why, "incomplete_transfer", "R8: incomplete_transfer for missing recipe pages")
+    GS._adoption = nil
+end
+
+-- R7: Manage orphan sync after requested-item removal (real editor hooks)
+do
+    GameTooltip = GameTooltip or {
+        Hide = function() end, SetOwner = function() end, SetText = function() end,
+        AddLine = function() end, Show = function() end,
+    }
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsStore = SF.SettingsStore or { Get = function() return true end, Set = function() end }
+    SF.SettingsUI.Style = SF.SettingsUI.Style or {}
+    SF.SettingsUI.Controls = SF.SettingsUI.Controls or {}
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+    SF.ItemDisplay = SF.ItemDisplay or {
+        RegisterRefresh = function() end,
+        ResetSession = function() end,
+        QUESTION_MARK = "Interface/Icons/INV_Misc_QuestionMark",
+        Describe = function(_, id) return { name = "Item" .. tostring(id), icon = "x" } end,
+    }
+    _G.UIParent = _G.UIParent or {}
+    _G.CreateFrame = function(_, name)
+        local f = {
+            name = name,
+            shown = false,
+            scripts = {},
+            children = {},
+        }
+        function f:SetSize() end
+        function f:SetPoint() end
+        function f:SetFrameStrata() end
+        function f:SetFrameLevel() end
+        function f:Hide() f.shown = false end
+        function f:Show() f.shown = true end
+        function f:IsShown() return f.shown end
+        function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:GetScript(k) return f.scripts[k] end
+        function f:RegisterEvent() end
+        function f:UnregisterEvent() end
+        function f:UnregisterAllEvents() end
+        function f:SetMovable() end
+        function f:EnableMouse() end
+        function f:RegisterForDrag() end
+        function f:SetBackdrop() end
+        function f:SetBackdropColor() end
+        function f:SetText() end
+        function f:SetShown(v) f.shown = v and true or false end
+        function f:Enable() end
+        function f:Disable() end
+        function f:ClearAllPoints() end
+        function f:CreateFontString()
+            return {
+                SetPoint = function() end, SetJustifyH = function() end,
+                SetWordWrap = function() end, SetText = function() end,
+                SetFontObject = function() end, SetTextColor = function() end,
+                Show = function() end, Hide = function() end,
+            }
+        end
+        function f:CreateTexture()
+            return {
+                SetPoint = function() end, SetSize = function() end,
+                SetTexture = function() end, Show = function() end, Hide = function() end,
+            }
+        end
+        function f:CreateScrollFrame() return f end
+        return f
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesManage.lua")
+    local managePage = SF.SettingsUI.pagesById.guildSuppliesManage
+    assertTrue(managePage and managePage.__sfTest, "R7: Manage page hooks")
+    local hooks = managePage.__sfTest
+    local record = {
+        datasetId = "gs1:manage",
+        _guildKey = "club:manage",
+        currentCampaignId = "camp1",
+        accounting = {
+            _consumables = {
+                configSeq = 1,
+                requestedItems = {
+                    ["10"] = { itemId = 10, goal = 1 },
+                    ["20"] = { itemId = 20, goal = 1 },
+                },
+                recipes = {
+                    ["100"] = { itemId = 100, reagents = { ["10"] = 3, ["20"] = 4 } },
+                },
+            },
+        },
+    }
+    GS.GetCurrentRecord = function() return record end
+    GS.GetCapabilities = function()
+        return { canEdit = true, canRead = true }
+    end
+    GS.GetCurrentContext = function()
+        return { ready = true, guildKey = "club:manage" }
+    end
+    GS.RecipeAvailability = function() return true end
+    -- Manage uses AdjustCanEdit → Caps via colon calls; ensure method form works.
+    local _getCaps = GS.GetCapabilities
+    GS.GetCapabilities = function(_, ...) return _getCaps(...) end
+    local _getRec = GS.GetCurrentRecord
+    GS.GetCurrentRecord = function(_, ...) return _getRec(...) end
+    local _getCtx = GS.GetCurrentContext
+    GS.GetCurrentContext = function(_, ...) return _getCtx(...) end
+    -- Seed editor draft as OpenRecipeEditor would with both reagents requested,
+    -- then apply production requested-item removal for 10 (configSeq unchanged).
+    local draft = hooks.RecipeEditorDraft()
+    draft.open = true
+    draft.outputItemId = 100
+    draft.isExisting = true
+    draft.reagentTexts = { ["10"] = "3", ["20"] = "4" }
+    draft.orphanReagentIds = {}
+    draft.boundConfigSeq = 1
+    draft.boundRecipeRevision = "10=3;20=4"
+    record.accounting._consumables.requestedItems["10"] = nil
+    hooks.SyncOrphanReagentsFromSavedAndDraft()
+    draft = hooks.RecipeEditorDraft()
+    assertEq(draft.orphanReagentIds["10"], true, "R7: removed requested item becomes orphan")
+    assertEq(draft.reagentTexts["10"], "3", "R7: orphan quantity preserved")
+    local reagents, bad = hooks.BuildRecipeReagentsFromDraft()
+    assertTrue(reagents ~= nil, "R7: build reagents ok bad=" .. tostring(bad))
+    assertEq(reagents["10"], 3, "R7: save payload keeps orphan 10=3")
+    assertEq(reagents["20"], 4, "R7: save payload keeps 20=4")
+    -- Explicit quantity-zero repair drops the orphan deliberately.
+    draft.reagentTexts["10"] = "0"
+    hooks.SyncOrphanReagentsFromSavedAndDraft()
+    reagents = hooks.BuildRecipeReagentsFromDraft()
+    assertEq(reagents["10"], nil, "R7: explicit zero removes orphan on save payload")
+    assertEq(reagents["20"], 4, "R7: remaining reagent kept after zero repair")
+    -- Re-add requested item 10: orphan clears; quantity still from draft/saved.
+    record.accounting._consumables.requestedItems["10"] = { itemId = 10, goal = 1 }
+    draft.reagentTexts["10"] = "3"
+    hooks.SyncOrphanReagentsFromSavedAndDraft()
+    assertEq(draft.orphanReagentIds["10"], nil, "R7: re-add clears orphan flag")
+    reagents = hooks.BuildRecipeReagentsFromDraft()
+    assertEq(reagents["10"], 3, "R7: re-add keeps quantity")
+end
+
+-- R9: ClearProcessedDrafts preserves unrelated recipe inputs; remaining uses request
+do
+    _G.GetServerTime = _G.GetServerTime or function() return 1000 end
+    _G.GetCursorInfo = function() return nil end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesWithdrawRuntime.lua")
+    local WR = SF.ConsumablesWithdrawRuntime
+    WR.craftDrafts = { ["900"] = 3, ["901"] = 2 }
+    WR.ClearProcessedDrafts({ ["900"] = 3 })
+    assertEq(WR.craftDrafts["900"], nil, "R9: processed draft cleared")
+    assertEq(WR.craftDrafts["901"], 2, "R9: unrelated draft preserved")
+
+    local settle
+    WR.work = {
+        settled = false,
+        movementStarted = true,
+        selections = { ["900"] = 1 },
+        take = { ["10"] = 4 },
+        requested = { ["10"] = 10 },
+        confirmed = { ["10"] = 4 },
+        confirmedTotal = 4,
+        onSettle = function(result) settle = result end,
+        timer = nil,
+    }
+    WR.StopWork("shortage", true)
+    assertTrue(settle ~= nil, "R9: settle callback")
+    assertEq(settle.requested["10"], 10, "R9: requested preserved")
+    assertEq(settle.authorized["10"], 4, "R9: authorized take")
+    assertEq(settle.confirmed["10"], 4, "R9: confirmed")
+    assertEq(settle.remaining["10"], 6, "R9: remaining is unfilled request not zero")
+    assertEq(WR.craftDrafts["901"], 2, "R9: settle preserves unrelated draft")
+
+    -- Idempotent settlement: second StopWork is a no-op.
+    local settleCount = 0
+    WR.craftDrafts = { ["900"] = 1 }
+    WR.work = {
+        settled = false,
+        movementStarted = true,
+        selections = { ["900"] = 1 },
+        take = { ["10"] = 5 },
+        requested = { ["10"] = 5 },
+        confirmed = { ["10"] = 5 },
+        confirmedTotal = 5,
+        onSettle = function() settleCount = settleCount + 1 end,
+    }
+    local workRef = WR.work
+    WR.StopWork("complete", false)
+    assertEq(settleCount, 1, "R9: first settle")
+    -- Simulate OnBankClosed capturing work then settling after ObservePending already stopped.
+    WR.work = workRef
+    WR.StopWork("bank_closed", true)
+    assertEq(settleCount, 1, "R9: second settle ignored via settled flag")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failure(s)\n", failures))
     os.exit(1)

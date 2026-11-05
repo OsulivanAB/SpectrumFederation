@@ -79,7 +79,11 @@ function GS.ValidateWithdrawalEventBody(event, datasetId)
     if not id then
         return false, "invalid_id"
     end
-    if type(event.datasetId) == "string" and datasetId and event.datasetId ~= datasetId then
+    local eventDataset = BoundedString(event.datasetId)
+    if not eventDataset then
+        return false, "invalid_dataset"
+    end
+    if datasetId and eventDataset ~= datasetId then
         return false, "dataset_mismatch"
     end
     local itemId = IsPositiveItemId(event.itemId)
@@ -148,6 +152,32 @@ function GS.CanonicalWithdrawalEvent(event)
         provenance = event.provenance,
         operationId = BoundedString(event.operationId),
         guildKey = BoundedString(event.guildKey),
+        gsProductionCredit = false,
+    }
+end
+
+--- Immutable logical body for duplicate/conflict detection.
+-- Provenance (ORIGIN vs RELAY) is transport presentation, not receipt identity:
+-- the same confirmed movement admitted via origin and relay must not id_conflict.
+function GS.CanonicalWithdrawalEventIdentity(event)
+    local canon = GS.CanonicalWithdrawalEvent(event)
+    if not canon then
+        return nil
+    end
+    return {
+        type = canon.type,
+        id = canon.id,
+        datasetId = canon.datasetId,
+        campaignId = canon.campaignId,
+        generation = canon.generation,
+        itemId = canon.itemId,
+        quantity = canon.quantity,
+        actor = canon.actor,
+        actorGuid = canon.actorGuid,
+        bankTab = canon.bankTab,
+        timestamp = canon.timestamp,
+        operationId = canon.operationId,
+        guildKey = canon.guildKey,
         gsProductionCredit = false,
     }
 end
@@ -355,11 +385,11 @@ function GS:CommitLocalWithdrawalReceipts(amounts, meta)
         end
         local existing = FindLedgerEventById(record, event.id)
         if existing then
-            local existingCanon = GS.CanonicalWithdrawalEvent(existing)
-            if existingCanon and GS._DeepEqualOps and GS._DeepEqualOps(existingCanon, event) then
-                -- duplicate ok
-            elseif existingCanon then
-                return "rejected", "id_conflict"
+            local existingId = GS.CanonicalWithdrawalEventIdentity(existing)
+            local incomingId = GS.CanonicalWithdrawalEventIdentity(event)
+            if existingId and incomingId and GS._DeepEqualOps
+                and GS._DeepEqualOps(existingId, incomingId) then
+                -- duplicate ok (provenance may differ ORIGIN vs RELAY)
             else
                 return "rejected", "id_conflict"
             end
@@ -419,14 +449,60 @@ function GS.AdmitWithdrawalEvent(record, event, opts)
             return "rejected", "unauthorized"
         end
     end
+    -- Scope against the bound record: guild, campaign, generation, dataset.
+    if canon.guildKey and record._guildKey and canon.guildKey ~= record._guildKey then
+        return "rejected", "guild_mismatch"
+    end
+    if not canon.guildKey and record._guildKey then
+        canon.guildKey = record._guildKey
+    end
+    local campaignId = canon.campaignId
+    local campaignOk = false
+    if record.currentCampaignId == campaignId then
+        campaignOk = true
+    elseif type(record.campaigns) == "table" and record.campaigns[campaignId] then
+        campaignOk = true
+    elseif type(record.campaignArchives) == "table" and record.campaignArchives[campaignId] then
+        campaignOk = true
+    end
+    if not campaignOk then
+        return "pending", "missing_campaign"
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    local liveGen = tonumber(cfg and cfg.generation)
+    local eventGen = tonumber(canon.generation)
+    if liveGen and eventGen then
+        if record.currentCampaignId == campaignId then
+            -- Live campaign: allow current generation and represented prior gens
+            -- that settle into archive; reject unrelated future generations.
+            if eventGen > liveGen then
+                return "rejected", "generation_mismatch"
+            end
+        else
+            local archive = record.campaignArchives and record.campaignArchives[campaignId]
+            local archGen = archive and tonumber(archive.generation)
+            if archGen and eventGen ~= archGen then
+                return "rejected", "generation_mismatch"
+            end
+        end
+    end
+
     if type(sender) == "string" and sender ~= "" and sender ~= canon.actorGuid then
         canon.provenance = GS.WITHDRAWAL_PROVENANCE.RELAY
     end
 
     local existing = FindLedgerEventById(record, canon.id)
     if existing then
-        local existingCanon = GS.CanonicalWithdrawalEvent(existing)
-        if existingCanon and GS._DeepEqualOps and GS._DeepEqualOps(existingCanon, canon) then
+        local existingId = GS.CanonicalWithdrawalEventIdentity(existing)
+        local incomingId = GS.CanonicalWithdrawalEventIdentity(canon)
+        if existingId and incomingId and GS._DeepEqualOps
+            and GS._DeepEqualOps(existingId, incomingId) then
+            -- Same logical receipt via origin/relay: keep ORIGIN if either path
+            -- established it; otherwise retain stored provenance.
+            if existing.provenance ~= GS.WITHDRAWAL_PROVENANCE.ORIGIN
+                and canon.provenance == GS.WITHDRAWAL_PROVENANCE.ORIGIN then
+                existing.provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN
+            end
             return "duplicate", "duplicate"
         end
         -- Conflicting same-ID body: fail closed; do not replace.

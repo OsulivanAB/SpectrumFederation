@@ -1686,6 +1686,13 @@ function Runtime:RebuildReview()
             local depositable = not line.goalComplete
             if depositable then
                 if row.GoalMet then row.GoalMet:Hide() end
+                -- Clear pooled Quick Withdraw handlers before programmatic text so
+                -- deposit SetText cannot mutate craft drafts via retained scripts.
+                row.Edit:SetScript("OnTextChanged", nil)
+                row.Edit:SetScript("OnEnterPressed", nil)
+                row.Button:SetScript("OnClick", nil)
+                row._qwDraftKey = nil
+                row._qwAvailable = nil
                 row.Edit:Show()
                 local editing = row.Edit.HasFocus and row.Edit:HasFocus()
                 local sameItem = row.boundItemId == line.itemId
@@ -1786,13 +1793,21 @@ function Runtime:FormatQuickWithdrawSettlement(result)
         return n
     end
     local requested = SumMap(result.requested)
+    local authorized = SumMap(result.authorized)
+    if authorized < 1 and type(result.authorized) ~= "table" then
+        -- Fall back when older settle payloads omit authorized.
+        authorized = requested - SumMap(result.remaining) + SumMap(result.confirmed)
+        if authorized < SumMap(result.confirmed) then
+            authorized = SumMap(result.confirmed)
+        end
+    end
     local confirmed = SumMap(result.confirmed)
-    local remaining = SumMap(result.remaining)
+    local remaining = SumMap(result.remaining) -- unfilled of original request
     local unresolved = result.unresolved and true or false
     local parts = {
         Loc("GUILD_SUPPLIES_WITHDRAW_SETTLE_FMT",
-            "Withdraw settled: requested %d, confirmed %d, remaining %d.")
-            :format(requested, confirmed, remaining),
+            "Withdraw settled: requested %d, authorized %d, confirmed %d, remaining %d.")
+            :format(requested, authorized, confirmed, remaining),
     }
     if unresolved then
         parts[#parts + 1] = Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED",

@@ -2010,13 +2010,23 @@ function GS:IsAdoptionTransferComplete()
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
         return false, "incomplete_transfer"
     end
-    -- Paged archives must include every page referenced by meta.
+    -- Paged archives must include every ordinary and recipe page referenced by meta.
     if type(archivePages) == "table" then
         for _, info in pairs(archivePages) do
             if type(info.meta) == "table" and not info.meta.requestedItems then
                 local pc = tonumber(info.pageCount) or 1
                 for page = 1, pc do
                     if type(info.pages[page]) ~= "table" then
+                        return false, "incomplete_transfer"
+                    end
+                end
+            end
+            local rpc = tonumber(info.recipePageCount)
+                or (type(info.meta) == "table" and tonumber(info.meta.recipePageCount))
+            if rpc and rpc >= 1 then
+                local recipePages = info.recipePages or {}
+                for page = 1, rpc do
+                    if type(recipePages[page]) ~= "table" then
                         return false, "incomplete_transfer"
                     end
                 end
@@ -4635,38 +4645,47 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 -- Bounded presence validation only. Resume charges remaining pages;
                 -- assemble always uses the immutable indexed page set so a yield
                 -- mid-archive cannot drop pages 1..p-1 from a fresh local table.
-                local startPage = tonumber(opts.archivePageCursor and opts.archivePageCursor[body.campaignId]) or 1
-                for p = startPage, pageCount do
-                    if visited >= budget then
-                        opts.archivePageCursor = opts.archivePageCursor or {}
-                        opts.archivePageCursor[body.campaignId] = p
-                        opts.cursor = i
-                        opts.budgetExhausted = true
-                        publishCompletenessStats()
-                        return false, "budget"
+                opts.archivePhase = opts.archivePhase or {}
+                opts.archivePageCursor = opts.archivePageCursor or {}
+                opts.archiveRecipePageCursor = opts.archiveRecipePageCursor or {}
+                local phase = opts.archivePhase[body.campaignId] or "items"
+                if phase == "items" then
+                    local startPage = tonumber(opts.archivePageCursor[body.campaignId]) or 1
+                    for p = startPage, pageCount do
+                        if visited >= budget then
+                            opts.archivePageCursor[body.campaignId] = p
+                            opts.archivePhase[body.campaignId] = "items"
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false, "budget"
+                        end
+                        visited = visited + 1
+                        archiveVisitedCall = archiveVisitedCall + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        adop._workStats.archiveVisited =
+                            (adop._workStats.archiveVisited or 0) + 1
+                        if type(info.pages[p]) ~= "table" then
+                            opts.cursor = nil
+                            publishCompletenessStats()
+                            return false, "incomplete_archive_pages"
+                        end
                     end
-                    visited = visited + 1
-                    archiveVisitedCall = archiveVisitedCall + 1
-                    adop._workStats.completenessVisited =
-                        (adop._workStats.completenessVisited or 0) + 1
-                    adop._workStats.archiveVisited =
-                        (adop._workStats.archiveVisited or 0) + 1
-                    if type(info.pages[p]) ~= "table" then
-                        opts.cursor = nil
-                        publishCompletenessStats()
-                        return false, "incomplete_archive_pages"
-                    end
-                end
-                if opts.archivePageCursor then
                     opts.archivePageCursor[body.campaignId] = nil
+                    opts.archivePhase[body.campaignId] = "recipes"
+                    phase = "recipes"
                 end
                 local recipePageCount = tonumber(body.recipePageCount)
                     or (type(info.meta) == "table" and tonumber(info.meta.recipePageCount))
                     or tonumber(info.recipePageCount)
-                if recipePageCount and recipePageCount >= 1 then
+                if phase == "recipes" and recipePageCount and recipePageCount >= 1 then
                     info.recipePages = info.recipePages or {}
-                    for rp = 1, recipePageCount do
+                    local startRp = tonumber(opts.archiveRecipePageCursor[body.campaignId]) or 1
+                    for rp = startRp, recipePageCount do
                         if visited >= budget then
+                            opts.archiveRecipePageCursor[body.campaignId] = rp
+                            opts.archivePhase[body.campaignId] = "recipes"
                             opts.cursor = i
                             opts.budgetExhausted = true
                             publishCompletenessStats()
@@ -4684,6 +4703,10 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                             return false, "incomplete_archive_pages"
                         end
                     end
+                    opts.archiveRecipePageCursor[body.campaignId] = nil
+                end
+                if opts.archivePhase then
+                    opts.archivePhase[body.campaignId] = nil
                 end
                 local archive, aerr = AssemblePagedArchive(body, info.pages, info.recipePages)
                 if not archive then
@@ -5048,6 +5071,9 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     publishCompletenessStats()
     return true, nil
 end
+
+-- Test seam: recipe-page resume / multi-slice completeness (#457).
+GS._ValidateAdoptionCompletenessForTest = ValidateAdoptionCompleteness
 
 --- Selected-source effective state: accepted membership + descriptor heads/config.
 local function ValidateAdoptionEffectiveState(temp, adop, desc)

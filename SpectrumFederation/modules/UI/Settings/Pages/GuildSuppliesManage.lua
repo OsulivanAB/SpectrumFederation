@@ -1097,6 +1097,47 @@ local function LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warningText
 	return 28
 end
 
+local function SyncOrphanReagentsFromSavedAndDraft()
+	-- Requested-item mutations often leave configSeq unchanged. Rebuild orphans
+	-- from the saved recipe + current draft texts whenever the editor refreshes
+	-- so Save cannot silently drop unavailable ingredients.
+	CaptureRecipeEditorDraftFromUi()
+	local outputId = tonumber(recipeEditorDraft.outputItemId)
+	local saved = FindSavedRecipe(outputId)
+	local reagentMap = saved and saved.reagents
+	local requested = {}
+	local reqRows = RequestedItemRows()
+	for i = 1, #reqRows do
+		local rid = tonumber(reqRows[i] and reqRows[i].itemId)
+		if rid then
+			requested[rid] = true
+		end
+	end
+	local orphans = {}
+	local texts = recipeEditorDraft.reagentTexts or {}
+	if type(reagentMap) == "table" then
+		for k, v in pairs(reagentMap) do
+			local rid = tonumber(k)
+			local qty = tonumber(v) or 0
+			if rid and qty > 0 and not requested[rid] then
+				orphans[tostring(rid)] = true
+				if texts[tostring(rid)] == nil then
+					texts[tostring(rid)] = tostring(qty)
+				end
+			end
+		end
+	end
+	for k, text in pairs(texts) do
+		local rid = tonumber(k)
+		local qty = ParseRecipeReagentQty(text)
+		if rid and qty and qty > 0 and not requested[rid] then
+			orphans[tostring(rid)] = true
+		end
+	end
+	recipeEditorDraft.reagentTexts = texts
+	recipeEditorDraft.orphanReagentIds = orphans
+end
+
 local function RefreshRecipeEditor()
 	SyncRecipeEditorContext()
 	local ui = EnsureRecipeEditorUi()
@@ -1107,6 +1148,7 @@ local function RefreshRecipeEditor()
 	if not outputId then
 		return
 	end
+	SyncOrphanReagentsFromSavedAndDraft()
 	local described = DescribeItem(outputId)
 	if ui.outputIcon and described.icon then
 		ui.outputIcon:SetTexture(described.icon)
@@ -2221,6 +2263,8 @@ Page.__sfTest = {
 	OpenRecipeEditor = OpenRecipeEditor,
 	CloseRecipeEditor = CloseRecipeEditor,
 	BuildRecipeReagentsFromDraft = BuildRecipeReagentsFromDraft,
+	SyncOrphanReagentsFromSavedAndDraft = SyncOrphanReagentsFromSavedAndDraft,
+	RefreshRecipeEditor = RefreshRecipeEditor,
 	RecipeEditorDraft = function()
 		return recipeEditorDraft
 	end,

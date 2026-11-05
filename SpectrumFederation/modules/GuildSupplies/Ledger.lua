@@ -529,8 +529,8 @@ local function LedgerEstablishesNameGuid(record, name, guid)
         return false
     end
     local lists = {
-        { record.accounting._consumableEvents, GS.MAX_LEDGER_EVENTS or 4096 },
-        { record.accounting._consumableEventArchive, GS.MAX_ARCHIVED_EVENTS or 4096 },
+        { record.accounting._consumableEvents, MaxLiveLedgerScan() },
+        { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
     }
     for li = 1, #lists do
         local list, maxLen = lists[li][1], lists[li][2]
@@ -2277,11 +2277,13 @@ local function TrimEventArchive(record)
     while true do
         local total = #archive
         local nonWithdraw = CountNonWithdrawalEvents(archive)
-        if total <= maxTotal and nonWithdraw <= maxDon then
+        local withdrawals = total - nonWithdraw
+        if total <= maxTotal and nonWithdraw <= maxDon and withdrawals <= maxWd then
             break
         end
         local removeIdx = nil
-        if total > maxTotal then
+        -- Prefer trimming oldest withdrawals when over the withdrawal or combined cap.
+        if withdrawals > maxWd or total > maxTotal then
             for i = 1, total do
                 if IsWithdrawalLedgerEvent(archive[i]) then
                     removeIdx = i
