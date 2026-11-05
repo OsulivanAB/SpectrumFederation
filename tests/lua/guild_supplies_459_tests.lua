@@ -1904,62 +1904,108 @@ do
 end
 
 do
-    -- Redrive attempt budget + eventual continuation for >32 pending corrections.
-    local record = seedLiveCampaignWithItem(9304, 200)
-    injectProductionDonation(record, {
-        id = "budget-don", itemId = 9304, quantity = 50,
-        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
-    })
-    record.operations.pending = record.operations.pending or {}
-    for i = 1, 40 do
-        local id = string.format("budget-corr-%02d", i)
-        record.operations.pending[id] = {
-            id = id,
-            sender = "Alice-Garona",
-            reason = "pending_event",
-            body = {
-                schemaVersion = GS.OP_SCHEMA_VERSION,
-                id = id,
-                guildKey = select(1, GS:GetCurrentContext()).guildKey,
-                datasetId = record.datasetId,
-                campaignId = record.currentCampaignId,
-                kind = GS.KIND.CORRECT_CONTRIBUTOR,
-                target = "budget-don",
-                value = {
-                    eventId = "budget-don",
-                    eventKind = "donation",
-                    attributed = "Bob-Garona",
-                    attributedGuid = "Player-1-Bob",
-                    baseAttributed = "Alice-Garona",
-                    baseAttributedGuid = "Player-1-Alice",
-                    itemId = 9304,
-                },
-                actorGuid = "Player-1-Alice",
-                actorName = "Alice-Garona",
+    -- Deletion-safe continuation: 64 eligible pending with budget 32 must all be
+    -- attempted across scheduled slices (no stranded middle when accepts shrink).
+    local function seedPendingWave(count, itemId)
+        local record = seedLiveCampaignWithItem(itemId, 500)
+        record.operations.pending = record.operations.pending or {}
+        local ctx = select(1, GS:GetCurrentContext())
+        for i = 1, count do
+            local donId = string.format("budget-don-%03d", i)
+            injectProductionDonation(record, {
+                id = donId, itemId = itemId, quantity = 2,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
                 timestamp = world.time + i,
-                baseTargetRevision = record.datasetId,
-                basePolicyRevision = record.permission and record.permission.revisionId,
-                baseCampaignId = record.currentCampaignId,
-            },
-        }
+            })
+            local id = string.format("budget-corr-%03d", i)
+            record.operations.pending[id] = {
+                id = id,
+                sender = "Alice-Garona",
+                reason = "pending_event",
+                body = {
+                    schemaVersion = GS.OP_SCHEMA_VERSION,
+                    id = id,
+                    guildKey = ctx.guildKey,
+                    datasetId = record.datasetId,
+                    campaignId = record.currentCampaignId,
+                    kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                    target = donId,
+                    value = {
+                        eventId = donId,
+                        eventKind = "donation",
+                        attributed = "Bob-Garona",
+                        attributedGuid = "Player-1-Bob",
+                        baseAttributed = "Alice-Garona",
+                        baseAttributedGuid = "Player-1-Alice",
+                        itemId = itemId,
+                    },
+                    actorGuid = "Player-1-Alice",
+                    actorName = "Alice-Garona",
+                    timestamp = world.time + 1000 + i,
+                    baseTargetRevision = record.datasetId,
+                    basePolicyRevision = record.permission and record.permission.revisionId,
+                    baseCampaignId = record.currentCampaignId,
+                },
+            }
+        end
+        return record
     end
-    local promoted, attempts = GS.RedrivePendingContributorCorrections(record, {
-        eventId = "budget-don",
-        itemId = 9304,
+    local function countEligiblePending(record)
+        local n = 0
+        for _, entry in pairs(record.operations.pending or {}) do
+            local body = entry and entry.body
+            if type(body) == "table"
+                and body.kind == GS.KIND.CORRECT_CONTRIBUTOR
+                and entry.reason ~= "untrusted_relay"
+                and entry.reason ~= "evidence"
+                and type(entry.sender) == "string" then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    local record64 = seedPendingWave(64, 9304)
+    local _, attempts64 = GS.RedrivePendingContributorCorrections(record64, {
         maxAttempts = 32,
     })
-    assertEq(attempts, 32, "459: redrive stops at attempt budget got " .. tostring(attempts))
-    assertTrue(#timers >= 1, "459: continuation scheduled when backlog remains")
+    assertEq(attempts64, 32, "459: 64-wave first slice attempts=32 got " .. tostring(attempts64))
+    assertTrue(#timers >= 1, "459: 64-wave schedules continuation")
     flushTimers()
-    local remaining = 0
-    for _ in pairs(record.operations.pending or {}) do
-        remaining = remaining + 1
+    assertEq(countEligiblePending(record64), 0,
+        "459: 64 eligible pending all settled after slices got "
+            .. tostring(countEligiblePending(record64)))
+
+    -- 80 entries: middle slice must not be skipped after first 32 accepts.
+    local record80 = seedPendingWave(80, 9307)
+    GS.RedrivePendingContributorCorrections(record80, { maxAttempts = 32 })
+    flushTimers()
+    assertEq(countEligiblePending(record80), 0,
+        "459: 80 eligible pending all settled after slices got "
+            .. tostring(countEligiblePending(record80)))
+
+    -- Mixed outcomes: failures stay until wave completes; successes remove mid-wave.
+    local recordMix = seedPendingWave(40, 9308)
+    -- Poison half with missing sender so attempts count but leave pending.
+    local mixIds = {}
+    for id in pairs(recordMix.operations.pending) do
+        mixIds[#mixIds + 1] = id
     end
-    -- First promotion accepts; later same-target ops become obsolete/duplicate paths.
-    assertTrue(promoted >= 1 or record.operations.records["budget-corr-01"] ~= nil
-        or remaining < 40,
-        "459: budget redrive made progress promoted=" .. tostring(promoted)
-            .. " remaining=" .. tostring(remaining))
+    table.sort(mixIds)
+    for i = 1, 20 do
+        recordMix.operations.pending[mixIds[i]].sender = nil
+    end
+    GS.RedrivePendingContributorCorrections(recordMix, { maxAttempts = 32 })
+    flushTimers()
+    local left = countEligiblePending(recordMix)
+    -- Entries without sender are not "eligible" under countEligiblePending.
+    assertEq(left, 0, "459: mixed wave settles sender-bearing entries got " .. tostring(left))
+    local noSenderLeft = 0
+    for _, entry in pairs(recordMix.operations.pending or {}) do
+        if entry and entry.sender == nil then
+            noSenderLeft = noSenderLeft + 1
+        end
+    end
+    assertEq(noSenderLeft, 20, "459: mixed wave retains no-sender pending for later wake")
 end
 
 do
@@ -2077,6 +2123,247 @@ do
     end
     assertEq(rebuilds - beforeHist, 1, "459: history ensure stays cached")
     GS.RebuildCreditCorrectionProjection = realRebuild
+end
+
+do
+    -- Joint-activation: two +10→Bob then production Bob −15 keeps Bob at 5.
+    local record = seedLiveCampaignWithItem(9310, 100)
+    local cut = record.liveCutover
+    local boundary = tonumber(cut and cut.eligibilityBoundary and cut.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(cut and cut.contextObservedAt) or world.time
+    local t0 = boundary + 100
+    injectProductionDonation(record, {
+        id = "joint-don-1", itemId = 9310, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = t0,
+    })
+    injectProductionDonation(record, {
+        id = "joint-don-2", itemId = 9310, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = t0 + 1,
+    })
+    world.time = t0 + 10
+    local c1 = select(1, GS:NewContributorCorrectionOperation(
+        "joint-don-1", "Bob-Garona", "Player-1-Bob"))
+    local c2 = select(1, GS:NewContributorCorrectionOperation(
+        "joint-don-2", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(c1 and c2, "459: joint prepare both corrections")
+    assertEq(GS:ApplyStagedConfigOperation(c1), "accepted", "459: joint apply don1→Bob")
+    assertEq(GS:ApplyStagedConfigOperation(c2), "accepted", "459: joint apply don2→Bob")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9310), 20,
+        "459: Bob has 20 before adjustment")
+    local itemBefore = 0
+    if GS.ProjectCampaignProgressOnRecord then
+        local prog = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+        itemBefore = tonumber(prog and prog.itemTotals and prog.itemTotals[9310]) or 0
+    end
+    world.time = t0 + 20
+    local adjOp, adjSt, adjReason = GS:NewAdjustmentOperation(9310, -15, "Bob-Garona")
+    assertTrue(adjOp ~= nil,
+        "459: joint NewAdjustmentOperation prepared got " .. tostring(adjSt) .. "/" .. tostring(adjReason))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted",
+        "459: joint Bob −15 via production ApplyStagedConfigOperation")
+    do
+        local adjEv = GS.FindLedgerEventById(record, adjOp.id)
+        assertTrue(adjEv ~= nil, "459: joint adjustment ledger row present")
+        assertEq(adjEv.gsProductionCredit, true, "459: joint adjustment production-credited")
+    end
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9310), 5,
+        "459: Bob personal 5 after joint reconstruction")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9310), 0,
+        "459: Alice personal 0 after joint reconstruction")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "joint-don-1"))), "Bob-Garona",
+        "459: joint don1 stays Bob")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "joint-don-2"))), "Bob-Garona",
+        "459: joint don2 stays Bob")
+    if GS.ProjectCampaignProgressOnRecord then
+        local prog = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+        local itemAfter = tonumber(prog and prog.itemTotals and prog.itemTotals[9310]) or 0
+        assertEq(itemAfter, itemBefore - 15, "459: campaign item total moves only by adjustment qty")
+    end
+    -- Durable evidence unchanged.
+    local d1 = GS.FindLedgerEventById(record, "joint-don-1")
+    assertEq(d1.actor, "Alice-Garona", "459: joint durable actor unchanged")
+    assertEq(tonumber(d1.quantity), 10, "459: joint durable qty unchanged")
+
+    -- Reload-style: wipe projection and rebuild from accepted ops alone.
+    record.creditCorrections = nil
+    GS.InvalidateCreditCorrectionProjection(record)
+    GS.EnsureCreditCorrectionProjection(record, nil)
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9310), 5,
+        "459: joint Bob 5 after cold rebuild")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, d1)), "Bob-Garona",
+        "459: joint cold rebuild keeps Bob")
+
+    -- Peer delivery: apply corrections then remote-admit the adjustment snapshot.
+    local peer = seedLiveCampaignWithItem(9310, 100)
+    injectProductionDonation(peer, {
+        id = "joint-don-1", itemId = 9310, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = t0,
+    })
+    injectProductionDonation(peer, {
+        id = "joint-don-2", itemId = 9310, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = t0 + 1,
+    })
+    local snapC1 = select(1, GS._SnapshotPublicOp(c1))
+    local snapC2 = select(1, GS._SnapshotPublicOp(c2))
+    local snapAdj = select(1, GS._SnapshotPublicOp(adjOp))
+    local function rebaseJoint(snap, rec)
+        local body = {}
+        for k, v in pairs(snap) do body[k] = v end
+        body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        body.datasetId = rec.datasetId
+        body.campaignId = rec.currentCampaignId
+        body.baseCampaignId = rec.currentCampaignId
+        body.basePolicyRevision = rec.permission and rec.permission.revisionId
+        if body.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            body.baseTargetRevision = rec.datasetId
+        end
+        return body
+    end
+    assertEq(select(1, GS:AdmitRemoteOperation(rebaseJoint(snapC1, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "459: peer admits joint c1")
+    assertEq(select(1, GS:AdmitRemoteOperation(rebaseJoint(snapC2, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "459: peer admits joint c2")
+    -- Adjustment commits are locally authored with cutover provenance (#389 A2).
+    -- Peer applies the same production commit path after receiving corrections.
+    local peerCut = peer.liveCutover
+    local peerBoundary = tonumber(peerCut and peerCut.eligibilityBoundary
+            and peerCut.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(peerCut and peerCut.contextObservedAt) or world.time
+    world.time = peerBoundary + 200
+    local peerAdj = select(1, GS:NewAdjustmentOperation(9310, -15, "Bob-Garona"))
+    assertTrue(peerAdj ~= nil, "459: peer prepares Bob −15")
+    assertEq(GS:ApplyStagedConfigOperation(peerAdj), "accepted",
+        "459: peer applies Bob −15 via production path")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", 9310), 5,
+        "459: peer Bob 5 after delivered joint sequence")
+    -- Also admit the original adjustment op as history (may be unmarked remote).
+    local stAdj = select(1, GS:AdmitRemoteOperation(rebaseJoint(snapAdj, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    }))
+    assertTrue(stAdj == "accepted" or stAdj == "duplicate" or stAdj == "pending"
+        or stAdj == "rejected",
+        "459: peer handles remote adjustment envelope got " .. tostring(stAdj))
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", 9310), 5,
+        "459: peer Bob stays 5 after remote adjustment envelope")
+end
+
+do
+    -- Remote cutover classification wakes pending not_credited corrections.
+    local record = seedLiveCampaignWithItem(9311, 40)
+    local cutover = record.liveCutover
+    assertTrue(type(cutover) == "table" and type(cutover.cutoverMarker) == "string",
+        "459: cutover fixture present")
+    local boundary = tonumber(cutover.eligibilityBoundary and cutover.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(cutover.contextObservedAt) or world.time
+    local don = injectProductionDonation(record, {
+        id = "cutover-don", itemId = 9311, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = boundary + 50,
+    })
+    don.approxTxnTime = boundary + 50
+    don.gsProductionCredit = false
+    don.gsSourceCutoverMarker = cutover.cutoverMarker
+    local pendingOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "cutover-corr",
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "cutover-don",
+        value = {
+            eventId = "cutover-don",
+            eventKind = "donation",
+            attributed = "Bob-Garona",
+            attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona",
+            baseAttributedGuid = "Player-1-Alice",
+            itemId = 9311,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local stP = select(1, GS:AdmitRemoteOperation(pendingOp, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    }))
+    assertEq(stP, "pending", "459: cutover correction pending before credit got " .. tostring(stP))
+    -- Demote to staged so InstallRemoteLiveCutover reclassifies.
+    local savedCutover = {}
+    for k, v in pairs(cutover) do
+        savedCutover[k] = v
+    end
+    record.activation = GS.ACTIVATION_STAGED
+    record.liveCutover = nil
+    local stCut = GS.InstallRemoteLiveCutover(record, savedCutover, select(1, GS:GetCurrentContext()).guildKey, {
+        quarantinePending = false,
+        forceActive = true,
+    })
+    assertTrue(stCut == "accepted" or stCut == "duplicate",
+        "459: InstallRemoteLiveCutover status " .. tostring(stCut))
+    flushTimers()
+    assertEq(don.gsProductionCredit, true, "459: cutover classified donation credited")
+    assertTrue(record.operations.records["cutover-corr"] ~= nil,
+        "459: cutover wake promoted pending correction")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459: credit after cutover wake")
+end
+
+do
+    -- Bounded projection work: row visits stay O(ledger + corrections), not product.
+    local record = seedLiveCampaignWithItem(9312, 200)
+    local nDon = 120
+    local nCorr = 40
+    for i = 1, nDon do
+        injectProductionDonation(record, {
+            id = string.format("bound-don-%03d", i),
+            itemId = 9312, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    for i = 1, nCorr do
+        local donId = string.format("bound-don-%03d", i)
+        local op = select(1, GS:NewContributorCorrectionOperation(
+            donId, "Bob-Garona", "Player-1-Bob"))
+        assertTrue(op ~= nil, "459: bound prepare corr " .. tostring(i))
+        assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+            "459: bound apply corr " .. tostring(i))
+    end
+    GS.InvalidateCreditCorrectionProjection(record)
+    local ok, err, details = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(ok, "459: bound rebuild ok got " .. tostring(err))
+    local visits = tonumber(details and details.rowVisits) or tonumber(GS._creditProjectionRowVisits) or 0
+    -- One baseline scan of live(+archive) rows; must not approach corrections×ledger.
+    local ledgerRows = #(record.accounting._consumableEvents or {})
+    assertTrue(visits <= ledgerRows + 8,
+        "459: rebuild row visits near ledger size visits=" .. tostring(visits)
+            .. " ledger=" .. tostring(ledgerRows))
+    local product = nCorr * ledgerRows
+    assertTrue(visits * 20 < product,
+        "459: visits far below corrections×ledger product=" .. tostring(product)
+            .. " visits=" .. tostring(visits))
+    -- One append triggers one bounded rebuild (not nested product).
+    GS._creditProjectionRowVisits = 0
+    injectProductionDonation(record, {
+        id = "bound-extra", itemId = 9312, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        timestamp = world.time + 500,
+    })
+    -- inject bypasses AppendLedgerEvent; call Ensure after invalidate like production.
+    GS.InvalidateCreditCorrectionProjection(record)
+    local ok2, _, det2 = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(ok2, "459: bound rebuild after append")
+    local visits2 = tonumber(det2 and det2.rowVisits) or 0
+    assertTrue(visits2 <= (#(record.accounting._consumableEvents or {}) + 8),
+        "459: post-append visits still O(ledger) got " .. tostring(visits2))
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

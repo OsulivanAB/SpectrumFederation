@@ -2422,7 +2422,7 @@ local function ScheduleCreditRedriveContinuation(record, opts)
     end
     local cont = creditRedriveContinuation[record]
     if type(cont) ~= "table" then
-        cont = { cursor = 1, opts = opts or {}, scheduled = false }
+        cont = { opts = opts or {}, scheduled = false }
         creditRedriveContinuation[record] = cont
     else
         -- Coalesce wakes: broaden filters toward a full drain when mixed.
@@ -2431,9 +2431,11 @@ local function ScheduleCreditRedriveContinuation(record, opts)
         for k, v in pairs(prev) do
             merged[k] = v
         end
+        local broadened = false
         if opts then
             if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
                 merged.eventId = nil
+                broadened = true
             elseif opts.eventId and not prev.eventId and not prev.itemId then
                 merged.eventId = opts.eventId
             elseif opts.eventId and prev.itemId and not prev.eventId then
@@ -2442,6 +2444,7 @@ local function ScheduleCreditRedriveContinuation(record, opts)
             if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
                 merged.itemId = nil
                 merged.eventId = nil
+                broadened = true
             elseif opts.itemId and not (prev.eventId or prev.itemId) then
                 merged.itemId = opts.itemId
             elseif opts.itemId then
@@ -2452,6 +2455,11 @@ local function ScheduleCreditRedriveContinuation(record, opts)
             end
         end
         cont.opts = merged
+        -- Broader wake must rebuild the snapshot; mid-wave index is invalid.
+        if broadened then
+            cont.snapshot = nil
+            cont.index = nil
+        end
     end
     if cont.scheduled then
         return
@@ -2490,45 +2498,54 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     if type(ops.pending) ~= "table" then
         return 0, 0
     end
-    local ids = {}
-    for id, entry in pairs(ops.pending) do
-        local body = entry and entry.body
-        if type(body) == "table"
-            and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
-            and type(body.target) == "string" then
-            local reason = entry.reason
-            if reason ~= "untrusted_relay" and reason ~= "evidence" then
-                if CreditRedriveMatch(record, body, opts) then
-                    ids[#ids + 1] = id
+    local cont = creditRedriveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = { opts = opts, scheduled = false }
+        creditRedriveContinuation[record] = cont
+    else
+        cont.opts = opts or cont.opts
+    end
+    -- Deletion-safe wave: snapshot eligible ids once; resume by index into that
+    -- snapshot (skip entries already removed by successful admission).
+    local snapshot = cont.snapshot
+    local startIndex = tonumber(cont.index) or 1
+    if type(snapshot) ~= "table" then
+        local ids = {}
+        for id, entry in pairs(ops.pending) do
+            local body = entry and entry.body
+            if type(body) == "table"
+                and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                and type(body.target) == "string" then
+                local reason = entry.reason
+                if reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    if CreditRedriveMatch(record, body, opts) then
+                        ids[#ids + 1] = id
+                    end
                 end
             end
         end
-    end
-    table.sort(ids)
-    local cont = creditRedriveContinuation[record]
-    local startIndex = 1
-    if type(cont) == "table" and tonumber(cont.cursor) and cont.cursor >= 1 then
-        startIndex = math.floor(cont.cursor)
-        if startIndex > #ids + 1 then
-            startIndex = 1
-        end
+        table.sort(ids)
+        snapshot = ids
+        startIndex = 1
+        cont.snapshot = snapshot
+        cont.index = 1
     end
     local promoted = 0
     local attempts = 0
     local maxAttempts = tonumber(opts.maxAttempts) or 32
     creditRedriveDepth = creditRedriveDepth + 1
     local i = startIndex
-    while i <= #ids do
+    while i <= #snapshot do
         if attempts >= maxAttempts then
             break
         end
         attempts = attempts + 1
-        local id = ids[i]
+        local id = snapshot[i]
         i = i + 1
         local entry = ops.pending[id]
         local body = entry and entry.body
         if type(body) ~= "table" then
-            -- counted toward the attempt budget
+            -- Already removed or malformed; attempt still counts toward budget.
         elseif type(entry.sender) ~= "string" or entry.sender == "" then
             -- leave pending until authenticated sender is known
         else
@@ -2550,17 +2567,15 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         end
     end
     creditRedriveDepth = creditRedriveDepth - 1
-    if i <= #ids then
-        -- More work remains: save cursor and continue eventually.
-        creditRedriveContinuation[record] = {
-            cursor = i,
-            opts = opts,
-            scheduled = false,
-        }
+    if i <= #snapshot then
+        cont.snapshot = snapshot
+        cont.index = i
+        cont.opts = opts
+        cont.scheduled = false
         ScheduleCreditRedriveContinuation(record, opts)
     else
+        -- Wave complete: every snapshotted id was attempted. Idle until a new wake.
         creditRedriveContinuation[record] = {
-            cursor = 1,
             opts = opts,
             scheduled = false,
         }
@@ -5308,17 +5323,6 @@ local function BindCorrectionNewIdentity(record, event, attributed, attributedGu
     return nil, nil, nil
 end
 
-local function CopyActiveMap(map)
-    local out = {}
-    if type(map) ~= "table" then
-        return out
-    end
-    for k, v in pairs(map) do
-        out[k] = v
-    end
-    return out
-end
-
 local function IdentityBucketKey(name, guid, itemId, campaignId)
     local g = ValidGuid(guid)
     local n = NormName(name)
@@ -5338,39 +5342,66 @@ local function IdentityBucketKey(name, guid, itemId, campaignId)
     return "n:" .. n .. "\0" .. tostring(itemId) .. "\0" .. campaignId
 end
 
---- True when every personal (identity, item, campaign) total is nonnegative
--- under the candidate active correction map (#459 dependency policy).
--- Identity buckets match personal-floor semantics: GUID-first when Guild Info
--- relationships are ready; when they are not, BindCharacterIdentity may strip
--- claimed GUIDs from correction heads while durable adjustments still carry
--- GUIDs — prefer name keys in that state so one character does not split.
-local function AllPersonalNonNegative(record, activeMap)
-    if type(record) ~= "table" then
-        return false
+--- Identity bucket for correction floor aggregates (#459).
+-- GUID-first when Guild Info relationships are ready; when they are not,
+-- BindCharacterIdentity may strip claimed GUIDs from correction heads while
+-- durable adjustments still carry GUIDs — prefer name keys in that state.
+-- resolveCache: optional per-rebuild name→guid memo so readiness is not
+-- revalidated once per ledger row.
+local function CreditFloorBucketKey(record, name, guid, itemId, campaignId, relationshipsReady, resolveCache)
+    local g = ValidGuid(guid)
+    local n = NormName(name)
+    -- Name-only buckets when relationships are not ready — skip unique-GUID
+    -- resolve so projection/readiness stays O(1) in relationship checks.
+    if n and not relationshipsReady then
+        return IdentityBucketKey(n, nil, itemId, campaignId)
     end
+    if not g and n and GS.ResolveUniqueCharacterGuid then
+        if type(resolveCache) == "table" and resolveCache[n] ~= nil then
+            g = ValidGuid(resolveCache[n])
+        else
+            g = ValidGuid(GS.ResolveUniqueCharacterGuid(record, n, nil))
+            if type(resolveCache) == "table" then
+                resolveCache[n] = g or false
+            end
+        end
+    end
+    return IdentityBucketKey(n, g, itemId, campaignId)
+end
+
+local function TotalsAdd(totals, key, qty)
+    if not key or not qty or qty == 0 then
+        return
+    end
+    totals[key] = (totals[key] or 0) + qty
+end
+
+local function TotalsAllNonNegative(totals)
+    for _, total in pairs(totals) do
+        if total < 0 then
+            return false
+        end
+    end
+    return true
+end
+
+--- Scan live+archive once into durable baseline totals and an id index.
+-- Returns totals, byId, rowVisits, relationshipsReady. Callers apply correction
+-- deltas in O(1).
+local function BuildDurableCreditFloorBaseline(record)
     local relationshipsReady = GS.WitnessRelationshipsReady
         and select(1, GS.WitnessRelationshipsReady(record))
     local totals = {}
-    local function addQty(name, guid, itemId, campaignId, qty)
-        local g = ValidGuid(guid)
-        local n = NormName(name)
-        if not g and n and GS.ResolveUniqueCharacterGuid then
-            g = ValidGuid(GS.ResolveUniqueCharacterGuid(record, n, nil))
-        end
-        local key
-        if n and not relationshipsReady then
-            key = IdentityBucketKey(n, nil, itemId, campaignId)
-        else
-            key = IdentityBucketKey(n, g, itemId, campaignId)
-        end
-        if not key or not qty or qty == 0 then
-            return
-        end
-        totals[key] = (totals[key] or 0) + qty
-    end
+    local byId = {}
+    local visits = 0
+    local resolveCache = {}
     local function consider(event)
         if type(event) ~= "table" then
             return
+        end
+        visits = visits + 1
+        if type(event.id) == "string" and event.id ~= "" then
+            byId[event.id] = event
         end
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
@@ -5382,23 +5413,20 @@ local function AllPersonalNonNegative(record, activeMap)
             return
         end
         local campaignId = event.campaignId or record.currentCampaignId
-        local creditName, creditGuid
-        local override = type(activeMap) == "table" and type(event.id) == "string"
-            and activeMap[event.id] or nil
-        if type(override) == "table" then
-            creditName, creditGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
-        else
-            creditName, creditGuid = DurableCreditIdentity(event)
-        end
+        local creditName, creditGuid = DurableCreditIdentity(event)
         local isDonation = IsDonationLedgerEvent(event)
         local isAdjustment = IsAdjustmentLedgerEvent(event)
         if isDonation then
             if qty > 0 then
-                addQty(creditName, creditGuid, itemId, campaignId, qty)
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
             end
         elseif isAdjustment then
             if creditName or creditGuid then
-                addQty(creditName, creditGuid, itemId, campaignId, qty)
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
             end
         end
     end
@@ -5414,12 +5442,67 @@ local function AllPersonalNonNegative(record, activeMap)
             consider(archived[i])
         end
     end
-    for _, total in pairs(totals) do
-        if total < 0 then
-            return false
+    return totals, byId, visits, relationshipsReady
+end
+
+--- Apply or reverse one donation/adjustment correction delta on floor totals.
+local function ApplyCorrectionFloorDelta(record, totals, event, newName, newGuid, relationshipsReady, sign)
+    sign = sign or 1
+    if type(event) ~= "table" then
+        return
+    end
+    if GS.EventCountsTowardLiveProgress
+        and not GS.EventCountsTowardLiveProgress(record, event) then
+        return
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    local oldName, oldGuid = DurableCreditIdentity(event)
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if isDonation and qty > 0 then
+        TotalsAdd(totals, CreditFloorBucketKey(
+            record, oldName, oldGuid, itemId, campaignId, relationshipsReady), -sign * qty)
+        TotalsAdd(totals, CreditFloorBucketKey(
+            record, newName, newGuid, itemId, campaignId, relationshipsReady), sign * qty)
+    elseif isAdjustment and (oldName or oldGuid or newName or newGuid) then
+        -- Adjustments move credit the same way: remove from durable, add to new.
+        if oldName or oldGuid then
+            TotalsAdd(totals, CreditFloorBucketKey(
+                record, oldName, oldGuid, itemId, campaignId, relationshipsReady), -sign * qty)
+        end
+        if newName or newGuid then
+            TotalsAdd(totals, CreditFloorBucketKey(
+                record, newName, newGuid, itemId, campaignId, relationshipsReady), sign * qty)
         end
     end
-    return true
+end
+
+--- True when every personal total is nonnegative under activeMap (#459).
+-- Prefer BuildDurableCreditFloorBaseline + ApplyCorrectionFloorDelta for rebuilds.
+local function AllPersonalNonNegative(record, activeMap)
+    if type(record) ~= "table" then
+        return false
+    end
+    local totals, _, _, relationshipsReady = BuildDurableCreditFloorBaseline(record)
+    if type(activeMap) == "table" then
+        for eventId, head in pairs(activeMap) do
+            if type(head) == "table" and type(eventId) == "string" then
+                local event = GS.FindLedgerEventById(record, eventId)
+                if event then
+                    ApplyCorrectionFloorDelta(
+                        record, totals, event,
+                        NormName(head.attributed), ValidGuid(head.attributedGuid),
+                        relationshipsReady, 1)
+                end
+            end
+        end
+    end
+    return TotalsAllNonNegative(totals)
 end
 
 local creditProjectionCache = setmetatable({}, { __mode = "k" })
@@ -5441,16 +5524,23 @@ function GS.InvalidateCreditCorrectionProjection(record)
 end
 
 --- Rebuild creditCorrections from accepted correct-contributor ops (#459).
--- Deterministic active-head policy: LWW winner per canonical event, then greedy
--- activation in descending (timestamp, id) order, admitting a head only when the
--- full ledger stays personally nonnegative for every identity (covers later
--- signed adjustments that spent corrected credit).
+-- Deterministic active-head policy:
+--   1) LWW winner per canonical event
+--   2) Activate *all* production-credited winners that bind
+--   3) While personal floors fail, deactivate the oldest active winner
+--      (ascending timestamp, id) — keeps jointly required corrections together
+--      (e.g. two +10→Bob with Bob−15) while preferring newer heads when a set
+--      is overconstrained (cross-entry / later-adjustment conflicts).
+-- Floor checks use one durable ledger baseline plus O(1) deltas per head
+-- (no nested full-ledger rescans per candidate).
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
--- @return boolean ok, string|nil err, table|nil details { activeIds = {...} }
+-- @return boolean ok, string|nil err, table|nil details { activeIds, rowVisits, deactivations }
 function GS.RebuildCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
     end
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionDeactivations = 0
     local ops = record.operations
     local candidates = {}
     local function considerOp(op)
@@ -5485,11 +5575,34 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             considerOp(extraOp)
         end
     end
-    -- Group by canonical event id; keep LWW winner.
+    -- No correction ops: publish empty active set without scanning the ledger
+    -- (keeps ordinary progress projection readiness-bounded — #427 / #459).
+    if #candidates == 0 then
+        record.creditCorrections = {}
+        creditProjectionCache[record] = {
+            stamp = CreditProjectionDependencyStamp(record),
+            ok = true,
+        }
+        return true, nil, {
+            activeIds = {},
+            rowVisits = 0,
+            deactivations = 0,
+        }
+    end
+    local totals, byId, rowVisits, relationshipsReady = BuildDurableCreditFloorBaseline(record)
+    GS._creditProjectionRowVisits = rowVisits
+    -- Group by canonical event id; keep LWW winner. Resolve via one-pass index
+    -- first, then alias-aware FindLedgerEventById only on miss.
     local winners = {}
     for i = 1, #candidates do
         local op = candidates[i]
-        local event = GS.FindLedgerEventById(record, op.target)
+        local event = byId[op.target]
+        if not event then
+            event = GS.FindLedgerEventById(record, op.target)
+            if event and type(event.id) == "string" then
+                byId[event.id] = event
+            end
+        end
         if event then
             local canonical = event.id
             local cur = winners[canonical]
@@ -5513,18 +5626,19 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             event = entry.event,
         }
     end
-    -- Newest-first greedy under global personal floors so later adjustments that
-    -- spent corrected credit keep that correction active when possible.
+    -- Oldest-first order for deterministic deactivation (prefer keeping newer).
     table.sort(ordered, function(a, b)
         local ta = tonumber(a.op.timestamp) or 0
         local tb = tonumber(b.op.timestamp) or 0
         if ta ~= tb then
-            return ta > tb
+            return ta < tb
         end
-        return tostring(a.op.id) > tostring(b.op.id)
+        return tostring(a.op.id) < tostring(b.op.id)
     end)
     local activeMap = {}
     local activeIds = {}
+    local bound = {}
+    -- Activate every bindable production-credited winner, then prune.
     for i = 1, #ordered do
         local entry = ordered[i]
         local op = entry.op
@@ -5533,15 +5647,38 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             local newName, newGuid, bindErr = BindCorrectionNewIdentity(
                 record, event, op.value.attributed, op.value.attributedGuid)
             if not bindErr then
-                local tentative = CopyActiveMap(activeMap)
-                local prior = tentative[event.id]
-                tentative[event.id] = CorrectionHeadFromOp(op, event, newName, newGuid, prior)
-                if AllPersonalNonNegative(record, tentative) then
-                    activeMap = tentative
-                    activeIds[op.id] = true
-                end
+                local head = CorrectionHeadFromOp(op, event, newName, newGuid, nil)
+                activeMap[event.id] = head
+                activeIds[op.id] = true
+                bound[#bound + 1] = {
+                    event = event,
+                    op = op,
+                    newName = newName,
+                    newGuid = newGuid,
+                }
+                ApplyCorrectionFloorDelta(
+                    record, totals, event, newName, newGuid, relationshipsReady, 1)
             end
         end
+    end
+    local deactivateIdx = 1
+    while not TotalsAllNonNegative(totals) and deactivateIdx <= #bound do
+        local entry = bound[deactivateIdx]
+        deactivateIdx = deactivateIdx + 1
+        if entry and activeMap[entry.event.id] then
+            ApplyCorrectionFloorDelta(
+                record, totals, entry.event, entry.newName, entry.newGuid,
+                relationshipsReady, -1)
+            activeMap[entry.event.id] = nil
+            activeIds[entry.op.id] = nil
+            GS._creditProjectionDeactivations =
+                (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+        end
+    end
+    -- Final invariant: never publish a negative projection.
+    if not TotalsAllNonNegative(totals) then
+        activeMap = {}
+        activeIds = {}
     end
     local nActive = 0
     for _ in pairs(activeMap) do
@@ -5555,7 +5692,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         stamp = CreditProjectionDependencyStamp(record),
         ok = true,
     }
-    return true, nil, { activeIds = activeIds }
+    return true, nil, {
+        activeIds = activeIds,
+        rowVisits = rowVisits,
+        deactivations = GS._creditProjectionDeactivations,
+    }
 end
 
 --- Ensure the credit projection matches current ops/ledger dependency stamps.
