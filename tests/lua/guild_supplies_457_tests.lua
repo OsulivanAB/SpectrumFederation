@@ -5569,6 +5569,310 @@ do
     end
 end
 
+-- Bank-side Raid Supplies panel shares Settings window opacity (#461 follow-up).
+do
+    SpectrumFederationDB = {
+        version = 3,
+        global = { settingsWindowOpacity = 75 },
+        lootHelper = { profiles = {}, activeProfileId = nil },
+    }
+    SpectrumFederationCharDB = {}
+    local savedTimer = C_Timer
+    C_Timer = nil
+    loadModule("SpectrumFederation/modules/Settings/Schema.lua")
+    loadModule("SpectrumFederation/modules/Settings/Store.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua")
+    loadModule("SpectrumFederation/modules/Settings/Apply.lua")
+    SF.SettingsStore.db = nil
+    SF.SettingsStore.charDb = nil
+    SF.SettingsStore._callbacks = nil
+    SF.SettingsStore:Init()
+    SF.SettingsApply.initialized = nil
+    SF.SettingsApply._debounce = nil
+    SF.SettingsApply:Init()
+    assertEq(SF.SettingsStore:Get("global.settingsWindowOpacity"), 75,
+        "bank-opacity: store holds nondefault 75")
+
+    local savedCreateFrame = _G.CreateFrame
+    _G.CreateFrame = function(frameType, name, parent, template)
+        local f = {
+            name = name,
+            shown = false,
+            scripts = {},
+            _text = "",
+            alpha = 1,
+            backdrop = nil,
+            backdropColor = nil,
+            width = 0,
+            height = 0,
+            points = {},
+        }
+        function f:SetSize(w, h) f.width = tonumber(w) or 0; f.height = tonumber(h) or 0 end
+        function f:SetWidth(w) f.width = tonumber(w) or 0 end
+        function f:SetHeight(h) f.height = tonumber(h) or 0 end
+        function f:GetWidth() return f.width end
+        function f:GetHeight() return f.height end
+        function f:ClearAllPoints() f.points = {} end
+        function f:SetPoint(point, relative, relativePoint, x, y)
+            f.points[#f.points + 1] = {
+                point = point, relative = relative, relativePoint = relativePoint,
+                x = x, y = y,
+            }
+        end
+        function f:Hide()
+            local wasShown = f.shown
+            f.shown = false
+            if wasShown and f.scripts.OnHide then f.scripts.OnHide(f) end
+        end
+        function f:Show() f.shown = true end
+        function f:IsShown() return f.shown end
+        function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:GetScript(k) return f.scripts[k] end
+        function f:SetMovable() end
+        function f:EnableMouse() end
+        function f:RegisterForDrag() end
+        function f:RegisterEvent() end
+        function f:UnregisterEvent() end
+        function f:UnregisterAllEvents() end
+        function f:SetFrameStrata() end
+        function f:SetFrameLevel() end
+        function f:SetScrollChild(child) f.scrollChild = child end
+        function f:GetScrollChild() return f.scrollChild end
+        function f:SetBackdrop(info) f.backdrop = info end
+        function f:SetBackdropColor(r, g, b, a)
+            f.backdropColor = { r = r, g = g, b = b, a = a }
+        end
+        function f:SetAlpha(a) f.alpha = a end
+        function f:GetAlpha() return f.alpha end
+        function f:SetText(t)
+            f._text = tostring(t or "")
+            if f.scripts.OnTextChanged then f.scripts.OnTextChanged(f) end
+        end
+        function f:GetText() return f._text end
+        function f:SetShown(v) f.shown = v and true or false end
+        function f:Enable() end
+        function f:Disable() end
+        function f:SetAutoFocus() end
+        function f:SetNumeric() end
+        function f:SetMaxLetters() end
+        function f:SetJustifyH() end
+        function f:SetMinMaxValues() end
+        function f:SetValue() end
+        function f:SetStatusBarTexture() end
+        function f:SetStatusBarColor() end
+        f._hasFocus = false
+        function f:HasFocus() return f._hasFocus and true or false end
+        function f:ClearFocus() f._hasFocus = false end
+        function f:SetFocus() f._hasFocus = true end
+        function f:CreateFontString()
+            local fs = {
+                width = 0, points = {}, shown = true, _text = "",
+            }
+            function fs:SetPoint(point, relative, relativePoint, x, y)
+                fs.points[#fs.points + 1] = {
+                    point = point, relative = relative, relativePoint = relativePoint,
+                    x = x, y = y,
+                }
+            end
+            function fs:ClearAllPoints() fs.points = {} end
+            function fs:SetJustifyH() end
+            function fs:SetWordWrap() end
+            function fs:SetText(t) fs._text = tostring(t or "") end
+            function fs:GetText() return fs._text end
+            function fs:SetFontObject() end
+            function fs:SetTextColor() end
+            function fs:SetWidth(w) fs.width = tonumber(w) or 0 end
+            function fs:GetWidth() return fs.width end
+            function fs:Show() fs.shown = true end
+            function fs:Hide() fs.shown = false end
+            return fs
+        end
+        function f:CreateTexture()
+            return {
+                SetPoint = function() end, SetSize = function() end,
+                SetTexture = function() end, Show = function() end, Hide = function() end,
+                SetAllPoints = function() end, SetVertexColor = function() end,
+            }
+        end
+        return f
+    end
+    _G.UIParent = _G.UIParent or {}
+    _G.InCombatLockdown = function() return false end
+    SF.SettingsWindow._opacityTargets = {}
+    -- Keep review identity fresh for this block.
+    if SF.ConsumablesRuntime then
+        SF.ConsumablesRuntime.review = nil
+        SF.ConsumablesRuntime.mobileHolder = nil
+    end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local RT = SF.ConsumablesRuntime
+    RT.WatchGuildBankFrame = function() end
+    RT.EnsureMobileButton = function() return nil end
+    RT.SyncMobileButton = function() end
+    RT.AlignReviewToGuildBank = function() end
+    RT.MatchReviewHeightToGuildBank = function() end
+    RT.RebuildReview = function() end
+    RT.EnsureItemIconWatch = function() end
+
+    local targetsBefore = #(SF.SettingsWindow._opacityTargets or {})
+    -- First open without main Settings window: create + apply saved opacity.
+    assertTrue(SF.SettingsWindow.frame == nil or SF.SettingsWindow.frame.shown ~= true,
+        "bank-opacity: main Settings window not required")
+    RT:ShowReview()
+    local panel = RT.review
+    assertTrue(panel ~= nil, "bank-opacity: review panel created")
+    assertTrue(panel.backdrop and panel.backdrop.bgFile == "Interface\\Buttons\\WHITE8X8",
+        "bank-opacity: panel uses WHITE8X8 backdrop foundation")
+    assertTrue(panel.backdrop and panel.backdrop.edgeFile == "Interface\\DialogFrame\\UI-DialogBox-Border",
+        "bank-opacity: panel retains DialogBox border")
+    assertTrue(panel.backdropColor and math.abs((panel.backdropColor.a or 0) - 0.75) < 1e-6,
+        "bank-opacity: first open applies saved nondefault 75%")
+    assertEq(panel.alpha, 1, "bank-opacity: frame alpha remains 1")
+    assertEq(#SF.SettingsWindow._opacityTargets, targetsBefore + 1,
+        "bank-opacity: panel registered once")
+
+    -- Live setting change updates an already-visible panel.
+    SF.SettingsStore:Set("global.settingsWindowOpacity", 100)
+    assertTrue(panel.backdropColor and math.abs((panel.backdropColor.a or 0) - 1.0) < 1e-6,
+        "bank-opacity: live Set updates visible panel to 100%")
+    assertEq(panel.alpha, 1, "bank-opacity: live update does not SetAlpha the frame")
+
+    -- Close, change, reopen uses current value without accumulating targets.
+    panel:Hide()
+    local targetsAfterClose = #SF.SettingsWindow._opacityTargets
+    SF.SettingsStore:Set("global.settingsWindowOpacity", 70)
+    RT:ShowReview()
+    assertTrue(panel.backdropColor and math.abs((panel.backdropColor.a or 0) - 0.70) < 1e-6,
+        "bank-opacity: reopen applies current 70%")
+    assertEq(#SF.SettingsWindow._opacityTargets, targetsAfterClose,
+        "bank-opacity: reopen does not accumulate opacity targets")
+
+    SF.SettingsStore:ResetAll()
+    assertEq(SF.SettingsStore:Get("global.settingsWindowOpacity"), 90,
+        "bank-opacity: ResetAll restores default")
+    assertTrue(panel.backdropColor and math.abs((panel.backdropColor.a or 0) - 0.90) < 1e-6,
+        "bank-opacity: ResetAll reapplies 90% to bank panel")
+
+    if savedCreateFrame then
+        _G.CreateFrame = savedCreateFrame
+    end
+    C_Timer = savedTimer
+end
+
+-- Quick Withdraw item rows expand name column; pooled reuse restores deposit geometry.
+do
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local RT = SF.ConsumablesRuntime
+    assertTrue(type(RT.ApplyDepositRowLayout) == "function",
+        "qw-layout: ApplyDepositRowLayout present")
+    assertTrue(type(RT.ApplyQuickWithdrawItemRowLayout) == "function",
+        "qw-layout: ApplyQuickWithdrawItemRowLayout present")
+
+    local function makeTrackedFontString()
+        local fs = { width = 0, points = {}, shown = true, _text = "", wordWrap = nil }
+        function fs:ClearAllPoints() fs.points = {} end
+        function fs:SetPoint(point, relative, relativePoint, x, y)
+            fs.points[#fs.points + 1] = {
+                point = point, relative = relative, relativePoint = relativePoint,
+                x = tonumber(x) or 0, y = tonumber(y) or 0,
+            }
+        end
+        function fs:SetWidth(w) fs.width = tonumber(w) or 0 end
+        function fs:GetWidth() return fs.width end
+        function fs:SetJustifyH() end
+        function fs:SetWordWrap(v) fs.wordWrap = v and true or false end
+        function fs:SetText(t) fs._text = tostring(t or "") end
+        function fs:Show() fs.shown = true end
+        function fs:Hide() fs.shown = false end
+        return fs
+    end
+    local function makeTrackedRegion(kind)
+        local r = {
+            kind = kind, width = 0, height = 0, points = {}, shown = true,
+            scripts = {}, _text = "", _hasFocus = false,
+        }
+        function r:ClearAllPoints() r.points = {} end
+        function r:SetPoint(point, relative, relativePoint, x, y)
+            r.points[#r.points + 1] = {
+                point = point, relative = relative, relativePoint = relativePoint,
+                x = tonumber(x) or 0, y = tonumber(y) or 0,
+            }
+        end
+        function r:SetSize(w, h) r.width = tonumber(w) or 0; r.height = tonumber(h) or 0 end
+        function r:SetWidth(w) r.width = tonumber(w) or 0 end
+        function r:SetHeight(h) r.height = tonumber(h) or 0 end
+        function r:GetWidth() return r.width end
+        function r:Show() r.shown = true end
+        function r:Hide() r.shown = false end
+        function r:SetScript(k, fn) r.scripts[k] = fn end
+        function r:SetText(t) r._text = tostring(t or "") end
+        function r:GetText() return r._text end
+        function r:SetAutoFocus() end
+        function r:SetNumeric() end
+        function r:Enable() end
+        function r:Disable() end
+        function r:HasFocus() return r._hasFocus end
+        return r
+    end
+
+    local row = makeTrackedRegion("row")
+    row.width = 212
+    row.IconButton = makeTrackedRegion("icon")
+    row.IconButton.width = 18
+    row.Progress = makeTrackedFontString()
+    row.Edit = makeTrackedRegion("edit")
+    row.Button = makeTrackedRegion("button")
+    row.GoalMet = makeTrackedFontString()
+
+    RT:ApplyDepositRowLayout(row)
+    assertEq(row._reviewLayout, "deposit", "qw-layout: deposit layout tag")
+    assertEq(row.Progress.width, 56, "qw-layout: deposit progress width is 56")
+    assertEq(row.Edit.points[1] and row.Edit.points[1].point, "LEFT",
+        "qw-layout: deposit edit anchors LEFT of progress")
+    assertEq(row.Edit.width, 34, "qw-layout: deposit edit width")
+    assertEq(row.Button.points[1] and row.Button.points[1].point, "LEFT",
+        "qw-layout: deposit button anchors LEFT of edit")
+    assertEq(row.Button.width, 72, "qw-layout: deposit button width")
+    assertEq(row.GoalMet.width, 34 + 4 + 72,
+        "qw-layout: deposit GoalMet spans edit+button")
+
+    RT:ApplyQuickWithdrawItemRowLayout(row)
+    assertEq(row._reviewLayout, "quickWithdraw", "qw-layout: quick-withdraw layout tag")
+    local expectedNameW = 212 - 18 - 4 - 4 - 34 - 4
+    assertEq(row.Progress.width, expectedNameW,
+        "qw-layout: quick-withdraw name column expands past deposit 56")
+    assertTrue(row.Progress.width > 56,
+        "qw-layout: quick-withdraw name wider than deposit progress")
+    assertEq(row.Edit.points[1] and row.Edit.points[1].point, "RIGHT",
+        "qw-layout: craft-count edit anchors to row RIGHT")
+    assertEq(row.Edit.points[1] and row.Edit.points[1].x, -4,
+        "qw-layout: craft-count keeps right-edge pad")
+    assertEq(row.Edit.width, 34, "qw-layout: craft-count edit size unchanged")
+    assertEq(row.GoalMet.points[1] and row.GoalMet.points[1].point, "RIGHT",
+        "qw-layout: unavailable GoalMet uses right column")
+    assertEq(row.GoalMet.width, 34, "qw-layout: unavailable GoalMet width matches edit")
+
+    -- Pooled reuse for deposit / Withdraw action / Clear must restore geometry.
+    RT:ApplyDepositRowLayout(row)
+    assertEq(row._reviewLayout, "deposit", "qw-layout: reuse restores deposit tag")
+    assertEq(row.Progress.width, 56, "qw-layout: reuse restores deposit progress width")
+    assertEq(row.Edit.points[1] and row.Edit.points[1].point, "LEFT",
+        "qw-layout: reuse restores LEFT edit anchor")
+    assertEq(row.Button.points[1] and row.Button.points[1].point, "LEFT",
+        "qw-layout: reuse restores LEFT button anchor")
+    assertEq(row.Button.width, 72, "qw-layout: reuse restores deposit button size")
+    assertEq(row.GoalMet.width, 34 + 4 + 72,
+        "qw-layout: reuse restores GoalMet span for completed goals")
+    -- Edit must not remain RIGHT-anchored after leaving Quick Withdraw.
+    local editIsRight = false
+    for i = 1, #(row.Edit.points or {}) do
+        if row.Edit.points[i].point == "RIGHT" then
+            editIsRight = true
+        end
+    end
+    assertFalse(editIsRight, "qw-layout: reuse clears RIGHT edit anchor")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failure(s)\n", failures))
     os.exit(1)
