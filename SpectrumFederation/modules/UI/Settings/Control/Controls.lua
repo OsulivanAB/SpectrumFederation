@@ -2213,9 +2213,36 @@ function Controls:AddSideBySideScrollLists(section, opts)
 				box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 			end
 
+			-- UIPanelScrollFrameTemplate places ScrollBar outside the scroll
+			-- frame to the right. In adjacent panels that overhang crosses into
+			-- the neighbor, so reserve an internal gutter and re-anchor the bar
+			-- inside this panel (same approach as PageBuilder).
+			local SCROLLBAR_INSET = 24
+			local SCROLLBAR_RIGHT_OFFSET = -2
+			local SCROLLBAR_BUTTON_CLEARANCE = 8
+
 			local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
-			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", 0, 0)
-			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", 0, 0)
+			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", borderInset, -borderInset)
+			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -SCROLLBAR_INSET, borderInset)
+
+			local sb = scroll.ScrollBar
+			if sb then
+				sb:ClearAllPoints()
+				sb:SetPoint(
+					"TOPRIGHT",
+					box,
+					"TOPRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					-(borderInset + SCROLLBAR_BUTTON_CLEARANCE)
+				)
+				sb:SetPoint(
+					"BOTTOMRIGHT",
+					box,
+					"BOTTOMRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					borderInset + SCROLLBAR_BUTTON_CLEARANCE
+				)
+			end
 
 			local content = CreateFrame("Frame", nil, scroll)
 			content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
@@ -2341,12 +2368,15 @@ function Controls:AddSideBySideScrollLists(section, opts)
 				end
 				content:SetHeight(math.max(1, contentH))
 
-				local showScroll = contentH > (panelHeight - borderInset * 2)
-				local sbw = SetScrollBarShown(showScroll)
+				-- Scroll frame already reserves a right gutter for the bar, so
+				-- do not subtract ScrollBar width again from content width.
+				local visibleH = math.max(1, (scroll:GetHeight() or 0))
+				local showScroll = contentH > visibleH
+				SetScrollBarShown(showScroll)
 				local w = scroll:GetWidth() or 0
 				local availableWidth = 0
 				if w > 0 then
-					availableWidth = math.max(1, w - sbw - 4)
+					availableWidth = math.max(1, w - 4)
 					content:SetWidth(availableWidth)
 				end
 

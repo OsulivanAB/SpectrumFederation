@@ -1143,7 +1143,227 @@ do
     assertTrue(calls <= 80, "440: repeated refreshes stay bounded")
 end
 
+---------------------------------------------------------------------------
+-- #468 / #469 — Side-by-side panel scrollbars stay inside each panel
+---------------------------------------------------------------------------
+
+do
+    if type(CopyTable) ~= "function" then
+        function CopyTable(src)
+            if type(src) ~= "table" then
+                return src
+            end
+            local copy = {}
+            for key, value in pairs(src) do
+                if type(value) == "table" then
+                    copy[key] = CopyTable(value)
+                else
+                    copy[key] = value
+                end
+            end
+            return copy
+        end
+    end
+
+    local SCROLLBAR_INSET = 24
+    local SCROLLBAR_RIGHT_OFFSET = -2
+    local borderInset = 4
+    local buttonClearance = 8
+
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Assignments")
+    section.Content:SetWidth(640)
+
+    local many = {}
+    for i = 1, 40 do
+        many[i] = {
+            text = string.format("VeryLongCharacterName-%02d-Garona", i),
+            guid = "Player-1-" .. tostring(i),
+            clusterId = "Player-1-" .. tostring(i),
+            canRemove = false,
+            canAction = false,
+        }
+    end
+    local selected = "Player-1-1"
+    local altItems = {
+        {
+            text = "AltWithAQuiteLongName-Garona",
+            guid = "Player-1-alt",
+            mainGuid = "Player-1-1",
+            role = "alt",
+            canRemove = true,
+            canAction = true,
+        },
+    }
+
+    Controls:AddSideBySideScrollLists(section, {
+        panelHeight = 220,
+        gap = 12,
+        left = {
+            title = "Main",
+            getItems = function()
+                return many
+            end,
+            getSelectedKey = function()
+                return selected
+            end,
+            onSelect = function(item)
+                selected = item.guid
+            end,
+        },
+        right = {
+            title = "Alts",
+            compactColumns = true,
+            actionTexture = "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
+            getItems = function()
+                return altItems
+            end,
+            onAction = function() end,
+            onRemove = function() end,
+            emptyText = "No assigned alts.",
+        },
+    })
+    pageBuilder:Finalize()
+
+    local function findPanelScroll(panelFrame)
+        local function walk(node)
+            if not node then
+                return nil
+            end
+            if node.kind == "ScrollFrame" then
+                return node
+            end
+            for i = 1, #(node.children or {}) do
+                local found = walk(node.children[i])
+                if found then
+                    return found
+                end
+            end
+            return nil
+        end
+        return walk(panelFrame)
+    end
+
+    local function findBox(panelFrame)
+        local function walk(node)
+            if not node then
+                return nil
+            end
+            -- Bordered host child that owns the scroll frame.
+            if node.kind == "Frame" then
+                for i = 1, #(node.children or {}) do
+                    if node.children[i].kind == "ScrollFrame" then
+                        return node
+                    end
+                end
+            end
+            for i = 1, #(node.children or {}) do
+                local found = walk(node.children[i])
+                if found then
+                    return found
+                end
+            end
+            return nil
+        end
+        return walk(panelFrame)
+    end
+
+    -- Prefer the content row whose children each contain a ScrollFrame.
+    -- Section title rows also have two children (texture/font), so do not
+    -- select by child count alone.
+    local dualRow, leftPanel, rightPanel
+    for _, child in ipairs(section.Content.children or {}) do
+        if child.kind == "Frame" and #(child.children or {}) >= 2 then
+            local a, b = child.children[1], child.children[2]
+            if a and b and findPanelScroll(a) and findPanelScroll(b) then
+                dualRow, leftPanel, rightPanel = child, a, b
+                break
+            end
+        end
+    end
+    assertTrue(dualRow ~= nil, "468-layout: dual-panel row present")
+    dualRow:SetSize(640, 238)
+    leftPanel:SetSize(314, 238)
+    rightPanel:SetSize(314, 238)
+
+    local leftScroll = findPanelScroll(leftPanel)
+    local rightScroll = findPanelScroll(rightPanel)
+    local leftBox = findBox(leftPanel)
+    local rightBox = findBox(rightPanel)
+    assertTrue(leftScroll ~= nil and rightScroll ~= nil, "468-layout: both panels have scroll frames")
+    assertTrue(leftBox ~= nil and rightBox ~= nil, "468-layout: both panels have bordered boxes")
+    assertTrue(leftScroll.ScrollBar ~= nil and rightScroll.ScrollBar ~= nil,
+        "468-layout: both panels expose ScrollBar")
+
+    fireEvent(leftScroll, "OnSizeChanged", leftScroll:GetWidth(), leftScroll:GetHeight())
+    fireEvent(rightScroll, "OnSizeChanged", rightScroll:GetWidth(), rightScroll:GetHeight())
+    -- Force a width so content math runs with a real viewport.
+    leftScroll:SetSize(280, 200)
+    rightScroll:SetSize(280, 200)
+    fireEvent(leftScroll, "OnSizeChanged", 280, 200)
+    fireEvent(rightScroll, "OnSizeChanged", 280, 200)
+
+    local leftBottomRight = pointAnchor(leftScroll, "BOTTOMRIGHT")
+    local rightBottomRight = pointAnchor(rightScroll, "BOTTOMRIGHT")
+    assertTrue(leftBottomRight ~= nil, "468-layout: left scroll has BOTTOMRIGHT")
+    assertTrue(rightBottomRight ~= nil, "468-layout: right scroll has BOTTOMRIGHT")
+    assertEq(leftBottomRight.x, -SCROLLBAR_INSET,
+        "468-layout: left scroll reserves internal scrollbar gutter")
+    assertEq(rightBottomRight.x, -SCROLLBAR_INSET,
+        "468-layout: right scroll reserves internal scrollbar gutter")
+    assertEq(leftBottomRight.relativeTo, leftBox,
+        "468-layout: left scroll anchors to its own box")
+    assertEq(rightBottomRight.relativeTo, rightBox,
+        "468-layout: right scroll anchors to its own box")
+
+    local function assertBarInsidePanel(scroll, box, label)
+        local sb = scroll.ScrollBar
+        assertTrue(sb ~= nil, label .. " scrollbar exists")
+        local top = pointAnchor(sb, "TOPRIGHT")
+        local bottom = pointAnchor(sb, "BOTTOMRIGHT")
+        assertTrue(top ~= nil and bottom ~= nil, label .. " scrollbar has vertical anchors")
+        assertEq(top.relativeTo, box, label .. " scrollbar TOPRIGHT relative to panel box")
+        assertEq(bottom.relativeTo, box, label .. " scrollbar BOTTOMRIGHT relative to panel box")
+        assertEq(top.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar stays inside right edge")
+        assertEq(bottom.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar bottom stays inside right edge")
+        assertEq(top.y, -(borderInset + buttonClearance),
+            label .. " scrollbar top aligns with content clearance")
+        assertEq(bottom.y, borderInset + buttonClearance,
+            label .. " scrollbar bottom aligns with content clearance")
+        -- Must not be anchored outside via the scroll frame's TOPRIGHT (Blizzard default).
+        assertTrue(top.relativeTo ~= scroll,
+            label .. " scrollbar is not overhanging from the scroll frame")
+    end
+
+    assertBarInsidePanel(leftScroll, leftBox, "468-layout left")
+    assertBarInsidePanel(rightScroll, rightBox, "468-layout right")
+
+    assertEq(leftPanel:GetHeight(), rightPanel:GetHeight(),
+        "468-layout: Main and Alts panels share height")
+    assertTrue(leftScroll.ScrollBar:IsShown(),
+        "468-layout: overflowing Main list shows its scrollbar")
+    -- Content width uses the already-inset scroll viewport (no second sbw subtract).
+    assertEq(leftScroll.scrollChild:GetWidth(), 276,
+        "468-layout: content uses scroll width minus padding only")
+
+    -- Long alt name with action+remove must keep a finite compact text width.
+    local altRows = {}
+    for _, child in ipairs(rightScroll.scrollChild.children or {}) do
+        if child.Text and child.Remove and child.Action then
+            altRows[#altRows + 1] = child
+        end
+    end
+    assertTrue(altRows[1] ~= nil, "468-layout: alt row with action+remove present")
+    assertTrue((altRows[1].Text.width or 0) > 0, "468-layout: alt text width is clamped")
+    assertTrue((altRows[1].Text.width or 0) < 280,
+        "468-layout: long alt name does not consume the full panel width")
+end
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
 end
+
