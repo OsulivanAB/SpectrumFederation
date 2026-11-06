@@ -177,18 +177,52 @@ local function ReportStatus(ctx, status, reason, extra)
 	RefreshPageControls()
 end
 
-local function SuggestionItems(prefix)
+--- Autocomplete suggestions for the Main or Alt field (#470).
+-- `field` is "main" or "alt". Role eligibility uses the Guild Info graph via
+-- GetCharacterRole and is applied before the visible-results cap.
+local function SuggestionItems(prefix, field)
 	local g = GI()
 	local roster = Roster()
 	if not roster or not roster.complete or not roster.Suggest then
 		return {}
 	end
-	local rows = roster:Suggest(prefix, 10)
+	-- Fail closed while relationship readiness is unknown/syncing; do not treat
+	-- missing roles as unassigned.
+	if not g or not g.GetCharacterRole then
+		return {}
+	end
+	if g.GetRelationshipReadiness then
+		local readiness = g:GetRelationshipReadiness()
+		if readiness ~= "ready" then
+			return {}
+		end
+	end
+
+	local excludeGuid = nil
+	if field == "main" and altResolved and altResolved.guid then
+		excludeGuid = altResolved.guid
+	elseif field == "alt" and mainResolved and mainResolved.guid then
+		excludeGuid = mainResolved.guid
+	end
+
+	local rows = roster:Suggest(prefix, 10, function(row)
+		if excludeGuid and row.guid == excludeGuid then
+			return false
+		end
+		-- GetCharacterRole: "main" = main with ≥1 alts; "alt" = assigned alt;
+		-- nil = unassigned or solo main (eligible for both fields).
+		local role = g:GetCharacterRole(row.guid)
+		if field == "main" then
+			return role ~= "alt"
+		end
+		return role ~= "main"
+	end)
+
 	local out = {}
 	for i = 1, #rows do
 		local row = rows[i]
 		local label = row.nameRealm
-		if g and g.ColorizeName then
+		if g.ColorizeName then
 			label = g.ColorizeName(row.nameRealm, row.classFile)
 		end
 		out[#out + 1] = {
@@ -677,7 +711,7 @@ local function Definition()
 							mainText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or mainText)
+							return SuggestionItems(prefix or mainText, "main")
 						end,
 						onResolved = function(_, item)
 							if item then
@@ -712,7 +746,7 @@ local function Definition()
 							altText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or altText)
+							return SuggestionItems(prefix or altText, "alt")
 						end,
 						onResolved = function(_, item)
 							if item then
