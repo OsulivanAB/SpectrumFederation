@@ -3143,8 +3143,10 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         GS._creditProjectionStructureCopyVisits = 0
         GS._creditProjectionTraversalVisits = 0
         GS._creditProjectionProvenanceVisits = 0
-        GS._creditRedriveLookupVisits = 0
-        GS._creditRedriveMatchVisits = 0
+        -- Keep _creditRedriveLookupVisits / _creditRedriveMatchVisits cumulative
+        -- across timer-slice re-entries so first-callback charges remain visible
+        -- to drain assertions (#459 CodeRabbit RA/CB evidence). Tests zero them
+        -- explicitly before a measured wave; soft budget uses callbackWork.
     end
     GS._creditProjectionAccumulating = true
     -- Always merge the incoming wake; never overwrite cont.opts with a narrow
@@ -3197,9 +3199,17 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             cont.snapshotBuilding = {}
             chargeMatch(#cands > 0 and 1 or 0)
         end
-        -- Full wakes need no ledger index for matching.
-        local needsIndex = (type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "")
+        -- Targeted wakes need the index for matching. Full wakes with eligible
+        -- candidates also need the complete stamp-current paced index so nested
+        -- Admit FindLedgerEventById reuses it (#459 discussion_r4498394368).
+        -- Empty wakes stay idle without indexing.
+        local cands = cont.pendingCandidates
+        local hasCandidates = type(cands) == "table" and #cands > 0
+        local needsIndex = hasCandidates and (
+            cont.fullWake == true
+            or (type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "")
             or tonumber(waveOpts.itemId) ~= nil
+        )
         local byId = cont.lookupById
         local primaryByAlias = cont.lookupPrimary
         local filterCanon = nil
@@ -3222,7 +3232,6 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                     record, waveOpts.eventId, byId, primaryByAlias)
             end
         end
-        local cands = cont.pendingCandidates
         local building = cont.snapshotBuilding or {}
         local mi = tonumber(cont.matchIndex) or 1
         while mi <= #cands do
@@ -5708,12 +5717,42 @@ local function CountCreditEventAliasKeys(map)
     return n
 end
 
+--- Follow registry/durable alias overlays to a terminal id without ledger scans.
+-- Used by required-binding collection so body resolution cannot stop on an
+-- intermediate hop (#459 discussion_r4498359287).
+local function FollowRequiredAliasTerminal(map, primaryIndex, startId)
+    if type(startId) ~= "string" or startId == "" then
+        return nil
+    end
+    local cur = startId
+    local seen = { [startId] = true }
+    for _ = 1, 8 do
+        local nxt = type(primaryIndex) == "table" and primaryIndex[cur] or nil
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            nxt = type(map) == "table" and map[cur] or nil
+        end
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            break
+        end
+        if seen[nxt] then
+            break
+        end
+        seen[nxt] = true
+        cur = nxt
+    end
+    return ValidTxnId(cur) or cur
+end
+
 --- Collect alias→canonical bindings required by retained accepted corrections
 -- and authenticated pending corrections. Prefers head keys (credit:<canon>) and
 -- registry/map-backed bodies so reclaim never drops a binding still needed after
 -- registry eviction (#459 G1 / review-5792509439 A).
+-- Head-derived terminals must not be downgraded by retained operation bodies
+-- (A→C must not become A→B); keep complete necessary edge closure (#459
+-- discussion_r4498359287 / 4498427811).
 local function CollectRequiredCreditEventAliases(record)
     local required = {}
+    local headProtected = {}
     if type(record) ~= "table" or type(record.operations) ~= "table" then
         return required
     end
@@ -5725,42 +5764,61 @@ local function CollectRequiredCreditEventAliases(record)
     -- One bounded registry pass — never FindRegistryByTxn per correction
     -- (#459 discussion_r4488856046).
     local primaryIndex = BuildTxnRegistryPrimaryIndex(cfg)
-    local function note(alias, canon)
+    local function note(alias, canon, protect)
         alias = ValidTxnId(alias)
         canon = ValidTxnId(canon)
-        if alias and canon and alias ~= canon then
-            required[alias] = canon
+        if not (alias and canon and alias ~= canon) then
+            return
         end
-    end
-    local function resolvePrimary(txnId)
-        if type(txnId) ~= "string" or txnId == "" then
-            return nil
+        local terminal = FollowRequiredAliasTerminal(map, primaryIndex, canon) or canon
+        if alias == terminal then
+            return
         end
-        local mapped = primaryIndex[txnId]
-        if type(mapped) == "string" and mapped ~= "" then
-            return ValidTxnId(mapped) or mapped
+        if headProtected[alias] and not protect then
+            -- Head already owns a terminal binding for this alias.
+            return
         end
-        if type(map) == "table" and type(map[txnId]) == "string" and map[txnId] ~= "" then
-            return ValidTxnId(map[txnId]) or map[txnId]
+        local existing = required[alias]
+        if type(existing) == "string" and existing ~= "" and existing ~= terminal then
+            local existingTerm = FollowRequiredAliasTerminal(map, primaryIndex, existing)
+                or existing
+            if existingTerm == terminal then
+                -- Normalize to the shared terminal; keep head protection.
+                required[alias] = terminal
+            elseif protect then
+                required[alias] = terminal
+            else
+                -- Do not replace a longer/terminal binding with an intermediate.
+                return
+            end
+        else
+            required[alias] = terminal
         end
-        return txnId
+        if protect then
+            headProtected[alias] = true
+        end
     end
     local function noteCorrectionBody(body)
         if type(body) ~= "table" or body.kind ~= kindCorrect then
             return
         end
         local tid = body.target
-        local primary = resolvePrimary(tid)
-        if type(primary) == "string" and type(tid) == "string" and primary ~= tid then
-            note(tid, primary)
+        if type(tid) == "string" and tid ~= "" then
+            local primary = FollowRequiredAliasTerminal(map, primaryIndex, tid)
+            if type(primary) == "string" and primary ~= tid then
+                note(tid, primary, false)
+            end
         end
         local ve = body.value and body.value.eventId
         if type(ve) == "string" and ve ~= "" then
-            local p2 = resolvePrimary(ve)
+            local p2 = FollowRequiredAliasTerminal(map, primaryIndex, ve)
             if type(p2) == "string" and p2 ~= ve then
-                note(ve, p2)
-            elseif type(primary) == "string" and ve ~= primary then
-                note(ve, primary)
+                note(ve, p2, false)
+            elseif type(tid) == "string" and tid ~= "" then
+                local primary = FollowRequiredAliasTerminal(map, primaryIndex, tid)
+                if type(primary) == "string" and ve ~= primary then
+                    note(ve, primary, false)
+                end
             end
         end
     end
@@ -5775,9 +5833,9 @@ local function CollectRequiredCreditEventAliases(record)
                         canon = targetKey:sub(#prefix + 1)
                     end
                     if type(canon) == "string" and canon ~= "" then
-                        note(body.target, canon)
+                        note(body.target, canon, true)
                         if type(body.value) == "table" then
-                            note(body.value.eventId, canon)
+                            note(body.value.eventId, canon, true)
                         end
                     end
                 end
@@ -5797,6 +5855,81 @@ local function CollectRequiredCreditEventAliases(record)
                 local reason = entry.reason
                 if reason ~= "untrusted_relay" and reason ~= "evidence" then
                     noteCorrectionBody(entry.body)
+                end
+            end
+        end
+    end
+    -- Complete necessary edge closure from the durable map: keep intermediate
+    -- hops that still reach a required terminal (A→B and B→C when A→C is owned).
+    -- Path walk covers A→B→C before collapse; a bounded map scan also retains
+    -- sibling edges that still terminate at an owned terminal after prune
+    -- rewrites A→C directly (so export/adoption does not drop B→C).
+    if type(map) == "table" then
+        local aliases = {}
+        local ownedTerminals = {}
+        for alias, terminal in pairs(required) do
+            aliases[#aliases + 1] = alias
+            if type(terminal) == "string" and terminal ~= "" then
+                ownedTerminals[terminal] = true
+            end
+        end
+        for ai = 1, #aliases do
+            local alias = aliases[ai]
+            local terminal = required[alias]
+            if type(terminal) == "string" and terminal ~= "" then
+                local cur = alias
+                for _ = 1, 8 do
+                    local nxt = map[cur]
+                    if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+                        break
+                    end
+                    local endId = FollowRequiredAliasTerminal(map, primaryIndex, nxt) or nxt
+                    if endId ~= terminal then
+                        break
+                    end
+                    if not headProtected[cur] then
+                        if nxt == terminal then
+                            required[cur] = terminal
+                        elseif required[cur] == nil then
+                            required[cur] = nxt
+                        end
+                    end
+                    if nxt ~= terminal and required[nxt] == nil then
+                        required[nxt] = terminal
+                        ownedTerminals[terminal] = true
+                    end
+                    cur = nxt
+                    if cur == terminal then
+                        break
+                    end
+                end
+            end
+        end
+        local scanned = 0
+        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        for alias, canon in pairs(map) do
+            scanned = scanned + 1
+            if scanned > scanCap then
+                break
+            end
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= ""
+                and required[alias] == nil then
+                local endId = FollowRequiredAliasTerminal(map, primaryIndex, alias)
+                    or alias
+                if ownedTerminals[endId] and alias ~= endId then
+                    if canon == endId then
+                        required[alias] = endId
+                    else
+                        local hopEnd = FollowRequiredAliasTerminal(
+                            map, primaryIndex, canon) or canon
+                        if hopEnd == endId then
+                            required[alias] = canon
+                            if canon ~= endId and required[canon] == nil then
+                                required[canon] = endId
+                            end
+                        end
+                    end
                 end
             end
         end

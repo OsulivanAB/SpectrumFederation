@@ -11258,22 +11258,30 @@ do
     local prom, att, work = GS.RedrivePendingContributorCorrections(record, {
         itemId = 9975, maxAttempts = 32,
     })
+    -- First-callback counters before timer drain (#459 CodeRabbit RA evidence).
+    local findVisitsFirst = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    local indexVisitsFirst = tonumber(GS._creditRedriveLookupVisits) or 0
+    drainRedrive(256)
     local findVisits = tonumber(GS._ledgerEventIdLookupVisits) or 0
     local indexVisits = tonumber(GS._creditRedriveLookupVisits) or 0
-    drainRedrive(256)
     local ledgerRows = LIVE_N + ARCH_N
     local oldProduct = 32 * ledgerRows
     assertEq(prom, 0, "459-RA: matching-hint missing promotes none")
     assertTrue((tonumber(att) or 0) >= 1, "459-RA: attempts observed")
-    assertTrue(indexVisits >= ledgerRows,
-        "459-RA: paced index charged lookup=" .. tostring(indexVisits))
+    assertTrue(indexVisitsFirst >= ledgerRows,
+        "459-RA: paced index charged lookup first=" .. tostring(indexVisitsFirst))
     -- Independent FindLedgerEventById counter: index hits charge O(1) per call
     -- (several calls per admit), never O(ledger) scans.
-    assertTrue(findVisits <= 32 * 16,
-        "459-RA: re-admit reuses index findVisits=" .. tostring(findVisits)
+    assertTrue(findVisitsFirst <= 32 * 16,
+        "459-RA: first callback reuses index findVisits=" .. tostring(findVisitsFirst)
             .. " work=" .. tostring(work) .. " oldProduct=" .. tostring(oldProduct))
+    assertTrue(findVisits <= 32 * 16 + ledgerRows,
+        "459-RA: cumulative find visits through drain findVisits="
+            .. tostring(findVisits))
     assertTrue(findVisits * 100 < oldProduct,
         "459-RA: find visits far below attempts×ledger")
+    assertTrue(indexVisits >= indexVisitsFirst,
+        "459-RA: cumulative index visits retain first-callback charge")
     assertEq(#timers, 0, "459-RA: idle after drain")
     -- Dependency recovery still promotes exactly once when the event arrives.
     local missDon = {
@@ -11383,7 +11391,8 @@ do
     local ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
     local findFirst = tonumber(GS._ledgerEventIdLookupVisits) or 0
     local slices = 0
-    local findTotal = findFirst
+    -- Do not reset the lookup counter after timer callbacks: timer-slice work
+    -- must remain visible to cumulative assertions (#459 CodeRabbit CB evidence).
     while (not ok0) and err0 == "work_budget" and slices < 256 do
         slices = slices + 1
         if #timers > 0 then
@@ -11391,11 +11400,10 @@ do
         else
             break
         end
-        GS._ledgerEventIdLookupVisits = 0
         ok0, err0 = GS.EnsureCreditCorrectionProjection(record, nil)
-        findTotal = findTotal + (tonumber(GS._ledgerEventIdLookupVisits) or 0)
     end
     flushTimers()
+    local findTotal = tonumber(GS._ledgerEventIdLookupVisits) or 0
     assertTrue(ok0 or GS.IsCreditCorrectionProjectionAvailable(record),
         "459-CB: projection available got " .. tostring(ok0) .. "/" .. tostring(err0)
             .. " slices=" .. tostring(slices))
@@ -11408,6 +11416,8 @@ do
     assertTrue(findTotal < oldProduct,
         "459-CB: total find visits below alias×ledger product total="
             .. tostring(findTotal) .. " product=" .. tostring(oldProduct))
+    assertTrue(findTotal >= findFirst,
+        "459-CB: cumulative visits include first callback")
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         record, GS.FindLedgerEventById(record, "ctx:cb-live-0001"))), "Bob-Garona",
         "459-CB: durable alias credit available")
@@ -11701,6 +11711,319 @@ do
             .. tostring(stFresh) .. "/" .. tostring(rFresh))
     switchPlayer("Alice", "Player-1-Alice", 1)
     settleRoster()
+end
+
+do
+    -- Terminal required alias bindings: collection must not downgrade head-derived
+    -- A→C to A→B after alias-page migration; capacity prune must preserve Bob
+    -- credit without waiting for structure validation (#459 4498359287 / 4498427811).
+    local function drainTimers(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then flushTimers() end
+            else
+                break
+            end
+        end
+        flushTimers()
+        return slices
+    end
+
+    local record = seedLiveCampaignWithItem(9988, 40)
+    injectProductionDonation(record, {
+        id = "ctx:term-c", itemId = 9988, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local ctx = select(1, GS:GetCurrentContext())
+    local opId = "term-head-a"
+    local op = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = opId,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:term-a",
+        value = {
+            eventId = "ctx:term-a", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9988,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    record.operations.records[opId] = op
+    record.operations.order[#record.operations.order + 1] = opId
+    record.operations.heads["credit:ctx:term-a"] = opId
+
+    -- Real alias-page install path: durable bindings then coalesced migration wake
+    -- (same helpers ValidateAndApply uses after accepting a page body).
+    assertTrue(GS.RememberCreditEventAlias(record, "ctx:term-a", "ctx:term-b"),
+        "459-TR: seed A→B")
+    assertTrue(GS.RememberCreditEventAlias(record, "ctx:term-b", "ctx:term-c"),
+        "459-TR: seed B→C")
+    GS.WakePendingCorrectionsAfterAliasPage(record, {
+        { alias = "ctx:term-a", canon = "ctx:term-b" },
+        { alias = "ctx:term-b", canon = "ctx:term-c" },
+    }, nil)
+    drainTimers(256)
+    assertEq(record.operations.heads["credit:ctx:term-c"], opId,
+        "459-TR: head migrated under credit:C")
+    assertNil(record.operations.heads["credit:ctx:term-a"],
+        "459-TR: credit:A cleared")
+
+    -- Failure-before: old one-hop body resolution overwrites head A→C with A→B
+    -- and never requires B→C, so capacity prune can drop the terminal path.
+    local mapNow = record.accounting._consumables.creditEventAliases
+    local oldRequired = {}
+    oldRequired["ctx:term-a"] = "ctx:term-c" -- head-derived first
+    -- Retained body target still names A; one-hop durable map yields B.
+    if type(mapNow) == "table" and type(mapNow["ctx:term-a"]) == "string" then
+        oldRequired["ctx:term-a"] = mapNow["ctx:term-a"]
+    end
+    assertEq(oldRequired["ctx:term-a"], "ctx:term-b",
+        "459-TR-fail: old one-hop body overwrite yields A→B")
+    assertTrue(oldRequired["ctx:term-b"] == nil,
+        "459-TR-fail: old collection omits B→C closure")
+
+    -- Pass-after: collection immediately after migration (before structure validation).
+    local required = GS.CollectRequiredCreditEventAliases(record)
+    assertEq(required["ctx:term-a"], "ctx:term-c",
+        "459-TR: required keeps terminal A→C got "
+            .. tostring(required["ctx:term-a"]))
+    assertTrue(required["ctx:term-a"] ~= "ctx:term-b",
+        "459-TR: required does not downgrade A→C to A→B")
+    assertEq(required["ctx:term-b"], "ctx:term-c",
+        "459-TR: required keeps B→C closure got "
+            .. tostring(required["ctx:term-b"]))
+
+    -- Capacity reclaim via production Write path must retain terminal bindings.
+    local map = record.accounting._consumables.creditEventAliases
+    local maxAliases = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+    local n = 0
+    for _ in pairs(map or {}) do n = n + 1 end
+    local filler = 0
+    while n < maxAliases and filler < maxAliases do
+        filler = filler + 1
+        local alias = string.format("ctx:term-fill-%04d", filler)
+        local canon = string.format("ctx:term-fill-c-%04d", filler)
+        if GS.RememberCreditEventAlias(record, alias, canon) then
+            n = n + 1
+        else
+            break
+        end
+    end
+    assertTrue(GS.RememberCreditEventAlias(
+        record, "ctx:term-extra", "ctx:term-extra-c")
+        or (record.accounting._consumables.creditEventAliases["ctx:term-a"]
+            == "ctx:term-c"),
+        "459-TR: capacity write attempted")
+    map = record.accounting._consumables.creditEventAliases
+    assertEq(map["ctx:term-a"], "ctx:term-c",
+        "459-TR: durable A→C survives capacity prune got "
+            .. tostring(map["ctx:term-a"]))
+    assertEq(map["ctx:term-b"], "ctx:term-c",
+        "459-TR: durable B→C survives capacity prune got "
+            .. tostring(map["ctx:term-b"]))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "ctx:term-c"))), "Bob-Garona",
+        "459-TR: Bob credit stable after prune")
+
+    -- Export/adoption still sees coherent required bindings.
+    local exportRequired = GS.CollectRequiredCreditEventAliases(record)
+    assertEq(exportRequired["ctx:term-a"], "ctx:term-c",
+        "459-TR: export required still A→C")
+    assertEq(exportRequired["ctx:term-b"], "ctx:term-c",
+        "459-TR: export required still B→C")
+end
+
+do
+    -- Full unfiltered re-admission wakes must build/reuse the paced lookup index
+    -- (#459 4498394368 / 4498425727). Cold {} previously scanned ~2,048,000 rows.
+    local LIVE_N, ARCH_N, PEND_N = 4000, 4000, 64
+    local record = seedLiveCampaignWithItem(9989, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    local live = record.accounting._consumableEvents
+    local arch = record.accounting._consumableEventArchive
+    if type(arch) ~= "table" then
+        record.accounting._consumableEventArchive = {}
+        arch = record.accounting._consumableEventArchive
+    end
+    for i = 1, LIVE_N do
+        live[#live + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("ctx:fw-live-%04d", i),
+            txnId = string.format("ctx:fw-live-%04d", i),
+            itemId = 9989, quantity = 1,
+            generation = 1, timestamp = world.time + i,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = record.currentCampaignId, datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    for i = 1, ARCH_N do
+        arch[#arch + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("ctx:fw-arch-%04d", i),
+            txnId = string.format("ctx:fw-arch-%04d", i),
+            itemId = 9989, quantity = 1,
+            generation = 0, timestamp = world.time - i,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = record.currentCampaignId, datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    for i = 1, PEND_N do
+        local target = string.format("ctx:fw-miss-%04d", i)
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = string.format("fw-corr-%04d", i),
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = target,
+            value = {
+                eventId = target, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9989,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 10 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending", "459-FW: admit pending " .. tostring(i))
+        assertEq(r, "pending_event", "459-FW: pending_event " .. tostring(i))
+    end
+    local function drainRedrive(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then flushTimers() end
+            else
+                break
+            end
+        end
+        flushTimers()
+        return slices
+    end
+    if GS._ClearCreditRedriveContinuationForTest then
+        GS._ClearCreditRedriveContinuationForTest(record)
+    end
+
+    -- Empty full wake with no eligible candidates stays idle without indexing.
+    local emptyRec = seedLiveCampaignWithItem(9990, 10)
+    flushTimers()
+    timers = {}
+    if GS._ClearCreditRedriveContinuationForTest then
+        GS._ClearCreditRedriveContinuationForTest(emptyRec)
+    end
+    GS._ledgerEventIdLookupVisits = 0
+    GS._creditRedriveLookupVisits = 0
+    local ep, ea, ew = GS.RedrivePendingContributorCorrections(emptyRec, {})
+    assertEq(ep, 0, "459-FW: empty promotes none")
+    assertEq(ea, 0, "459-FW: empty attempts none")
+    assertTrue((tonumber(GS._ledgerEventIdLookupVisits) or 0) < 64,
+        "459-FW: empty wake does not index ledger")
+    assertTrue((tonumber(GS._creditRedriveLookupVisits) or 0) < 64,
+        "459-FW: empty wake skips paced index build")
+    drainRedrive(32)
+    assertEq(#timers, 0, "459-FW: empty idle")
+
+    -- Cold full wake {}.
+    GS._ledgerEventIdLookupVisits = 0
+    GS._creditRedriveLookupVisits = 0
+    local prom, att, work = GS.RedrivePendingContributorCorrections(record, {
+        maxAttempts = 32,
+    })
+    local findFirst = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    local indexFirst = tonumber(GS._creditRedriveLookupVisits) or 0
+    local slices = drainRedrive(256)
+    local findTotal = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    local ledgerRows = LIVE_N + ARCH_N
+    local oldProduct = 32 * ledgerRows
+    assertTrue((tonumber(att) or 0) >= 1, "459-FW: cold attempts observed")
+    assertEq(prom, 0, "459-FW: cold missing promotes none")
+    assertTrue(indexFirst >= ledgerRows,
+        "459-FW: cold builds paced index index=" .. tostring(indexFirst))
+    assertTrue(findFirst <= 32 * 16,
+        "459-FW: cold first callback findVisits=" .. tostring(findFirst)
+            .. " work=" .. tostring(work) .. " oldProduct=" .. tostring(oldProduct))
+    assertTrue(findTotal < oldProduct,
+        "459-FW: cold cumulative find through drain total="
+            .. tostring(findTotal) .. " slices=" .. tostring(slices))
+    assertTrue(findTotal * 100 < oldProduct,
+        "459-FW: cold far below attempts×ledger product")
+    assertEq(#timers, 0, "459-FW: cold idle after drain")
+
+    -- Warm full wake reuses the stamp-current index.
+    GS._ledgerEventIdLookupVisits = 0
+    GS._creditRedriveLookupVisits = 0
+    local prom2, att2 = GS.RedrivePendingContributorCorrections(record, {})
+    local findWarm = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    drainRedrive(256)
+    local findWarmTotal = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertTrue((tonumber(att2) or 0) >= 1, "459-FW: warm attempts")
+    assertEq(prom2, 0, "459-FW: warm missing promotes none")
+    assertTrue(findWarm <= 32 * 16,
+        "459-FW: warm first findVisits=" .. tostring(findWarm))
+    assertTrue(findWarmTotal < oldProduct,
+        "459-FW: warm cumulative find=" .. tostring(findWarmTotal))
+    assertEq(#timers, 0, "459-FW: warm idle")
+
+    -- Invalidation + timer-only recovery still accepts exactly once.
+    if GS._ClearCreditRedriveContinuationForTest then
+        GS._ClearCreditRedriveContinuationForTest(record)
+    end
+    local missDon = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = "ctx:fw-miss-0001",
+        txnId = "ctx:fw-miss-0001",
+        itemId = 9989, quantity = 5,
+        generation = tonumber(record.accounting._consumables.generation) or 1,
+        timestamp = world.time + 50,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        writer = "Player-1-Alice", verification = GS.VERIFICATION.OFFICER,
+        verifierGuid = "Player-1-Alice",
+        campaignId = record.currentCampaignId, datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    local stDon = select(1, GS:AdmitLedgerEvent(missDon, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = ctx.guildKey, rankOrder = 1 },
+        offlineRecord = record, adoptionReplay = true,
+        preserveAttribution = true, localWrite = false,
+    }))
+    assertTrue(stDon == "accepted" or stDon == "duplicate",
+        "459-FW: dependency admitted got " .. tostring(stDon))
+    GS._ledgerEventIdLookupVisits = 0
+    GS.RedrivePendingContributorCorrections(record, {})
+    drainRedrive(256)
+    assertTrue(record.operations.records["fw-corr-0001"] ~= nil,
+        "459-FW: matching pending accepted once")
+    assertTrue(record.operations.pending["fw-corr-0001"] == nil,
+        "459-FW: pending cleared after accept")
+    assertEq(#timers, 0, "459-FW: idle after recovery")
+    assertTrue((tonumber(GS._ledgerEventIdLookupVisits) or 0) < oldProduct,
+        "459-FW: recovery find visits bounded")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
