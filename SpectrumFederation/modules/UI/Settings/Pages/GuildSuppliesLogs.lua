@@ -1351,6 +1351,14 @@ local function Definition()
 							return EditAttributionSuggestions(prefix)
 						end,
 						onResolved = function(_, item)
+							-- Typing notifies nil before set. Do not refresh here:
+							-- get() still has the prior draft and would rewrite the
+							-- edit mid-keystroke (#459 discussion_r4496331290).
+							-- set refreshes after the draft catches up (Manage pattern).
+							if not item then
+								ApplyEditAttributionSuggestion(nil)
+								return
+							end
 							ApplyEditAttributionSuggestion(item)
 							if Page.Refresh and Page.panel then
 								Page:Refresh(Page.panel)
@@ -1657,6 +1665,27 @@ Page.__sfTest = {
 	EditAttributionSuggestions = EditAttributionSuggestions,
 	--- Apply an autocomplete suggestion through the real onResolved path (#459 C5).
 	ResolveEditAttributionSuggestion = ApplyEditAttributionSuggestion,
+	--- Production onResolved(nil) only — must not refresh (#459 4496331290).
+	NotifyEditAttributionResolvedNil = function()
+		ApplyEditAttributionSuggestion(nil)
+	end,
+	--- Production AddAutocomplete OnTextChanged order: onResolved(nil) then set
+	-- (refresh only from set). Used to regress mid-keystroke draft restore
+	-- (#459 discussion_r4496331290).
+	SimulateEditAttributionTextChanged = function(text)
+		ApplyEditAttributionSuggestion(nil)
+		SetEditAttributionFromText(text)
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+	end,
+	--- Production suggestion selection: onResolved(item) then refresh.
+	SimulateEditAttributionSuggestionResolved = function(item)
+		ApplyEditAttributionSuggestion(item)
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+	end,
 	--- Peek the page projection cache without rebuilding (#459 B4).
 	PeekCachedProjectedRows = function()
 		return cachedProjectedRows, cachedProjectionKey

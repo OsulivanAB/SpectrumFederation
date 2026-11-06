@@ -424,7 +424,10 @@ local function ApplyCreditAliasExportToDesc(record, descId, descBody)
             kind = "gs-credit-aliases-page",
             datasetId = datasetId,
             page = pageIdx,
-            pageCount = 1, -- rewritten after packing
+            -- Reserve the max pageCount CBOR integer width so rewriting the
+            -- final count (e.g. 1→24) cannot overflow the wire budget
+            -- (#459 discussion_r4496331283).
+            pageCount = maxPages,
             aliases = trial,
         }
         local trialId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
@@ -443,6 +446,7 @@ local function ApplyCreditAliasExportToDesc(record, descId, descBody)
             pageIdx = #pageSlices + 1
             trialBody.aliases = trial
             trialBody.page = pageIdx
+            trialBody.pageCount = maxPages
             trialId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
             if EstimateWireRecordBytes(trialId, trialBody) > budget then
                 DebugWarn("credit-alias export: single binding exceeds wire budget %s→%s",
@@ -478,8 +482,17 @@ local function ApplyCreditAliasExportToDesc(record, descId, descBody)
             pageCount = pageCount,
             aliases = pageSlices[p],
         }
+        local pageId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(p)
+        -- Final wrapper-inclusive body (real pageCount + id/versionFp) must fit.
+        if EstimateWireRecordBytes(pageId, body) > budget then
+            DebugWarn("credit-alias export: final page %s exceeds wire budget dataset=%s",
+                tostring(p), tostring(datasetId))
+            descBody.creditEventAliasCount = aliasCount
+            descBody.creditEventAliasPageCount = aliasCount
+            return {}, aliasCount, aliasCount
+        end
         pages[#pages + 1] = {
-            id = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(p),
+            id = pageId,
             body = body,
         }
     end

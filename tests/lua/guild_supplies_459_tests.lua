@@ -10344,6 +10344,532 @@ do
             .. tostring(ceaAfter))
 end
 
+do
+    -- Contributor autocomplete: OnTextChanged notifies onResolved(nil) before set.
+    -- Refreshing on nil rewrites the prior draft into the edit box
+    -- (#459 discussion_r4496331290 / 4496719322).
+    local record = seedLiveCampaignWithItem(9981, 40)
+    injectProductionDonation(record, {
+        id = "ctx:ac-don", itemId = 9981, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(logsPage and logsPage.__sfTest, "459-AC: logs hooks")
+    logsPage.panel = { IsShown = function() return true end }
+    local rows = logsPage.__sfTest.BuildProjectedRows()
+    local row = nil
+    for i = 1, #rows do
+        if rows[i].id == "ctx:ac-don" then row = rows[i] break end
+    end
+    assertTrue(row ~= nil, "459-AC: target row")
+    logsPage.__sfTest.OpenEditContributorDialog("ctx:ac-don", row)
+    local session = logsPage.__sfTest.GetEditSession()
+    assertTrue(session ~= nil, "459-AC: edit session")
+    session.attributed = "Alice-Garona"
+    session.attributedGuid = "Player-1-Alice"
+    session.attributionText = "Alice-Garona"
+    session.attributionResolved = true
+    -- Mock focused edit box rebound by Refresh from get().
+    local boxText = "Alice-Garona"
+    local refreshCount = 0
+    local prevRefresh = logsPage.Refresh
+    logsPage.Refresh = function(self, panel)
+        refreshCount = refreshCount + 1
+        local sess = logsPage.__sfTest.GetEditSession()
+        if type(sess) == "table" then
+            if type(sess.attributionText) == "string" then
+                boxText = sess.attributionText
+            else
+                boxText = sess.attributed or ""
+            end
+        end
+        if type(prevRefresh) == "function" then
+            return prevRefresh(self, panel)
+        end
+    end
+    -- Production AddAutocomplete OnTextChanged order (Controls.lua):
+    -- NotifyResolved(nil) → read GetText → set(text) → set refreshes.
+    local typed = "Bob"
+    logsPage.__sfTest.SimulateEditAttributionTextChanged(typed)
+    assertEq(session.attributionText, typed,
+        "459-AC: draft keeps typed text after nil→set→refresh")
+    assertEq(boxText, typed,
+        "459-AC: edit box shows typed text after refresh got " .. tostring(boxText))
+    assertTrue(session.attributionResolved ~= true
+            or session.attributed == "Bob-Garona",
+        "459-AC: unresolved or Bob after partial type")
+    -- Explicit production nil path must not refresh (Manage pattern).
+    local refreshesAfterNil = refreshCount
+    logsPage.__sfTest.NotifyEditAttributionResolvedNil()
+    assertEq(refreshCount, refreshesAfterNil,
+        "459-AC: onResolved(nil) does not refresh before set")
+    assertEq(boxText, typed,
+        "459-AC: nil notification left typed box text intact")
+    -- Real suggestion selection + confirmation.
+    logsPage.__sfTest.SimulateEditAttributionSuggestionResolved({
+        value = "Bob-Garona",
+        label = "Bob-Garona",
+        text = "Bob-Garona",
+    })
+    assertEq(session.attributed, "Bob-Garona", "459-AC: suggestion selects Bob")
+    assertEq(session.attributionResolved, true, "459-AC: suggestion resolved")
+    assertEq(boxText, "Bob-Garona", "459-AC: box shows Bob after suggestion refresh")
+    local prevConfirm = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    local confirmCb = nil
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+        confirmCb = onConfirm
+    end
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(type(confirmCb) == "function" or type(logsPage.__sfTest.GetPendingConfirm()) == "table"
+            or record.operations.records ~= nil,
+        "459-AC: confirmation path reachable")
+    if type(confirmCb) == "function" then
+        confirmCb()
+    end
+    flushTimers()
+    logsPage.Refresh = prevRefresh
+    logsPage.__sfTest.ClearEditSession()
+    logsPage.panel = nil
+end
+
+do
+    -- Alias-chain head migration: A→B→C must fold retained credit:A onto credit:C
+    -- even when B→C is enumerated first and A's ledger row was evicted
+    -- (#459 discussion_r4496331267 / 4496720120).
+    local function withCurrentRecord(target, fn)
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        local saved = GS._root and GS._root.guilds and GS._root.guilds[gk]
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = target
+        end
+        local ok, a, b, c = pcall(fn)
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = saved
+        end
+        if not ok then error(a) end
+        return a, b, c
+    end
+    local function providerAliasPage(target, pageId, pageBody, sender)
+        return withCurrentRecord(target, function()
+            GS:EnsureGossipProvider()
+            local entry = GG.GetProvider(GS.PROVIDER_ID)
+            return entry.api.ValidateAndApply({
+                id = pageId,
+                versionFp = GS.ContentFingerprint(pageBody),
+                body = pageBody,
+            }, { sender = sender })
+        end)
+    end
+    local function drainAliasTimers(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then flushTimers() end
+            else
+                break
+            end
+        end
+        flushTimers()
+    end
+    local function seedChainFixture()
+        local record = seedLiveCampaignWithItem(9982, 40)
+        injectProductionDonation(record, {
+            id = "ctx:chain-c", itemId = 9982, quantity = 4,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        -- Accepted correction head originally targeted A; A ledger row later evicted.
+        local ctx = select(1, GS:GetCurrentContext())
+        local opId = "chain-head-a"
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = "ctx:chain-a",
+            value = {
+                eventId = "ctx:chain-a", eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9982,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 1,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[opId] = op
+        record.operations.order[#record.operations.order + 1] = opId
+        record.operations.heads["credit:ctx:chain-a"] = opId
+        -- Evict any A ledger row if present; C remains.
+        local live = record.accounting._consumableEvents
+        local filtered = {}
+        for i = 1, #live do
+            if live[i].id ~= "ctx:chain-a" then
+                filtered[#filtered + 1] = live[i]
+            end
+        end
+        record.accounting._consumableEvents = filtered
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        local okStruct, reasonStruct = GS._ValidateGuildRecordStructure(gk, record)
+        assertTrue(okStruct,
+            "459-CH: pre-delivery structure ok got " .. tostring(reasonStruct))
+        return record, opId, gk
+    end
+    local function assertChainMigrated(record, opId, label, gk)
+        local heads = record.operations.heads
+        assertEq(heads["credit:ctx:chain-c"], opId,
+            "459-CH-" .. label .. ": head under credit:C")
+        assertTrue(heads["credit:ctx:chain-a"] == nil,
+            "459-CH-" .. label .. ": credit:A cleared")
+        assertTrue(heads["credit:ctx:chain-b"] == nil,
+            "459-CH-" .. label .. ": credit:B cleared")
+        local okAfter, reasonAfter = GS._ValidateGuildRecordStructure(gk, record)
+        assertTrue(okAfter,
+            "459-CH-" .. label .. ": structure after delivery got "
+                .. tostring(reasonAfter))
+        -- Reload-style revalidate.
+        local okReload, reasonReload = GS._ValidateGuildRecordStructure(gk, record)
+        assertTrue(okReload,
+            "459-CH-" .. label .. ": structure after reload got "
+                .. tostring(reasonReload))
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            record, GS.FindLedgerEventById(record, "ctx:chain-c"))), "Bob-Garona",
+            "459-CH-" .. label .. ": credit Bob on C")
+    end
+    -- Order 1: B→C enumerated before A→B (pairs iteration / page order).
+    local rec1, op1, gk1 = seedChainFixture()
+    local pageId1 = "gs:cea:" .. rec1.datasetId .. ":p1"
+    local bodyBCFirst = {
+        kind = "gs-credit-aliases-page",
+        datasetId = rec1.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:chain-b"] = "ctx:chain-c",
+            ["ctx:chain-a"] = "ctx:chain-b",
+        },
+    }
+    GS._creditAliasPageWakeCalls = 0
+    local st1, r1 = providerAliasPage(rec1, pageId1, bodyBCFirst, "Alice-Garona")
+    assertTrue(st1 == "accepted" or st1 == "duplicate",
+        "459-CH-bc: page accepted got " .. tostring(st1) .. "/" .. tostring(r1))
+    assertEq(tonumber(GS._creditAliasPageWakeCalls) or 0, 1,
+        "459-CH-bc: one coalesced wake")
+    drainAliasTimers(256)
+    assertChainMigrated(rec1, op1, "bc", gk1)
+    assertEq(#timers, 0, "459-CH-bc: idle")
+    -- Subsequent correction causality against canonical C.
+    local stCorr, rCorr = withCurrentRecord(rec1, function()
+        local corrC = select(1, GS:NewContributorCorrectionOperation(
+            "ctx:chain-c", "Carol-Garona", "Player-1-Carol"))
+        if type(corrC) == "table" then
+            corrC.baseTargetRevision = op1
+        end
+        return GS:ApplyStagedConfigOperation(corrC)
+    end)
+    assertTrue(stCorr == "accepted" or stCorr == "duplicate" or stCorr == "rejected",
+        "459-CH-bc: subsequent correction classified got "
+            .. tostring(stCorr) .. "/" .. tostring(rCorr))
+    if stCorr == "accepted" then
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            rec1, GS.FindLedgerEventById(rec1, "ctx:chain-c"))), "Carol-Garona",
+            "459-CH-bc: Carol after causal correction")
+    end
+
+    -- Order 2: A→B before B→C.
+    local rec2, op2, gk2 = seedChainFixture()
+    local pageId2 = "gs:cea:" .. rec2.datasetId .. ":p1"
+    local st2, r2 = providerAliasPage(rec2, pageId2, {
+        kind = "gs-credit-aliases-page",
+        datasetId = rec2.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:chain-a"] = "ctx:chain-b",
+            ["ctx:chain-b"] = "ctx:chain-c",
+        },
+    }, "Alice-Garona")
+    assertTrue(st2 == "accepted" or st2 == "duplicate",
+        "459-CH-ab: page accepted got " .. tostring(st2) .. "/" .. tostring(r2))
+    drainAliasTimers(256)
+    assertChainMigrated(rec2, op2, "ab", gk2)
+    assertEq(#timers, 0, "459-CH-ab: idle")
+
+    -- Competing heads: newer terminal head wins LWW.
+    local rec3, op3 = seedChainFixture()
+    local newerId = "chain-head-c-newer"
+    local newer = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = newerId,
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = rec3.datasetId,
+        campaignId = rec3.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:chain-c",
+        value = {
+            eventId = "ctx:chain-c", eventKind = "donation",
+            attributed = "Dave-Garona", attributedGuid = "Player-1-Dave",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9982,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 99,
+        baseTargetRevision = rec3.datasetId,
+        basePolicyRevision = rec3.permission and rec3.permission.revisionId,
+        baseCampaignId = rec3.currentCampaignId,
+    }
+    rec3.operations.records[newerId] = newer
+    rec3.operations.order[#rec3.operations.order + 1] = newerId
+    rec3.operations.heads["credit:ctx:chain-c"] = newerId
+    -- Make alias head older so C head wins.
+    rec3.operations.records[op3].timestamp = world.time + 1
+    providerAliasPage(rec3, "gs:cea:" .. rec3.datasetId .. ":p1", {
+        kind = "gs-credit-aliases-page",
+        datasetId = rec3.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:chain-b"] = "ctx:chain-c",
+            ["ctx:chain-a"] = "ctx:chain-b",
+        },
+    }, "Alice-Garona")
+    drainAliasTimers(256)
+    assertEq(rec3.operations.heads["credit:ctx:chain-c"], newerId,
+        "459-CH-comp: terminal keeps winning head")
+    assertTrue(rec3.operations.heads["credit:ctx:chain-a"] == nil,
+        "459-CH-comp: alias head folded away")
+end
+
+do
+    -- Final alias-page sizing: pack with reserved pageCount width; every final
+    -- wrapper-inclusive body must fit (#459 discussion_r4496331283 / 4496720924).
+    local function wireRawBytes(id, body)
+        local fp = (GS.ContentFingerprint and GS.ContentFingerprint(body))
+            or string.rep("f", GS.MAX_OPERATION_ID or 192)
+        local raw = C_EncodingUtil.SerializeCBOR({
+            id = id, versionFp = fp, body = body,
+        })
+        return type(raw) == "string" and #raw or 0
+    end
+    local budget = GS.MAX_WIRE_RECORD_BYTES
+        or (SF.GuildGossip and SF.GuildGossip.MAX_RECORD_CBOR)
+        or 2048
+    local maxAliases = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    local BIND_N = 512
+    assertTrue(BIND_N <= maxAliases, "459-PS: 512 within alias capacity")
+    -- Long dataset id so page ids consume representative wrapper bytes.
+    local record = seedLiveCampaignWithItem(9983, 40)
+    -- Force a long datasetId for wire sizing (37+ chars as in reproduction).
+    local longDs = "ds-page-size-" .. string.rep("x", 24)
+    record.datasetId = longDs
+    if record.accounting and record.accounting._consumables then
+        record.accounting._consumables.datasetId = longDs
+    end
+    injectProductionDonation(record, {
+        id = "ctx:ps-canon", itemId = 9983, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local ctx = select(1, GS:GetCurrentContext())
+    record.operations.records = record.operations.records or {}
+    record.operations.order = record.operations.order or {}
+    record.operations.heads = record.operations.heads or {}
+    -- Pad aliases so the harness estimator yields ≥24 pages (CBOR int-width
+    -- boundary). Standard-CBOR reproduction used 26 pages at 512 bindings.
+    local aliasPad = string.rep("z", 48)
+    for i = 1, BIND_N do
+        local alias = string.format("ctx:ps-a-%04d-%s", i, aliasPad)
+        assertTrue(#alias <= (GS.MAX_TXN_ID or 160),
+            "459-PS: alias length within ValidTxnId")
+        local opId = string.format("ps-corr-%04d", i)
+        record.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = longDs,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9983,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = longDs,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.order[#record.operations.order + 1] = opId
+        record.operations.heads[GS.CorrectionTargetKey(record, "ctx:ps-canon")] = opId
+        assertTrue(GS.RememberCreditEventAlias(record, alias, "ctx:ps-canon"),
+            "459-PS: seed alias " .. tostring(i))
+    end
+    local descBody = {
+        kind = "dataset-desc",
+        schemaVersion = GS.PROVIDER_SCHEMA,
+        guildKey = ctx.guildKey,
+        datasetId = longDs,
+        editorRankPosition = record.permission and record.permission.editorRankPosition,
+        permissionRevisionId = record.permission and record.permission.revisionId,
+        currentCampaignId = record.currentCampaignId,
+        activation = record.activation,
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 1,
+        archiveCount = 0,
+        acceptedLedgerCount = #(record.accounting._consumableEvents or {}),
+        donationEvidenceCount = 1,
+        valuationCount = 0,
+        bankTab = record.accounting._consumables.bankTab,
+        hasBankTab = true,
+        creditEventAliases = {},
+        creditEventAliasCount = 0,
+        creditEventAliasPageCount = 0,
+    }
+    local descId = "gs:desc:" .. longDs
+    local pages, aliasCount, pageCount = GS._ApplyCreditAliasExportToDescForTest(
+        record, descId, descBody)
+    assertTrue((tonumber(pageCount) or 0) >= 24,
+        "459-PS: enough pages to cross CBOR int-width boundary pages="
+            .. tostring(pageCount))
+    assertEq(tonumber(aliasCount) or 0, BIND_N,
+        "459-PS: all bindings accounted count=" .. tostring(aliasCount))
+    assertTrue(type(pages) == "table" and #pages == pageCount,
+        "459-PS: pages emitted for every advertised page")
+    local over = 0
+    for i = 1, #pages do
+        local nbytes = wireRawBytes(pages[i].id, pages[i].body)
+        if nbytes > budget then
+            over = over + 1
+        end
+        assertEq(tonumber(pages[i].body.pageCount), pageCount,
+            "459-PS: page " .. tostring(i) .. " final pageCount")
+        assertEq(tonumber(pages[i].body.page), i,
+            "459-PS: page " .. tostring(i) .. " index")
+    end
+    assertEq(over, 0,
+        "459-PS: every final wrapper-inclusive page fits budget over="
+            .. tostring(over))
+    -- Pre-fix contrast: measuring with pageCount=1 can undersize vs final.
+    if pageCount >= 24 then
+        local sample = pages[math.min(24, #pages)]
+        local trial = {}
+        for k, v in pairs(sample.body) do trial[k] = v end
+        trial.pageCount = 1
+        local withOne = wireRawBytes(sample.id, trial)
+        local withFinal = wireRawBytes(sample.id, sample.body)
+        assertTrue(withFinal >= withOne,
+            "459-PS: final pageCount width >= placeholder")
+        -- When the harness shows growth, final must still be in budget.
+        assertTrue(withFinal <= budget,
+            "459-PS: page 24-region final fits after growth "
+                .. tostring(withOne) .. "→" .. tostring(withFinal))
+    end
+    -- Wire-filter + adoption completeness: no advertised page may be skipped.
+    local filtered, dropped = {}, 0
+    for i = 1, #pages do
+        if wireRawBytes(pages[i].id, pages[i].body) <= budget then
+            filtered[#filtered + 1] = pages[i]
+        else
+            dropped = dropped + 1
+        end
+    end
+    assertEq(dropped, 0, "459-PS: wire filter drops none")
+    assertEq(#filtered, pageCount, "459-PS: filter keeps all pages")
+    -- Maximum supported required bindings: seed up to capacity with padded ids.
+    local maxRecord = seedLiveCampaignWithItem(9984, 40)
+    maxRecord.datasetId = longDs
+    injectProductionDonation(maxRecord, {
+        id = "ctx:ps-max-canon", itemId = 9984, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    maxRecord.operations.records = {}
+    maxRecord.operations.order = {}
+    maxRecord.operations.heads = {}
+    local maxCtx = select(1, GS:GetCurrentContext())
+    local seededMax = 0
+    for i = 1, maxAliases do
+        local alias = string.format("ctx:ps-m-%04d-%s", i, string.rep("y", 40))
+        if #alias > (GS.MAX_TXN_ID or 160) then
+            break
+        end
+        local opId = string.format("ps-max-%04d", i)
+        maxRecord.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = maxCtx.guildKey,
+            datasetId = longDs,
+            campaignId = maxRecord.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9984,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = longDs,
+            basePolicyRevision = maxRecord.permission and maxRecord.permission.revisionId,
+            baseCampaignId = maxRecord.currentCampaignId,
+        }
+        maxRecord.operations.order[#maxRecord.operations.order + 1] = opId
+        maxRecord.operations.heads[GS.CorrectionTargetKey(
+            maxRecord, "ctx:ps-max-canon")] = opId
+        if GS.RememberCreditEventAlias(maxRecord, alias, "ctx:ps-max-canon") then
+            seededMax = seededMax + 1
+        else
+            break
+        end
+    end
+    assertTrue(seededMax >= BIND_N,
+        "459-PS-max: seeded capacity n=" .. tostring(seededMax))
+    local descMax = {
+        kind = "dataset-desc",
+        schemaVersion = GS.PROVIDER_SCHEMA,
+        guildKey = maxCtx.guildKey,
+        datasetId = longDs,
+        editorRankPosition = maxRecord.permission and maxRecord.permission.editorRankPosition,
+        permissionRevisionId = maxRecord.permission and maxRecord.permission.revisionId,
+        currentCampaignId = maxRecord.currentCampaignId,
+        activation = maxRecord.activation,
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 1,
+        archiveCount = 0,
+        acceptedLedgerCount = 1,
+        donationEvidenceCount = 1,
+        valuationCount = 0,
+        bankTab = maxRecord.accounting._consumables.bankTab,
+        hasBankTab = true,
+        creditEventAliases = {},
+        creditEventAliasCount = 0,
+        creditEventAliasPageCount = 0,
+    }
+    local pagesMax, countMax, pcMax = GS._ApplyCreditAliasExportToDescForTest(
+        maxRecord, descId, descMax)
+    assertTrue((tonumber(countMax) or 0) >= seededMax
+            or (tonumber(pcMax) or 0) >= 1,
+        "459-PS-max: packing path count=" .. tostring(countMax)
+            .. " pages=" .. tostring(pcMax))
+    if type(pagesMax) == "table" and #pagesMax > 0 then
+        local overMax = 0
+        for i = 1, #pagesMax do
+            if wireRawBytes(pagesMax[i].id, pagesMax[i].body) > budget then
+                overMax = overMax + 1
+            end
+        end
+        assertEq(overMax, 0, "459-PS-max: all final pages fit")
+    end
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

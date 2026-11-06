@@ -6199,12 +6199,72 @@ function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId, res
     ops.heads[aliasKey] = nil
 end
 
---- After trusted alias discovery: migrate heads, rebuild projection, redrive (#459).
+--- Follow the durable credit-event alias overlay (and optional ledger index) to
+-- a terminal canonical id without another full-ledger scan (#459 OD chain).
+local function ResolveAliasOverlayTerminal(record, startId, ledgerById)
+    if type(startId) ~= "string" or startId == "" then
+        return nil
+    end
+    local map = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    local cur = startId
+    local seen = { [startId] = true }
+    if type(map) == "table" then
+        for _ = 1, 8 do
+            local nextId = map[cur]
+            if type(nextId) ~= "string" or nextId == "" or nextId == cur then
+                break
+            end
+            if seen[nextId] then
+                break
+            end
+            seen[nextId] = true
+            cur = nextId
+        end
+    end
+    if type(ledgerById) == "table" then
+        local ev = ledgerById[cur]
+        if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+            return ev.id
+        end
+    end
+    return cur
+end
+
+--- After trusted alias discovery: migrate heads onto the terminal canonical,
+-- rebuild projection, redrive (#459). Also folds upstream retained heads that
+-- resolve onto the same terminal through the durable alias overlay.
 function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, itemId)
     if type(record) ~= "table" then
         return
     end
-    GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId)
+    local terminal = ResolveAliasOverlayTerminal(record, primaryTxnId, nil)
+    if type(terminal) ~= "string" or terminal == "" then
+        terminal = primaryTxnId
+    end
+    if type(aliasTxnId) == "string" and aliasTxnId ~= "" then
+        GS.MigrateCorrectionHeadsForAlias(record, terminal, aliasTxnId, terminal)
+    end
+    local ops = record.operations
+    if type(ops) == "table" and type(ops.heads) == "table" then
+        local prefix = "credit:"
+        local pending = {}
+        for targetKey in pairs(ops.heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
+                local id = targetKey:sub(#prefix + 1)
+                if id ~= "" and id ~= terminal and id ~= aliasTxnId then
+                    local resolved = ResolveAliasOverlayTerminal(record, id, nil)
+                    if resolved == terminal then
+                        pending[#pending + 1] = id
+                    end
+                end
+            end
+        end
+        for i = 1, #pending do
+            GS.MigrateCorrectionHeadsForAlias(
+                record, terminal, pending[i], terminal)
+        end
+    end
     if GS.InvalidateCreditCorrectionProjection then
         GS.InvalidateCreditCorrectionProjection(record)
     end
@@ -6216,8 +6276,9 @@ function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, i
     end
 end
 
---- After a whole alias-page install: migrate every new binding, then one shared
--- projection/redrive under a single remaining allowance (#459 OD).
+--- After a whole alias-page install: migrate every new binding onto its
+-- terminal canonical id (including upstream retained heads), then one shared
+-- projection/redrive under a single remaining allowance (#459 OD / chain).
 -- @param installed { {alias=, canon=}... } newly committed bindings
 -- @param ledgerById table|nil optional id→event index from the page's one pass
 function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
@@ -6226,18 +6287,42 @@ function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
     end
     GS._creditAliasPageWakeCalls =
         (tonumber(GS._creditAliasPageWakeCalls) or 0) + 1
+    local terminalsTouched = {}
     for i = 1, #installed do
         local row = installed[i]
-        if type(row) == "table" then
-            local resolved = row.canon
-            if type(ledgerById) == "table" and type(row.canon) == "string" then
-                local ev = ledgerById[row.canon]
-                if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
-                    resolved = ev.id
+        if type(row) == "table" and type(row.alias) == "string" and row.alias ~= "" then
+            local terminal = ResolveAliasOverlayTerminal(
+                record, row.canon or row.alias, ledgerById)
+            if type(terminal) ~= "string" or terminal == "" then
+                terminal = row.canon or row.alias
+            end
+            terminalsTouched[terminal] = true
+            GS.MigrateCorrectionHeadsForAlias(
+                record, terminal, row.alias, terminal)
+        end
+    end
+    -- Fold retained upstream heads (e.g. credit:A when A→B→C and B→C arrives)
+    -- onto the same terminals without per-binding ledger scans.
+    local ops = record.operations
+    if type(ops) == "table" and type(ops.heads) == "table" then
+        local prefix = "credit:"
+        local pending = {}
+        for targetKey in pairs(ops.heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
+                local id = targetKey:sub(#prefix + 1)
+                if id ~= "" then
+                    local terminal = ResolveAliasOverlayTerminal(
+                        record, id, ledgerById)
+                    if type(terminal) == "string" and terminal ~= ""
+                        and terminalsTouched[terminal] and terminal ~= id then
+                        pending[#pending + 1] = { alias = id, terminal = terminal }
+                    end
                 end
             end
+        end
+        for i = 1, #pending do
             GS.MigrateCorrectionHeadsForAlias(
-                record, row.canon, row.alias, resolved)
+                record, pending[i].terminal, pending[i].alias, pending[i].terminal)
         end
     end
     if GS.InvalidateCreditCorrectionProjection then
