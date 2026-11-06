@@ -1253,6 +1253,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:SetBackdrop() end
         function f:SetBackdropColor() end
         function f:SetText(t)
@@ -2347,6 +2348,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:Hide() end
         function f:Show() end
         function f:IsShown() return false end
@@ -3069,6 +3071,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:RegisterEvent() end
         function f:UnregisterEvent() end
         function f:UnregisterAllEvents() end
@@ -4808,6 +4811,7 @@ do
                 function f:GetText() return f._text end
                 function f:Enable() end
                 function f:Disable() end
+                function f:RegisterForClicks() end
                 function f:SetNumeric() end
                 function f:SetAutoFocus() end
                 function f:HasFocus() return f._hasFocus end
@@ -5631,6 +5635,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:RegisterEvent() end
         function f:UnregisterEvent() end
         function f:UnregisterAllEvents() end
