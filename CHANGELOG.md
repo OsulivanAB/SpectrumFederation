@@ -7,6 +7,9 @@ All notable changes to SpectrumFederation will be documented in this file.
 ### Changed
 - Filter Main/Alt assignment autocomplete suggestions by existing relationship roles (#470)
 
+### Fixed
+- Reuse one validated Guild Info record per Main/Alt suggestion request instead of revalidating per candidate (#470, #472)
+
 ## [1.5.19-beta.2] - 2026-11-06
 
 ### Changed

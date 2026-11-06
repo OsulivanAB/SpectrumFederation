@@ -177,9 +177,35 @@ local function ReportStatus(ctx, status, reason, extra)
 	RefreshPageControls()
 end
 
+--- Role classification from an already-validated Guild Info record (#470/#472).
+-- Mirrors GI:GetCharacterRole solo-main semantics without re-entering
+-- GetCurrentRecord / ValidateGuildRecord per candidate.
+-- nil record (ready + not_configured) ⇒ every GUID is unassigned.
+local function RoleFromValidatedRecord(record, guid)
+	if type(guid) ~= "string" or guid == "" then
+		return nil
+	end
+	if not record or type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+		return nil
+	end
+	local info = record.graph.byGuid[guid]
+	if not info then
+		return nil
+	end
+	-- Solo main (no alts) is not a displayed relationship role.
+	if info.role == "main" then
+		local mainGroup = record.graph.mains and record.graph.mains[guid]
+		if not mainGroup or #(mainGroup.altGuids or {}) == 0 then
+			return nil
+		end
+	end
+	return info.role, info.mainGuid
+end
+
 --- Autocomplete suggestions for the Main or Alt field (#470).
--- `field` is "main" or "alt". Role eligibility uses the Guild Info graph via
--- GetCharacterRole and is applied before the visible-results cap.
+-- `field` is "main" or "alt". Role eligibility uses the Guild Info graph and is
+-- applied before the visible-results cap. Relationship readiness/validation is
+-- captured once per request; candidates use the validated record's graph.
 local function SuggestionItems(prefix, field)
 	local g = GI()
 	local roster = Roster()
@@ -187,15 +213,14 @@ local function SuggestionItems(prefix, field)
 		return {}
 	end
 	-- Fail closed while relationship readiness is unknown/syncing; do not treat
-	-- missing roles as unassigned.
-	if not g or not g.GetCharacterRole then
+	-- missing roles as unassigned. ready + nil record is empty/unconfigured and
+	-- keeps every roster candidate eligible as unassigned.
+	if not g or not g.GetRelationshipReadiness then
 		return {}
 	end
-	if g.GetRelationshipReadiness then
-		local readiness = g:GetRelationshipReadiness()
-		if readiness ~= "ready" then
-			return {}
-		end
+	local readiness, record = g:GetRelationshipReadiness()
+	if readiness ~= "ready" then
+		return {}
 	end
 
 	local excludeGuid = nil
@@ -209,9 +234,9 @@ local function SuggestionItems(prefix, field)
 		if excludeGuid and row.guid == excludeGuid then
 			return false
 		end
-		-- GetCharacterRole: "main" = main with ≥1 alts; "alt" = assigned alt;
+		-- "main" = main with ≥1 alts; "alt" = assigned alt;
 		-- nil = unassigned or solo main (eligible for both fields).
-		local role = g:GetCharacterRole(row.guid)
+		local role = RoleFromValidatedRecord(record, row.guid)
 		if field == "main" then
 			return role ~= "alt"
 		end

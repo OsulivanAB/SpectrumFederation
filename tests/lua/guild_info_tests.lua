@@ -6927,6 +6927,130 @@ do
     pass("470 Main/Alt autocomplete role filtering")
 end
 
+do
+    -- #472 repair: one readiness/validation per suggestion request, not per candidate.
+    local function suggestionGuids(items)
+        local set = {}
+        for i = 1, #(items or {}) do
+            local guid = items[i].guid or items[i].value
+            if type(guid) == "string" then
+                set[guid] = items[i]
+            end
+        end
+        return set
+    end
+
+    local function openAssignSuggestions()
+        local page = SF.SettingsUI.pagesById.guildInfoMainAlt
+        local panel = CreateFrame()
+        panel.IsVisible = function() return true end
+        page:Build(panel)
+        local def = panel.__sfPageDef
+        local mainSug, altSug, mainTextCb, altTextCb
+        for _, sec in ipairs(def.sections or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "autocomplete" and item.label == "Main name" then
+                    mainSug = item.getSuggestions
+                    mainTextCb = item.onTextChanged
+                end
+                if item.type == "autocomplete" and item.label == "Alt name" then
+                    altSug = item.getSuggestions
+                    altTextCb = item.onTextChanged
+                end
+            end
+        end
+        if mainTextCb then mainTextCb(nil, "") end
+        if altTextCb then altTextCb(nil, "") end
+        return mainSug, altSug
+    end
+
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "472: Alice←Bob seed")
+    -- Solo main Carol remains eligible for both fields.
+    assertEq(assign("Carol-Garona", "Eve-Garona"), "accepted", "472: Carol←Eve seed")
+    assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "472: Carol becomes solo main")
+    assertNil(GI:GetCharacterRole("Player-1-Carol"), "472: solo Carol has nil displayed role")
+    for i = 1, 12 do
+        ensureRosterGuid(string.format("Val%02d-Garona", i), string.format("Player-1-Val%02d", i), 4)
+    end
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+
+    local mainSug, altSug = openAssignSuggestions()
+    local origValidate = GI.ValidateGuildRecord
+    local validateCalls = 0
+    function GI.ValidateGuildRecord(...)
+        validateCalls = validateCalls + 1
+        return origValidate(...)
+    end
+    local origReadiness = GI.GetRelationshipReadiness
+    local readinessCalls = 0
+    function GI.GetRelationshipReadiness(...)
+        readinessCalls = readinessCalls + 1
+        return origReadiness(...)
+    end
+    local origGet = GI.GetCurrentRecord
+    local getCalls = 0
+    function GI.GetCurrentRecord(...)
+        getCalls = getCalls + 1
+        return origGet(...)
+    end
+
+    validateCalls, readinessCalls, getCalls = 0, 0, 0
+    local mainItems = suggestionGuids(mainSug(nil, "val"))
+    local v1, r1, g1 = validateCalls, readinessCalls, getCalls
+    validateCalls, readinessCalls, getCalls = 0, 0, 0
+    local altItems = suggestionGuids(altSug(nil, "val"))
+    local v2, r2, g2 = validateCalls, readinessCalls, getCalls
+
+    GI.ValidateGuildRecord = origValidate
+    GI.GetRelationshipReadiness = origReadiness
+    GI.GetCurrentRecord = origGet
+
+    assertTrue(countKeys(mainItems) >= 10, "472: Main returns capped eligible Val* matches")
+    assertTrue(countKeys(altItems) >= 10, "472: Alt returns capped eligible Val* matches")
+    -- One readiness capture per request; validation/GetCurrentRecord must not scale
+    -- with candidate count (would be ≥10 if GetCharacterRole were called per row).
+    assertEq(r1, 1, "472: Main suggestions call GetRelationshipReadiness once")
+    assertEq(r2, 1, "472: Alt suggestions call GetRelationshipReadiness once")
+    assertTrue(v1 <= 2, "472: Main ValidateGuildRecord bounded got=" .. tostring(v1))
+    assertTrue(v2 <= 2, "472: Alt ValidateGuildRecord bounded got=" .. tostring(v2))
+    assertTrue(g1 <= 2, "472: Main GetCurrentRecord bounded got=" .. tostring(g1))
+    assertTrue(g2 <= 2, "472: Alt GetCurrentRecord bounded got=" .. tostring(g2))
+    assertTrue(v1 < 10 and g1 < 10, "472: Main does not validate per candidate")
+    assertTrue(v2 < 10 and g2 < 10, "472: Alt does not validate per candidate")
+
+    -- Solo-main Carol stays eligible on both fields via the shared record path.
+    assertTrue(suggestionGuids(mainSug(nil, "ca"))["Player-1-Carol"] ~= nil,
+        "472: Main includes solo Carol after shared-record filter")
+    assertTrue(suggestionGuids(altSug(nil, "ca"))["Player-1-Carol"] ~= nil,
+        "472: Alt includes solo Carol after shared-record filter")
+    assertTrue(suggestionGuids(mainSug(nil, "bo"))["Player-1-Bob"] == nil,
+        "472: Main still excludes assigned alt Bob")
+    assertTrue(suggestionGuids(altSug(nil, "ali"))["Player-1-Alice"] == nil,
+        "472: Alt still excludes main-with-alts Alice")
+
+    -- ready + nil record (not_configured / empty graph): all roster candidates unassigned.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local readiness, emptyRec = GI:GetRelationshipReadiness()
+    assertEq(readiness, "ready", "472: empty guild info is ready")
+    assertNil(emptyRec, "472: not_configured yields nil relationship record")
+    mainSug, altSug = openAssignSuggestions()
+    assertTrue(suggestionGuids(mainSug(nil, "ali"))["Player-1-Alice"] ~= nil,
+        "472: empty record still suggests Alice as Main")
+    assertTrue(suggestionGuids(altSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "472: empty record still suggests Bob as Alt")
+    assertTrue(suggestionGuids(mainSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "472: empty record treats Bob as unassigned for Main")
+
+    restoreBaseRoster()
+    pass("472 suggestion readiness reuse / empty-record / solo-main")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
