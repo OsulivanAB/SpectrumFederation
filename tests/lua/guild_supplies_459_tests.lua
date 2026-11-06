@@ -9097,6 +9097,155 @@ do
     assertEq(#timers, 0, "459-PM: idle after match settle")
 end
 
+do
+    -- Effective-credit Resolve must not re-scan the ledger for each already-known
+    -- event (discussion_r4488489365). Broken path: N rows → N(N+1)/2 lookup visits.
+    local ITEM = 9950
+    local N = 1200
+    local record = seedLiveCampaignWithItem(ITEM, 100000)
+    local ctx = select(1, GS:GetCurrentContext())
+    for i = 1, N do
+        injectProductionDonation(record, {
+            id = string.format("ctx:ec-don-%04d", i),
+            itemId = ITEM, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    -- Warm projection once so later measured reads are not conflated with rebuild.
+    assertTrue(GS.EnsureCreditCorrectionProjection(record, nil) ~= false,
+        "459-EC: projection available before measure")
+
+    local function quadraticFloor(n)
+        return (n * (n + 1)) / 2
+    end
+
+    -- No corrections: personal + campaign progress reads stay linear/bounded.
+    GS._ledgerEventIdLookupVisits = 0
+    local aliceBefore = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", ITEM)
+    local visitsPersonal = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertEq(aliceBefore, N, "459-EC: Alice personal before adj got " .. tostring(aliceBefore))
+    assertTrue(visitsPersonal <= N * 4,
+        "459-EC: personal Resolve lookups linear visits="
+            .. tostring(visitsPersonal) .. " n=" .. tostring(N))
+    assertTrue(visitsPersonal * 20 < quadraticFloor(N),
+        "459-EC: personal visits far below N(N+1)/2 visits="
+            .. tostring(visitsPersonal) .. " quad=" .. tostring(quadraticFloor(N)))
+
+    GS._ledgerEventIdLookupVisits = 0
+    local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    local visitsProgress = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertEq(tonumber(progress.itemTotals[ITEM]) or 0, N,
+        "459-EC: campaign item total before adj")
+    local aliceContrib = progress.contributions and progress.contributions["Alice-Garona"]
+    assertEq(tonumber(aliceContrib and aliceContrib[ITEM]) or 0, N,
+        "459-EC: Alice contribution before adj")
+    assertTrue(visitsProgress <= N * 4,
+        "459-EC: progress Resolve lookups linear visits="
+            .. tostring(visitsProgress) .. " n=" .. tostring(N))
+    assertTrue(visitsProgress * 20 < quadraticFloor(N),
+        "459-EC: progress visits far below quadratic")
+
+    -- Ordinary positive remote adjustment over large history (zero pending).
+    GS._ledgerEventIdLookupVisits = 0
+    local adjOp = select(1, GS:NewAdjustmentOperation(ITEM, 1, "Alice-Garona"))
+    assertTrue(adjOp ~= nil, "459-EC: adjustment prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "459-EC: apply adjustment")
+    flushTimers()
+    local visitsAdj = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertTrue(visitsAdj <= N * 8 + 64,
+        "459-EC: adjustment callback lookups bounded visits="
+            .. tostring(visitsAdj) .. " n=" .. tostring(N))
+    assertTrue(visitsAdj * 10 < quadraticFloor(N),
+        "459-EC: adjustment visits far below N(N+1)/2 visits="
+            .. tostring(visitsAdj) .. " quad=" .. tostring(quadraticFloor(N)))
+    local aliceAfter = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", ITEM)
+    assertEq(aliceAfter, N + 1, "459-EC: Alice personal after adj")
+    local progressAfter = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    assertEq(tonumber(progressAfter.itemTotals[ITEM]) or 0, N + 1,
+        "459-EC: campaign total after adj")
+
+    -- Sparse corrections among many untouched rows: still linear, credit moves.
+    local sparseTargets = { "ctx:ec-don-0001", "ctx:ec-don-0600", "ctx:ec-don-1200" }
+    for i = 1, #sparseTargets do
+        local corr = select(1, GS:NewContributorCorrectionOperation(
+            sparseTargets[i], "Bob-Garona", "Player-1-Bob"))
+        assertTrue(corr ~= nil, "459-EC: sparse corr " .. tostring(i))
+        assertEq(GS:ApplyStagedConfigOperation(corr), "accepted",
+            "459-EC: apply sparse corr " .. tostring(i))
+    end
+    flushTimers()
+    GS._ledgerEventIdLookupVisits = 0
+    local aliceSparse = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", ITEM)
+    local bobSparse = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", ITEM)
+    local visitsSparse = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertEq(bobSparse, 3, "459-EC: Bob sparse credit got " .. tostring(bobSparse))
+    assertEq(aliceSparse, (N + 1) - 3,
+        "459-EC: Alice after sparse got " .. tostring(aliceSparse))
+    assertTrue(visitsSparse <= N * 4,
+        "459-EC: sparse personal lookups linear visits=" .. tostring(visitsSparse))
+    assertTrue(visitsSparse * 20 < quadraticFloor(N),
+        "459-EC: sparse visits far below quadratic")
+
+    GS._ledgerEventIdLookupVisits = 0
+    local progressSparse = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    local visitsSparseProg = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertEq(tonumber(progressSparse.itemTotals[ITEM]) or 0, N + 1,
+        "459-EC: campaign total unchanged by corrections")
+    assertEq(tonumber(progressSparse.contributions["Bob-Garona"]
+        and progressSparse.contributions["Bob-Garona"][ITEM]) or 0, 3,
+        "459-EC: progress credits Bob sparse")
+    assertTrue(visitsSparseProg <= N * 4,
+        "459-EC: sparse progress lookups linear visits="
+            .. tostring(visitsSparseProg))
+
+    -- Alias-shaped id still resolves via durable alias map (no ledger rescan).
+    local cfg = record.accounting._consumables
+    cfg.creditEventAliases = cfg.creditEventAliases or {}
+    cfg.creditEventAliases["ctx:ec-alias-shaped"] = "ctx:ec-don-0001"
+    local aliasShaped = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = "ctx:ec-alias-shaped",
+        itemId = ITEM, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        generation = tonumber(cfg.generation) or 1,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    GS._ledgerEventIdLookupVisits = 0
+    local aliasName = select(1, GS.ResolveEffectiveCreditIdentity(record, aliasShaped))
+    local aliasVisits = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    assertEq(aliasName, "Bob-Garona",
+        "459-EC: alias-shaped Resolve uses durable alias map")
+    assertEq(aliasVisits, 0, "459-EC: alias-shaped Resolve does not scan ledger")
+
+    -- Real event via FindLedgerEventById(alias) still credits corrected winner.
+    local canonEv = GS.FindLedgerEventById(record, "ctx:ec-don-0001")
+    assertTrue(type(canonEv) == "table", "459-EC: canonical event present")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, canonEv)), "Bob-Garona",
+        "459-EC: known event Resolve after sparse correction")
+
+    -- Unassigned adjustment + credit_unavailable still covered by prior suites;
+    -- confirm Unassigned status remains nil (not credit_unavailable) here.
+    local unAdj = injectProductionAdjustment(record, {
+        id = "ctx:ec-unassigned", itemId = ITEM, quantity = -1,
+        attributed = nil, attributedGuid = nil,
+    })
+    assertTrue(GS.EnsureCreditCorrectionProjection(record, nil) ~= false,
+        "459-EC: projection after unassigned adj")
+    local unName, unGuid, unHead, unStatus =
+        GS.ResolveEffectiveCreditIdentity(record, unAdj)
+    assertNil(unName, "459-EC: Unassigned name nil")
+    assertNil(unGuid, "459-EC: Unassigned guid nil")
+    assertNil(unHead, "459-EC: Unassigned head nil")
+    assertNil(unStatus, "459-EC: Unassigned status nil (not credit_unavailable)")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

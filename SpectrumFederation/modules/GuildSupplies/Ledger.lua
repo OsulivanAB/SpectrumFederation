@@ -6009,10 +6009,15 @@ end
 
 --- Locate a durable ledger event by id across live + archive lists.
 -- Also resolves trusted donation txn aliases onto the canonical ledger row.
+-- Increments GS._ledgerEventIdLookupVisits per examined row (test/metric).
 -- @return event|nil
 function GS.FindLedgerEventById(record, eventId)
     if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
         return nil
+    end
+    local function chargeVisit()
+        GS._ledgerEventIdLookupVisits =
+            (tonumber(GS._ledgerEventIdLookupVisits) or 0) + 1
     end
     local lists = CreditEventLists(record)
     for li = 1, #lists do
@@ -6021,6 +6026,7 @@ function GS.FindLedgerEventById(record, eventId)
             local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
                 or (GS.MAX_ARCHIVED_EVENTS or 4096))
             for i = 1, limit do
+                chargeVisit()
                 local event = list[i]
                 if type(event) == "table" and event.id == eventId then
                     return event
@@ -6045,6 +6051,7 @@ function GS.FindLedgerEventById(record, eventId)
                 local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
                     or (GS.MAX_ARCHIVED_EVENTS or 4096))
                 for i = 1, limit do
+                    chargeVisit()
                     local event = list[i]
                     if type(event) == "table" and event.id == primary then
                         return event
@@ -6180,11 +6187,50 @@ function GS.IsCreditCorrectionProjectionAvailable(record)
     return GS.EnsureCreditCorrectionProjection(record, nil) ~= false
 end
 
+--- Correction head for a known ledger event without scanning the ledger.
+-- Heads are keyed by durable event.id. Alias-shaped ids consult the durable
+-- creditEventAliases hash only — never FindLedgerEventById / registry scans
+-- (those are quadratic when Resolve runs once per campaign row).
+-- @return head|nil
+local function CorrectionHeadForKnownEvent(record, map, event)
+    if type(map) ~= "table" or type(event) ~= "table" then
+        return nil
+    end
+    local id = event.id
+    if type(id) ~= "string" or id == "" then
+        return nil
+    end
+    local head = map[id]
+    if type(head) == "table" then
+        return head
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    local aliases = cfg and cfg.creditEventAliases
+    if type(aliases) ~= "table" then
+        return nil
+    end
+    local current = id
+    for _ = 1, 8 do
+        local mapped = aliases[current]
+        if type(mapped) ~= "string" or mapped == "" or mapped == current then
+            break
+        end
+        current = mapped
+        head = map[current]
+        if type(head) == "table" then
+            return head
+        end
+    end
+    return nil
+end
+
 --- Effective credited identity for one ledger event (#459).
 -- When projection reconstruction is failed/blocked, returns
 -- nil, nil, nil, GS.CREDIT_UNAVAILABLE — never durable fallback.
 -- Legitimate Unassigned adjustments still return nil, nil, nil, nil while
 -- the projection is available.
+-- Caller already holds the event row: do not re-canonicalize via
+-- FindLedgerEventById (#459 discussion_r4488489365).
 -- @return name|nil, guid|nil, correctionHead|nil, status|nil
 function GS.ResolveEffectiveCreditIdentity(record, event)
     if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
@@ -6197,16 +6243,7 @@ function GS.ResolveEffectiveCreditIdentity(record, event)
         end
     end
     local map = type(record) == "table" and record.creditCorrections or nil
-    local head = nil
-    if type(map) == "table" then
-        head = map[event.id]
-        if type(head) ~= "table" then
-            local canonical = GS.CanonicalCreditEventId(record, event.id)
-            if canonical and canonical ~= event.id then
-                head = map[canonical]
-            end
-        end
-    end
+    local head = CorrectionHeadForKnownEvent(record, map, event)
     if type(head) == "table" then
         return NormName(head.attributed), ValidGuid(head.attributedGuid), head, nil
     end
