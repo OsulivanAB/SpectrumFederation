@@ -165,7 +165,7 @@ Future Loot Helper / Guild Supplies integration may **read** these APIs. They mu
 
 **Guild Settings** in **Core**, between General and Gameplay → **Main / Alt Assignments** page. The category id remains `guildInfo`:
 
-- Class-colored roster autocomplete (offline-inclusive), snapshot refreshed on roster/guild events while visible.
+- Class-colored roster autocomplete (offline-inclusive), snapshot refreshed on roster/guild events while visible. Main and Alt fields filter suggestions by current Guild Info role before the visible-results cap (#470).
 - Assignments uses two side-by-side scroll panels (**Main** / **Alts**). Main lists every rostered non-alt (including characters with no alts) and hides confirmed departed mains. Alts shows the selected main's currently rostered alts with promote (up-arrow → existing `ChangeMain`) and unassign (X) controls for editors. Departed relationships stay in backend state.
 - Feedback via section banners only (no normal game Chat).
 
