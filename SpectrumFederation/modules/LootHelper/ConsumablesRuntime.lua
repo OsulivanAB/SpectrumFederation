@@ -1285,7 +1285,7 @@ local REVIEW_RANKINGS_BTN_INSET_X = 14
 local REVIEW_RANKINGS_BTN_INSET_Y = -10
 -- Keep the chart graphic inset inside the red button chrome (breathing room).
 local REVIEW_RANKINGS_ICON_INSET = 6
--- Packaged chart icon: white/ivory bars so vertex color tints cleanly.
+-- Packaged chart icon: three separated horizontal ranking bars (ivory for gold tint).
 local REVIEW_RANKINGS_ICON =
     "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\RaidSuppliesRankings.tga"
 -- WoW-style gold accent (matches Settings section/title accents) for contrast on red.
