@@ -649,6 +649,8 @@ local function resetRuntime()
     RT.bannerBankNavTimer = nil
     RT.bannerBankNavGen = 0
     RT._reminderDebugFingerprint = nil
+    RT._rankingsShortcutWatch = nil
+    RT._rankingsAuthFrame = nil
     RT.qtyOverrides = {}
     RT.pendingItemLoads = {}
     RT.bagCounts = {}
@@ -3369,6 +3371,160 @@ local function checkRuntimeReviewGuildBankLifecycle()
     unchanged(p, "runtime review guild bank lifecycle")
 end
 
+local function checkRuntimeReviewRankingsShortcut()
+    -- #466: Rankings shortcut visibility mirrors guildSuppliesRankings canEdit,
+    -- navigates via SettingsWindow:ShowPage, and never closes bank/review.
+    local p = runtimeFixture("rt-review-rankings")
+    local uiListeners = {}
+    local impersonationCallbacks = {}
+    local showPageCalls = {}
+    local caps = { canEdit = false, reason = "unauthorized" }
+
+    SF.GuildSupplies = {
+        GetCapabilities = function()
+            return caps
+        end,
+        RegisterUIListener = function(fn)
+            uiListeners[#uiListeners + 1] = fn
+        end,
+        IsLiveActiveForCurrentGuild = function()
+            return false
+        end,
+    }
+    SF.GuildOfficer = {
+        RegisterUIListener = function(fn)
+            uiListeners[#uiListeners + 1] = fn
+        end,
+    }
+    SF.LootHelperImpersonation = {
+        RegisterCallback = function(_, fn)
+            impersonationCallbacks[#impersonationCallbacks + 1] = fn
+        end,
+    }
+    SF.SettingsWindow = {
+        ShowPage = function(_, pageId)
+            showPageCalls[#showPageCalls + 1] = pageId
+        end,
+        ApplySettingsWindowOpacity = function() end,
+        RegisterSettingsWindowOpacityTarget = function() end,
+    }
+
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(),
+        "rankings shortcut fixture opens the Raid Supplies window")
+    local btn = review.RankingsButton
+    assertTrue(btn ~= nil, "EnsureReview creates the Rankings shortcut button")
+    assertEq(btn.width, 24, "Rankings shortcut uses close-button-sized chrome")
+    assertEq(btn.height, 24, "Rankings shortcut height matches its width")
+    assertTrue(btn.anchor ~= nil
+        and btn.anchor.point == "TOPRIGHT"
+        and btn.anchor.relative == review,
+        "Rankings shortcut anchors to the panel top-right")
+    assertTrue(review.Title ~= nil
+        and review.Title.anchor
+        and review.Title.anchor.point == "TOP"
+        and review.Title.anchor.relative == review,
+        "panel title stays centered while the Rankings shortcut exists")
+    assertEq(countCloseButtons(review), 0,
+        "Rankings shortcut does not add a close button")
+    assertFalse(btn:IsShown(),
+        "unauthorized players do not see the Rankings shortcut")
+    assertTrue(#uiListeners >= 2,
+        "Rankings shortcut watches Guild Supplies and Guild Officer UI listeners")
+    assertTrue(#impersonationCallbacks >= 1,
+        "Rankings shortcut watches Preview as Non-Admin changes")
+    assertTrue(RT._rankingsAuthFrame ~= nil
+        and RT._rankingsAuthFrame.registeredEvents
+        and RT._rankingsAuthFrame.registeredEvents.GUILD_ROSTER_UPDATE,
+        "Rankings shortcut watches guild roster updates")
+
+    caps = { canEdit = true, reason = nil }
+    RT:SyncRankingsShortcut()
+    assertTrue(btn:IsShown(),
+        "authorized officers see the Rankings shortcut")
+    assertTrue(btn.Icon ~= nil and btn.Icon.texture ~= nil
+        and tostring(btn.Icon.texture):find("RaidSuppliesRankings", 1, true),
+        "Rankings shortcut uses the packaged chart icon")
+
+    caps = { canEdit = false, reason = "preview_non_admin" }
+    for i = 1, #impersonationCallbacks do
+        impersonationCallbacks[i]()
+    end
+    assertFalse(btn:IsShown(),
+        "Preview as Non-Admin hides the Rankings shortcut without a reload")
+
+    caps = { canEdit = true, reason = nil }
+    RT._rankingsAuthFrame.scripts.OnEvent(RT._rankingsAuthFrame, "GUILD_ROSTER_UPDATE")
+    assertTrue(btn:IsShown(),
+        "guild roster eligibility changes reshow the Rankings shortcut")
+
+    caps = nil
+    SF.GuildSupplies.GetCapabilities = function()
+        return nil
+    end
+    RT:SyncRankingsShortcut()
+    assertFalse(btn:IsShown(),
+        "missing authorization information fails closed and hides the shortcut")
+
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = true }
+    end
+    RT:SyncRankingsShortcut()
+    assertTrue(btn:IsShown(), "restored canEdit shows the Rankings shortcut again")
+
+    showPageCalls = {}
+    world.bankOpen = true
+    assertTrue(review:IsShown(), "bank panel stays open before Rankings navigation")
+    btn.scripts.OnClick(btn)
+    assertEq(#showPageCalls, 1, "clicking Rankings navigates once")
+    assertEq(showPageCalls[1], "guildSuppliesRankings",
+        "Rankings shortcut opens the existing guildSuppliesRankings page")
+    assertTrue(review:IsShown(),
+        "opening Rankings does not close the Raid Supplies panel")
+    assertTrue(world.bankOpen,
+        "opening Rankings does not close the guild bank")
+
+    -- Access lost between show and click: hide and do not navigate.
+    showPageCalls = {}
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = false, reason = "unauthorized" }
+    end
+    btn.scripts.OnClick(btn)
+    assertEq(#showPageCalls, 0,
+        "unauthorized click does not open Rankings")
+    assertFalse(btn:IsShown(),
+        "unauthorized click syncs visibility closed")
+
+    -- Existing configured-tab / bank-close lifecycle is unchanged.
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = true }
+    end
+    RT:SyncRankingsShortcut()
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab still hides the Raid Supplies window")
+    world.currentTab = 2
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "returning to the configured tab still shows the Raid Supplies window")
+    assertTrue(review.RankingsButton:IsShown(),
+        "authorized Rankings shortcut remains after tab lifecycle")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    assertFalse(review:IsShown(),
+        "closing the Guild Bank still hides the Raid Supplies window")
+
+    SF.GuildSupplies = nil
+    SF.GuildOfficer = nil
+    SF.LootHelperImpersonation = nil
+    SF.SettingsWindow = nil
+    unchanged(p, "runtime review rankings shortcut")
+end
+
 local function startDeposit(line)
     local collected = RT:Collect()
     RT:BeginDeposit(line or collected.plan.lines[1], collected)
@@ -5095,6 +5251,7 @@ checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
 checkRuntimeReviewGuildBankLifecycle()
+checkRuntimeReviewRankingsShortcut()
 checkRuntimeReviewDepositTabSwitch()
 checkRuntimeDeposit()
 checkStaleDepositReview()

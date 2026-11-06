@@ -156,6 +156,17 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "SyncReviewWithGuildBank" in runtime
     assert "HideReviewForBankLifecycle" in runtime
     assert "UIPanelCloseButton" not in runtime
+    # #466: Rankings shortcut reuses Settings ShowPage + Guild Supplies canEdit.
+    assert 'ShowPage("guildSuppliesRankings")' in runtime
+    assert "CanViewRankingsShortcut" in runtime
+    assert "RaidSuppliesRankings.tga" in runtime
+    assert (
+        REPO_ROOT
+        / "SpectrumFederation"
+        / "media"
+        / "Icons"
+        / "RaidSuppliesRankings.tga"
+    ).is_file()
     assert "HasReminderPath" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRouting.lua"
     ).read_text(encoding="utf-8")

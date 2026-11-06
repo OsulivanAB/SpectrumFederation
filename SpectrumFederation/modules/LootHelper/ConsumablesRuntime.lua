@@ -1279,6 +1279,190 @@ local REVIEW_QW_RIGHT_PAD = 4
 local REVIEW_QW_NAME_WIDTH = REVIEW_ROW_WIDTH
     - REVIEW_ICON_SIZE - 4 - 4 - REVIEW_EDIT_WIDTH - REVIEW_QW_RIGHT_PAD
 local REVIEW_MOBILE_WIDTH = 140
+-- Square Rankings shortcut (about the size of a standard close control).
+local REVIEW_RANKINGS_BTN_SIZE = 24
+local REVIEW_RANKINGS_BTN_INSET_X = 14
+local REVIEW_RANKINGS_BTN_INSET_Y = -10
+-- Packaged chart icon: no durable Blizzard small chart chrome texture was suitable.
+local REVIEW_RANKINGS_ICON =
+    "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\RaidSuppliesRankings.tga"
+
+-- Same effective Rankings gate as Settings page `guildSuppliesRankings`
+-- (`available` / CanViewRankings): shared Guild Supplies canEdit, fail closed.
+function Runtime:CanViewRankingsShortcut()
+    local g = SF.GuildSupplies
+    if not g or type(g.GetCapabilities) ~= "function" then
+        return false
+    end
+    local caps = g:GetCapabilities()
+    return type(caps) == "table" and caps.canEdit == true
+end
+
+function Runtime:SyncRankingsShortcut()
+    local frame = self.review
+    local btn = frame and frame.RankingsButton
+    if not btn then
+        return
+    end
+    local show = self:CanViewRankingsShortcut()
+    if btn.SetShown then
+        btn:SetShown(show and true or false)
+    elseif show then
+        btn:Show()
+    else
+        btn:Hide()
+    end
+end
+
+-- Listen for the same access-change paths Rankings/Settings already use.
+-- No polling; SyncRankingsShortcut is a cheap canEdit + SetShown.
+function Runtime:EnsureRankingsShortcutWatch()
+    if self._rankingsShortcutWatch then
+        return
+    end
+    self._rankingsShortcutWatch = true
+
+    local function sync()
+        self:SyncRankingsShortcut()
+    end
+
+    local impersonation = SF.LootHelperImpersonation
+    if impersonation and type(impersonation.RegisterCallback) == "function" then
+        impersonation:RegisterCallback(sync)
+    end
+
+    local supplies = SF.GuildSupplies
+    if supplies and type(supplies.RegisterUIListener) == "function" then
+        supplies.RegisterUIListener(sync)
+    end
+
+    local officer = SF.GuildOfficer
+    if officer and type(officer.RegisterUIListener) == "function" then
+        officer.RegisterUIListener(sync)
+    end
+
+    if type(CreateFrame) == "function" then
+        local watch = CreateFrame("Frame")
+        self._rankingsAuthFrame = watch
+        if watch.RegisterEvent then
+            pcall(watch.RegisterEvent, watch, "GUILD_ROSTER_UPDATE")
+            pcall(watch.RegisterEvent, watch, "PLAYER_GUILD_UPDATE")
+        end
+        watch:SetScript("OnEvent", function()
+            sync()
+        end)
+    end
+end
+
+function Runtime:OpenRankingsFromReview()
+    -- Fail closed if access disappeared between show and click.
+    if not self:CanViewRankingsShortcut() then
+        self:SyncRankingsShortcut()
+        return
+    end
+    local win = SF.SettingsWindow
+    if win and type(win.ShowPage) == "function" then
+        -- Established Settings navigation; respects page availability.
+        -- Must not close the guild bank or Raid Supplies panel.
+        win:ShowPage("guildSuppliesRankings")
+    end
+end
+
+function Runtime:EnsureRankingsShortcut(frame)
+    if not frame then
+        return nil
+    end
+    if frame.RankingsButton then
+        return frame.RankingsButton
+    end
+
+    local btn = CreateFrame("Button", nil, frame)
+    btn:SetSize(REVIEW_RANKINGS_BTN_SIZE, REVIEW_RANKINGS_BTN_SIZE)
+    btn:SetPoint(
+        "TOPRIGHT",
+        frame,
+        "TOPRIGHT",
+        -REVIEW_RANKINGS_BTN_INSET_X,
+        REVIEW_RANKINGS_BTN_INSET_Y
+    )
+    btn:EnableMouse(true)
+    btn:RegisterForClicks("LeftButtonUp")
+    btn:Hide()
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    if icon.SetAllPoints then
+        icon:SetAllPoints(btn)
+    end
+    if icon.SetTexture then
+        icon:SetTexture(REVIEW_RANKINGS_ICON)
+    end
+    if icon.SetTexCoord then
+        icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    end
+    btn.Icon = icon
+
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    if highlight.SetAllPoints then
+        highlight:SetAllPoints(btn)
+    end
+    if highlight.SetColorTexture then
+        highlight:SetColorTexture(1, 1, 1, 0.18)
+    end
+    btn.Highlight = highlight
+
+    btn:SetScript("OnMouseDown", function()
+        if icon.SetVertexColor then
+            icon:SetVertexColor(0.75, 0.75, 0.75, 1)
+        end
+        if icon.ClearAllPoints and icon.SetPoint then
+            icon:ClearAllPoints()
+            icon:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
+            icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 1, -1)
+        end
+    end)
+    btn:SetScript("OnMouseUp", function()
+        if icon.SetVertexColor then
+            icon:SetVertexColor(1, 1, 1, 1)
+        end
+        if icon.ClearAllPoints and icon.SetAllPoints then
+            icon:ClearAllPoints()
+            icon:SetAllPoints(btn)
+        end
+    end)
+    btn:SetScript("OnEnter", function(owner)
+        if not GameTooltip then
+            return
+        end
+        GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+        GameTooltip:SetText(
+            Loc("RAID_SUPPLIES_OPEN_RANKINGS", "Open Raid Supplies Rankings"),
+            1,
+            1,
+            1
+        )
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function()
+        if icon.SetVertexColor then
+            icon:SetVertexColor(1, 1, 1, 1)
+        end
+        if icon.ClearAllPoints and icon.SetAllPoints then
+            icon:ClearAllPoints()
+            icon:SetAllPoints(btn)
+        end
+        if GameTooltip and GameTooltip.Hide then
+            GameTooltip:Hide()
+        end
+    end)
+    btn:SetScript("OnClick", function()
+        self:OpenRankingsFromReview()
+    end)
+
+    frame.RankingsButton = btn
+    self:EnsureRankingsShortcutWatch()
+    self:SyncRankingsShortcut()
+    return btn
+end
 
 -- Deposit/progress layout (default AcquireRow geometry). Call when a pooled row
 -- leaves Quick Withdraw item layout so edit/button/goal-met stay in panel.
@@ -1450,7 +1634,10 @@ function Runtime:EnsureReview()
     local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     title:SetPoint("TOP", frame, "TOP", 0, -12)
     title:SetText("Raid supplies")
+    frame.Title = title
     -- No X/close control: visibility follows Guild Bank + configured-tab lifecycle.
+    -- Officer Rankings shortcut (#466): top-right chart button; title stays centered.
+    self:EnsureRankingsShortcut(frame)
     local status = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     status:SetPoint("TOPLEFT", frame, "TOPLEFT", REVIEW_PAD_X, -34)
     status:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -REVIEW_PAD_X, -34)
@@ -1735,6 +1922,7 @@ function Runtime:ShowReview()
     end
     -- Realign only when the helper opens again; keep manual drag while visible.
     self:AlignReviewToGuildBank(not wasShown)
+    self:SyncRankingsShortcut()
     self:RebuildReview()
 end
 
@@ -1742,6 +1930,8 @@ function Runtime:RebuildReview()
     local frame = self:EnsureReview()
     if not frame:IsShown() then return end
     self:EnsureItemIconWatch()
+    -- Keep Rankings shortcut visibility aligned with canEdit (Preview / roster).
+    self:SyncRankingsShortcut()
     local collected = self:Collect()
     self:ClearRows()
     if not collected then return end
