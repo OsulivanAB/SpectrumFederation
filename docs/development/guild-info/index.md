@@ -154,7 +154,9 @@ Schema-2 (epochless) wires are rejected. Remote admission requires a transport-a
 | `GI:GetRelationshipGroups([guildKey])` | Sorted-ready group list; empty when unconfigured; hides mains-only rows |
 | `GI:GetCharacterRole(guid[, guildKey])` | `"main"` / `"alt"` / nil |
 | `GI:GetCapabilities()` | `canRead` / `canEdit` (UI hints; recheck at commit) |
-| `GI:GetAssignmentDisplayRows(roster)` | Settings list rows with membership status |
+| `GI:GetAssignmentDisplayRows(roster)` | Legacy grouped Settings rows with membership status |
+| `GI:GetEligibleMainDisplayRows(roster)` | Two-panel Main list: rostered non-alts (hides departed; incomplete roster yields no rows) |
+| `GI:GetSelectedAltDisplayRows(mainGuid, roster)` | Two-panel Alts list for one main (rostered alts only; departed hidden) |
 | `GI.CountRetainedState([record])` | Bound diagnostics (members/groups/tombstones) |
 
 Future Loot Helper / Guild Supplies integration may **read** these APIs. They must not become the authority for those systems in this ticket.
@@ -164,7 +166,7 @@ Future Loot Helper / Guild Supplies integration may **read** these APIs. They mu
 **Guild Settings** in **Core**, between General and Gameplay → **Main / Alt Assignments** page. The category id remains `guildInfo`:
 
 - Class-colored roster autocomplete (offline-inclusive), snapshot refreshed on roster/guild events while visible.
-- Grouped list with remove controls for editors; Change Main for the selected group.
+- Assignments uses two side-by-side scroll panels (**Main** / **Alts**). Main lists every rostered non-alt (including characters with no alts) and hides confirmed departed mains. Alts shows the selected main's currently rostered alts with promote (up-arrow → existing `ChangeMain`) and unassign (X) controls for editors. Departed relationships stay in backend state.
 - Feedback via section banners only (no normal game Chat).
 
 ## Validation

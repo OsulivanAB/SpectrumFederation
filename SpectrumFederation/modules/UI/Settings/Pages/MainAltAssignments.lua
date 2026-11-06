@@ -45,8 +45,7 @@ local mainText = ""
 local altText = ""
 local mainResolved = nil -- { guid, nameRealm, classFile }
 local altResolved = nil
-local selectedGroupMainGuid = nil
-local changeMainCandidate = nil
+local selectedMainGuid = nil -- ephemeral Main-panel selection (#468)
 
 local function BeginRenderPass()
 	passCache = {}
@@ -317,34 +316,61 @@ local function DoAssign(ctx, moveConfirmed, expectedOldMain)
 	ReportStatus(ctx, status, reason)
 end
 
-local function ChangeMainOptions()
+--- Keep Main selection valid after roster/relationship updates (#468).
+local function NormalizeMainSelection(roster)
+	if not selectedMainGuid then
+		return
+	end
 	local g = GI()
-	local roster = Roster()
-	local opts = {}
-	if not selectedGroupMainGuid or not g then
-		return opts
+	if g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(selectedMainGuid, roster) then
+		return
 	end
-	local _, _, displayGroups = g:GetAssignmentDisplayRows(roster)
-	if type(displayGroups) ~= "table" then
-		return opts
+	selectedMainGuid = nil
+end
+
+local function PromoteAltToMain(ctx, altItem)
+	local gi = GI()
+	if not gi or not gi.ChangeMain then
+		return
 	end
-	for i = 1, #displayGroups do
-		local group = displayGroups[i]
-		if group.mainGuid == selectedGroupMainGuid then
-			for j = 1, #group.alts do
-				local a = group.alts[j]
-				if a.status == "in_guild" then
-					local label = a.nameRealm
-					if g.ColorizeName then
-						label = g.ColorizeName(a.nameRealm, a.classFile)
-					end
-					opts[#opts + 1] = { value = a.guid, label = label }
-				end
-			end
-			break
+	if not altItem or altItem.role ~= "alt" or not altItem.guid or not altItem.mainGuid then
+		return
+	end
+	local oldMain = altItem.mainGuid
+	local newMain = altItem.guid
+	local record = select(1, gi:GetCurrentRecord())
+	local r = Roster()
+	local msg = Loc("GUILD_INFO_CHANGE_MAIN_CONFIRM",
+		"Promote %s to main? %s becomes an alt; all other alts stay in the group."):format(
+		CharacterLabel(newMain, record, r),
+		CharacterLabel(oldMain, record, r)
+	)
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local function commit()
+		-- Revalidate roster at confirm time; the dialog may outlive
+		-- the render-pass snapshot if the candidate leaves the guild.
+		if gi.InvalidateRosterSnapshot then
+			gi.InvalidateRosterSnapshot()
 		end
+		local freshRoster = gi.GetRosterSnapshot and gi.GetRosterSnapshot(true) or nil
+		if not freshRoster or not freshRoster.complete then
+			ReportStatus(ctx, "rejected",
+				(freshRoster and freshRoster.reason) or "roster_incomplete")
+			return
+		end
+		local status, reason = gi:ChangeMain(oldMain, newMain, {
+			roster = freshRoster,
+		})
+		if status == "accepted" then
+			selectedMainGuid = newMain
+		end
+		ReportStatus(ctx, status, reason)
 	end
-	return opts
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(msg, Loc("GUILD_INFO_PROMOTE_BUTTON", "Promote"), commit)
+	else
+		commit()
+	end
 end
 
 local function AccessStatusText()
@@ -730,126 +756,95 @@ local function Definition()
 				title = Loc("GUILD_INFO_SECTION_LIST", "Assignments"),
 				items = {
 					{
-						type = "scrollList",
-						label = Loc("GUILD_INFO_LIST_LABEL", "Mains and alts"),
-						height = 220,
-						border = true,
+						type = "sideBySideScrollLists",
+						panelHeight = 220,
+						gap = 12,
 						enabled = function()
 							return Caps().canRead
 						end,
-						getItems = function()
-							local gi = GI()
-							if not gi or not gi.GetAssignmentDisplayRows then
-								return {}
-							end
-							local rows = gi:GetAssignmentDisplayRows(Roster())
-							return rows or {}
-						end,
-						getSelectedKey = function()
-							return selectedGroupMainGuid
-						end,
-						onSelect = function(_, item)
-							if item and item.clusterId then
-								selectedGroupMainGuid = item.clusterId
-								changeMainCandidate = nil
-								RefreshPageControls()
-							end
-						end,
-						onRemove = function(ctx, item)
-							if not item or item.role ~= "alt" or not item.guid then
-								return
-							end
-							local gi = GI()
-							if not gi or not gi.UnassignAlt then
-								return
-							end
-							-- Capture the displayed relationship for stale confirmation.
-							local expectedMainGuid = item.mainGuid
-							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-							local msg = Loc("GUILD_INFO_UNASSIGN_CONFIRM",
-								"Unassign this alt from its main?")
-							local function commit()
-								local status, reason = gi:UnassignAlt(item.guid, {
-									expectedMainGuid = expectedMainGuid,
-								})
-								ReportStatus(ctx, status, reason)
-							end
-							if dialogs and dialogs.Confirm then
-								dialogs:Confirm(msg, Loc("GUILD_INFO_UNASSIGN_BUTTON", "Unassign"), commit)
-							else
-								commit()
-							end
-						end,
-					},
-					{
-						type = "dropdown",
-						label = Loc("GUILD_INFO_CHANGE_MAIN_FIELD", "New main (selected group)"),
-						defaultText = Loc("GUILD_INFO_CHANGE_MAIN_DEFAULT", "Select a rostered alt"),
-						enabled = function()
-							return Caps().canEdit and selectedGroupMainGuid ~= nil and #ChangeMainOptions() > 0
-						end,
-						get = function()
-							return changeMainCandidate
-						end,
-						set = function(v)
-							changeMainCandidate = v
-							QueueFormRefresh()
-						end,
-						options = function()
-							return ChangeMainOptions()
-						end,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_INFO_CHANGE_MAIN_LABEL", "Change Main"),
-						buttonText = Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"),
-						enabled = function()
-							return Caps().canEdit
-								and selectedGroupMainGuid ~= nil
-								and changeMainCandidate ~= nil
-						end,
-						onClick = function(ctx)
-							local gi = GI()
-							if not gi or not gi.ChangeMain then
-								return
-							end
-							local oldMain = selectedGroupMainGuid
-							local newMain = changeMainCandidate
-							local record = select(1, gi:GetCurrentRecord())
-							local r = Roster()
-							local msg = Loc("GUILD_INFO_CHANGE_MAIN_CONFIRM",
-								"Promote %s to main? %s becomes an alt; all other alts stay in the group."):format(
-								CharacterLabel(newMain, record, r),
-								CharacterLabel(oldMain, record, r)
-							)
-							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-							local function commit()
-								-- Revalidate roster at confirm time; the dialog may outlive
-								-- the render-pass snapshot if the candidate leaves the guild.
-								if gi.InvalidateRosterSnapshot then
-									gi.InvalidateRosterSnapshot()
+						left = {
+							title = Loc("GUILD_INFO_PANEL_MAIN", "Main"),
+							border = true,
+							resize = false,
+							height = 220,
+							compactColumns = true,
+							removeColumnGap = 6,
+							getItems = function()
+								local gi = GI()
+								if not gi or not gi.GetEligibleMainDisplayRows then
+									return {}
 								end
-								local freshRoster = gi.GetRosterSnapshot and gi.GetRosterSnapshot(true) or nil
-								if not freshRoster or not freshRoster.complete then
-									ReportStatus(ctx, "rejected",
-										(freshRoster and freshRoster.reason) or "roster_incomplete")
+								local roster = Roster()
+								NormalizeMainSelection(roster)
+								local rows = gi:GetEligibleMainDisplayRows(roster)
+								return rows or {}
+							end,
+							getSelectedKey = function()
+								return selectedMainGuid
+							end,
+							onSelect = function(_, item)
+								if item and item.guid then
+									selectedMainGuid = item.guid
+									-- Selection-only: refresh controls without roster rescan.
+									RefreshPageControls()
+								end
+							end,
+						},
+						right = {
+							title = Loc("GUILD_INFO_PANEL_ALTS", "Alts"),
+							border = true,
+							resize = false,
+							height = 220,
+							compactColumns = true,
+							removeColumnGap = 6,
+							actionColumnGap = 6,
+							actionTexture = "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
+							actionTooltip = Loc("GUILD_INFO_PROMOTE_TIP", "Promote this alt to Main"),
+							emptyText = function()
+								if not selectedMainGuid then
+									return Loc("GUILD_INFO_ALTS_SELECT_MAIN",
+										"Select a main to view its alts.")
+								end
+								return Loc("GUILD_INFO_ALTS_EMPTY",
+									"No assigned alts.")
+							end,
+							getItems = function()
+								local gi = GI()
+								if not selectedMainGuid or not gi or not gi.GetSelectedAltDisplayRows then
+									return {}
+								end
+								local rows = gi:GetSelectedAltDisplayRows(selectedMainGuid, Roster())
+								return rows or {}
+							end,
+							onAction = function(ctx, item)
+								PromoteAltToMain(ctx, item)
+							end,
+							onRemove = function(ctx, item)
+								if not item or item.role ~= "alt" or not item.guid then
 									return
 								end
-								local status, reason = gi:ChangeMain(oldMain, newMain, {
-									roster = freshRoster,
-								})
-								if status == "accepted" then
-									selectedGroupMainGuid = newMain
-									changeMainCandidate = nil
+								local gi = GI()
+								if not gi or not gi.UnassignAlt then
+									return
 								end
-								ReportStatus(ctx, status, reason)
-							end
-							if dialogs and dialogs.Confirm then
-								dialogs:Confirm(msg, Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"), commit)
-							else
-								commit()
-							end
-						end,
+								-- Capture the displayed relationship for stale confirmation.
+								local expectedMainGuid = item.mainGuid
+								local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+								local msg = Loc("GUILD_INFO_UNASSIGN_CONFIRM",
+									"Unassign this alt from its main?")
+								local function commit()
+									local status, reason = gi:UnassignAlt(item.guid, {
+										expectedMainGuid = expectedMainGuid,
+									})
+									ReportStatus(ctx, status, reason)
+								end
+								if dialogs and dialogs.Confirm then
+									dialogs:Confirm(msg, Loc("GUILD_INFO_UNASSIGN_BUTTON", "Unassign"), commit)
+								else
+									commit()
+								end
+							end,
+						},
 					},
 				},
 			},
