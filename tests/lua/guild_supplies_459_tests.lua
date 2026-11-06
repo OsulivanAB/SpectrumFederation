@@ -10354,9 +10354,9 @@ do
 end
 
 do
-    -- Contributor autocomplete: OnTextChanged notifies onResolved(nil) before set.
-    -- Refreshing on nil rewrites the prior draft into the edit box
-    -- (#459 discussion_r4496331290 / 4496719322).
+    -- Contributor autocomplete: exercise the real Controls:AddAutocomplete
+    -- OnTextChanged → Logs definition onResolved → setter → refresh boundary
+    -- (#459 discussion_r4496331290 / 4497018238 / 4497814453).
     local record = seedLiveCampaignWithItem(9981, 40)
     injectProductionDonation(record, {
         id = "ctx:ac-don", itemId = 9981, quantity = 3,
@@ -10378,29 +10378,253 @@ do
     session.attributedGuid = "Player-1-Alice"
     session.attributionText = "Alice-Garona"
     session.attributionResolved = true
-    -- Mock focused edit box rebound by Refresh from get().
-    local boxText = "Alice-Garona"
+
+    -- Minimal native-frame harness for Controls:AddAutocomplete only.
+    local created = {}
+    local function makeRegion(objectType, name, parent, template)
+        local region = {
+            _shown = true, _text = "", _enabled = true, _alpha = 1,
+            _scripts = {}, _points = {}, _width = 180, _height = 20,
+            parent = parent, name = name,
+            objectType = objectType or "Frame",
+        }
+        function region:GetObjectType() return self.objectType end
+        function region:SetShown(v) self._shown = v and true or false end
+        function region:IsShown() return self._shown end
+        function region:Show() self._shown = true end
+        function region:Hide() self._shown = false end
+        function region:SetSize(w, h)
+            self._width = tonumber(w) or self._width
+            self._height = tonumber(h) or self._height
+        end
+        function region:SetWidth(w) self._width = tonumber(w) or self._width end
+        function region:SetHeight(h) self._height = tonumber(h) or self._height end
+        function region:GetWidth() return self._width end
+        function region:GetHeight() return self._height end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetText(t) self._text = tostring(t or "") end
+        function region:GetText() return self._text end
+        function region:SetTextColor() end
+        function region:SetHighlightColor() end
+        function region:SetAutoFocus() end
+        function region:SetMaxLetters() end
+        function region:SetEnabled(v) self._enabled = v and true or false end
+        function region:IsEnabled() return self._enabled end
+        function region:Enable() self._enabled = true end
+        function region:Disable() self._enabled = false end
+        function region:EnableMouse() end
+        function region:SetAlpha(a) self._alpha = a end
+        function region:SetScript(ev, fn) self._scripts[ev] = fn end
+        function region:GetScript(ev) return self._scripts[ev] end
+        function region:HasFocus() return self._focused end
+        function region:SetFocus() self._focused = true end
+        function region:ClearFocus()
+            self._focused = false
+            local fn = self._scripts.OnEditFocusLost
+            if fn then fn(self) end
+        end
+        function region:Click(...)
+            local fn = self._scripts.OnClick
+            if fn then fn(self, ...) end
+        end
+        function region:SetCursorPosition() end
+        function region:GetCursorPosition() return 0 end
+        function region:SetFrameStrata() end
+        function region:SetClampedToScreen() end
+        function region:SetJustifyH() end
+        function region:SetColorTexture() end
+        function region:SetBackdrop() end
+        function region:SetBackdropColor() end
+        function region:SetBackdropBorderColor() end
+        function region:CreateFontString()
+            return makeRegion("FontString", nil, self)
+        end
+        function region:CreateTexture()
+            return makeRegion("Texture", nil, self)
+        end
+        function region:TypeText(text)
+            self._text = tostring(text or "")
+            local fn = self._scripts.OnTextChanged
+            if fn then fn(self, true) end
+        end
+        if template and tostring(template):find("InputBox", 1, true) then
+            region.objectType = "EditBox"
+            region.Instructions = makeRegion("FontString", nil, region)
+            function region.Instructions:SetText(t) self._text = tostring(t or "") end
+        end
+        if objectType == "EditBox" then
+            region.objectType = "EditBox"
+        end
+        if objectType == "Button" or (template and tostring(template):find("Button", 1, true)) then
+            region.objectType = "Button"
+            region.Text = makeRegion("FontString", nil, region)
+        end
+        created[#created + 1] = region
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    local priorUIParent = UIParent
+    local priorGameTooltip = GameTooltip
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+    UIParent = makeRegion("Frame", "UIParent")
+    GameTooltip = {
+        SetOwner = function() end,
+        SetText = function() end,
+        AddLine = function() end,
+        Show = function() end,
+        Hide = function() end,
+    }
+
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    assertTrue(SF.SettingsUI.Controls and SF.SettingsUI.Controls.AddAutocomplete,
+        "459-AC: Controls:AddAutocomplete loaded")
+
+    -- Capture the production Logs autocomplete definition via Page:Build.
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+    local prevRendererBuild = SF.SettingsUI.DefinitionRenderer.Build
+    local capturedDef = nil
+    SF.SettingsUI.DefinitionRenderer.Build = function(_, panel, pageDef)
+        capturedDef = pageDef
+        panel.__sfPageDef = pageDef
+        return panel
+    end
+    local buildPanel = makeRegion("Frame", "LogsACPanel")
+    function buildPanel:IsVisible() return true end
+    local buildOk, buildErr = pcall(function()
+        logsPage:Build(buildPanel)
+    end)
+    SF.SettingsUI.DefinitionRenderer.Build = prevRendererBuild
+    assertTrue(buildOk, "459-AC: Logs Build captured definition got " .. tostring(buildErr))
+    local acDef = nil
+    for _, sec in ipairs((capturedDef and capturedDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "autocomplete" then
+                acDef = item
+            end
+        end
+    end
+    assertTrue(type(acDef) == "table" and type(acDef.onResolved) == "function",
+        "459-AC: production autocomplete definition found")
+    assertTrue(type(acDef.set) == "function" and type(acDef.get) == "function",
+        "459-AC: production get/set bound")
+
+    -- Page:Refresh must fire Controls RegisterRefresh so get() can rewrite the
+    -- focused edit (DefinitionRenderer path). Without that, the fail-before
+    -- mutation cannot restore Alice mid-keystroke.
     local refreshCount = 0
+    local activeRefreshFns = {}
     local prevRefresh = logsPage.Refresh
     logsPage.Refresh = function(self, panel)
         refreshCount = refreshCount + 1
-        local sess = logsPage.__sfTest.GetEditSession()
-        if type(sess) == "table" then
-            if type(sess.attributionText) == "string" then
-                boxText = sess.attributionText
-            else
-                boxText = sess.attributed or ""
-            end
-        end
-        if type(prevRefresh) == "function" then
-            return prevRefresh(self, panel)
+        for i = 1, #activeRefreshFns do
+            activeRefreshFns[i]()
         end
     end
-    -- Production AddAutocomplete OnTextChanged order (Controls.lua):
-    -- NotifyResolved(nil) → read GetText → set(text) → set refreshes.
-    -- Unique roster short name "Bob" must resolve through the real set path.
+    -- Keep the Build panel visible for production set()/onResolved refresh gates.
+    if type(logsPage.panel) == "table" then
+        function logsPage.panel:IsShown() return true end
+        function logsPage.panel:IsVisible() return true end
+    end
+
+    local function bindAutocomplete(onResolvedFn)
+        created = {}
+        activeRefreshFns = {}
+        local section = {
+            __sfPageBuilder = {
+                RegisterRefresh = function(_, fn)
+                    if type(fn) == "function" then
+                        activeRefreshFns[#activeRefreshFns + 1] = fn
+                    end
+                end,
+                Refresh = function()
+                    for i = 1, #activeRefreshFns do
+                        activeRefreshFns[i]()
+                    end
+                end,
+                FireRefresh = function()
+                    for i = 1, #activeRefreshFns do
+                        activeRefreshFns[i]()
+                    end
+                end,
+            },
+            AddRow = function(_, _h, builder)
+                local r = makeRegion("Frame", "ACRow")
+                builder(r)
+                return r
+            end,
+        }
+        SF.SettingsUI.Controls:AddAutocomplete(section, {
+            label = acDef.label,
+            width = acDef.width or 220,
+            maxLetters = acDef.maxLetters,
+            maxSuggestions = acDef.maxSuggestions or 8,
+            hint = acDef.hint,
+            get = acDef.get,
+            set = acDef.set,
+            enabled = acDef.enabled,
+            visible = acDef.visible,
+            getSuggestions = function(prefix)
+                return acDef.getSuggestions(nil, prefix)
+            end,
+            onResolved = onResolvedFn,
+        })
+        local edit = nil
+        for i = 1, #created do
+            if created[i].objectType == "EditBox" then
+                edit = created[i]
+                break
+            end
+        end
+        assertTrue(edit ~= nil, "459-AC: autocomplete EditBox created")
+        return edit
+    end
+
     local typed = "Bob"
-    logsPage.__sfTest.SimulateEditAttributionTextChanged(typed)
+    -- Failure-before: restore the old synchronous refresh inside onResolved(nil).
+    -- Production AddAutocomplete notifies nil before GetText/set; refreshing here
+    -- rewrites the focused box from the stale Alice draft.
+    session.attributed = "Alice-Garona"
+    session.attributedGuid = "Player-1-Alice"
+    session.attributionText = "Alice-Garona"
+    session.attributionResolved = true
+    local buggyEdit = bindAutocomplete(function(item)
+        if not item then
+            acDef.onResolved(nil, nil)
+            if logsPage.Refresh and logsPage.panel then
+                logsPage:Refresh(logsPage.panel)
+            end
+            return
+        end
+        return acDef.onResolved(nil, item)
+    end)
+    buggyEdit:SetText("Alice-Garona")
+    buggyEdit:TypeText(typed)
+    assertEq(buggyEdit:GetText(), "Alice-Garona",
+        "459-AC-fail: old onResolved(nil) refresh restores Alice box got "
+            .. tostring(buggyEdit:GetText()))
+    assertEq(session.attributionText, "Alice-Garona",
+        "459-AC-fail: old refresh restores Alice draft")
+    assertTrue(session.attributed == "Alice-Garona" or session.attributionResolved ~= true,
+        "459-AC-fail: typed Bob does not uniquely resolve under old bug")
+
+    -- Pass-after: real Logs definition onResolved (nil returns before refresh).
+    session.attributed = "Alice-Garona"
+    session.attributedGuid = "Player-1-Alice"
+    session.attributionText = "Alice-Garona"
+    session.attributionResolved = true
+    refreshCount = 0
+    local edit = bindAutocomplete(function(item)
+        return acDef.onResolved(nil, item)
+    end)
+    edit:SetText("Alice-Garona")
+    local refreshesBeforeType = refreshCount
+    edit:TypeText(typed)
     assertEq(session.attributionText, typed,
         "459-AC: draft keeps typed text after nil→set→refresh")
     assertEq(session.attributed, "Bob-Garona",
@@ -10409,26 +10633,54 @@ do
         "459-AC: unique short-name binds Bob guid")
     assertEq(session.attributionResolved, true,
         "459-AC: unique short-name marks resolved")
-    assertEq(boxText, typed,
-        "459-AC: edit box shows typed text after refresh got " .. tostring(boxText))
-    -- Explicit production nil path must not refresh (Manage pattern).
+    assertEq(edit:GetText(), typed,
+        "459-AC: edit box shows typed text after production chain got "
+            .. tostring(edit:GetText()))
+    assertTrue(refreshCount > refreshesBeforeType,
+        "459-AC: setter refresh ran after draft update")
+
+    -- Explicit nil notification through the production definition must not refresh.
     local refreshesAfterNil = refreshCount
-    logsPage.__sfTest.NotifyEditAttributionResolvedNil()
+    acDef.onResolved(nil, nil)
     assertEq(refreshCount, refreshesAfterNil,
         "459-AC: onResolved(nil) does not refresh before set")
-    assertEq(boxText, typed,
+    assertEq(edit:GetText(), typed,
         "459-AC: nil notification left typed box text intact")
     assertEq(session.attributionResolved, false,
         "459-AC: nil clears resolution before suggestion")
-    -- Real suggestion selection + confirmation.
-    logsPage.__sfTest.SimulateEditAttributionSuggestionResolved({
-        value = "Bob-Garona",
-        label = "Bob-Garona",
-        text = "Bob-Garona",
-    })
+
+    -- Suggestion selection through the real AddAutocomplete SelectItem path.
+    local clicked = false
+    for i = 1, #created do
+        local obj = created[i]
+        if obj.objectType == "Button" and obj.Text
+            and tostring(obj.Text._text or "") == "Bob-Garona"
+            and obj._scripts and obj._scripts.OnClick then
+            obj:Click()
+            clicked = true
+            break
+        end
+    end
+    if not clicked then
+        -- Dropdown may have been hidden; re-type to populate then click.
+        edit:TypeText(typed)
+        for i = 1, #created do
+            local obj = created[i]
+            if obj.objectType == "Button" and obj.Text
+                and tostring(obj.Text._text or "") == "Bob-Garona"
+                and obj._scripts and obj._scripts.OnClick then
+                obj:Click()
+                clicked = true
+                break
+            end
+        end
+    end
+    assertTrue(clicked, "459-AC: suggestion button clicked via AddAutocomplete")
     assertEq(session.attributed, "Bob-Garona", "459-AC: suggestion selects Bob")
     assertEq(session.attributionResolved, true, "459-AC: suggestion resolved")
-    assertEq(boxText, "Bob-Garona", "459-AC: box shows Bob after suggestion refresh")
+    assertEq(edit:GetText(), "Bob-Garona",
+        "459-AC: box shows Bob after suggestion selection")
+
     local prevConfirm = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
     local confirmCb = nil
     SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
@@ -10446,9 +10698,13 @@ do
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         record, GS.FindLedgerEventById(record, "ctx:ac-don"))), "Bob-Garona",
         "459-AC: stored credit is Bob after confirm")
+
     logsPage.Refresh = prevRefresh
     logsPage.__sfTest.ClearEditSession()
     logsPage.panel = nil
+    CreateFrame = priorCreateFrame
+    UIParent = priorUIParent
+    GameTooltip = priorGameTooltip
 end
 
 do
