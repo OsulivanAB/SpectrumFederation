@@ -161,6 +161,8 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "CanViewRankingsShortcut" in runtime
     assert "RaidSuppliesRankings.tga" in runtime
     assert "SharedButtonExtraSmallTemplate" in runtime
+    assert "REVIEW_RANKINGS_ICON_INSET = 6" in runtime
+    assert "REVIEW_RANKINGS_ICON_R, REVIEW_RANKINGS_ICON_G, REVIEW_RANKINGS_ICON_B = 1.00, 0.82, 0.18" in runtime
     assert (
         REPO_ROOT
         / "SpectrumFederation"

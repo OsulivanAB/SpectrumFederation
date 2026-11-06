@@ -405,11 +405,32 @@ function FrameMethods:CreateTexture()
     local tex = FrameMock("Texture", self)
     tex.texture = nil
     tex.desaturated = false
+    tex.points = {}
     function tex:SetTexture(value) self.texture = value end
     function tex:SetDesaturated(value) self.desaturated = value and true or false end
     function tex:SetTexCoord() end
     function tex:SetColorTexture() end
-    function tex:SetVertexColor() end
+    function tex:SetVertexColor(r, g, b, a)
+        self.vertexColor = { r = r, g = g, b = b, a = a }
+    end
+    function tex:ClearAllPoints()
+        self.points = {}
+        self.anchor = nil
+    end
+    function tex:SetPoint(point, relative, relativePoint, x, y)
+        self.anchor = {
+            point = point,
+            relative = relative,
+            relativePoint = relativePoint,
+            x = x,
+            y = y,
+        }
+        self.points[#self.points + 1] = self.anchor
+    end
+    function tex:SetAllPoints(relative)
+        self.anchor = { point = "ALL", relative = relative }
+        self.points[#self.points + 1] = self.anchor
+    end
     return tex
 end
 function FrameMethods:RegisterForClicks() end
@@ -3452,6 +3473,21 @@ local function checkRuntimeReviewRankingsShortcut()
     assertTrue(btn.Icon ~= nil and btn.Icon.texture ~= nil
         and tostring(btn.Icon.texture):find("RaidSuppliesRankings", 1, true),
         "Rankings shortcut uses the packaged chart icon")
+    assertTrue(btn.Icon.vertexColor ~= nil
+        and math.abs((btn.Icon.vertexColor.r or 0) - 1.00) < 1e-6
+        and math.abs((btn.Icon.vertexColor.g or 0) - 0.82) < 1e-6
+        and math.abs((btn.Icon.vertexColor.b or 0) - 0.18) < 1e-6,
+        "Rankings chart uses WoW gold accent tint against the red button")
+    local iconTopLeft = nil
+    for i = 1, #(btn.Icon.points or {}) do
+        if btn.Icon.points[i].point == "TOPLEFT" then
+            iconTopLeft = btn.Icon.points[i]
+        end
+    end
+    assertTrue(iconTopLeft ~= nil
+        and iconTopLeft.x == 6
+        and iconTopLeft.y == -6,
+        "Rankings chart uses a larger inset for breathing room inside the red chrome")
 
     caps = { canEdit = false, reason = "preview_non_admin" }
     for i = 1, #impersonationCallbacks do

@@ -1283,13 +1283,39 @@ local REVIEW_MOBILE_WIDTH = 140
 local REVIEW_RANKINGS_BTN_SIZE = 24
 local REVIEW_RANKINGS_BTN_INSET_X = 14
 local REVIEW_RANKINGS_BTN_INSET_Y = -10
--- Keep the chart graphic inset inside the red button chrome.
-local REVIEW_RANKINGS_ICON_INSET = 4
--- Packaged chart icon: no durable Blizzard small chart chrome texture was suitable.
+-- Keep the chart graphic inset inside the red button chrome (breathing room).
+local REVIEW_RANKINGS_ICON_INSET = 6
+-- Packaged chart icon: white/ivory bars so vertex color tints cleanly.
 local REVIEW_RANKINGS_ICON =
     "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\RaidSuppliesRankings.tga"
+-- WoW-style gold accent (matches Settings section/title accents) for contrast on red.
+local REVIEW_RANKINGS_ICON_R, REVIEW_RANKINGS_ICON_G, REVIEW_RANKINGS_ICON_B = 1.00, 0.82, 0.18
+local REVIEW_RANKINGS_ICON_PRESSED_R = 0.82
+local REVIEW_RANKINGS_ICON_PRESSED_G = 0.66
+local REVIEW_RANKINGS_ICON_PRESSED_B = 0.12
 -- Blizzard SharedXML red three-slice chrome (128-RedButton art kit).
 local REVIEW_RANKINGS_BTN_TEMPLATE = "SharedButtonExtraSmallTemplate"
+
+local function TintRankingsIcon(icon, pressed)
+    if not icon or not icon.SetVertexColor then
+        return
+    end
+    if pressed then
+        icon:SetVertexColor(
+            REVIEW_RANKINGS_ICON_PRESSED_R,
+            REVIEW_RANKINGS_ICON_PRESSED_G,
+            REVIEW_RANKINGS_ICON_PRESSED_B,
+            1
+        )
+    else
+        icon:SetVertexColor(
+            REVIEW_RANKINGS_ICON_R,
+            REVIEW_RANKINGS_ICON_G,
+            REVIEW_RANKINGS_ICON_B,
+            1
+        )
+    end
+end
 
 -- Same effective Rankings gate as Settings page `guildSuppliesRankings`
 -- (`available` / CanViewRankings): shared Guild Supplies canEdit, fail closed.
@@ -1489,19 +1515,16 @@ function Runtime:EnsureRankingsShortcut(frame)
         icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     end
     PlaceRankingsIcon(icon, btn, false)
+    TintRankingsIcon(icon, false)
     btn.Icon = icon
 
     -- Hook mouse scripts so Blizzard three-slice pressed/highlight chrome still runs.
     BindRankingsScript(btn, "OnMouseDown", function()
-        if icon.SetVertexColor then
-            icon:SetVertexColor(0.82, 0.82, 0.82, 1)
-        end
+        TintRankingsIcon(icon, true)
         PlaceRankingsIcon(icon, btn, true)
     end, true)
     BindRankingsScript(btn, "OnMouseUp", function()
-        if icon.SetVertexColor then
-            icon:SetVertexColor(1, 1, 1, 1)
-        end
+        TintRankingsIcon(icon, false)
         PlaceRankingsIcon(icon, btn, false)
     end, true)
     BindRankingsScript(btn, "OnEnter", function(owner)
@@ -1518,9 +1541,7 @@ function Runtime:EnsureRankingsShortcut(frame)
         GameTooltip:Show()
     end, true)
     BindRankingsScript(btn, "OnLeave", function()
-        if icon.SetVertexColor then
-            icon:SetVertexColor(1, 1, 1, 1)
-        end
+        TintRankingsIcon(icon, false)
         PlaceRankingsIcon(icon, btn, false)
         if GameTooltip and GameTooltip.Hide then
             GameTooltip:Hide()
