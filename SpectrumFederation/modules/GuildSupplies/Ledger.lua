@@ -1394,6 +1394,9 @@ local function FindRegistryByTxn(cfg, txnId)
     if not txnId then return nil end
     local list = EnsureTxnRegistry(cfg)
     for i = 1, #list do
+        -- Metric for bounded-scan regressions (#459 registry matching / alias export).
+        GS._txnRegistryRowVisits =
+            (tonumber(GS._txnRegistryRowVisits) or 0) + 1
         local row = list[i]
         if type(row) == "table" then
             if row.txnId == txnId then
@@ -1409,6 +1412,40 @@ local function FindRegistryByTxn(cfg, txnId)
         end
     end
     return nil
+end
+
+--- One-pass alias/txn → primary index over the txn registry (cold collectors).
+-- Charges GS._txnRegistryRowVisits once per examined row.
+-- @return table primaryById
+local function BuildTxnRegistryPrimaryIndex(cfg)
+    local primaryById = {}
+    local list = type(cfg) == "table" and EnsureTxnRegistry(cfg) or nil
+    if type(list) ~= "table" then
+        return primaryById
+    end
+    for i = 1, #list do
+        GS._txnRegistryRowVisits =
+            (tonumber(GS._txnRegistryRowVisits) or 0) + 1
+        local row = list[i]
+        if type(row) == "table" then
+            if row.status == "alias"
+                and type(row.txnId) == "string" and row.txnId ~= ""
+                and type(row.aliasOf) == "string" and row.aliasOf ~= "" then
+                primaryById[row.txnId] = row.aliasOf
+            elseif type(row.txnId) == "string" and row.txnId ~= "" then
+                primaryById[row.txnId] = row.txnId
+                if type(row.aliases) == "table" then
+                    for j = 1, #row.aliases do
+                        local alias = row.aliases[j]
+                        if type(alias) == "string" and alias ~= "" then
+                            primaryById[alias] = row.txnId
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return primaryById
 end
 
 local function RegistryMatchOccurrence(cfg, evidence)
@@ -2646,8 +2683,9 @@ function GS._ClearCreditRedriveContinuationForTest(record)
 end
 
 --- Resolve a credit-event id through an already-built lookup index (O(1)).
--- Falls back to registry primary then index; never scans ledger lists.
-local function CanonicalFromRedriveIndex(record, eventId, byId)
+-- Uses paced primaryByAlias + durable creditEventAliases; never FindRegistryByTxn
+-- or ledger scans (#459 discussion_r4488855210).
+local function CanonicalFromRedriveIndex(record, eventId, byId, primaryByAlias)
     if type(eventId) ~= "string" or eventId == "" then
         return nil
     end
@@ -2657,40 +2695,27 @@ local function CanonicalFromRedriveIndex(record, eventId, byId)
             return hit.id
         end
     end
-    -- Registry / durable alias map only (no ledger scan).
-    local primary = eventId
     local cfg = record and record.accounting and record.accounting._consumables
-    if type(cfg) == "table" then
-        local current = eventId
-        for _ = 1, 8 do
-            local reg = type(FindRegistryByTxn) == "function" and FindRegistryByTxn(cfg, current)
-            if type(reg) == "table" then
-                if reg.status == "alias" and type(reg.aliasOf) == "string" and reg.aliasOf ~= ""
-                    and reg.aliasOf ~= current then
-                    current = reg.aliasOf
-                else
-                    primary = ValidTxnId(reg.txnId) or current
-                    break
-                end
-            else
-                local map = cfg.creditEventAliases
-                local mapped = type(map) == "table" and map[current]
-                if type(mapped) == "string" and mapped ~= "" and mapped ~= current then
-                    current = mapped
-                else
-                    primary = current
-                    break
-                end
-            end
+    local durable = cfg and cfg.creditEventAliases
+    local current = eventId
+    for _ = 1, 8 do
+        local mapped = type(primaryByAlias) == "table" and primaryByAlias[current] or nil
+        if type(mapped) ~= "string" or mapped == "" or mapped == current then
+            mapped = type(durable) == "table" and durable[current] or nil
+        end
+        if type(mapped) == "string" and mapped ~= "" and mapped ~= current then
+            current = mapped
+        else
+            break
         end
     end
-    if type(byId) == "table" and type(primary) == "string" then
-        local hit = byId[primary]
+    if type(byId) == "table" then
+        local hit = byId[current]
         if type(hit) == "table" and type(hit.id) == "string" and hit.id ~= "" then
             return hit.id
         end
     end
-    return primary
+    return current
 end
 
 local function CreditRedriveLookupEvent(byId, eventId)
@@ -2706,7 +2731,9 @@ end
 
 --- Match pending body against wake filters using the paced redrive index.
 -- @param byId table complete id/txn/alias → event index
-local function CreditRedriveMatch(record, body, opts, byId)
+-- @param primaryByAlias table alias/txn → primary id (includes missing primaries)
+-- @param filterCanon string|nil precomputed canonical id for opts.eventId
+local function CreditRedriveMatch(record, body, opts, byId, primaryByAlias, filterCanon)
     local eventIdFilter = opts.eventId
     local itemIdFilter = tonumber(opts.itemId)
     if (type(eventIdFilter) ~= "string" or eventIdFilter == "") and not itemIdFilter then
@@ -2717,8 +2744,12 @@ local function CreditRedriveMatch(record, body, opts, byId)
         if body.target == eventIdFilter then
             matchEvent = true
         else
-            local canonical = CanonicalFromRedriveIndex(record, body.target, byId)
-            local filterCanon = CanonicalFromRedriveIndex(record, eventIdFilter, byId)
+            local canonical = CanonicalFromRedriveIndex(
+                record, body.target, byId, primaryByAlias)
+            if filterCanon == nil then
+                filterCanon = CanonicalFromRedriveIndex(
+                    record, eventIdFilter, byId, primaryByAlias)
+            end
             matchEvent = canonical ~= nil and filterCanon ~= nil and canonical == filterCanon
         end
     end
@@ -2730,7 +2761,8 @@ local function CreditRedriveMatch(record, body, opts, byId)
         else
             local ev = CreditRedriveLookupEvent(byId, body.target)
             if not ev then
-                local canon = CanonicalFromRedriveIndex(record, body.target, byId)
+                local canon = CanonicalFromRedriveIndex(
+                    record, body.target, byId, primaryByAlias)
                 ev = CreditRedriveLookupEvent(byId, canon)
             end
             if ev and tonumber(ev.itemId) == itemIdFilter then
@@ -2768,13 +2800,18 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
     end
     if cont.lookupStamp ~= stamp then
         cont.lookupById = {}
+        cont.lookupPrimary = {}
         cont.lookupPhase = "live"
         cont.lookupIndex = 1
         cont.lookupStamp = stamp
         cont.lookupComplete = false
         cont.lookupRegistryIndex = 1
     end
+    if type(cont.lookupPrimary) ~= "table" then
+        cont.lookupPrimary = {}
+    end
     local byId = cont.lookupById
+    local primaryByAlias = cont.lookupPrimary
     local softLimit = tonumber(GS._creditProjectionCallbackLimit)
         or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
         or 16384
@@ -2789,16 +2826,24 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
     local function overBudget()
         return (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit
     end
+    local function notePrimary(alias, primary)
+        if type(alias) == "string" and alias ~= ""
+            and type(primary) == "string" and primary ~= "" then
+            primaryByAlias[alias] = primary
+        end
+    end
     local function indexEvent(event)
         if type(event) ~= "table" then
             return
         end
         if type(event.id) == "string" and event.id ~= "" then
             byId[event.id] = event
+            notePrimary(event.id, event.id)
         end
         local txnId = type(event.txnId) == "string" and event.txnId or nil
         if txnId and txnId ~= "" then
             byId[txnId] = event
+            notePrimary(txnId, event.id or txnId)
         end
     end
     local live = record.accounting and record.accounting._consumableEvents
@@ -2853,13 +2898,16 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
                 if type(row) == "table" then
                     if type(row.txnId) == "string" and row.txnId ~= ""
                         and type(row.aliases) == "table" then
+                        -- Bind aliases even when the primary ledger event is absent.
+                        notePrimary(row.txnId, row.txnId)
                         local primary = byId[row.txnId]
-                        if primary then
-                            for j = 1, #row.aliases do
-                                local alias = row.aliases[j]
-                                if type(alias) == "string" and alias ~= "" then
+                        for j = 1, #row.aliases do
+                            local alias = row.aliases[j]
+                            if type(alias) == "string" and alias ~= "" then
+                                notePrimary(alias, row.txnId)
+                                charge(1)
+                                if primary then
                                     byId[alias] = primary
-                                    charge(1)
                                 end
                             end
                         end
@@ -2867,6 +2915,7 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
                     if row.status == "alias"
                         and type(row.txnId) == "string" and row.txnId ~= ""
                         and type(row.aliasOf) == "string" and row.aliasOf ~= "" then
+                        notePrimary(row.txnId, row.aliasOf)
                         local primary = byId[row.aliasOf]
                         if primary then
                             byId[row.txnId] = primary
@@ -2889,6 +2938,7 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
                 end
                 if type(alias) == "string" and alias ~= ""
                     and type(canon) == "string" and canon ~= "" then
+                    notePrimary(alias, canon)
                     local primary = byId[canon]
                     if primary then
                         byId[alias] = primary
@@ -2917,6 +2967,7 @@ local function EnsureCreditRedriveLookupIndex(record, cont)
                     end
                     if type(alias) == "string" and alias ~= ""
                         and type(canon) == "string" and canon ~= "" then
+                        notePrimary(alias, canon)
                         local primary = byId[canon]
                         if primary then
                             byId[alias] = primary
@@ -3150,9 +3201,12 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         local needsIndex = (type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "")
             or tonumber(waveOpts.itemId) ~= nil
         local byId = cont.lookupById
+        local primaryByAlias = cont.lookupPrimary
+        local filterCanon = nil
         if needsIndex then
             local ready
             ready, byId = EnsureCreditRedriveLookupIndex(record, cont)
+            primaryByAlias = cont.lookupPrimary
             if not ready then
                 cont.opts = waveOpts
                 cont.scheduled = false
@@ -3161,6 +3215,11 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 end
                 ScheduleCreditRedriveContinuation(record, nil)
                 return 0, 0, tonumber(GS._creditProjectionCallbackWork) or 0
+            end
+            -- Reuse one filter canonicalization for the whole match wave.
+            if type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "" then
+                filterCanon = CanonicalFromRedriveIndex(
+                    record, waveOpts.eventId, byId, primaryByAlias)
             end
         end
         local cands = cont.pendingCandidates
@@ -3187,7 +3246,8 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 local reason = entry.reason
                 local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
                     and reason == "work_budget"
-                if isBudgetAdj or CreditRedriveMatch(record, body, waveOpts, byId) then
+                if isBudgetAdj or CreditRedriveMatch(
+                    record, body, waveOpts, byId, primaryByAlias, filterCanon) then
                     building[#building + 1] = id
                 end
             end
@@ -5653,6 +5713,9 @@ local function CollectRequiredCreditEventAliases(record)
     local map = record.accounting and record.accounting._consumables
         and record.accounting._consumables.creditEventAliases
     local cfg = record.accounting and record.accounting._consumables
+    -- One bounded registry pass — never FindRegistryByTxn per correction
+    -- (#459 discussion_r4488856046).
+    local primaryIndex = BuildTxnRegistryPrimaryIndex(cfg)
     local function note(alias, canon)
         alias = ValidTxnId(alias)
         canon = ValidTxnId(canon)
@@ -5664,14 +5727,9 @@ local function CollectRequiredCreditEventAliases(record)
         if type(txnId) ~= "string" or txnId == "" then
             return nil
         end
-        if type(FindRegistryByTxn) == "function" and type(cfg) == "table" then
-            local reg = FindRegistryByTxn(cfg, txnId)
-            if type(reg) == "table" then
-                if reg.status == "alias" and type(reg.aliasOf) == "string" and reg.aliasOf ~= "" then
-                    return ValidTxnId(reg.aliasOf) or reg.aliasOf
-                end
-                return ValidTxnId(reg.txnId) or txnId
-            end
+        local mapped = primaryIndex[txnId]
+        if type(mapped) == "string" and mapped ~= "" then
+            return ValidTxnId(mapped) or mapped
         end
         if type(map) == "table" and type(map[txnId]) == "string" and map[txnId] ~= "" then
             return ValidTxnId(map[txnId]) or map[txnId]

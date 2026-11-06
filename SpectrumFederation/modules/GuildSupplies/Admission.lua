@@ -8388,11 +8388,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     if not scopeOk then
                         if scopeErr == "pending_event" or scopeErr == "missing_event" then
                             -- Preserve missing-event pending rather than accepted retention.
+                            local stPend, reasonPend = "pending", scopeErr
                             if GS._AdmitPendingOrConflict then
-                                return GS._AdmitPendingOrConflict(
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
                                     ops, stored, scopeErr, admissionCtx.sender)
                             end
-                            return "pending", scopeErr
+                            -- Same provider notify as ordinary pending retention so
+                            -- warm exporters advertise the body without an unrelated
+                            -- mutation (#459 discussion_r4488855215).
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
                         end
                         return "rejected", scopeErr or classReason or "stale_credit"
                     end
@@ -8407,11 +8416,17 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         record, stored, scopeEvent)
                     if not eligOk then
                         if eligErr == "not_credited" then
+                            local stPend, reasonPend = "pending", eligErr
                             if GS._AdmitPendingOrConflict then
-                                return GS._AdmitPendingOrConflict(
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
                                     ops, stored, eligErr, admissionCtx.sender)
                             end
-                            return "pending", eligErr
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
                         end
                         return "rejected", eligErr or "invalid_event"
                     end

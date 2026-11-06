@@ -494,15 +494,101 @@ local function ApplyCreditAliasExportToDesc(record, descId, descBody)
     return pages, aliasCount, pageCount
 end
 
+--- Inputs that affect required alias collection / packing (#459 export maint).
+local function CreditAliasExportStamp(record)
+    if type(record) ~= "table" then
+        return "nil"
+    end
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    local aliasN = 0
+    local map = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    if type(map) == "table" then
+        for _ in pairs(map) do
+            aliasN = aliasN + 1
+        end
+    end
+    local regN = 0
+    local registry = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.txnRegistry
+    if type(registry) == "table" then
+        regN = #registry
+    end
+    local pendingN, acceptedN = 0, 0
+    if type(record.operations) == "table" then
+        if type(record.operations.pending) == "table" then
+            for _ in pairs(record.operations.pending) do
+                pendingN = pendingN + 1
+            end
+        end
+        if type(record.operations.order) == "table" then
+            acceptedN = #record.operations.order
+        end
+    end
+    return table.concat({
+        tostring(record.datasetId or ""),
+        tostring(opsGen),
+        tostring(acctMut),
+        tostring(aliasN),
+        tostring(regN),
+        tostring(pendingN),
+        tostring(acceptedN),
+        tostring(WireBudget()),
+    }, ":")
+end
+
+local function ClearCreditAliasExportCache()
+    exportState.creditAliasExportStamp = nil
+    exportState.creditAliasExportPages = nil
+    exportState.creditAliasExportInline = nil
+    exportState.creditAliasExportCount = nil
+    exportState.creditAliasExportPageCount = nil
+end
+
 --- Upsert credit-alias pages and drop stale page ids after a desc rewrite.
+-- Reuses unchanged collection/packing across maintenance slices when the
+-- export stamp matches (#459 discussion_r4488856046).
 local function SyncCreditAliasExportPages(record, descId, descBody, upsertFn)
-    local pages, aliasCount, pageCount = ApplyCreditAliasExportToDesc(record, descId, descBody)
+    local datasetId = descBody.datasetId or (record and record.datasetId)
+    local stamp = CreditAliasExportStamp(record)
+    local pages, aliasCount, pageCount
+    if exportState.creditAliasExportStamp == stamp
+        and type(exportState.creditAliasExportPages) == "table" then
+        pages = exportState.creditAliasExportPages
+        aliasCount = tonumber(exportState.creditAliasExportCount) or 0
+        pageCount = tonumber(exportState.creditAliasExportPageCount) or 0
+        descBody.creditEventAliasCount = aliasCount
+        descBody.creditEventAliasPageCount = pageCount
+        if pageCount > 0 then
+            descBody.creditEventAliases = {}
+        else
+            descBody.creditEventAliases = exportState.creditAliasExportInline or {}
+        end
+        GS._creditAliasExportCacheHits =
+            (tonumber(GS._creditAliasExportCacheHits) or 0) + 1
+    else
+        pages, aliasCount, pageCount = ApplyCreditAliasExportToDesc(record, descId, descBody)
+        exportState.creditAliasExportStamp = stamp
+        exportState.creditAliasExportPages = pages
+        exportState.creditAliasExportCount = aliasCount
+        exportState.creditAliasExportPageCount = pageCount
+        if pageCount > 0 then
+            exportState.creditAliasExportInline = {}
+        else
+            exportState.creditAliasExportInline = descBody.creditEventAliases or {}
+        end
+        GS._creditAliasExportCacheMisses =
+            (tonumber(GS._creditAliasExportCacheMisses) or 0) + 1
+    end
     if type(upsertFn) == "function" then
         for i = 1, #pages do
             upsertFn(pages[i].id, pages[i].body)
         end
     end
-    local datasetId = descBody.datasetId or (record and record.datasetId)
     if type(datasetId) == "string" and datasetId ~= "" then
         local prefix = "gs:cea:" .. datasetId .. ":p"
         local stale = {}
@@ -520,6 +606,10 @@ local function SyncCreditAliasExportPages(record, descId, descBody, upsertFn)
             -- so a subsequent successful rebuild can replace them.
         elseif #stale > 0 then
             GS.RemoveGossipExportBodies(stale)
+            -- Page shrink must not keep a stale packed cache.
+            if exportState.creditAliasExportStamp == stamp then
+                -- Cache still valid for content; stale ids already removed.
+            end
         end
     end
     return pages, aliasCount, pageCount
@@ -2052,6 +2142,12 @@ local function RebuildExportIndex()
     exportState.cachedOpCount = 0
     exportState.cachedCampaignCount = 0
     exportState.cachedArchiveCount = 0
+    -- Drop packed alias-page cache on full rebuild / dataset replacement.
+    exportState.creditAliasExportStamp = nil
+    exportState.creditAliasExportPages = nil
+    exportState.creditAliasExportInline = nil
+    exportState.creditAliasExportCount = nil
+    exportState.creditAliasExportPageCount = nil
     local record, guildKey = CurrentGuildRecord()
     if not record then
         exportState.guildKey = nil
@@ -3666,6 +3762,88 @@ local function ValidateAndApply(record, ctx)
             -- without rewriting the immutable assignment.txnId.
             exportRecordId = tostring(record.id),
         })
+    end
+
+    -- Ordinary same-dataset credit-alias pages (non-adoption sync). Install
+    -- validated bindings without overwriting conflicting local ownership
+    -- (#459 discussion_r4488856040).
+    if body.kind == "gs-credit-aliases-page" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if type(body.datasetId) ~= "string" or body.datasetId == "" then
+            return "rejected", "malformed"
+        end
+        if body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        if type(body.aliases) ~= "table" then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        local maxPages = GS.MAX_CREDIT_ALIAS_PAGE_COUNT or 512
+        local pageCount = tonumber(body.pageCount)
+        local page = tonumber(body.page)
+        if not pageCount or pageCount < 1 or pageCount > maxPages
+            or pageCount ~= math.floor(pageCount) then
+            return "rejected", "invalid_operation"
+        end
+        if not page or page < 1 or page > pageCount or page ~= math.floor(page) then
+            return "rejected", "invalid_operation"
+        end
+        local cfg = localRecord.accounting and localRecord.accounting._consumables
+        if type(cfg) ~= "table" then
+            return "rejected", "invalid_record"
+        end
+        if type(cfg.creditEventAliases) ~= "table" then
+            cfg.creditEventAliases = {}
+        end
+        local map = cfg.creditEventAliases
+        local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        local existingN = 0
+        for _ in pairs(map) do
+            existingN = existingN + 1
+        end
+        local changed = false
+        local any = false
+        for alias, canon in pairs(body.aliases) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return "rejected", "invalid_credit_event_aliases"
+            end
+            any = true
+            local prior = map[alias]
+            if type(prior) == "string" and prior ~= "" and prior ~= canon then
+                -- Conflicting peer binding must not overwrite local ownership.
+                return "rejected", "alias_conflict"
+            end
+            if prior == canon then
+                -- duplicate binding
+            else
+                if existingN >= maxN then
+                    return "rejected", "full"
+                end
+                if GS.RememberCreditEventAlias then
+                    if not GS.RememberCreditEventAlias(localRecord, alias, canon) then
+                        return "rejected", "full"
+                    end
+                else
+                    map[alias] = canon
+                end
+                existingN = existingN + 1
+                changed = true
+            end
+        end
+        if not any then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        if changed then
+            if GS._NotifyLocalDurableChange then
+                GS._NotifyLocalDurableChange("remote-op")
+            end
+            return "accepted", nil
+        end
+        return "duplicate", "duplicate"
     end
 
     return "rejected", "unsupported_kind"

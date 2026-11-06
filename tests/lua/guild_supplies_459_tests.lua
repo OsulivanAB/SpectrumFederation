@@ -8985,7 +8985,12 @@ do
         "459-PM: cold wake indexes ledger once lookup="
             .. tostring(lookupAfterFirst) .. " rows=" .. tostring(ledgerRows)
             .. " work=" .. tostring(work1))
-    assertTrue(tonumber(work1) or 0 >= ledgerRows,
+    -- Parenthesize fallback before comparison: bare `tonumber(work1) or 0 >= n`
+    -- is always true for any numeric work1 (including undercharged 0).
+    assertTrue(not ((tonumber(0) or 0) >= ledgerRows),
+        "459-PM: undercharged work fails cold-wake predicate rows="
+            .. tostring(ledgerRows))
+    assertTrue((tonumber(work1) or 0) >= ledgerRows,
         "459-PM: cold wake callbackWork includes lookup work=" .. tostring(work1))
     -- Warm wake should not rescan the full ledger.
     assertTrue((tonumber(GS._creditRedriveLookupVisits) or 0) <= pendingBefore + 64,
@@ -9244,6 +9249,431 @@ do
     assertNil(unGuid, "459-EC: Unassigned guid nil")
     assertNil(unHead, "459-EC: Unassigned head nil")
     assertNil(unStatus, "459-EC: Unassigned status nil (not credit_unavailable)")
+end
+
+do
+    -- Registry matching: paced index retains alias→primary for missing events so
+    -- match does not fall back to FindRegistryByTxn (#459 discussion_r4488855210).
+    local ITEM = 9960
+    local record = seedLiveCampaignWithItem(ITEM, 100000)
+    local ctx = select(1, GS:GetCurrentContext())
+    local cfg = record.accounting._consumables
+    cfg.txnRegistry = cfg.txnRegistry or {}
+    local REG_N, PEND_N = 512, 128
+    for i = 1, REG_N do
+        local canon = string.format("ctx:rm-reg-%04d", i)
+        local alias = string.format("ctx:rm-reg-alias-%04d", i)
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = canon, status = "verified", committed = true,
+            aliases = { alias }, itemId = 9991, quantity = 1,
+            donor = "Retired-Garona", approxTxnTime = world.time - i,
+        }
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = alias, status = "alias", aliasOf = canon, committed = true,
+            itemId = 9991, quantity = 1,
+        }
+    end
+    for i = 1, PEND_N do
+        local target = string.format("ctx:rm-miss-%04d", i)
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = string.format("rm-corr-%04d", i),
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = target,
+            value = {
+                eventId = target, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9999,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 10 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending", "459-RM: admit " .. tostring(i))
+        assertEq(r, "pending_event", "459-RM: pending_event " .. tostring(i))
+    end
+    if GS._ClearCreditRedriveContinuationForTest then
+        GS._ClearCreditRedriveContinuationForTest(record)
+    end
+    GS._txnRegistryRowVisits = 0
+    GS._creditRedriveLookupVisits = 0
+    local _, _, workCold = GS.RedrivePendingContributorCorrections(record, {
+        itemId = ITEM, maxAttempts = 32,
+    })
+    local function drainRedrive(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then flushTimers() end
+            else
+                break
+            end
+        end
+        flushTimers()
+    end
+    drainRedrive(256)
+    local regCold = tonumber(GS._txnRegistryRowVisits) or 0
+    local lookupCold = tonumber(GS._creditRedriveLookupVisits) or 0
+    -- Warm wake: matching must not rescan the registry via FindRegistryByTxn.
+    GS._txnRegistryRowVisits = 0
+    GS._creditRedriveLookupVisits = 0
+    local promWarm, attWarm, workWarm = GS.RedrivePendingContributorCorrections(record, {
+        itemId = ITEM, maxAttempts = 32,
+    })
+    drainRedrive(64)
+    local regWarm = tonumber(GS._txnRegistryRowVisits) or 0
+    assertEq(promWarm, 0, "459-RM: nonmatch promotes none")
+    assertTrue(regWarm <= 8,
+        "459-RM: warm wake avoids FindRegistryByTxn product regWarm="
+            .. tostring(regWarm) .. " coldLookup=" .. tostring(lookupCold)
+            .. " coldReg=" .. tostring(regCold) .. " workCold=" .. tostring(workCold)
+            .. " workWarm=" .. tostring(workWarm))
+    assertTrue(regWarm * 100 < REG_N * PEND_N,
+        "459-RM: warm registry visits far below pending×registry")
+    assertEq(#timers, 0, "459-RM: idle after drain")
+    local still = 0
+    for _ in pairs(record.operations.pending or {}) do still = still + 1 end
+    assertTrue(still >= PEND_N, "459-RM: pending retained")
+end
+
+do
+    -- Obsolete-path pending retention must notify the warm provider
+    -- (#459 discussion_r4488855215) for pending_event and not_credited.
+    local function retainObsoletePending(mode)
+        local record = seedLiveCampaignWithItem(9961, 80)
+        injectProductionDonation(record, {
+            id = "ctx:pn-don", itemId = 9961, quantity = 5,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        world.time = world.time + 1
+        local early = select(1, GS:NewContributorCorrectionOperation(
+            "ctx:pn-don", "Bob-Garona", "Player-1-Bob"))
+        world.time = world.time + 5
+        local late = select(1, GS:NewContributorCorrectionOperation(
+            "ctx:pn-don", "Carol-Garona", "Player-1-Carol"))
+        assertEq(GS:ApplyStagedConfigOperation(late), "accepted",
+            "459-PN-" .. mode .. ": late winner")
+        if mode == "missing" then
+            local live = record.accounting._consumableEvents
+            for i = #live, 1, -1 do
+                if live[i] and live[i].id == "ctx:pn-don" then
+                    table.remove(live, i)
+                end
+            end
+            if GS._BumpAccountingMutation then
+                GS._BumpAccountingMutation(record)
+            end
+        else
+            local ev = GS.FindLedgerEventById(record, "ctx:pn-don")
+            assertTrue(type(ev) == "table", "459-PN-nc: event present")
+            ev.gsProductionCredit = false
+        end
+        GS:EnsureGossipProvider()
+        drainExportMaint(32)
+        local notifies = {}
+        local prevNotify = GS._NotifyLocalDurableChange
+        GS._NotifyLocalDurableChange = function(reason)
+            notifies[#notifies + 1] = reason
+            if prevNotify then prevNotify(reason) end
+        end
+        local snap = select(1, GS._SnapshotPublicOp(early))
+        snap.baseTargetRevision = record.datasetId
+        local st, reason = GS:AdmitRemoteOperation(snap, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        GS._NotifyLocalDurableChange = prevNotify
+        assertEq(st, "pending",
+            "459-PN-" .. mode .. ": pending got " .. tostring(st) .. "/" .. tostring(reason))
+        local expectReason = mode == "missing" and "pending_event" or "not_credited"
+        assertEq(reason, expectReason,
+            "459-PN-" .. mode .. ": reason got " .. tostring(reason))
+        assertTrue(record.operations.pending[early.id] ~= nil,
+            "459-PN-" .. mode .. ": durable pending body")
+        local saw = false
+        for i = 1, #notifies do
+            if notifies[i] == "remote-pending" then
+                saw = true
+            end
+        end
+        assertTrue(saw, "459-PN-" .. mode .. ": remote-pending notify")
+        drainExportMaint(64)
+        local exported = false
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local b = bodies[i].body
+            if b and b.kind == "gs-op" and b.op and b.op.id == early.id then
+                exported = true
+            elseif b and b.kind == "gs-evidence" and b.op and b.op.id == early.id then
+                exported = true
+            elseif b and b.opId == early.id then
+                exported = true
+            end
+        end
+        -- Evidence export may use pending id as record id.
+        if not exported then
+            for i = 1, #bodies do
+                local id = bodies[i].id
+                if id == early.id or id == ("gs:pend:" .. early.id)
+                    or id == ("gs:ev:" .. early.id) then
+                    exported = true
+                end
+            end
+        end
+        assertTrue(exported,
+            "459-PN-" .. mode .. ": warm export includes pending body n="
+                .. tostring(#bodies))
+        -- Peer that already has the prerequisite admits the exported evidence body.
+        local peer = seedLiveCampaignWithItem(9962, 80)
+        injectProductionDonation(peer, {
+            id = "ctx:pn-don", itemId = 9962, quantity = 5,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local exportedOp = nil
+        for i = 1, #bodies do
+            local b = bodies[i].body
+            if type(b) == "table" then
+                if b.kind == "gs-op" and b.op and b.op.id == early.id then
+                    exportedOp = b.op
+                elseif b.kind == "gs-evidence" and type(b.op) == "table" and b.op.id == early.id then
+                    exportedOp = b.op
+                elseif type(b.op) == "table" and b.op.id == early.id then
+                    exportedOp = b.op
+                end
+            end
+        end
+        if not exportedOp then
+            exportedOp = select(1, GS._SnapshotPublicOp(early))
+        end
+        exportedOp.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        exportedOp.datasetId = peer.datasetId
+        exportedOp.campaignId = peer.currentCampaignId
+        exportedOp.baseCampaignId = peer.currentCampaignId
+        exportedOp.baseTargetRevision = peer.datasetId
+        exportedOp.basePolicyRevision = peer.permission and peer.permission.revisionId
+        local stPeer, rPeer = GS:AdmitRemoteOperation(exportedOp, {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })
+        assertTrue(stPeer == "accepted" or stPeer == "duplicate",
+            "459-PN-" .. mode .. ": peer admits relay got "
+                .. tostring(stPeer) .. "/" .. tostring(rPeer))
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            peer, GS.FindLedgerEventById(peer, "ctx:pn-don"))), "Bob-Garona",
+            "459-PN-" .. mode .. ": peer credit Bob")
+        return record, early.id
+    end
+    retainObsoletePending("missing")
+    retainObsoletePending("not_credited")
+end
+
+do
+    -- Ordinary same-dataset alias-page delivery via provider ValidateAndApply
+    -- (#459 discussion_r4488856040).
+    local record = seedLiveCampaignWithItem(9963, 40)
+    injectProductionDonation(record, {
+        id = "ctx:od-canon", itemId = 9963, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    GS:EnsureGossipProvider()
+    local pageBody = {
+        kind = "gs-credit-aliases-page",
+        datasetId = record.datasetId,
+        page = 1,
+        pageCount = 1,
+        aliases = { ["ctx:od-alias"] = "ctx:od-canon" },
+    }
+    local pageId = "gs:cea:" .. record.datasetId .. ":p1"
+    local st, reason = GS._ValidateAndApplyForTest(
+        { id = pageId, body = pageBody }, { sender = "Alice-Garona" })
+    assertTrue(st == "accepted" or st == "duplicate",
+        "459-OD: ordinary page accepted got " .. tostring(st) .. "/" .. tostring(reason))
+    assertEq(record.accounting._consumables.creditEventAliases["ctx:od-alias"], "ctx:od-canon",
+        "459-OD: binding installed")
+    local stDup = GS._ValidateAndApplyForTest(
+        { id = pageId, body = pageBody }, { sender = "Alice-Garona" })
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "459-OD: redelivery duplicate-safe")
+    local stBadDs = select(1, GS._ValidateAndApplyForTest({
+        id = pageId .. "x",
+        body = {
+            kind = "gs-credit-aliases-page",
+            datasetId = "other-dataset",
+            page = 1, pageCount = 1,
+            aliases = { ["ctx:od-alias-2"] = "ctx:od-canon" },
+        },
+    }, { sender = "Alice-Garona" }))
+    assertEq(stBadDs, "rejected", "459-OD: wrong dataset rejected")
+    local stBadShape = select(1, GS._ValidateAndApplyForTest({
+        id = pageId .. "y",
+        body = {
+            kind = "gs-credit-aliases-page",
+            datasetId = record.datasetId,
+            page = 1, pageCount = 1,
+            aliases = { ["ctx:bad"] = "ctx:bad" },
+        },
+    }, { sender = "Alice-Garona" }))
+    assertEq(stBadShape, "rejected", "459-OD: alias==canon rejected")
+    -- Conflicting binding must not overwrite.
+    record.accounting._consumables.creditEventAliases["ctx:od-conflict"] = "ctx:od-canon"
+    local stConf, rConf = GS._ValidateAndApplyForTest({
+        id = pageId .. "z",
+        body = {
+            kind = "gs-credit-aliases-page",
+            datasetId = record.datasetId,
+            page = 1, pageCount = 1,
+            aliases = { ["ctx:od-conflict"] = "ctx:od-other" },
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stConf, "rejected",
+        "459-OD: conflict rejected got " .. tostring(stConf) .. "/" .. tostring(rConf))
+    assertEq(record.accounting._consumables.creditEventAliases["ctx:od-conflict"], "ctx:od-canon",
+        "459-OD: local ownership preserved")
+    -- Second peer record receives the same valid page.
+    local peer = seedLiveCampaignWithItem(9964, 40)
+    peer.datasetId = record.datasetId
+    if peer.accounting and peer.accounting._consumables then
+        peer.accounting._consumables.creditEventAliases =
+            peer.accounting._consumables.creditEventAliases or {}
+    end
+    -- ValidateAndApply uses CurrentGuildRecord(); switch context by applying on
+    -- the active record again is already covered. Install via Remember path for peer.
+    assertTrue(GS.RememberCreditEventAlias(peer, "ctx:od-alias", "ctx:od-canon"),
+        "459-OD: peer can install same binding")
+    assertEq(peer.accounting._consumables.creditEventAliases["ctx:od-alias"], "ctx:od-canon",
+        "459-OD: peer binding present")
+end
+
+do
+    -- Alias export maintenance: one registry pass cold; unchanged slices reuse
+    -- packed collection (#459 discussion_r4488856046).
+    local ITEM = 9965
+    local record = seedLiveCampaignWithItem(ITEM, 500)
+    local ctx = select(1, GS:GetCurrentContext())
+    local cfg = record.accounting._consumables
+    cfg.txnRegistry = cfg.txnRegistry or {}
+    local REG_N, CORR_N = 256, 200
+    for i = 1, REG_N do
+        local canon = string.format("ctx:em-reg-%04d", i)
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = canon, status = "verified", committed = true,
+            aliases = { string.format("ctx:em-reg-alias-%04d", i) },
+            itemId = 9992, quantity = 1,
+            donor = "Retired-Garona", approxTxnTime = world.time - i,
+        }
+    end
+    record.operations.records = record.operations.records or {}
+    record.operations.order = record.operations.order or {}
+    record.operations.heads = record.operations.heads or {}
+    for i = 1, CORR_N do
+        local canon = string.format("ctx:em-don-%04d", i)
+        local alias = string.format("ctx:em-alias-%04d", i)
+        injectProductionDonation(record, {
+            id = canon, itemId = ITEM, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        -- Durable alias map only (registry already holds unrelated filler rows).
+        local opId = string.format("em-corr-%04d", i)
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = ITEM,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.records[opId] = op
+        record.operations.order[#record.operations.order + 1] = opId
+        record.operations.heads[GS.CorrectionTargetKey(record, canon)] = opId
+        assertTrue(GS.RememberCreditEventAlias(record, alias, canon),
+            "459-EM: durable alias " .. tostring(i))
+    end
+    GS:EnsureGossipProvider()
+    -- Cold required-alias collection: one registry pass, not correction×registry.
+    GS._txnRegistryRowVisits = 0
+    local required = GS.CollectRequiredCreditEventAliases(record)
+    local coldCollect = tonumber(GS._txnRegistryRowVisits) or 0
+    local requiredN = 0
+    for _ in pairs(required) do requiredN = requiredN + 1 end
+    assertTrue(requiredN >= CORR_N,
+        "459-EM: required aliases collected n=" .. tostring(requiredN))
+    assertTrue(coldCollect <= REG_N + 64,
+        "459-EM: cold collection one registry pass visits="
+            .. tostring(coldCollect) .. " reg=" .. tostring(REG_N))
+    assertTrue(coldCollect * 20 < CORR_N * REG_N,
+        "459-EM: cold visits far below correction×registry product")
+    GS._txnRegistryRowVisits = 0
+    GS._creditAliasExportCacheHits = 0
+    GS._creditAliasExportCacheMisses = 0
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    assertTrue(GS._exportMaintIsIdle and GS._exportMaintIsIdle(),
+        "459-EM: maint becomes idle after dataset rebuild")
+    GS._txnRegistryRowVisits = 0
+    local hitsBefore = tonumber(GS._creditAliasExportCacheHits) or 0
+    GS.NotifyLocalDurableChange("export-maint")
+    drainExportMaint(16)
+    local warmVisits = tonumber(GS._txnRegistryRowVisits) or 0
+    local hitsAfter = tonumber(GS._creditAliasExportCacheHits) or 0
+    assertTrue(warmVisits <= REG_N,
+        "459-EM: unchanged maint avoids registry product warm="
+            .. tostring(warmVisits))
+    assertTrue(hitsAfter > hitsBefore,
+        "459-EM: unchanged maint reuses packed alias export")
+    assertTrue(GS._exportMaintIsIdle and GS._exportMaintIsIdle(),
+        "459-EM: maint becomes idle")
+    -- Mutation invalidates cache: durable alias ownership change.
+    local missesBefore = tonumber(GS._creditAliasExportCacheMisses) or 0
+    assertTrue(GS.RememberCreditEventAlias(record, "ctx:em-extra", "ctx:em-don-0001"),
+        "459-EM: extra durable alias for invalidation")
+    GS.NotifyLocalDurableChange("remote-op")
+    drainExportMaint(64)
+    local missesAfter = tonumber(GS._creditAliasExportCacheMisses) or 0
+    assertTrue(missesAfter > missesBefore,
+        "459-EM: alias ownership invalidates alias export cache")
+    -- Page shrink / stale cleanup: dropping required aliases rebuilds pages.
+    for i = 1, CORR_N do
+        record.operations.heads[GS.CorrectionTargetKey(
+            record, string.format("ctx:em-don-%04d", i))] = nil
+        record.operations.records[string.format("em-corr-%04d", i)] = nil
+    end
+    record.operations.order = {}
+    record.operations.pending = {}
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    local bodies = collectAllExportBodies()
+    local ceaPages = 0
+    for i = 1, #bodies do
+        if bodies[i].body and bodies[i].body.kind == "gs-credit-aliases-page" then
+            ceaPages = ceaPages + 1
+        end
+    end
+    assertEq(ceaPages, 0, "459-EM: stale alias pages removed after shrink")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
