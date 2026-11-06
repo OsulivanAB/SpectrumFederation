@@ -380,6 +380,10 @@ function FrameMethods:GetText() return self.text end
 function FrameMethods:Show() self.shown = true end
 function FrameMethods:Hide() self.shown = false end
 function FrameMethods:IsShown() return self.shown == true end
+function FrameMethods:Raise()
+    self.raiseCount = (self.raiseCount or 0) + 1
+    self.raised = true
+end
 -- Prefer an explicit visible flag so tests can model a shown child under a
 -- hidden standalone settings parent (IsShown true, IsVisible false).
 function FrameMethods:IsVisible()
@@ -3422,9 +3426,20 @@ local function checkRuntimeReviewRankingsShortcut()
             impersonationCallbacks[#impersonationCallbacks + 1] = fn
         end,
     }
+    local settingsFrame = FrameMock("Frame")
+    settingsFrame.shown = false
     SF.SettingsWindow = {
-        ShowPage = function(_, pageId)
+        frame = settingsFrame,
+        -- Mirror production ShowPage: show + Raise so Settings sits above
+        -- same-strata Raid Supplies review chrome without closing it (#466).
+        ShowPage = function(self, pageId)
             showPageCalls[#showPageCalls + 1] = pageId
+            if self.frame then
+                self.frame:Show()
+                if self.frame.Raise then
+                    self.frame:Raise()
+                end
+            end
         end,
         ApplySettingsWindowOpacity = function() end,
         RegisterSettingsWindowOpacityTarget = function() end,
@@ -3516,12 +3531,19 @@ local function checkRuntimeReviewRankingsShortcut()
     assertTrue(btn:IsShown(), "restored canEdit shows the Rankings shortcut again")
 
     showPageCalls = {}
+    settingsFrame.raiseCount = 0
+    settingsFrame.raised = false
+    settingsFrame.shown = false
     world.bankOpen = true
     assertTrue(review:IsShown(), "bank panel stays open before Rankings navigation")
     btn.scripts.OnClick(btn)
     assertEq(#showPageCalls, 1, "clicking Rankings navigates once")
     assertEq(showPageCalls[1], "guildSuppliesRankings",
         "Rankings shortcut opens the existing guildSuppliesRankings page")
+    assertTrue(settingsFrame:IsShown(),
+        "Settings/Rankings window is shown when the shortcut is clicked")
+    assertTrue(settingsFrame.raised == true and (settingsFrame.raiseCount or 0) >= 1,
+        "Settings/Rankings is Raised in front of same-strata bank/review chrome")
     assertTrue(review:IsShown(),
         "opening Rankings does not close the Raid Supplies panel")
     assertTrue(world.bankOpen,

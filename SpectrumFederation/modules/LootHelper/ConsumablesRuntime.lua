@@ -1393,7 +1393,8 @@ function Runtime:OpenRankingsFromReview()
     local win = SF.SettingsWindow
     if win and type(win.ShowPage) == "function" then
         -- Established Settings navigation; respects page availability.
-        -- Must not close the guild bank or Raid Supplies panel.
+        -- Must not close the guild bank or Raid Supplies panel. ShowPage Raises
+        -- Settings above same-strata bank/review chrome so Rankings is usable.
         win:ShowPage("guildSuppliesRankings")
     end
 end

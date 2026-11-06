@@ -335,6 +335,10 @@ do
         windowSource:find("BG = {0, 0, 0, 0.90}", 1, true) ~= nil,
         "StandaloneWindow BG alpha matches 90% default"
     )
+    assertTrue(
+        windowSource:find("self.frame:Raise()", 1, true) ~= nil,
+        "ShowPage Raises Settings above same-strata chrome (#466)"
+    )
 end
 
 -- Normalize: missing, invalid, clamp, step rounding

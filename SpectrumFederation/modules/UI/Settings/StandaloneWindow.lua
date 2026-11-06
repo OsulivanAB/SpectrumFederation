@@ -1282,6 +1282,11 @@ function SettingsWindow:ShowPage(pageId)
 
     self:RefreshEnablementIfNeeded()
     self.frame:Show()
+    -- Same DIALOG strata as Raid Supplies review / other chrome: Raise so Settings
+    -- is interactable in front without closing those frames (#466).
+    if self.frame.Raise then
+        self.frame:Raise()
+    end
 
     local model = Model()
     local ui = Registry()
