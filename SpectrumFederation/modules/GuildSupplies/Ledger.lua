@@ -5859,19 +5859,15 @@ local function CollectRequiredCreditEventAliases(record)
             end
         end
     end
-    -- Complete necessary edge closure from the durable map: keep intermediate
-    -- hops that still reach a required terminal (A→B and B→C when A→C is owned).
-    -- Path walk covers A→B→C before collapse; a bounded map scan also retains
-    -- sibling edges that still terminate at an owned terminal after prune
-    -- rewrites A→C directly (so export/adoption does not drop B→C).
+    -- Edge closure only along paths from already-required aliases (A→B→C while
+    -- the map still carries that chain). Do not retain every unused sibling that
+    -- merely shares an owned terminal — that blocked capacity reclaim
+    -- (#459 discussion_r4498767528). Once referenced aliases compact to the
+    -- terminal (A→C), an unreferenced intermediate B may be reclaimed.
     if type(map) == "table" then
         local aliases = {}
-        local ownedTerminals = {}
-        for alias, terminal in pairs(required) do
+        for alias in pairs(required) do
             aliases[#aliases + 1] = alias
-            if type(terminal) == "string" and terminal ~= "" then
-                ownedTerminals[terminal] = true
-            end
         end
         for ai = 1, #aliases do
             local alias = aliases[ai]
@@ -5896,39 +5892,10 @@ local function CollectRequiredCreditEventAliases(record)
                     end
                     if nxt ~= terminal and required[nxt] == nil then
                         required[nxt] = terminal
-                        ownedTerminals[terminal] = true
                     end
                     cur = nxt
                     if cur == terminal then
                         break
-                    end
-                end
-            end
-        end
-        local scanned = 0
-        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
-        for alias, canon in pairs(map) do
-            scanned = scanned + 1
-            if scanned > scanCap then
-                break
-            end
-            if type(alias) == "string" and alias ~= ""
-                and type(canon) == "string" and canon ~= ""
-                and required[alias] == nil then
-                local endId = FollowRequiredAliasTerminal(map, primaryIndex, alias)
-                    or alias
-                if ownedTerminals[endId] and alias ~= endId then
-                    if canon == endId then
-                        required[alias] = endId
-                    else
-                        local hopEnd = FollowRequiredAliasTerminal(
-                            map, primaryIndex, canon) or canon
-                        if hopEnd == endId then
-                            required[alias] = canon
-                            if canon ~= endId and required[canon] == nil then
-                                required[canon] = endId
-                            end
-                        end
                     end
                 end
             end

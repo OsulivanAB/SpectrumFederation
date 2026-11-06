@@ -11800,48 +11800,161 @@ do
             .. tostring(required["ctx:term-a"]))
     assertTrue(required["ctx:term-a"] ~= "ctx:term-b",
         "459-TR: required does not downgrade A→C to A→B")
-    assertEq(required["ctx:term-b"], "ctx:term-c",
-        "459-TR: required keeps B→C closure got "
-            .. tostring(required["ctx:term-b"]))
+    -- While the durable map still carries A→B→C, path closure may require B→C.
+    -- After terminal compaction, unreferenced B is reclaimable (#459 4498767528).
+    if mapNow["ctx:term-a"] == "ctx:term-b" then
+        assertEq(required["ctx:term-b"], "ctx:term-c",
+            "459-TR: path closure keeps B→C while A→B→C remains")
+    end
 
-    -- Capacity reclaim via production Write path must retain terminal bindings.
+    -- Capacity reclaim must free unreferenced siblings that only share terminal C
+    -- (owned-terminal sibling scan previously pinned them all and blocked writes).
     local map = record.accounting._consumables.creditEventAliases
     local maxAliases = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+    map["ctx:term-unref-b"] = "ctx:term-c" -- unreferenced sibling of C
     local n = 0
     for _ in pairs(map or {}) do n = n + 1 end
     local filler = 0
     while n < maxAliases and filler < maxAliases do
         filler = filler + 1
-        local alias = string.format("ctx:term-fill-%04d", filler)
-        local canon = string.format("ctx:term-fill-c-%04d", filler)
-        if GS.RememberCreditEventAlias(record, alias, canon) then
+        local alias = string.format("ctx:term-sib-%04d", filler)
+        if map[alias] == nil then
+            map[alias] = "ctx:term-c"
             n = n + 1
-        else
-            break
         end
     end
-    assertTrue(GS.RememberCreditEventAlias(
-        record, "ctx:term-extra", "ctx:term-extra-c")
-        or (record.accounting._consumables.creditEventAliases["ctx:term-a"]
-            == "ctx:term-c"),
-        "459-TR: capacity write attempted")
+    assertEq(n, maxAliases, "459-TR: map saturated with C-siblings")
+    local requiredFull = GS.CollectRequiredCreditEventAliases(record)
+    local reqN = 0
+    for _ in pairs(requiredFull) do reqN = reqN + 1 end
+    assertTrue(reqN < 64,
+        "459-TR: required set stays small amid C-siblings got " .. tostring(reqN))
+    assertEq(requiredFull["ctx:term-a"], "ctx:term-c",
+        "459-TR: referenced A→C still required at capacity")
+    assertTrue(requiredFull["ctx:term-sib-0001"] == nil,
+        "459-TR: unreferenced C-sibling not required")
+    assertTrue(requiredFull["ctx:term-unref-b"] == nil,
+        "459-TR: unreferenced B-like sibling not required")
+
+    -- Strict successful insertion of a new required binding via production Write.
+    injectProductionDonation(record, {
+        id = "ctx:term-new", itemId = 9988, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local newOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "term-new-corr",
+        target = "ctx:term-new-alias",
+        value = { eventId = "ctx:term-new-alias" },
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+    }
+    local okNew, errNew = GS.EnsureContributorCorrectionDurableAliases(
+        record, newOp, GS.FindLedgerEventById(record, "ctx:term-new"))
+    assertTrue(okNew,
+        "459-TR: new required binding inserts after reclaim got "
+            .. tostring(okNew) .. "/" .. tostring(errNew))
     map = record.accounting._consumables.creditEventAliases
+    assertEq(map["ctx:term-new-alias"], "ctx:term-new",
+        "459-TR: new durable alias present")
     assertEq(map["ctx:term-a"], "ctx:term-c",
         "459-TR: durable A→C survives capacity prune got "
             .. tostring(map["ctx:term-a"]))
-    assertEq(map["ctx:term-b"], "ctx:term-c",
-        "459-TR: durable B→C survives capacity prune got "
-            .. tostring(map["ctx:term-b"]))
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
         record, GS.FindLedgerEventById(record, "ctx:term-c"))), "Bob-Garona",
         "459-TR: Bob credit stable after prune")
 
-    -- Export/adoption still sees coherent required bindings.
+    -- Retain an accepted body for the new alias so collection/export protect it.
+    local newCorrId = "term-new-corr-body"
+    record.operations.records[newCorrId] = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = newCorrId,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:term-new-alias",
+        value = {
+            eventId = "ctx:term-new-alias", eventKind = "donation",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9988,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 2,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    record.operations.heads["credit:ctx:term-new"] = newCorrId
+
     local exportRequired = GS.CollectRequiredCreditEventAliases(record)
     assertEq(exportRequired["ctx:term-a"], "ctx:term-c",
         "459-TR: export required still A→C")
-    assertEq(exportRequired["ctx:term-b"], "ctx:term-c",
-        "459-TR: export required still B→C")
+    assertEq(exportRequired["ctx:term-new-alias"], "ctx:term-new",
+        "459-TR: export protects genuinely referenced new alias")
+    assertTrue(exportRequired["ctx:term-unref-b"] == nil,
+        "459-TR: export does not pin unreferenced sibling")
+
+    -- Genuine all-required exhaustion still refuses without corrupting Bob.
+    local map2 = record.accounting._consumables.creditEventAliases
+    for alias in pairs(map2) do
+        map2[alias] = nil
+    end
+    map2["ctx:term-a"] = "ctx:term-c"
+    local fill2 = 0
+    local n2 = 1
+    while n2 < maxAliases and fill2 < maxAliases do
+        fill2 = fill2 + 1
+        local alias = string.format("ctx:term-own-%04d", fill2)
+        local canon = string.format("ctx:term-own-c-%04d", fill2)
+        map2[alias] = canon
+        local opId = string.format("term-own-%04d", fill2)
+        record.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = 9988,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        n2 = n2 + 1
+    end
+    assertEq(n2, maxAliases, "459-TR: exhaustion map fully owned")
+    injectProductionDonation(record, {
+        id = "ctx:term-exh", itemId = 9988, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local exhOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "term-exh-corr",
+        target = "ctx:term-exh-alias",
+        value = { eventId = "ctx:term-exh-alias" },
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+    }
+    local okExh, errExh = GS.EnsureContributorCorrectionDurableAliases(
+        record, exhOp, GS.FindLedgerEventById(record, "ctx:term-exh"))
+    assertTrue(not okExh,
+        "459-TR: genuine all-required exhaustion refuses")
+    assertEq(errExh, "full",
+        "459-TR: exhaustion reason full got " .. tostring(errExh))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "ctx:term-c"))), "Bob-Garona",
+        "459-TR: Bob credit unchanged after exhaustion refuse")
+    assertEq(map2["ctx:term-a"], "ctx:term-c",
+        "459-TR: A→C intact after exhaustion refuse")
 end
 
 do
