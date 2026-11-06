@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.19-beta.1] - 2026-11-06
+
+### Changed
+- Easily Open Raid Supply Rankings (#466)
+
 ## [1.5.18] - 2026-11-05
 
 ### Added
