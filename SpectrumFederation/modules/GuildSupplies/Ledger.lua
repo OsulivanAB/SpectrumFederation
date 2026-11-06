@@ -2631,11 +2631,82 @@ end
 -- Skips untrusted_relay/evidence. Bounds attempted work (including failures).
 -- opts.eventId / opts.itemId wake related deps with OR matching when both set.
 -- Non-reentrant: nested accepts coalesce into one continuation with a saved cursor.
+-- Snapshot matching uses a paced id/txn/alias index so dependency lookup charges
+-- the shared callback allowance instead of rescanning live+archive per pending
+-- entry (#459 discussion_r4487530434).
 -- @return promotedCount, attemptCount
 local creditRedriveDepth = 0
 local creditRedriveContinuation = setmetatable({}, { __mode = "k" })
 
-local function CreditRedriveMatch(record, body, opts)
+--- Test seam: drop paced redrive continuation/index for a record (#459 PM).
+function GS._ClearCreditRedriveContinuationForTest(record)
+    if type(record) == "table" then
+        creditRedriveContinuation[record] = nil
+    end
+end
+
+--- Resolve a credit-event id through an already-built lookup index (O(1)).
+-- Falls back to registry primary then index; never scans ledger lists.
+local function CanonicalFromRedriveIndex(record, eventId, byId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    if type(byId) == "table" then
+        local hit = byId[eventId]
+        if type(hit) == "table" and type(hit.id) == "string" and hit.id ~= "" then
+            return hit.id
+        end
+    end
+    -- Registry / durable alias map only (no ledger scan).
+    local primary = eventId
+    local cfg = record and record.accounting and record.accounting._consumables
+    if type(cfg) == "table" then
+        local current = eventId
+        for _ = 1, 8 do
+            local reg = type(FindRegistryByTxn) == "function" and FindRegistryByTxn(cfg, current)
+            if type(reg) == "table" then
+                if reg.status == "alias" and type(reg.aliasOf) == "string" and reg.aliasOf ~= ""
+                    and reg.aliasOf ~= current then
+                    current = reg.aliasOf
+                else
+                    primary = ValidTxnId(reg.txnId) or current
+                    break
+                end
+            else
+                local map = cfg.creditEventAliases
+                local mapped = type(map) == "table" and map[current]
+                if type(mapped) == "string" and mapped ~= "" and mapped ~= current then
+                    current = mapped
+                else
+                    primary = current
+                    break
+                end
+            end
+        end
+    end
+    if type(byId) == "table" and type(primary) == "string" then
+        local hit = byId[primary]
+        if type(hit) == "table" and type(hit.id) == "string" and hit.id ~= "" then
+            return hit.id
+        end
+    end
+    return primary
+end
+
+local function CreditRedriveLookupEvent(byId, eventId)
+    if type(byId) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    local hit = byId[eventId]
+    if type(hit) == "table" then
+        return hit
+    end
+    return nil
+end
+
+--- Match pending body against wake filters using the paced redrive index.
+-- @param byId table complete id/txn/alias → event index
+local function CreditRedriveMatch(record, body, opts, byId)
     local eventIdFilter = opts.eventId
     local itemIdFilter = tonumber(opts.itemId)
     if (type(eventIdFilter) ~= "string" or eventIdFilter == "") and not itemIdFilter then
@@ -2643,16 +2714,12 @@ local function CreditRedriveMatch(record, body, opts)
     end
     local matchEvent = false
     if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
-        local canonical = GS.CanonicalCreditEventId
-            and GS.CanonicalCreditEventId(record, body.target) or body.target
-        local filterCanon = GS.CanonicalCreditEventId
-            and GS.CanonicalCreditEventId(record, eventIdFilter) or eventIdFilter
-        matchEvent = (canonical == filterCanon or body.target == eventIdFilter)
-        -- Alias of either side also matches.
-        if not matchEvent and type(body.target) == "string" then
-            local bodyCanon = canonical
-            local filterPrimary = filterCanon
-            matchEvent = bodyCanon ~= nil and filterPrimary ~= nil and bodyCanon == filterPrimary
+        if body.target == eventIdFilter then
+            matchEvent = true
+        else
+            local canonical = CanonicalFromRedriveIndex(record, body.target, byId)
+            local filterCanon = CanonicalFromRedriveIndex(record, eventIdFilter, byId)
+            matchEvent = canonical ~= nil and filterCanon ~= nil and canonical == filterCanon
         end
     end
     local matchItem = false
@@ -2661,7 +2728,11 @@ local function CreditRedriveMatch(record, body, opts)
         if bodyItem and bodyItem == itemIdFilter then
             matchItem = true
         else
-            local ev = GS.FindLedgerEventById and GS.FindLedgerEventById(record, body.target)
+            local ev = CreditRedriveLookupEvent(byId, body.target)
+            if not ev then
+                local canon = CanonicalFromRedriveIndex(record, body.target, byId)
+                ev = CreditRedriveLookupEvent(byId, canon)
+            end
             if ev and tonumber(ev.itemId) == itemIdFilter then
                 matchItem = true
             end
@@ -2674,6 +2745,192 @@ local function CreditRedriveMatch(record, body, opts)
         return matchEvent
     end
     return matchItem
+end
+
+--- Accounting+ops stamp for redrive lookup reuse (same inputs as projection).
+local function CreditRedriveLookupStamp(record)
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    return tostring(opsGen) .. ":" .. tostring(acctMut) .. ":" .. tostring(record.datasetId or "")
+end
+
+--- Pace-build id/txn/alias → event index for dependency matching.
+-- Charges each row visit into the shared callback work counter.
+-- @return boolean ready, table|nil byId
+local function EnsureCreditRedriveLookupIndex(record, cont)
+    local stamp = CreditRedriveLookupStamp(record)
+    if type(cont.lookupById) == "table" and cont.lookupComplete == true
+        and cont.lookupStamp == stamp then
+        return true, cont.lookupById
+    end
+    if cont.lookupStamp ~= stamp then
+        cont.lookupById = {}
+        cont.lookupPhase = "live"
+        cont.lookupIndex = 1
+        cont.lookupStamp = stamp
+        cont.lookupComplete = false
+        cont.lookupRegistryIndex = 1
+    end
+    local byId = cont.lookupById
+    local softLimit = tonumber(GS._creditProjectionCallbackLimit)
+        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+        or 16384
+    local function charge(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+        GS._creditRedriveLookupVisits =
+            (tonumber(GS._creditRedriveLookupVisits) or 0) + (n or 1)
+    end
+    local function overBudget()
+        return (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit
+    end
+    local function indexEvent(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if type(event.id) == "string" and event.id ~= "" then
+            byId[event.id] = event
+        end
+        local txnId = type(event.txnId) == "string" and event.txnId or nil
+        if txnId and txnId ~= "" then
+            byId[txnId] = event
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if cont.lookupPhase == "live" then
+        if type(live) == "table" then
+            local limit = math.min(#live, MaxLiveLedgerScan())
+            local i = tonumber(cont.lookupIndex) or 1
+            while i <= limit do
+                if overBudget() then
+                    cont.lookupIndex = i
+                    return false, byId
+                end
+                indexEvent(live[i])
+                charge(1)
+                i = i + 1
+            end
+        end
+        cont.lookupPhase = "archive"
+        cont.lookupIndex = 1
+    end
+    if cont.lookupPhase == "archive" then
+        if type(archived) == "table" then
+            local limit = math.min(#archived, MaxArchivedLedgerScan())
+            local i = tonumber(cont.lookupIndex) or 1
+            while i <= limit do
+                if overBudget() then
+                    cont.lookupIndex = i
+                    return false, byId
+                end
+                indexEvent(archived[i])
+                charge(1)
+                i = i + 1
+            end
+        end
+        cont.lookupPhase = "registry"
+        cont.lookupIndex = 1
+        cont.lookupRegistryIndex = 1
+    end
+    if cont.lookupPhase == "registry" then
+        local cfg = record.accounting and record.accounting._consumables
+        local registry = cfg and cfg.txnRegistry
+        if type(registry) == "table" then
+            local i = tonumber(cont.lookupRegistryIndex) or 1
+            while i <= #registry do
+                if overBudget() then
+                    cont.lookupRegistryIndex = i
+                    return false, byId
+                end
+                local row = registry[i]
+                charge(1)
+                if type(row) == "table" then
+                    if type(row.txnId) == "string" and row.txnId ~= ""
+                        and type(row.aliases) == "table" then
+                        local primary = byId[row.txnId]
+                        if primary then
+                            for j = 1, #row.aliases do
+                                local alias = row.aliases[j]
+                                if type(alias) == "string" and alias ~= "" then
+                                    byId[alias] = primary
+                                    charge(1)
+                                end
+                            end
+                        end
+                    end
+                    if row.status == "alias"
+                        and type(row.txnId) == "string" and row.txnId ~= ""
+                        and type(row.aliasOf) == "string" and row.aliasOf ~= "" then
+                        local primary = byId[row.aliasOf]
+                        if primary then
+                            byId[row.txnId] = primary
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        -- Fold durable creditEventAliases map (survives registry eviction).
+        local map = cfg and cfg.creditEventAliases
+        if type(map) == "table" then
+            for alias, canon in pairs(map) do
+                if overBudget() then
+                    -- Map fold is unordered; mark incomplete and resume next slice
+                    -- by restarting registry phase only for the alias map.
+                    cont.lookupPhase = "aliasMap"
+                    cont.lookupAliasCursor = alias
+                    return false, byId
+                end
+                if type(alias) == "string" and alias ~= ""
+                    and type(canon) == "string" and canon ~= "" then
+                    local primary = byId[canon]
+                    if primary then
+                        byId[alias] = primary
+                    end
+                    charge(1)
+                end
+            end
+        end
+        cont.lookupPhase = "done"
+        cont.lookupComplete = true
+    elseif cont.lookupPhase == "aliasMap" then
+        local cfg = record.accounting and record.accounting._consumables
+        local map = cfg and cfg.creditEventAliases
+        if type(map) == "table" then
+            local seenResume = cont.lookupAliasCursor == nil
+            for alias, canon in pairs(map) do
+                if not seenResume then
+                    if alias == cont.lookupAliasCursor then
+                        seenResume = true
+                    end
+                end
+                if seenResume then
+                    if overBudget() then
+                        cont.lookupAliasCursor = alias
+                        return false, byId
+                    end
+                    if type(alias) == "string" and alias ~= ""
+                        and type(canon) == "string" and canon ~= "" then
+                        local primary = byId[canon]
+                        if primary then
+                            byId[alias] = primary
+                        end
+                        charge(1)
+                    end
+                end
+            end
+        end
+        cont.lookupPhase = "done"
+        cont.lookupComplete = true
+        cont.lookupAliasCursor = nil
+    end
+    return cont.lookupComplete == true, byId
 end
 
 --- True when opts is an explicit full dependency wake (no item/event filter).
@@ -2753,9 +3010,13 @@ local function MergeCreditRedriveWake(record, opts)
     if broadened then
         cont.snapshot = nil
         cont.index = nil
+        cont.pendingCandidates = nil
+        cont.matchIndex = nil
+        cont.snapshotBuilding = nil
+        -- Lookup index remains valid for the same ledger stamp; keep it.
     end
     if externalWake and (type(cont.snapshot) == "table" or creditRedriveDepth > 0
-        or cont.scheduled) then
+        or cont.scheduled or type(cont.pendingCandidates) == "table") then
         cont.followUpWake = true
     end
     return cont, broadened
@@ -2831,60 +3092,126 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         GS._creditProjectionStructureCopyVisits = 0
         GS._creditProjectionTraversalVisits = 0
         GS._creditProjectionProvenanceVisits = 0
+        GS._creditRedriveLookupVisits = 0
+        GS._creditRedriveMatchVisits = 0
     end
     GS._creditProjectionAccumulating = true
     -- Always merge the incoming wake; never overwrite cont.opts with a narrow
     -- filter while an existing snapshot drains (A/B/C interleaving).
     local cont = MergeCreditRedriveWake(record, opts)
     local waveOpts = cont.opts or opts or {}
-    -- Deletion-safe wave: snapshot eligible ids once; resume by index into that
-    -- snapshot (skip entries already removed by successful admission).
+    -- Independent callback work ceiling (not derived from measured history cost).
+    local workBudget = tonumber(waveOpts.workBudget)
+        or tonumber(GS._creditProjectionWorkBudgetOverride)
+        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+        or 16384
+    local softLimit = tonumber(GS._creditProjectionCallbackLimit) or workBudget
+    local function overSoft()
+        return (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit
+    end
+    local function chargeMatch(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+        GS._creditRedriveMatchVisits =
+            (tonumber(GS._creditRedriveMatchVisits) or 0) + (n or 1)
+    end
+
+    -- Deletion-safe wave: pace lookup-index + match snapshot under the shared
+    -- budget, then resume admissions by index into that snapshot.
     local snapshot = cont.snapshot
     local startIndex = tonumber(cont.index) or 1
     if type(snapshot) ~= "table" then
-        local ids = {}
-        for id, entry in pairs(ops.pending) do
-            local body = entry and entry.body
-            if type(body) == "table" then
-                local reason = entry.reason
-                local isCorrection = body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
-                    and type(body.target) == "string"
-                -- Ordinary adjustments retained for transient work_budget must
-                -- resume through the same bounded redrive (#459 B).
-                local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
-                    and reason == "work_budget"
-                if (isCorrection or isBudgetAdj)
-                    and reason ~= "untrusted_relay" and reason ~= "evidence" then
-                    if isBudgetAdj or CreditRedriveMatch(record, body, waveOpts) then
-                        ids[#ids + 1] = id
+        -- Collect candidate pending ids cheaply (kind/reason only; no ledger scan).
+        if type(cont.pendingCandidates) ~= "table" then
+            local cands = {}
+            for id, entry in pairs(ops.pending) do
+                local body = entry and entry.body
+                if type(body) == "table" then
+                    local reason = entry.reason
+                    local isCorrection = body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                        and type(body.target) == "string"
+                    local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
+                        and reason == "work_budget"
+                    if (isCorrection or isBudgetAdj)
+                        and reason ~= "untrusted_relay" and reason ~= "evidence" then
+                        cands[#cands + 1] = id
                     end
                 end
             end
+            table.sort(cands)
+            cont.pendingCandidates = cands
+            cont.matchIndex = 1
+            cont.snapshotBuilding = {}
+            chargeMatch(#cands > 0 and 1 or 0)
         end
-        table.sort(ids)
-        snapshot = ids
+        -- Full wakes need no ledger index for matching.
+        local needsIndex = (type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "")
+            or tonumber(waveOpts.itemId) ~= nil
+        local byId = cont.lookupById
+        if needsIndex then
+            local ready
+            ready, byId = EnsureCreditRedriveLookupIndex(record, cont)
+            if not ready then
+                cont.opts = waveOpts
+                cont.scheduled = false
+                if not nested then
+                    GS._creditProjectionAccumulating = false
+                end
+                ScheduleCreditRedriveContinuation(record, nil)
+                return 0, 0, tonumber(GS._creditProjectionCallbackWork) or 0
+            end
+        end
+        local cands = cont.pendingCandidates
+        local building = cont.snapshotBuilding or {}
+        local mi = tonumber(cont.matchIndex) or 1
+        while mi <= #cands do
+            if overSoft() then
+                cont.matchIndex = mi
+                cont.snapshotBuilding = building
+                cont.opts = waveOpts
+                cont.scheduled = false
+                if not nested then
+                    GS._creditProjectionAccumulating = false
+                end
+                ScheduleCreditRedriveContinuation(record, nil)
+                return 0, 0, tonumber(GS._creditProjectionCallbackWork) or 0
+            end
+            local id = cands[mi]
+            mi = mi + 1
+            chargeMatch(1)
+            local entry = ops.pending[id]
+            local body = entry and entry.body
+            if type(body) == "table" then
+                local reason = entry.reason
+                local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
+                    and reason == "work_budget"
+                if isBudgetAdj or CreditRedriveMatch(record, body, waveOpts, byId) then
+                    building[#building + 1] = id
+                end
+            end
+        end
+        snapshot = building
         startIndex = 1
         cont.snapshot = snapshot
         cont.index = 1
+        cont.pendingCandidates = nil
+        cont.matchIndex = nil
+        cont.snapshotBuilding = nil
         -- Starting a fresh snapshot consumes the follow-up request that caused it.
         cont.followUpWake = false
     end
     local promoted = 0
     local attempts = 0
     local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
-    -- Independent callback work ceiling (not derived from measured history cost).
-    local workBudget = tonumber(waveOpts.workBudget)
-        or tonumber(GS._creditProjectionWorkBudgetOverride)
-        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
-        or 16384
     creditRedriveDepth = creditRedriveDepth + 1
     local i = startIndex
     while i <= #snapshot do
         if attempts >= maxAttempts then
             break
         end
-        local softLimit = tonumber(GS._creditProjectionCallbackLimit) or workBudget
-        if (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit then
+        if overSoft() then
             break
         end
         attempts = attempts + 1
@@ -2919,7 +3246,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         end
     end
     creditRedriveDepth = creditRedriveDepth - 1
-    if i <= #snapshot then
+    if i <= #snapshot or type(cont.pendingCandidates) == "table" then
         cont.snapshot = snapshot
         cont.index = i
         cont.opts = waveOpts
@@ -2935,12 +3262,25 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         if wasFull and not followUp then
             retainedOpts = { maxAttempts = waveOpts and waveOpts.maxAttempts or nil }
         end
+        local retainedLookup = nil
+        if cont.lookupComplete and cont.lookupStamp == CreditRedriveLookupStamp(record) then
+            retainedLookup = {
+                lookupById = cont.lookupById,
+                lookupComplete = true,
+                lookupStamp = cont.lookupStamp,
+                lookupPhase = "done",
+            }
+        end
         creditRedriveContinuation[record] = {
             opts = retainedOpts,
             scheduled = false,
             followUpWake = false,
             -- Keep fullWake through a follow-up so narrow wakes cannot re-narrow.
             fullWake = followUp and wasFull or false,
+            lookupById = retainedLookup and retainedLookup.lookupById or nil,
+            lookupComplete = retainedLookup and true or nil,
+            lookupStamp = retainedLookup and retainedLookup.lookupStamp or nil,
+            lookupPhase = retainedLookup and retainedLookup.lookupPhase or nil,
         }
         if followUp then
             ScheduleCreditRedriveContinuation(record, wasFull and {} or nil)

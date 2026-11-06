@@ -8843,6 +8843,260 @@ do
         "459-C-elig: winner credit unchanged")
 end
 
+do
+    -- Pending-dependency matching must charge/pace lookup under the shared
+    -- callback budget (no full live+archive rescan per pending entry).
+    local record = seedLiveCampaignWithItem(9930, 100000)
+    local ctx = select(1, GS:GetCurrentContext())
+    local LIVE_N, ARCH_N, PEND_N = 800, 800, 64
+    -- Filler ledger history uses a different item so campaign goal for 9930
+    -- stays clear for the ordinary adjustment wake.
+    local live = record.accounting._consumableEvents
+    local arch = record.accounting._consumableEventArchive
+    if type(arch) ~= "table" then
+        record.accounting._consumableEventArchive = {}
+        arch = record.accounting._consumableEventArchive
+    end
+    for i = 1, LIVE_N do
+        live[#live + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("ctx:pm-live-%04d", i),
+            txnId = string.format("ctx:pm-live-%04d", i),
+            itemId = 9940, quantity = 1,
+            generation = 1, timestamp = world.time + i,
+            actor = "Retired-Garona", actorGuid = "Player-1-Retired",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = record.currentCampaignId, datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    for i = 1, ARCH_N do
+        arch[#arch + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("ctx:pm-arch-%04d", i),
+            txnId = string.format("ctx:pm-arch-%04d", i),
+            itemId = 9941, quantity = 1,
+            generation = 0, timestamp = world.time - 10000 + i,
+            actor = "Retired-Garona", actorGuid = "Player-1-Retired",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = record.currentCampaignId, datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    injectProductionDonation(record, {
+        id = "ctx:pm-adj-base", itemId = 9930, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    -- Authenticated missing-event corrections (mismatching targets/item hints).
+    for i = 1, PEND_N do
+        local target = string.format("ctx:pm-miss-%04d", i)
+        local op = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = string.format("pm-corr-%04d", i),
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = target,
+            value = {
+                eventId = target, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9999, -- mismatch hint vs wake item 9930
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 10 + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending",
+            "459-PM: admit pending " .. tostring(i) .. " got " .. tostring(st) .. "/" .. tostring(r))
+        assertEq(r, "pending_event", "459-PM: pending_event " .. tostring(i))
+    end
+    local pendingBefore = 0
+    for _ in pairs(record.operations.pending or {}) do pendingBefore = pendingBefore + 1 end
+    assertTrue(pendingBefore >= PEND_N, "459-PM: retained pending n=" .. tostring(pendingBefore))
+
+    -- Ordinary positive adjustment accepts (timer-only recovery path preserved).
+    local adjOp, adjSt, adjReason = GS:NewAdjustmentOperation(9930, 1, "Alice-Garona")
+    assertTrue(adjOp ~= nil,
+        "459-PM: adjustment prepared got " .. tostring(adjSt) .. "/" .. tostring(adjReason))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "459-PM: apply adjustment")
+    local adjId = adjOp.id
+    local adjEv = nil
+    local events = record.accounting._consumableEvents
+    for i = #events, 1, -1 do
+        local e = events[i]
+        if type(e) == "table" and (e.id == adjId or e.opId == adjId) then
+            adjEv = e
+            break
+        end
+    end
+    assertTrue(type(adjEv) == "table", "459-PM: adjustment ledger row present")
+    local wakeEventId = adjEv.id or adjId
+
+    local function drainRedrive(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then
+                    flushTimers()
+                end
+            else
+                break
+            end
+        end
+        flushTimers()
+        return slices
+    end
+
+    -- Drop any continuation left by the adjustment's EnsureThenRedrive so the
+    -- measured wake rebuilds the lookup index under a fresh callback allowance.
+    if GS._ClearCreditRedriveContinuationForTest then
+        GS._ClearCreditRedriveContinuationForTest(record)
+    end
+    -- Nonmatching targeted wake: must charge lookup work, stay bounded, go idle.
+    GS._creditRedriveLookupVisits = 0
+    GS._creditRedriveMatchVisits = 0
+    local prom1, att1, work1 = GS.RedrivePendingContributorCorrections(record, {
+        eventId = wakeEventId, itemId = 9930, maxAttempts = 32,
+    })
+    local lookupAfterFirst = tonumber(GS._creditRedriveLookupVisits) or 0
+    drainRedrive(256)
+    -- Warm wake (index retained): match work only, no full ledger rescan.
+    GS._creditRedriveLookupVisits = 0
+    GS._creditRedriveMatchVisits = 0
+    local prom1b, att1b, work1b = GS.RedrivePendingContributorCorrections(record, {
+        eventId = wakeEventId, itemId = 9930, maxAttempts = 32,
+    })
+    drainRedrive(256)
+    local lookupVisits = math.max(lookupAfterFirst, tonumber(GS._creditRedriveLookupVisits) or 0)
+    local matchVisits = tonumber(GS._creditRedriveMatchVisits) or 0
+    local workTotal = math.max(tonumber(work1) or 0, tonumber(work1b) or 0)
+    local ledgerRows = LIVE_N + ARCH_N
+    local oldProduct = pendingBefore * ledgerRows * 2
+    assertTrue(lookupAfterFirst >= ledgerRows,
+        "459-PM: cold wake indexes ledger once lookup="
+            .. tostring(lookupAfterFirst) .. " rows=" .. tostring(ledgerRows)
+            .. " work=" .. tostring(work1))
+    assertTrue(tonumber(work1) or 0 >= ledgerRows,
+        "459-PM: cold wake callbackWork includes lookup work=" .. tostring(work1))
+    -- Warm wake should not rescan the full ledger.
+    assertTrue((tonumber(GS._creditRedriveLookupVisits) or 0) <= pendingBefore + 64,
+        "459-PM: warm wake skips full rescan lookup="
+            .. tostring(GS._creditRedriveLookupVisits))
+    assertTrue(lookupVisits <= ledgerRows + pendingBefore + 256,
+        "459-PM: lookup visits bounded visits="
+            .. tostring(lookupVisits) .. " rows=" .. tostring(ledgerRows))
+    assertTrue(oldProduct > 100000 and (lookupAfterFirst + matchVisits) * 20 < oldProduct,
+        "459-PM: visits far below pending×ledger product="
+            .. tostring(oldProduct) .. " lookup=" .. tostring(lookupAfterFirst)
+            .. " match=" .. tostring(matchVisits))
+    assertTrue(workTotal > 0, "459-PM: workTotal observed " .. tostring(workTotal))
+    assertEq(prom1, 0, "459-PM: nonmatch promotes none got " .. tostring(prom1))
+    assertEq(prom1b, 0, "459-PM: warm nonmatch promotes none")
+    assertTrue((tonumber(att1) or 0) >= 0 and (tonumber(att1b) or 0) >= 0,
+        "459-PM: attempts observed")
+    local stillPending = 0
+    for _ in pairs(record.operations.pending or {}) do stillPending = stillPending + 1 end
+    assertTrue(stillPending >= PEND_N, "459-PM: pending retained after nonmatch")
+    assertEq(#timers, 0, "459-PM: idle after nonmatch drain")
+
+    -- Repeated nonmatching wakes stay bounded (reuse complete index).
+    GS._creditRedriveLookupVisits = 0
+    local _, _, work2 = GS.RedrivePendingContributorCorrections(record, {
+        eventId = wakeEventId, itemId = 9930, maxAttempts = 32,
+    })
+    drainRedrive(64)
+    local lookup2 = tonumber(GS._creditRedriveLookupVisits) or 0
+    assertTrue(lookup2 <= pendingBefore + 64,
+        "459-PM: repeated nonmatch reuses index lookup2=" .. tostring(lookup2))
+    assertTrue((tonumber(work2) or 0) >= 0, "459-PM: work2 observed")
+
+    -- Matching wake while a paced snapshot drains: force a mid-build pause then
+    -- admit the missing dependency and prove once-only settlement.
+    GS._creditProjectionWorkBudgetOverride = 64
+    GS._creditRedriveLookupVisits = 0
+    -- Force lookup rebuild under the tight budget by mutating accounting stamp.
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = "ctx:pm-stamp-bump",
+        txnId = "ctx:pm-stamp-bump",
+        itemId = 9940, quantity = 1,
+        generation = 1, timestamp = world.time + 40,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        writer = "Player-1-Alice", verification = "officer",
+        campaignId = record.currentCampaignId, datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    local promPause = GS.RedrivePendingContributorCorrections(record, {
+        eventId = "ctx:pm-miss-0001", itemId = 9999, maxAttempts = 8,
+    })
+    assertTrue(#timers >= 1 or promPause == 0,
+        "459-PM: tight budget schedules paced continuation timers="
+            .. tostring(#timers))
+    -- While draining, supply the matching dependency via real admission path.
+    local missDon = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = "ctx:pm-miss-0001",
+        txnId = "ctx:pm-miss-0001",
+        itemId = 9999,
+        quantity = 5,
+        generation = tonumber(record.accounting._consumables.generation) or 1,
+        timestamp = world.time + 50,
+        actor = "Alice-Garona",
+        actorGuid = "Player-1-Alice",
+        writer = "Player-1-Alice",
+        verification = GS.VERIFICATION.OFFICER,
+        verifierGuid = "Player-1-Alice",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    GS._creditProjectionWorkBudgetOverride = nil
+    local stDon, rDon = GS:AdmitLedgerEvent(missDon, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = ctx.guildKey, rankOrder = 1 },
+        offlineRecord = record,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        localWrite = false,
+    })
+    assertTrue(stDon == "accepted" or stDon == "duplicate",
+        "459-PM: miss dependency admitted got " .. tostring(stDon) .. "/" .. tostring(rDon))
+    local settleGuard = 0
+    while record.operations.pending["pm-corr-0001"] and settleGuard < 256 do
+        if not runOneDueTimer() then
+            GS.RedrivePendingContributorCorrections(record, {
+                eventId = "ctx:pm-miss-0001", itemId = 9999, maxAttempts = 32,
+            })
+        end
+        settleGuard = settleGuard + 1
+    end
+    flushTimers()
+    assertTrue(record.operations.records["pm-corr-0001"] ~= nil,
+        "459-PM: matching pending settled once")
+    assertNil(record.operations.pending["pm-corr-0001"],
+        "459-PM: pending cleared without redelivery")
+    local stAgain, rAgain = GS:AdmitRemoteOperation(
+        record.operations.records["pm-corr-0001"], {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+    assertTrue(stAgain == "duplicate" or stAgain == "accepted",
+        "459-PM: redelivery duplicate-safe got " .. tostring(stAgain) .. "/" .. tostring(rAgain))
+    assertEq(#timers, 0, "459-PM: idle after match settle")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
