@@ -9349,11 +9349,27 @@ end
 
 do
     -- Obsolete-path pending retention must notify the warm provider
-    -- (#459 discussion_r4488855215) for pending_event and not_credited.
+    -- (#459 discussion_r4488855215). Onward delivery uses an unchanged
+    -- exported body against a faithful same-dataset receiver: original-author
+    -- accept credits Bob; another officer's relay stays untrusted_pending.
+    local function shallowCopyOp(op)
+        local out = {}
+        for k, v in pairs(op) do
+            if type(v) == "table" and k == "value" then
+                local vv = {}
+                for vk, vv2 in pairs(v) do vv[vk] = vv2 end
+                out[k] = vv
+            else
+                out[k] = v
+            end
+        end
+        return out
+    end
     local function retainObsoletePending(mode)
-        local record = seedLiveCampaignWithItem(9961, 80)
+        local itemId = mode == "missing" and 9961 or 9962
+        local record = seedLiveCampaignWithItem(itemId, 80)
         injectProductionDonation(record, {
-            id = "ctx:pn-don", itemId = 9961, quantity = 5,
+            id = "ctx:pn-don", itemId = itemId, quantity = 5,
             actor = "Alice-Garona", actorGuid = "Player-1-Alice",
         })
         world.time = world.time + 1
@@ -9408,37 +9424,7 @@ do
         end
         assertTrue(saw, "459-PN-" .. mode .. ": remote-pending notify")
         drainExportMaint(64)
-        local exported = false
         local bodies = collectAllExportBodies()
-        for i = 1, #bodies do
-            local b = bodies[i].body
-            if b and b.kind == "gs-op" and b.op and b.op.id == early.id then
-                exported = true
-            elseif b and b.kind == "gs-evidence" and b.op and b.op.id == early.id then
-                exported = true
-            elseif b and b.opId == early.id then
-                exported = true
-            end
-        end
-        -- Evidence export may use pending id as record id.
-        if not exported then
-            for i = 1, #bodies do
-                local id = bodies[i].id
-                if id == early.id or id == ("gs:pend:" .. early.id)
-                    or id == ("gs:ev:" .. early.id) then
-                    exported = true
-                end
-            end
-        end
-        assertTrue(exported,
-            "459-PN-" .. mode .. ": warm export includes pending body n="
-                .. tostring(#bodies))
-        -- Peer that already has the prerequisite admits the exported evidence body.
-        local peer = seedLiveCampaignWithItem(9962, 80)
-        injectProductionDonation(peer, {
-            id = "ctx:pn-don", itemId = 9962, quantity = 5,
-            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
-        })
         local exportedOp = nil
         for i = 1, #bodies do
             local b = bodies[i].body
@@ -9453,23 +9439,95 @@ do
             end
         end
         if not exportedOp then
-            exportedOp = select(1, GS._SnapshotPublicOp(early))
+            local pend = record.operations.pending[early.id]
+            exportedOp = pend and pend.body or select(1, GS._SnapshotPublicOp(early))
         end
-        exportedOp.guildKey = select(1, GS:GetCurrentContext()).guildKey
-        exportedOp.datasetId = peer.datasetId
-        exportedOp.campaignId = peer.currentCampaignId
-        exportedOp.baseCampaignId = peer.currentCampaignId
-        exportedOp.baseTargetRevision = peer.datasetId
-        exportedOp.basePolicyRevision = peer.permission and peer.permission.revisionId
-        local stPeer, rPeer = GS:AdmitRemoteOperation(exportedOp, {
-            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
-        })
-        assertTrue(stPeer == "accepted" or stPeer == "duplicate",
-            "459-PN-" .. mode .. ": peer admits relay got "
-                .. tostring(stPeer) .. "/" .. tostring(rPeer))
+        assertTrue(type(exportedOp) == "table",
+            "459-PN-" .. mode .. ": warm export includes pending body n="
+                .. tostring(#bodies))
+        local function cloneGuildRecord(src)
+            local function copy(v, depth)
+                depth = (depth or 0) + 1
+                if type(v) ~= "table" then
+                    return v
+                end
+                if depth > 40 then
+                    return nil
+                end
+                local out = {}
+                for k, val in pairs(v) do
+                    out[copy(k, depth)] = copy(val, depth)
+                end
+                return out
+            end
+            return copy(src, 0)
+        end
+        local function installSameDatasetPeer()
+            -- Deep-clone the exporter so dataset/permission/cutover stay valid for
+            -- GetRecordForGuildKey; do not rewrite the exported body.
+            local peer = cloneGuildRecord(record)
+            peer.operations = peer.operations or {}
+            peer.operations.pending = {}
+            peer.operations.records = {}
+            peer.operations.order = {}
+            peer.operations.heads = {}
+            peer.operations.conflicts = {}
+            if type(peer.accounting) == "table" then
+                peer.accounting._consumableEvents = {}
+                if type(peer.accounting._consumables) == "table" then
+                    peer.accounting._consumables.creditEventAliases = {}
+                end
+            end
+            injectProductionDonation(peer, {
+                id = "ctx:pn-don", itemId = itemId, quantity = 5,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            })
+            return peer
+        end
+        local function withPeer(peer, fn)
+            local gk = select(1, GS:GetCurrentContext()).guildKey
+            local saved = GS._root and GS._root.guilds and GS._root.guilds[gk]
+            if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+                GS._root.guilds[gk] = peer
+            end
+            local ok, a, b = pcall(fn)
+            if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+                GS._root.guilds[gk] = saved
+            end
+            if not ok then error(a) end
+            return a, b
+        end
+        -- Faithful same-dataset receiver + unchanged exported body.
+        local peer = installSameDatasetPeer()
+        local authorBody = shallowCopyOp(exportedOp)
+        local stAuthor, rAuthor = withPeer(peer, function()
+            return GS:AdmitRemoteOperation(authorBody, {
+                sender = "Alice-Garona",
+                preserveAttribution = true,
+            })
+        end)
+        assertTrue(stAuthor == "accepted" or stAuthor == "duplicate",
+            "459-PN-" .. mode .. ": original-author admit got "
+                .. tostring(stAuthor) .. "/" .. tostring(rAuthor))
         assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
             peer, GS.FindLedgerEventById(peer, "ctx:pn-don"))), "Bob-Garona",
             "459-PN-" .. mode .. ": peer credit Bob")
+        -- Another officer relays the same unchanged body → untrusted_relay.
+        local peerRelay = installSameDatasetPeer()
+        local relayBody = shallowCopyOp(exportedOp)
+        local stRelay, rRelay = withPeer(peerRelay, function()
+            return GS:AdmitRemoteOperation(relayBody, {
+                sender = "Bob-Garona",
+            })
+        end)
+        assertEq(stRelay, "pending",
+            "459-PN-" .. mode .. ": officer relay pending got "
+                .. tostring(stRelay) .. "/" .. tostring(rRelay))
+        assertEq(rRelay, "untrusted_relay",
+            "459-PN-" .. mode .. ": officer relay untrusted got " .. tostring(rRelay))
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            peerRelay, GS.FindLedgerEventById(peerRelay, "ctx:pn-don"))), "Alice-Garona",
+            "459-PN-" .. mode .. ": relay does not credit Bob")
         return record, early.id
     end
     retainObsoletePending("missing")
@@ -9477,80 +9535,273 @@ do
 end
 
 do
-    -- Ordinary same-dataset alias-page delivery via provider ValidateAndApply
-    -- (#459 discussion_r4488856040).
-    local record = seedLiveCampaignWithItem(9963, 40)
-    injectProductionDonation(record, {
-        id = "ctx:od-canon", itemId = 9963, quantity = 3,
+    -- Ordinary same-dataset alias-page delivery via real provider ValidateAndApply
+    -- (#459 discussion_r4488856040 / assessment 4494080823).
+    local function withCurrentRecord(target, fn)
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        local saved = GS._root and GS._root.guilds and GS._root.guilds[gk]
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = target
+        end
+        local ok, a, b, c = pcall(fn)
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = saved
+        end
+        if not ok then
+            error(a)
+        end
+        return a, b, c
+    end
+    local function providerAliasPage(target, pageId, pageBody, sender)
+        return withCurrentRecord(target, function()
+            GS:EnsureGossipProvider()
+            local entry = GG.GetProvider(GS.PROVIDER_ID)
+            assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+                "459-OD: provider registered")
+            return entry.api.ValidateAndApply({
+                id = pageId,
+                versionFp = GS.ContentFingerprint(pageBody),
+                body = pageBody,
+            }, { sender = sender })
+        end)
+    end
+    local function drainAliasTimers(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then
+                    flushTimers()
+                end
+            else
+                break
+            end
+        end
+        flushTimers()
+    end
+
+    -- Authority: non-editor must not redirect real donation A onto corrected B.
+    local authRecord = seedLiveCampaignWithItem(9963, 40)
+    injectProductionDonation(authRecord, {
+        id = "ctx:od-don-a", itemId = 9963, quantity = 3,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
     })
-    GS:EnsureGossipProvider()
-    local pageBody = {
+    injectProductionDonation(authRecord, {
+        id = "ctx:od-don-b", itemId = 9963, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corrB = select(1, GS:NewContributorCorrectionOperation(
+        "ctx:od-don-b", "Bob-Garona", "Player-1-Bob"))
+    assertEq(GS:ApplyStagedConfigOperation(corrB), "accepted", "459-OD: B corrected to Bob")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        authRecord, GS.FindLedgerEventById(authRecord, "ctx:od-don-a"))), "Alice-Garona",
+        "459-OD: A starts as Alice")
+    local evilBody = {
         kind = "gs-credit-aliases-page",
-        datasetId = record.datasetId,
-        page = 1,
-        pageCount = 1,
-        aliases = { ["ctx:od-alias"] = "ctx:od-canon" },
+        datasetId = authRecord.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-don-a"] = "ctx:od-don-b" },
     }
-    local pageId = "gs:cea:" .. record.datasetId .. ":p1"
-    local st, reason = GS._ValidateAndApplyForTest(
-        { id = pageId, body = pageBody }, { sender = "Alice-Garona" })
-    assertTrue(st == "accepted" or st == "duplicate",
-        "459-OD: ordinary page accepted got " .. tostring(st) .. "/" .. tostring(reason))
-    assertEq(record.accounting._consumables.creditEventAliases["ctx:od-alias"], "ctx:od-canon",
-        "459-OD: binding installed")
-    local stDup = GS._ValidateAndApplyForTest(
-        { id = pageId, body = pageBody }, { sender = "Alice-Garona" })
+    local evilId = "gs:cea:" .. authRecord.datasetId .. ":p1"
+    local stDave, rDave = providerAliasPage(authRecord, evilId, evilBody, "Dave-Garona")
+    assertEq(stDave, "rejected",
+        "459-OD: non-editor rejected got " .. tostring(stDave) .. "/" .. tostring(rDave))
+    assertTrue(authRecord.accounting._consumables.creditEventAliases["ctx:od-don-a"] == nil,
+        "459-OD: non-editor left no binding")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        authRecord, GS.FindLedgerEventById(authRecord, "ctx:od-don-a"))), "Alice-Garona",
+        "459-OD: A credit unchanged after non-editor")
+    -- Editor still cannot redirect a known ledger event onto another donation.
+    local stOwn, rOwn = providerAliasPage(authRecord, evilId, evilBody, "Alice-Garona")
+    assertEq(stOwn, "rejected",
+        "459-OD: owned-event redirect rejected got "
+            .. tostring(stOwn) .. "/" .. tostring(rOwn))
+    assertEq(rOwn, "alias_conflict",
+        "459-OD: owned-event reason alias_conflict got " .. tostring(rOwn))
+    assertTrue(authRecord.accounting._consumables.creditEventAliases["ctx:od-don-a"] == nil,
+        "459-OD: owned-event left no binding")
+
+    -- Atomic mixed-validity page: valid first + invalid second writes nothing.
+    local atomic = seedLiveCampaignWithItem(9964, 40)
+    injectProductionDonation(atomic, {
+        id = "ctx:od-atom-canon", itemId = 9964, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local mixedBody = {
+        kind = "gs-credit-aliases-page",
+        datasetId = atomic.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:od-atom-ok"] = "ctx:od-atom-canon",
+            ["ctx:od-atom-bad"] = "ctx:od-atom-bad",
+        },
+    }
+    local mixedId = "gs:cea:" .. atomic.datasetId .. ":p1"
+    local stMix, rMix = providerAliasPage(atomic, mixedId, mixedBody, "Alice-Garona")
+    assertEq(stMix, "rejected",
+        "459-OD: mixed page rejected got " .. tostring(stMix) .. "/" .. tostring(rMix))
+    assertTrue(atomic.accounting._consumables.creditEventAliases["ctx:od-atom-ok"] == nil,
+        "459-OD: mixed page left no partial binding")
+    -- Wrong record id rejected without mutation.
+    local stBadId = select(1, providerAliasPage(atomic, mixedId .. "x", {
+        kind = "gs-credit-aliases-page",
+        datasetId = atomic.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-atom-ok"] = "ctx:od-atom-canon" },
+    }, "Alice-Garona"))
+    assertEq(stBadId, "rejected", "459-OD: wrong record id rejected")
+    assertTrue(atomic.accounting._consumables.creditEventAliases["ctx:od-atom-ok"] == nil,
+        "459-OD: wrong id left no binding")
+
+    -- Dependency recovery: pending alias-targeted correction settles after page.
+    local wake = seedLiveCampaignWithItem(9965, 40)
+    injectProductionDonation(wake, {
+        id = "ctx:od-wake-canon", itemId = 9965, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local ctxWake = select(1, GS:GetCurrentContext())
+    local pendingAliasOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "od-wake-corr",
+        guildKey = ctxWake.guildKey,
+        datasetId = wake.datasetId,
+        campaignId = wake.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:od-wake-alias",
+        value = {
+            eventId = "ctx:od-wake-alias", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9965,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = wake.datasetId,
+        basePolicyRevision = wake.permission and wake.permission.revisionId,
+        baseCampaignId = wake.currentCampaignId,
+    }
+    local stPend, rPend = GS:AdmitRemoteOperation(pendingAliasOp, {
+        sender = "Alice-Garona", offlineRecord = wake, preserveAttribution = true,
+    })
+    assertEq(stPend, "pending",
+        "459-OD: alias correction pending got " .. tostring(stPend) .. "/" .. tostring(rPend))
+    assertEq(rPend, "pending_event", "459-OD: pending_event before alias page")
+    local wakeBody = {
+        kind = "gs-credit-aliases-page",
+        datasetId = wake.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-wake-alias"] = "ctx:od-wake-canon" },
+    }
+    local wakePageId = "gs:cea:" .. wake.datasetId .. ":p1"
+    local stWake, rWake = providerAliasPage(wake, wakePageId, wakeBody, "Alice-Garona")
+    assertTrue(stWake == "accepted" or stWake == "duplicate",
+        "459-OD: wake page accepted got " .. tostring(stWake) .. "/" .. tostring(rWake))
+    assertEq(wake.accounting._consumables.creditEventAliases["ctx:od-wake-alias"],
+        "ctx:od-wake-canon", "459-OD: wake binding installed")
+    drainAliasTimers(256)
+    assertTrue(wake.operations.records["od-wake-corr"] ~= nil,
+        "459-OD: pending correction accepted after alias page")
+    assertTrue(wake.operations.pending["od-wake-corr"] == nil,
+        "459-OD: pending cleared after alias wake")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        wake, GS.FindLedgerEventById(wake, "ctx:od-wake-canon"))), "Bob-Garona",
+        "459-OD: credit Bob after timer-only settlement")
+    assertEq(#timers, 0, "459-OD: idle after alias wake drain")
+
+    -- Two same-dataset peers, both delivery orders, conflict, duplicate.
+    local function cloneGuildRecord(src)
+        local function copy(v, depth)
+            depth = (depth or 0) + 1
+            if type(v) ~= "table" then
+                return v
+            end
+            if depth > 40 then
+                return nil
+            end
+            local out = {}
+            for k, val in pairs(v) do
+                out[copy(k, depth)] = copy(val, depth)
+            end
+            return out
+        end
+        return copy(src, 0)
+    end
+    local peerA = seedLiveCampaignWithItem(9966, 40)
+    injectProductionDonation(peerA, {
+        id = "ctx:od-peer-canon", itemId = 9966, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    -- Clone before alias install so B stays a valid same-dataset peer.
+    local peerB = cloneGuildRecord(peerA)
+    if peerB.accounting and peerB.accounting._consumables then
+        peerB.accounting._consumables.creditEventAliases = {}
+    end
+    local peerPage = {
+        kind = "gs-credit-aliases-page",
+        datasetId = peerA.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-peer-alias"] = "ctx:od-peer-canon" },
+    }
+    local peerPageId = "gs:cea:" .. peerA.datasetId .. ":p1"
+    -- Order 1: A then B via real provider.
+    local stA1, rA1 = providerAliasPage(peerA, peerPageId, peerPage, "Alice-Garona")
+    assertTrue(stA1 == "accepted" or stA1 == "duplicate",
+        "459-OD: peerA accept order1 got " .. tostring(stA1) .. "/" .. tostring(rA1))
+    local stB1, rB1 = providerAliasPage(peerB, peerPageId, peerPage, "Alice-Garona")
+    assertTrue(stB1 == "accepted" or stB1 == "duplicate",
+        "459-OD: peerB accept order1 got " .. tostring(stB1) .. "/" .. tostring(rB1))
+    assertEq(peerA.accounting._consumables.creditEventAliases["ctx:od-peer-alias"],
+        "ctx:od-peer-canon", "459-OD: peerA binding")
+    assertEq(peerB.accounting._consumables.creditEventAliases["ctx:od-peer-alias"],
+        "ctx:od-peer-canon", "459-OD: peerB binding")
+    -- Duplicate redelivery.
+    local stDup = select(1, providerAliasPage(peerA, peerPageId, peerPage, "Alice-Garona"))
     assertTrue(stDup == "duplicate" or stDup == "accepted",
-        "459-OD: redelivery duplicate-safe")
-    local stBadDs = select(1, GS._ValidateAndApplyForTest({
-        id = pageId .. "x",
-        body = {
-            kind = "gs-credit-aliases-page",
-            datasetId = "other-dataset",
-            page = 1, pageCount = 1,
-            aliases = { ["ctx:od-alias-2"] = "ctx:od-canon" },
-        },
-    }, { sender = "Alice-Garona" }))
-    assertEq(stBadDs, "rejected", "459-OD: wrong dataset rejected")
-    local stBadShape = select(1, GS._ValidateAndApplyForTest({
-        id = pageId .. "y",
-        body = {
-            kind = "gs-credit-aliases-page",
-            datasetId = record.datasetId,
-            page = 1, pageCount = 1,
-            aliases = { ["ctx:bad"] = "ctx:bad" },
-        },
-    }, { sender = "Alice-Garona" }))
-    assertEq(stBadShape, "rejected", "459-OD: alias==canon rejected")
-    -- Conflicting binding must not overwrite.
-    record.accounting._consumables.creditEventAliases["ctx:od-conflict"] = "ctx:od-canon"
-    local stConf, rConf = GS._ValidateAndApplyForTest({
-        id = pageId .. "z",
-        body = {
-            kind = "gs-credit-aliases-page",
-            datasetId = record.datasetId,
-            page = 1, pageCount = 1,
-            aliases = { ["ctx:od-conflict"] = "ctx:od-other" },
-        },
-    }, { sender = "Alice-Garona" })
+        "459-OD: duplicate-safe redelivery got " .. tostring(stDup))
+    -- Order 2 on fresh peers (D then C).
+    local peerC = seedLiveCampaignWithItem(9968, 40)
+    injectProductionDonation(peerC, {
+        id = "ctx:od-peer2-canon", itemId = 9968, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local peerD = cloneGuildRecord(peerC)
+    if peerD.accounting and peerD.accounting._consumables then
+        peerD.accounting._consumables.creditEventAliases = {}
+    end
+    local peerPage2 = {
+        kind = "gs-credit-aliases-page",
+        datasetId = peerC.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-peer2-alias"] = "ctx:od-peer2-canon" },
+    }
+    local peerPageId2 = "gs:cea:" .. peerC.datasetId .. ":p1"
+    local stD2, rD2 = providerAliasPage(peerD, peerPageId2, peerPage2, "Alice-Garona")
+    local stC2, rC2 = providerAliasPage(peerC, peerPageId2, peerPage2, "Alice-Garona")
+    assertTrue(stD2 == "accepted" or stD2 == "duplicate",
+        "459-OD: peerD accept order2 got " .. tostring(stD2) .. "/" .. tostring(rD2))
+    assertTrue(stC2 == "accepted" or stC2 == "duplicate",
+        "459-OD: peerC accept order2 got " .. tostring(stC2) .. "/" .. tostring(rC2))
+    -- Conflicting binding rejected; local ownership preserved.
+    peerC.accounting._consumables.creditEventAliases["ctx:od-peer2-conflict"] =
+        "ctx:od-peer2-canon"
+    local stConf, rConf = providerAliasPage(peerC, peerPageId2, {
+        kind = "gs-credit-aliases-page",
+        datasetId = peerC.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-peer2-conflict"] = "ctx:od-peer2-other" },
+    }, "Alice-Garona")
     assertEq(stConf, "rejected",
         "459-OD: conflict rejected got " .. tostring(stConf) .. "/" .. tostring(rConf))
-    assertEq(record.accounting._consumables.creditEventAliases["ctx:od-conflict"], "ctx:od-canon",
-        "459-OD: local ownership preserved")
-    -- Second peer record receives the same valid page.
-    local peer = seedLiveCampaignWithItem(9964, 40)
-    peer.datasetId = record.datasetId
-    if peer.accounting and peer.accounting._consumables then
-        peer.accounting._consumables.creditEventAliases =
-            peer.accounting._consumables.creditEventAliases or {}
-    end
-    -- ValidateAndApply uses CurrentGuildRecord(); switch context by applying on
-    -- the active record again is already covered. Install via Remember path for peer.
-    assertTrue(GS.RememberCreditEventAlias(peer, "ctx:od-alias", "ctx:od-canon"),
-        "459-OD: peer can install same binding")
-    assertEq(peer.accounting._consumables.creditEventAliases["ctx:od-alias"], "ctx:od-canon",
-        "459-OD: peer binding present")
+    assertEq(peerC.accounting._consumables.creditEventAliases["ctx:od-peer2-conflict"],
+        "ctx:od-peer2-canon", "459-OD: local ownership preserved")
+    local stBadDs = select(1, providerAliasPage(peerC, peerPageId2 .. "ds", {
+        kind = "gs-credit-aliases-page",
+        datasetId = "other-dataset",
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:od-peer2-alias-x"] = "ctx:od-peer2-canon" },
+    }, "Alice-Garona"))
+    assertEq(stBadDs, "rejected", "459-OD: wrong dataset rejected")
 end
 
 do
@@ -9653,27 +9904,234 @@ do
     local missesAfter = tonumber(GS._creditAliasExportCacheMisses) or 0
     assertTrue(missesAfter > missesBefore,
         "459-EM: alias ownership invalidates alias export cache")
-    -- Page shrink / stale cleanup: dropping required aliases rebuilds pages.
-    for i = 1, CORR_N do
-        record.operations.heads[GS.CorrectionTargetKey(
-            record, string.format("ctx:em-don-%04d", i))] = nil
-        record.operations.records[string.format("em-corr-%04d", i)] = nil
+
+    -- Descriptor-sensitive packing: donationEvidenceCount 9→10 must not reuse
+    -- an oversized inline alias map (#459 discussion_r4488856046 / 4494082374).
+    local budget = GS.MAX_WIRE_RECORD_BYTES
+        or (SF.GuildGossip and SF.GuildGossip.MAX_RECORD_CBOR)
+        or 2048
+    local edgeRecord = seedLiveCampaignWithItem(9970, 40)
+    local edgeCtx = select(1, GS:GetCurrentContext())
+    injectProductionDonation(edgeRecord, {
+        id = "ctx:em-edge-canon", itemId = 9970, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local function edgeDesc(donationEvidenceCount)
+        return {
+            kind = "dataset-desc",
+            schemaVersion = GS.PROVIDER_SCHEMA,
+            guildKey = edgeCtx.guildKey,
+            datasetId = edgeRecord.datasetId,
+            editorRankPosition = edgeRecord.permission
+                and edgeRecord.permission.editorRankPosition,
+            permissionRevisionId = edgeRecord.permission
+                and edgeRecord.permission.revisionId,
+            currentCampaignId = edgeRecord.currentCampaignId,
+            activation = edgeRecord.activation,
+            acceptedOpCount = 0,
+            transferOpCount = 0,
+            campaignCount = 1,
+            archiveCount = 0,
+            acceptedLedgerCount = #(edgeRecord.accounting._consumableEvents or {}),
+            donationEvidenceCount = donationEvidenceCount,
+            valuationCount = 0,
+            bankTab = edgeRecord.accounting._consumables.bankTab,
+            hasBankTab = true,
+            creditEventAliases = {},
+            creditEventAliasCount = 0,
+            creditEventAliasPageCount = 0,
+        }
     end
-    record.operations.order = {}
-    record.operations.pending = {}
-    if GS._BumpAccountingMutation then
-        GS._BumpAccountingMutation(record)
+    local edgeDescId = "gs:desc:" .. edgeRecord.datasetId
+    -- ValidTxnId max is 160; grow a short-alias set until count=9 is inline at
+    -- budget and naive reuse under count=10 overflows by one byte.
+    local foundN, foundPad = nil, nil
+    for pad = 80, 130 do
+        for n = 1, 40 do
+            edgeRecord.operations.records = {}
+            edgeRecord.operations.order = {}
+            edgeRecord.operations.heads = {}
+            edgeRecord.accounting._consumables.creditEventAliases = {}
+            local seeded = true
+            for i = 1, n do
+                local alias = string.format("ctx:em-%03d-%s", i, string.rep("x", pad))
+                if #alias > (GS.MAX_TXN_ID or 160) then
+                    seeded = false
+                    break
+                end
+                local opId = string.format("em-edge-%03d", i)
+                edgeRecord.operations.records[opId] = {
+                    schemaVersion = GS.OP_SCHEMA_VERSION,
+                    id = opId,
+                    guildKey = edgeCtx.guildKey,
+                    datasetId = edgeRecord.datasetId,
+                    campaignId = edgeRecord.currentCampaignId,
+                    kind = GS.KIND.CORRECT_CONTRIBUTOR,
+                    target = alias,
+                    value = {
+                        eventId = alias, eventKind = "donation",
+                        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                        baseAttributed = "Alice-Garona",
+                        baseAttributedGuid = "Player-1-Alice",
+                        itemId = 9970,
+                    },
+                    actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                    timestamp = world.time + i,
+                    baseTargetRevision = edgeRecord.datasetId,
+                    basePolicyRevision = edgeRecord.permission
+                        and edgeRecord.permission.revisionId,
+                    baseCampaignId = edgeRecord.currentCampaignId,
+                }
+                edgeRecord.operations.order[#edgeRecord.operations.order + 1] = opId
+                edgeRecord.operations.heads[GS.CorrectionTargetKey(
+                    edgeRecord, "ctx:em-edge-canon")] = opId
+                if not GS.RememberCreditEventAlias(
+                    edgeRecord, alias, "ctx:em-edge-canon") then
+                    seeded = false
+                    break
+                end
+            end
+            if not seeded then
+                break
+            end
+            local d9 = edgeDesc(9)
+            GS._ApplyCreditAliasExportToDescForTest(edgeRecord, edgeDescId, d9)
+            if (tonumber(d9.creditEventAliasPageCount) or 0) ~= 0 then
+                break
+            end
+            local b9 = GS._EstimateWireRecordBytesForTest(edgeDescId, d9)
+            if b9 > budget then
+                break
+            end
+            local d10trial = edgeDesc(10)
+            d10trial.creditEventAliases = d9.creditEventAliases
+            d10trial.creditEventAliasCount = d9.creditEventAliasCount
+            d10trial.creditEventAliasPageCount = 0
+            local b10 = GS._EstimateWireRecordBytesForTest(edgeDescId, d10trial)
+            if b9 <= budget and b10 > budget then
+                foundN, foundPad = n, pad
+                break
+            end
+        end
+        if foundN then break end
     end
-    GS.NotifyLocalDurableChange("dataset")
-    drainExportMaint(64)
-    local bodies = collectAllExportBodies()
-    local ceaPages = 0
-    for i = 1, #bodies do
-        if bodies[i].body and bodies[i].body.kind == "gs-credit-aliases-page" then
-            ceaPages = ceaPages + 1
+    assertTrue(foundN ~= nil,
+        "459-EM-edge: located 9→10 overflow boundary")
+    GS._ClearCreditAliasExportCacheForTest()
+    local upserted = {}
+    local function upsertCapture(id, body)
+        upserted[id] = body
+    end
+    local desc9 = edgeDesc(9)
+    local _, c9, pc9 = GS._SyncCreditAliasExportPagesForTest(
+        edgeRecord, edgeDescId, desc9, upsertCapture)
+    local bytes9 = GS._EstimateWireRecordBytesForTest(edgeDescId, desc9)
+    assertEq(tonumber(pc9) or -1, 0, "459-EM-edge: count=9 packs inline")
+    assertTrue(bytes9 <= budget,
+        "459-EM-edge: count=9 fits bytes=" .. tostring(bytes9)
+            .. " n=" .. tostring(foundN) .. " pad=" .. tostring(foundPad))
+    local inline9 = desc9.creditEventAliases
+    local trialBroken = edgeDesc(10)
+    trialBroken.creditEventAliases = inline9
+    trialBroken.creditEventAliasCount = tonumber(c9) or 0
+    trialBroken.creditEventAliasPageCount = 0
+    local brokenBytes = GS._EstimateWireRecordBytesForTest(edgeDescId, trialBroken)
+    assertTrue(brokenBytes > budget,
+        "459-EM-edge: naive reuse overflows bytes=" .. tostring(brokenBytes)
+            .. " budget=" .. tostring(budget)
+            .. " (9→10 delta " .. tostring(brokenBytes - bytes9) .. ")")
+    assertEq(brokenBytes - bytes9, 1,
+        "459-EM-edge: donationEvidenceCount 9→10 adds one byte")
+    local missesBeforeEdge = tonumber(GS._creditAliasExportCacheMisses) or 0
+    local desc10 = edgeDesc(10)
+    local _, _, pc10 = GS._SyncCreditAliasExportPagesForTest(
+        edgeRecord, edgeDescId, desc10, upsertCapture)
+    local bytes10 = GS._EstimateWireRecordBytesForTest(edgeDescId, desc10)
+    assertTrue(bytes10 <= budget,
+        "459-EM-edge: count=10 fresh pack fits bytes=" .. tostring(bytes10)
+            .. " pages=" .. tostring(pc10))
+    assertTrue((tonumber(pc10) or 0) >= 1,
+        "459-EM-edge: count=10 pages aliases pages=" .. tostring(pc10))
+    local missesAfterEdge = tonumber(GS._creditAliasExportCacheMisses) or 0
+    assertTrue(missesAfterEdge > missesBeforeEdge,
+        "459-EM-edge: descriptor size change misses cache")
+
+    -- Incremental stale-page cleanup without a full dataset reset.
+    local pageRecord = seedLiveCampaignWithItem(9971, 40)
+    local pageCtx = select(1, GS:GetCurrentContext())
+    injectProductionDonation(pageRecord, {
+        id = "ctx:em-page-canon", itemId = 9971, quantity = 1,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    pageRecord.operations.records = pageRecord.operations.records or {}
+    pageRecord.operations.order = pageRecord.operations.order or {}
+    pageRecord.operations.heads = pageRecord.operations.heads or {}
+    local PAGE_ALIAS_N = 80
+    for i = 1, PAGE_ALIAS_N do
+        local alias = string.format("ctx:em-page-alias-%04d-%s", i, string.rep("z", 24))
+        local opId = string.format("em-page-corr-%04d", i)
+        pageRecord.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = pageCtx.guildKey,
+            datasetId = pageRecord.datasetId,
+            campaignId = pageRecord.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9971,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = pageRecord.datasetId,
+            basePolicyRevision = pageRecord.permission and pageRecord.permission.revisionId,
+            baseCampaignId = pageRecord.currentCampaignId,
+        }
+        pageRecord.operations.order[#pageRecord.operations.order + 1] = opId
+        pageRecord.operations.heads[GS.CorrectionTargetKey(
+            pageRecord, "ctx:em-page-canon")] = opId
+        assertTrue(GS.RememberCreditEventAlias(pageRecord, alias, "ctx:em-page-canon"),
+            "459-EM-page: durable alias " .. tostring(i))
+    end
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("remote-op")
+    drainExportMaint(128)
+    local bodiesBefore = collectAllExportBodies()
+    local ceaBefore = 0
+    for i = 1, #bodiesBefore do
+        if bodiesBefore[i].body and bodiesBefore[i].body.kind == "gs-credit-aliases-page" then
+            ceaBefore = ceaBefore + 1
         end
     end
-    assertEq(ceaPages, 0, "459-EM: stale alias pages removed after shrink")
+    assertTrue(ceaBefore >= 1,
+        "459-EM-page: paged export present before shrink n=" .. tostring(ceaBefore))
+    for i = 1, PAGE_ALIAS_N do
+        pageRecord.operations.records[string.format("em-page-corr-%04d", i)] = nil
+    end
+    pageRecord.operations.order = {}
+    pageRecord.operations.heads = {}
+    pageRecord.operations.pending = {}
+    if pageRecord.accounting._consumables then
+        pageRecord.accounting._consumables.creditEventAliases = {}
+    end
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(pageRecord.operations)
+    end
+    GS.NotifyLocalDurableChange("remote-op")
+    drainExportMaint(128)
+    local bodiesAfter = collectAllExportBodies()
+    local ceaAfter = 0
+    for i = 1, #bodiesAfter do
+        if bodiesAfter[i].body and bodiesAfter[i].body.kind == "gs-credit-aliases-page" then
+            ceaAfter = ceaAfter + 1
+        end
+    end
+    assertEq(ceaAfter, 0,
+        "459-EM-page: stale alias pages removed without dataset reset n="
+            .. tostring(ceaAfter))
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
