@@ -9802,6 +9802,216 @@ do
         aliases = { ["ctx:od-peer2-alias-x"] = "ctx:od-peer2-canon" },
     }, "Alice-Garona"))
     assertEq(stBadDs, "rejected", "459-OD: wrong dataset rejected")
+
+    -- Coalesced whole-page work: 20 bindings at supported history size must not
+    -- multiply ledger scans or wake calls (#459 discussion_r4494986528).
+    local BIND_N, HIST_N = 20, 4000
+    local coalesce = seedLiveCampaignWithItem(9970, 80)
+    local filler = HIST_N - BIND_N
+    for i = 1, filler do
+        injectProductionDonation(coalesce, {
+            id = string.format("ctx:od-fill-%04d", i),
+            itemId = 9970, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    local coalesceAliases = {}
+    for i = 1, BIND_N do
+        local canon = string.format("ctx:od-co-canon-%02d", i)
+        local alias = string.format("ctx:od-co-alias-%02d", i)
+        injectProductionDonation(coalesce, {
+            id = canon, itemId = 9970, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + filler + i,
+        })
+        coalesceAliases[alias] = canon
+    end
+    assertEq(#coalesce.accounting._consumableEvents, HIST_N,
+        "459-OD: coalesce fixture ledger size")
+    -- Pending alias-targeted corrections for two bindings (credit + wake).
+    -- Advance clock past donation timestamps so correction times stay valid.
+    world.time = (world.time or 0) + filler + BIND_N + 10
+    local ctxCo = select(1, GS:GetCurrentContext())
+    for _, idx in ipairs({ 1, 2 }) do
+        local alias = string.format("ctx:od-co-alias-%02d", idx)
+        local opId = "od-co-corr-" .. tostring(idx)
+        local pendOp = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctxCo.guildKey,
+            datasetId = coalesce.datasetId,
+            campaignId = coalesce.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9970,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + idx,
+            baseTargetRevision = coalesce.datasetId,
+            basePolicyRevision = coalesce.permission and coalesce.permission.revisionId,
+            baseCampaignId = coalesce.currentCampaignId,
+        }
+        local stP, rP = GS:AdmitRemoteOperation(pendOp, {
+            sender = "Alice-Garona", offlineRecord = coalesce, preserveAttribution = true,
+        })
+        assertEq(stP, "pending",
+            "459-OD: coalesce pending " .. tostring(idx) .. " got "
+                .. tostring(stP) .. "/" .. tostring(rP))
+        assertEq(rP, "pending_event",
+            "459-OD: coalesce pending_event " .. tostring(idx))
+    end
+    GS._creditAliasPageLedgerVisits = 0
+    GS._creditAliasPageWakeCalls = 0
+    GS._ledgerEventIdLookupVisits = 0
+    -- Soft budget during page apply: atomic publish, then paced continuation.
+    GS._creditProjectionWorkBudgetOverride = 64
+    local coalesceBody = {
+        kind = "gs-credit-aliases-page",
+        datasetId = coalesce.datasetId,
+        page = 1, pageCount = 1,
+        aliases = coalesceAliases,
+    }
+    local coalesceId = "gs:cea:" .. coalesce.datasetId .. ":p1"
+    local stCo, rCo = providerAliasPage(
+        coalesce, coalesceId, coalesceBody, "Alice-Garona")
+    assertTrue(stCo == "accepted" or stCo == "duplicate",
+        "459-OD: coalesce page accepted got " .. tostring(stCo) .. "/" .. tostring(rCo))
+    local pageLedgerVisits = tonumber(GS._creditAliasPageLedgerVisits) or 0
+    local findVisitsDuring = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    local wakeCalls = tonumber(GS._creditAliasPageWakeCalls) or 0
+    assertTrue(pageLedgerVisits <= HIST_N + 8,
+        "459-OD: one-pass ledger visits got " .. tostring(pageLedgerVisits)
+            .. " (hist " .. tostring(HIST_N) .. ")")
+    -- Pre-fix regression: 20 bindings × ~history ≈ 399k synchronous visits.
+    assertTrue(pageLedgerVisits + findVisitsDuring < 80000,
+        "459-OD: page apply must not multiply history scans; visits page="
+            .. tostring(pageLedgerVisits) .. " find=" .. tostring(findVisitsDuring))
+    assertEq(wakeCalls, 1,
+        "459-OD: one coalesced page wake got " .. tostring(wakeCalls))
+    for i = 1, BIND_N do
+        local alias = string.format("ctx:od-co-alias-%02d", i)
+        local canon = string.format("ctx:od-co-canon-%02d", i)
+        assertEq(coalesce.accounting._consumables.creditEventAliases[alias], canon,
+            "459-OD: coalesce binding " .. tostring(i))
+    end
+    assertTrue(#timers > 0
+            or (coalesce.operations.pending
+                and (coalesce.operations.pending["od-co-corr-1"]
+                    or coalesce.operations.pending["od-co-corr-2"])),
+        "459-OD: soft budget leaves continuation or pending obligation")
+    GS._creditProjectionWorkBudgetOverride = nil
+    drainAliasTimers(512)
+    assertTrue(coalesce.operations.records["od-co-corr-1"] ~= nil,
+        "459-OD: coalesce corr1 accepted after drain")
+    assertTrue(coalesce.operations.records["od-co-corr-2"] ~= nil,
+        "459-OD: coalesce corr2 accepted after drain")
+    assertTrue(coalesce.operations.pending["od-co-corr-1"] == nil,
+        "459-OD: coalesce corr1 pending cleared")
+    assertTrue(coalesce.operations.pending["od-co-corr-2"] == nil,
+        "459-OD: coalesce corr2 pending cleared")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        coalesce, GS.FindLedgerEventById(coalesce, "ctx:od-co-canon-01"))),
+        "Bob-Garona", "459-OD: coalesce credit Bob on canon-01")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        coalesce, GS.FindLedgerEventById(coalesce, "ctx:od-co-canon-02"))),
+        "Bob-Garona", "459-OD: coalesce credit Bob on canon-02")
+    -- Duplicate-safe redelivery of the same multi-binding page.
+    local stCoDup = select(1, providerAliasPage(
+        coalesce, coalesceId, coalesceBody, "Alice-Garona"))
+    assertTrue(stCoDup == "duplicate" or stCoDup == "accepted",
+        "459-OD: coalesce duplicate-safe got " .. tostring(stCoDup))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        coalesce, GS.FindLedgerEventById(coalesce, "ctx:od-co-canon-01"))),
+        "Bob-Garona", "459-OD: coalesce credit stable after duplicate")
+    assertEq(#timers, 0, "459-OD: coalesce idle after drain")
+
+    -- Proposed-overlay cycle validation (same-page and existing+incoming).
+    -- Use non-ledger alias ids so rejection is from the overlay cycle check,
+    -- not owned-event redirect on a live donation id.
+    local cycle = seedLiveCampaignWithItem(9971, 40)
+    injectProductionDonation(cycle, {
+        id = "ctx:cycle-unrelated", itemId = 9971, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    -- Same-page A↔B must reject regardless of pairs iteration order.
+    local samePageCycle = {
+        kind = "gs-credit-aliases-page",
+        datasetId = cycle.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:cycle-a"] = "ctx:cycle-b",
+            ["ctx:cycle-b"] = "ctx:cycle-a",
+        },
+    }
+    local cycleId = "gs:cea:" .. cycle.datasetId .. ":p1"
+    local stCy, rCy = providerAliasPage(
+        cycle, cycleId, samePageCycle, "Alice-Garona")
+    assertEq(stCy, "rejected",
+        "459-OD: same-page cycle rejected got "
+            .. tostring(stCy) .. "/" .. tostring(rCy))
+    assertEq(rCy, "alias_conflict",
+        "459-OD: same-page cycle reason got " .. tostring(rCy))
+    assertTrue(cycle.accounting._consumables.creditEventAliases["ctx:cycle-a"] == nil,
+        "459-OD: same-page cycle left no A binding")
+    assertTrue(cycle.accounting._consumables.creditEventAliases["ctx:cycle-b"] == nil,
+        "459-OD: same-page cycle left no B binding")
+    -- Reverse insertion-order table still rejected (pairs order independence).
+    local stCyRev, rCyRev = providerAliasPage(cycle, cycleId, {
+        kind = "gs-credit-aliases-page",
+        datasetId = cycle.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:cycle-b"] = "ctx:cycle-a",
+            ["ctx:cycle-a"] = "ctx:cycle-b",
+        },
+    }, "Alice-Garona")
+    assertEq(stCyRev, "rejected",
+        "459-OD: reverse-order cycle rejected got "
+            .. tostring(stCyRev) .. "/" .. tostring(rCyRev))
+    -- Existing A→B plus incoming B→A rejected; no mutation of existing.
+    cycle.accounting._consumables.creditEventAliases["ctx:cycle-a"] = "ctx:cycle-b"
+    local stCy2, rCy2 = providerAliasPage(cycle, cycleId, {
+        kind = "gs-credit-aliases-page",
+        datasetId = cycle.datasetId,
+        page = 1, pageCount = 1,
+        aliases = { ["ctx:cycle-b"] = "ctx:cycle-a" },
+    }, "Alice-Garona")
+    assertEq(stCy2, "rejected",
+        "459-OD: existing+incoming cycle rejected got "
+            .. tostring(stCy2) .. "/" .. tostring(rCy2))
+    assertEq(cycle.accounting._consumables.creditEventAliases["ctx:cycle-a"],
+        "ctx:cycle-b", "459-OD: existing binding preserved on cycle reject")
+    assertTrue(cycle.accounting._consumables.creditEventAliases["ctx:cycle-b"] == nil,
+        "459-OD: cycle reject installed no B→A")
+    -- Valid bounded chain A→B→C accepted (C is the ledger donation).
+    local chain = seedLiveCampaignWithItem(9972, 40)
+    injectProductionDonation(chain, {
+        id = "ctx:chain-c", itemId = 9972, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local chainId = "gs:cea:" .. chain.datasetId .. ":p1"
+    local stCh, rCh = providerAliasPage(chain, chainId, {
+        kind = "gs-credit-aliases-page",
+        datasetId = chain.datasetId,
+        page = 1, pageCount = 1,
+        aliases = {
+            ["ctx:chain-a"] = "ctx:chain-b",
+            ["ctx:chain-b"] = "ctx:chain-c",
+        },
+    }, "Alice-Garona")
+    assertTrue(stCh == "accepted" or stCh == "duplicate",
+        "459-OD: valid chain accepted got " .. tostring(stCh) .. "/" .. tostring(rCh))
+    assertEq(chain.accounting._consumables.creditEventAliases["ctx:chain-a"],
+        "ctx:chain-b", "459-OD: chain A→B")
+    assertEq(chain.accounting._consumables.creditEventAliases["ctx:chain-b"],
+        "ctx:chain-c", "459-OD: chain B→C")
+    assertEq(GS.CanonicalCreditEventId(chain, "ctx:chain-a"), "ctx:chain-c",
+        "459-OD: chain resolves A onto ledger C")
 end
 
 do

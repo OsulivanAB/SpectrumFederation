@@ -3797,8 +3797,8 @@ local function ValidateAndApply(record, ctx)
     end
 
     -- Ordinary same-dataset credit-alias pages (non-adoption sync). Trusted
-    -- editors only; whole-page preflight then install; wake pending corrections
-    -- through the existing alias lifecycle (#459 discussion_r4488856040).
+    -- editors only; whole-page preflight against the proposed overlay; one
+    -- bounded ledger/registry pass; one coalesced wake (#459 OD).
     if body.kind == "gs-credit-aliases-page" then
         if not localRecord then
             return "pending", "awaiting_dataset"
@@ -3845,83 +3845,56 @@ local function ValidateAndApply(record, ctx)
         local maxLedger = GS.MAX_LEDGER_EVENTS or 4096
         local maxArchive = GS.MAX_ARCHIVED_EVENTS or 4096
 
-        local function ExactLedgerOwnsId(eventId)
-            local live = localRecord.accounting and localRecord.accounting._consumableEvents
-            if type(live) == "table" then
-                local limit = math.min(#live, maxLedger)
-                for i = 1, limit do
-                    local ev = live[i]
-                    if type(ev) == "table" and ev.id == eventId then
-                        return true
+        -- One bounded ledger pass for ownership + canonical event lookup for
+        -- the whole page (never FindLedgerEventById / ExactLedgerOwnsId per binding).
+        local ledgerById = {}
+        local ledgerVisits = 0
+        local function indexList(list, limit)
+            if type(list) ~= "table" then
+                return
+            end
+            local n = math.min(#list, limit)
+            for i = 1, n do
+                ledgerVisits = ledgerVisits + 1
+                local ev = list[i]
+                if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+                    if ledgerById[ev.id] == nil then
+                        ledgerById[ev.id] = ev
                     end
                 end
             end
-            local archive = localRecord.accounting
-                and localRecord.accounting._consumableEventArchive
-            if type(archive) == "table" then
-                local limit = math.min(#archive, maxArchive)
-                for i = 1, limit do
-                    local ev = archive[i]
-                    if type(ev) == "table" and ev.id == eventId then
-                        return true
-                    end
-                end
-            end
-            return false
         end
+        indexList(localRecord.accounting and localRecord.accounting._consumableEvents,
+            maxLedger)
+        indexList(localRecord.accounting and localRecord.accounting._consumableEventArchive,
+            maxArchive)
+        GS._creditAliasPageLedgerVisits =
+            (tonumber(GS._creditAliasPageLedgerVisits) or 0) + ledgerVisits
 
-        local function RegistryOwnsPrimary(eventId)
-            local registry = cfg.txnRegistry
-            if type(registry) ~= "table" then
-                return false
-            end
+        local registryPrimary = {}
+        local registry = cfg.txnRegistry
+        if type(registry) == "table" then
             local limit = math.min(#registry, GS.MAX_TXN_REGISTRY or 512)
             for i = 1, limit do
                 local row = registry[i]
-                if type(row) == "table" and row.txnId == eventId
+                if type(row) == "table" and type(row.txnId) == "string"
+                    and row.txnId ~= ""
                     and row.status ~= "alias"
                     and (row.status == "verified" or row.committed == true) then
-                    return true
+                    registryPrimary[row.txnId] = true
                 end
             end
-            return false
         end
 
-        local function AliasWouldRedirectOwned(alias, canon)
-            -- Real ledger/registry ownership of the alias id must not be
-            -- redirected onto a different canonical donation.
-            if ExactLedgerOwnsId(alias) then
-                return true
-            end
-            if RegistryOwnsPrimary(alias) and alias ~= canon then
-                return true
-            end
-            -- Cycle / chain that collapses a known event onto itself.
-            local cur = canon
-            for _ = 1, 8 do
-                if cur == alias then
-                    return true
-                end
-                local nextId = map[cur]
-                if type(nextId) ~= "string" or nextId == "" or nextId == cur then
-                    break
-                end
-                cur = nextId
-            end
-            if ExactLedgerOwnsId(canon) then
-                local primary = GS.CanonicalCreditEventId
-                    and GS.CanonicalCreditEventId(localRecord, canon)
-                if type(primary) == "string" and primary ~= "" and primary ~= canon
-                    and primary == alias then
-                    return true
-                end
-            end
-            return false
-        end
-
-        -- Pass 1: whole-page preflight. No durable writes until every binding
-        -- is shape-/ownership-/capacity-valid.
+        -- Pass 1a: shape/conflict/capacity against existing map; build proposed
+        -- overlay including every incoming binding (order-independent).
         local pendingInstall = {}
+        local proposed = {}
+        for alias, canon in pairs(map) do
+            if type(alias) == "string" and type(canon) == "string" then
+                proposed[alias] = canon
+            end
+        end
         local existingN = 0
         for _ in pairs(map) do
             existingN = existingN + 1
@@ -3939,9 +3912,8 @@ local function ValidateAndApply(record, ctx)
             if type(prior) == "string" and prior ~= "" and prior ~= canon then
                 return "rejected", "alias_conflict"
             end
-            if AliasWouldRedirectOwned(alias, canon) then
-                return "rejected", "alias_conflict"
-            end
+            -- Incoming overrides for proposed overlay (same-page A→B then B→A).
+            proposed[alias] = canon
             if prior == canon then
                 -- duplicate binding
             else
@@ -3959,8 +3931,54 @@ local function ValidateAndApply(record, ctx)
             return "duplicate", "duplicate"
         end
 
-        -- Pass 2: commit all bindings, then coalesce alias-head migration /
-        -- projection invalidation / pending redrive under existing pacing.
+        -- Follow the complete proposed overlay. Cycle or depth>8 ⇒ invalid.
+        local function FollowProposed(startId)
+            local cur = startId
+            local seen = { [startId] = true }
+            for _ = 1, 8 do
+                local nextId = proposed[cur]
+                if type(nextId) ~= "string" or nextId == "" or nextId == cur then
+                    return cur, false
+                end
+                if seen[nextId] then
+                    return nextId, true
+                end
+                seen[nextId] = true
+                cur = nextId
+            end
+            return cur, true
+        end
+
+        local function AliasConflictsProposed(alias, canon)
+            -- Owned ledger/registry ids must not be redirected.
+            if ledgerById[alias] ~= nil then
+                return true
+            end
+            if registryPrimary[alias] and alias ~= canon then
+                return true
+            end
+            -- Cycle / invalid chain against the complete proposed overlay.
+            local terminal, bad = FollowProposed(canon)
+            if bad or terminal == alias then
+                return true
+            end
+            local _, aliasBad = FollowProposed(alias)
+            if aliasBad then
+                return true
+            end
+            return false
+        end
+
+        -- Pass 1b: ownership + cycle checks on every new binding using proposed.
+        for i = 1, #pendingInstall do
+            local alias = pendingInstall[i].alias
+            local canon = pendingInstall[i].canon
+            if AliasConflictsProposed(alias, canon) then
+                return "rejected", "alias_conflict"
+            end
+        end
+
+        -- Pass 2: commit all bindings atomically, then one coalesced wake.
         if GS.BeginLocalDurableNotifyBatch then
             GS.BeginLocalDurableNotifyBatch()
         end
@@ -3983,8 +4001,6 @@ local function ValidateAndApply(record, ctx)
             installed[#installed + 1] = pendingInstall[i]
         end
         if not ok then
-            -- Fail closed: undo any bindings from this page so a rejected page
-            -- leaves no partial durable credit authority.
             for i = 1, #installed do
                 map[installed[i].alias] = nil
             end
@@ -3993,18 +4009,14 @@ local function ValidateAndApply(record, ctx)
             end
             return "rejected", "full"
         end
-        for i = 1, #installed do
-            local alias = installed[i].alias
-            local canon = installed[i].canon
-            local itemId = nil
-            if GS.FindLedgerEventById then
-                local ev = GS.FindLedgerEventById(localRecord, canon)
-                if type(ev) == "table" then
-                    itemId = ev.itemId
-                end
-            end
-            if GS.WakePendingCorrectionsAfterAlias then
-                GS.WakePendingCorrectionsAfterAlias(localRecord, canon, alias, itemId)
+        if GS.WakePendingCorrectionsAfterAliasPage then
+            GS.WakePendingCorrectionsAfterAliasPage(
+                localRecord, installed, ledgerById)
+        elseif GS.WakePendingCorrectionsAfterAlias then
+            -- Fallback: still migrate each binding; prefer page helper above.
+            for i = 1, #installed do
+                GS.WakePendingCorrectionsAfterAlias(
+                    localRecord, installed[i].canon, installed[i].alias, nil)
             end
         end
         if GS._NotifyLocalDurableChange then

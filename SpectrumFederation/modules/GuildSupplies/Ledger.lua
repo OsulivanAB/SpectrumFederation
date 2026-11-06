@@ -6148,7 +6148,9 @@ end
 
 --- Fold alias-keyed correction heads onto the canonical primary after trusted
 -- A→X discovery so obsolete/LWW classification sees one head (#459).
-function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId)
+-- @param resolvedPrimaryId string|nil when the caller already resolved the
+--   canonical ledger id (alias-page one-pass index), skip another ledger scan.
+function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId, resolvedPrimaryId)
     if type(record) ~= "table" or type(record.operations) ~= "table" then
         return
     end
@@ -6156,9 +6158,19 @@ function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId)
     if type(ops.heads) ~= "table" then
         return
     end
-    local primaryKey = GS.CorrectionTargetKey
-        and GS.CorrectionTargetKey(record, primaryTxnId)
-        or ("credit:" .. tostring(primaryTxnId))
+    local primaryKey
+    if type(resolvedPrimaryId) == "string" and resolvedPrimaryId ~= "" then
+        if GS.ComputeTargetKey and GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR then
+            primaryKey = GS.ComputeTargetKey(
+                GS.KIND.CORRECT_CONTRIBUTOR, resolvedPrimaryId)
+        else
+            primaryKey = "credit:" .. resolvedPrimaryId
+        end
+    else
+        primaryKey = GS.CorrectionTargetKey
+            and GS.CorrectionTargetKey(record, primaryTxnId)
+            or ("credit:" .. tostring(primaryTxnId))
+    end
     local aliasKey = "credit:" .. tostring(aliasTxnId)
     if primaryKey == aliasKey then
         return
@@ -6201,6 +6213,39 @@ function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, i
         GS.EnsureThenRedriveCreditCorrections(record, {
             itemId = itemId,
         })
+    end
+end
+
+--- After a whole alias-page install: migrate every new binding, then one shared
+-- projection/redrive under a single remaining allowance (#459 OD).
+-- @param installed { {alias=, canon=}... } newly committed bindings
+-- @param ledgerById table|nil optional id→event index from the page's one pass
+function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
+    if type(record) ~= "table" or type(installed) ~= "table" then
+        return
+    end
+    GS._creditAliasPageWakeCalls =
+        (tonumber(GS._creditAliasPageWakeCalls) or 0) + 1
+    for i = 1, #installed do
+        local row = installed[i]
+        if type(row) == "table" then
+            local resolved = row.canon
+            if type(ledgerById) == "table" and type(row.canon) == "string" then
+                local ev = ledgerById[row.canon]
+                if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+                    resolved = ev.id
+                end
+            end
+            GS.MigrateCorrectionHeadsForAlias(
+                record, row.canon, row.alias, resolved)
+        end
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    -- No per-binding item filter: one coalesced Ensure/Redrive covers the page.
+    if GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {})
     end
 end
 
