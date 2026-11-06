@@ -151,7 +151,16 @@ local function makeRegion(kind, name, parent)
         self.scripts["hook:" .. event] = fn
     end
 
-    function region:SetFrameStrata()
+    function region:SetFrameStrata(strata)
+        self.frameStrata = strata
+    end
+
+    function region:GetFrameStrata()
+        return self.frameStrata
+    end
+
+    function region:Raise()
+        self.raiseCount = (self.raiseCount or 0) + 1
     end
 
     function region:SetBackdrop()
@@ -334,6 +343,18 @@ do
     assertTrue(
         windowSource:find("BG = {0, 0, 0, 0.90}", 1, true) ~= nil,
         "StandaloneWindow BG alpha matches 90% default"
+    )
+    assertTrue(
+        windowSource:find('FRAME_STRATA_ABOVE_BANK_CHROME = "FULLSCREEN_DIALOG"', 1, true) ~= nil,
+        "Settings defines FULLSCREEN_DIALOG elevation for bank-overlay Rankings (#466)"
+    )
+    assertTrue(
+        windowSource:find("function SettingsWindow:ElevateAboveBankChrome()", 1, true) ~= nil,
+        "Settings exposes ElevateAboveBankChrome for Rankings-from-bank (#466)"
+    )
+    assertTrue(
+        windowSource:find("function SettingsWindow:RestoreNormalFrameStrata()", 1, true) ~= nil,
+        "Settings restores normal strata after bank-overlay Rankings (#466)"
     )
 end
 
