@@ -997,6 +997,7 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     if opts.quarantinePending ~= false then
         QuarantinePreActivationPending(record)
     end
+    local classified = false
     if opts.classifyPreActivation ~= false then
         -- Same-dataset catch-up: preserve authenticated post-cutover rows that
         -- arrived while this peer was still staged (marker-bound provenance).
@@ -1005,6 +1006,7 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
         else
             GS.ClassifyPreActivationAccounting(record)
         end
+        classified = true
     end
 
     if GS._ValidateGuildRecordStructure then
@@ -1020,6 +1022,22 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     end
     if GS.ReconcileValuationsAfterCreditChange then
         GS.ReconcileValuationsAfterCreditChange(record)
+    end
+    -- #459: remote cutover false→true production credit must invalidate the
+    -- correction projection and wake authenticated pending corrections. Skip
+    -- temporary adoption installs that opt out of classification/redrive.
+    if classified and opts.skipCreditCorrectionWake ~= true then
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(record)
+        end
+        if GS.EnsureThenRedriveCreditCorrections then
+            GS.EnsureThenRedriveCreditCorrections(record, {})
+        elseif GS.EnsureCreditCorrectionProjection then
+            GS.EnsureCreditCorrectionProjection(record, nil)
+            if GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {})
+            end
+        end
     end
     return "accepted", nil
 end

@@ -12,7 +12,7 @@ GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
 -- Wire schema for sf.guildsupplies.config. Schema 4 (#447) carries attributed
 -- adjustment unitCopper on ledger events; schema-3 peers drop that field.
 -- Guild Gossip matches by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 5
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 6
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -349,6 +349,315 @@ local function WireBudget()
     return GS.MAX_WIRE_RECORD_BYTES
         or (GG and GG.MAX_RECORD_CBOR)
         or 2048
+end
+
+--- Collect required alias→canon pairs as a sorted list for stable paging.
+local function SortedRequiredCreditAliases(record)
+    local aliases = nil
+    if GS.CollectRequiredCreditEventAliases then
+        aliases = GS.CollectRequiredCreditEventAliases(record)
+    end
+    local pairsOut, map, n, maxN = {}, {}, 0, (GS.MAX_CREDIT_EVENT_ALIASES or 2048)
+    if type(aliases) ~= "table" then
+        return pairsOut, map, 0
+    end
+    for alias, canon in pairs(aliases) do
+        if type(alias) == "string" and alias ~= ""
+            and type(canon) == "string" and canon ~= ""
+            and alias ~= canon and n < maxN then
+            map[alias] = canon
+            pairsOut[#pairsOut + 1] = { alias = alias, canon = canon }
+            n = n + 1
+        end
+    end
+    table.sort(pairsOut, function(a, b)
+        return tostring(a.alias) < tostring(b.alias)
+    end)
+    return pairsOut, map, n
+end
+
+--- Apply required credit-event aliases onto a dataset-desc body under the real
+-- wrapper-inclusive wire budget. When the full map cannot fit, page bindings as
+-- `gs-credit-aliases-page` records and leave the desc map empty (#459 A).
+-- @return pages { {id=, body=}... }, aliasCount, pageCount
+local function ApplyCreditAliasExportToDesc(record, descId, descBody)
+    local pairsList, fullMap, aliasCount = SortedRequiredCreditAliases(record)
+    descBody.creditEventAliasCount = aliasCount
+    descBody.creditEventAliases = fullMap
+    descBody.creditEventAliasPageCount = 0
+    if aliasCount < 1 then
+        descBody.creditEventAliases = {}
+        return {}, 0, 0
+    end
+    local budget = WireBudget()
+    if EstimateWireRecordBytes(descId, descBody) <= budget then
+        return {}, aliasCount, 0
+    end
+    -- Over budget: strip the map and emit byte-aware pages.
+    descBody.creditEventAliases = {}
+    local maxPages = GS.MAX_CREDIT_ALIAS_PAGE_COUNT or 512
+    local datasetId = descBody.datasetId or (record and record.datasetId)
+    local pageSlices = {}
+    local slice, sliceCount = {}, 0
+    local function flushSlice()
+        if sliceCount < 1 then
+            return true
+        end
+        if #pageSlices >= maxPages then
+            return false
+        end
+        pageSlices[#pageSlices + 1] = slice
+        slice, sliceCount = {}, 0
+        return true
+    end
+    for i = 1, #pairsList do
+        local alias = pairsList[i].alias
+        local canon = pairsList[i].canon
+        local trial = {}
+        for k, v in pairs(slice) do
+            trial[k] = v
+        end
+        trial[alias] = canon
+        local trialCount = sliceCount + 1
+        local pageIdx = #pageSlices + 1
+        local trialBody = {
+            kind = "gs-credit-aliases-page",
+            datasetId = datasetId,
+            page = pageIdx,
+            -- Reserve the max pageCount CBOR integer width so rewriting the
+            -- final count (e.g. 1→24) cannot overflow the wire budget
+            -- (#459 discussion_r4496331283).
+            pageCount = maxPages,
+            aliases = trial,
+        }
+        local trialId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
+        local overBudget = EstimateWireRecordBytes(trialId, trialBody) > budget
+        if sliceCount > 0 and overBudget then
+            if not flushSlice() then
+                DebugWarn("credit-alias export: page ceiling exceeded dataset=%s",
+                    tostring(datasetId))
+                -- Advertise required count with unmet pageCount so adoption cannot
+                -- complete as if aliases transferred (#459 A: no silent truncate).
+                descBody.creditEventAliasCount = aliasCount
+                descBody.creditEventAliasPageCount = aliasCount
+                return {}, aliasCount, aliasCount
+            end
+            trial, trialCount = { [alias] = canon }, 1
+            pageIdx = #pageSlices + 1
+            trialBody.aliases = trial
+            trialBody.page = pageIdx
+            trialBody.pageCount = maxPages
+            trialId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
+            if EstimateWireRecordBytes(trialId, trialBody) > budget then
+                DebugWarn("credit-alias export: single binding exceeds wire budget %s→%s",
+                    tostring(alias), tostring(canon))
+                descBody.creditEventAliasCount = aliasCount
+                descBody.creditEventAliasPageCount = aliasCount
+                return {}, aliasCount, aliasCount
+            end
+        elseif sliceCount < 1 and overBudget then
+            DebugWarn("credit-alias export: single binding exceeds wire budget %s→%s",
+                tostring(alias), tostring(canon))
+            descBody.creditEventAliasCount = aliasCount
+            descBody.creditEventAliasPageCount = aliasCount
+            return {}, aliasCount, aliasCount
+        end
+        slice, sliceCount = trial, trialCount
+    end
+    if not flushSlice() then
+        DebugWarn("credit-alias export: page ceiling exceeded dataset=%s",
+            tostring(datasetId))
+        descBody.creditEventAliasCount = aliasCount
+        descBody.creditEventAliasPageCount = aliasCount
+        return {}, aliasCount, aliasCount
+    end
+    local pageCount = #pageSlices
+    descBody.creditEventAliasPageCount = pageCount
+    local pages = {}
+    for p = 1, pageCount do
+        local body = {
+            kind = "gs-credit-aliases-page",
+            datasetId = datasetId,
+            page = p,
+            pageCount = pageCount,
+            aliases = pageSlices[p],
+        }
+        local pageId = "gs:cea:" .. tostring(datasetId) .. ":p" .. tostring(p)
+        -- Final wrapper-inclusive body (real pageCount + id/versionFp) must fit.
+        if EstimateWireRecordBytes(pageId, body) > budget then
+            DebugWarn("credit-alias export: final page %s exceeds wire budget dataset=%s",
+                tostring(p), tostring(datasetId))
+            descBody.creditEventAliasCount = aliasCount
+            descBody.creditEventAliasPageCount = aliasCount
+            return {}, aliasCount, aliasCount
+        end
+        pages[#pages + 1] = {
+            id = pageId,
+            body = body,
+        }
+    end
+    -- Final desc (empty map + counts) must itself fit the wire budget.
+    if EstimateWireRecordBytes(descId, descBody) > budget then
+        DebugWarn("credit-alias export: paged descriptor still over budget dataset=%s",
+            tostring(datasetId))
+        descBody.creditEventAliasCount = aliasCount
+        descBody.creditEventAliasPageCount = pageCount
+        return {}, aliasCount, pageCount
+    end
+    return pages, aliasCount, pageCount
+end
+
+--- Inputs that affect required alias collection / packing (#459 export maint).
+-- Includes wrapper-inclusive descriptor sizing fields so a donationEvidenceCount
+-- (or sibling count) change cannot reuse an oversized inline alias map
+-- (#459 discussion_r4488856046).
+local function CreditAliasExportStamp(record, descBody)
+    if type(record) ~= "table" then
+        return "nil"
+    end
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    local aliasN = 0
+    local map = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    if type(map) == "table" then
+        for _ in pairs(map) do
+            aliasN = aliasN + 1
+        end
+    end
+    local regN = 0
+    local registry = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.txnRegistry
+    if type(registry) == "table" then
+        regN = #registry
+    end
+    local pendingN, acceptedN = 0, 0
+    if type(record.operations) == "table" then
+        if type(record.operations.pending) == "table" then
+            for _ in pairs(record.operations.pending) do
+                pendingN = pendingN + 1
+            end
+        end
+        if type(record.operations.order) == "table" then
+            acceptedN = #record.operations.order
+        end
+    end
+    descBody = type(descBody) == "table" and descBody or nil
+    local acceptedOpCount = descBody and tonumber(descBody.acceptedOpCount) or acceptedN
+    local transferOpCount = descBody and tonumber(descBody.transferOpCount) or acceptedOpCount
+    local campaignCount = descBody and tonumber(descBody.campaignCount) or 0
+    local archiveCount = descBody and tonumber(descBody.archiveCount) or 0
+    local acceptedLedgerCount = descBody and tonumber(descBody.acceptedLedgerCount) or 0
+    local donationEvidenceCount = descBody and tonumber(descBody.donationEvidenceCount) or 0
+    local valuationCount = descBody and tonumber(descBody.valuationCount) or 0
+    return table.concat({
+        tostring(record.datasetId or ""),
+        tostring(opsGen),
+        tostring(acctMut),
+        tostring(aliasN),
+        tostring(regN),
+        tostring(pendingN),
+        tostring(acceptedN),
+        tostring(acceptedOpCount),
+        tostring(transferOpCount),
+        tostring(campaignCount),
+        tostring(archiveCount),
+        tostring(acceptedLedgerCount),
+        tostring(donationEvidenceCount),
+        tostring(valuationCount),
+        tostring(WireBudget()),
+    }, ":")
+end
+
+local function ClearCreditAliasExportCache()
+    exportState.creditAliasExportStamp = nil
+    exportState.creditAliasExportPages = nil
+    exportState.creditAliasExportInline = nil
+    exportState.creditAliasExportCount = nil
+    exportState.creditAliasExportPageCount = nil
+end
+
+--- Upsert credit-alias pages and drop stale page ids after a desc rewrite.
+-- Reuses unchanged collection/packing across maintenance slices when the
+-- export stamp matches (#459 discussion_r4488856046). On stamp hit, still
+-- revalidates wrapper-inclusive descriptor bytes before reusing an inline map.
+local function SyncCreditAliasExportPages(record, descId, descBody, upsertFn)
+    local datasetId = descBody.datasetId or (record and record.datasetId)
+    local stamp = CreditAliasExportStamp(record, descBody)
+    local pages, aliasCount, pageCount
+    local reused = false
+    if exportState.creditAliasExportStamp == stamp
+        and type(exportState.creditAliasExportPages) == "table" then
+        local trialCount = tonumber(exportState.creditAliasExportCount) or 0
+        local trialPages = tonumber(exportState.creditAliasExportPageCount) or 0
+        local trialInline = exportState.creditAliasExportInline
+        descBody.creditEventAliasCount = trialCount
+        descBody.creditEventAliasPageCount = trialPages
+        if trialPages > 0 then
+            descBody.creditEventAliases = {}
+            pages = exportState.creditAliasExportPages
+            aliasCount = trialCount
+            pageCount = trialPages
+            reused = true
+        else
+            descBody.creditEventAliases = type(trialInline) == "table" and trialInline or {}
+            -- Descriptor sizing inputs can share a stamp and still need a size
+            -- check when envelope helpers change; never reuse an over-budget inline.
+            if EstimateWireRecordBytes(descId, descBody) <= WireBudget() then
+                pages = exportState.creditAliasExportPages or {}
+                aliasCount = trialCount
+                pageCount = 0
+                reused = true
+            end
+        end
+        if reused then
+            GS._creditAliasExportCacheHits =
+                (tonumber(GS._creditAliasExportCacheHits) or 0) + 1
+        end
+    end
+    if not reused then
+        pages, aliasCount, pageCount = ApplyCreditAliasExportToDesc(record, descId, descBody)
+        stamp = CreditAliasExportStamp(record, descBody)
+        exportState.creditAliasExportStamp = stamp
+        exportState.creditAliasExportPages = pages
+        exportState.creditAliasExportCount = aliasCount
+        exportState.creditAliasExportPageCount = pageCount
+        if pageCount > 0 then
+            exportState.creditAliasExportInline = {}
+        else
+            exportState.creditAliasExportInline = descBody.creditEventAliases or {}
+        end
+        GS._creditAliasExportCacheMisses =
+            (tonumber(GS._creditAliasExportCacheMisses) or 0) + 1
+    end
+    if type(upsertFn) == "function" then
+        for i = 1, #pages do
+            upsertFn(pages[i].id, pages[i].body)
+        end
+    end
+    if type(datasetId) == "string" and datasetId ~= "" then
+        local prefix = "gs:cea:" .. datasetId .. ":p"
+        local stale = {}
+        for id in pairs(exportState.byId or {}) do
+            if type(id) == "string" and id:sub(1, #prefix) == prefix then
+                local pageNum = tonumber(id:sub(#prefix + 1))
+                if pageNum and (pageCount < 1 or pageNum > pageCount) then
+                    stale[#stale + 1] = id
+                end
+            end
+        end
+        -- Avoid removing ids we just upserted when pageCount is unmet (failure path).
+        if #stale > 0 and #pages == 0 and pageCount > 0 then
+            -- Packing failed: do not delete nothing→everything; leave prior pages
+            -- so a subsequent successful rebuild can replace them.
+        elseif #stale > 0 then
+            GS.RemoveGossipExportBodies(stale)
+        end
+    end
+    return pages, aliasCount, pageCount
 end
 
 local function FingerprintBody(body)
@@ -1878,6 +2187,12 @@ local function RebuildExportIndex()
     exportState.cachedOpCount = 0
     exportState.cachedCampaignCount = 0
     exportState.cachedArchiveCount = 0
+    -- Drop packed alias-page cache on full rebuild / dataset replacement.
+    exportState.creditAliasExportStamp = nil
+    exportState.creditAliasExportPages = nil
+    exportState.creditAliasExportInline = nil
+    exportState.creditAliasExportCount = nil
+    exportState.creditAliasExportPageCount = nil
     local record, guildKey = CurrentGuildRecord()
     if not record then
         exportState.guildKey = nil
@@ -1942,6 +2257,9 @@ local function RebuildExportIndex()
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
         hasBankTab = true,
+        creditEventAliases = {},
+        creditEventAliasCount = 0,
+        creditEventAliasPageCount = 0,
     }
     add("gs:desc:" .. record.datasetId, desc)
 
@@ -2069,6 +2387,11 @@ local function RebuildExportIndex()
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
+        -- Required credit-event alias bindings for adoption replay of
+        -- alias-targeted correction winners/losers (#459 A). Local SavedVariables
+        -- map is not otherwise transferred; page under the wrapper-inclusive
+        -- Guild Gossip wire budget when the full map cannot fit on the desc.
+        SyncCreditAliasExportPages(record, descId, descEntry.body, add)
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
@@ -3486,6 +3809,243 @@ local function ValidateAndApply(record, ctx)
         })
     end
 
+    -- Ordinary same-dataset credit-alias pages (non-adoption sync). Trusted
+    -- editors only; whole-page preflight against the proposed overlay; one
+    -- bounded ledger/registry pass; one coalesced wake (#459 OD).
+    if body.kind == "gs-credit-aliases-page" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if type(body.datasetId) ~= "string" or body.datasetId == "" then
+            return "rejected", "malformed"
+        end
+        if body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        -- Membership alone is not credit-authority mutation; require a verified editor.
+        local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {
+            allowBootstrapInstall = false,
+        })
+        if not editorOk then
+            return "rejected", editorReason or "unauthorized"
+        end
+        if type(body.aliases) ~= "table" then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        local maxPages = GS.MAX_CREDIT_ALIAS_PAGE_COUNT or 512
+        local pageCount = tonumber(body.pageCount)
+        local page = tonumber(body.page)
+        if not pageCount or pageCount < 1 or pageCount > maxPages
+            or pageCount ~= math.floor(pageCount) then
+            return "rejected", "invalid_operation"
+        end
+        if not page or page < 1 or page > pageCount or page ~= math.floor(page) then
+            return "rejected", "invalid_operation"
+        end
+        local expectId = "gs:cea:" .. body.datasetId .. ":p" .. tostring(math.floor(page))
+        if tostring(record.id) ~= expectId then
+            return "rejected", "invalid_operation"
+        end
+        local cfg = localRecord.accounting and localRecord.accounting._consumables
+        if type(cfg) ~= "table" then
+            return "rejected", "invalid_record"
+        end
+        if type(cfg.creditEventAliases) ~= "table" then
+            cfg.creditEventAliases = {}
+        end
+        local map = cfg.creditEventAliases
+        local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        -- Full mixed-list bounds include withdrawal headroom (#457 / #459
+        -- discussion_r4497154750). Donation-only ceilings miss owned rows past
+        -- position MAX_LEDGER_EVENTS when withdrawals occupy earlier slots.
+        local maxLedger = (GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local maxArchive = (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
+
+        -- One bounded ledger pass for ownership + canonical event lookup for
+        -- the whole page (never FindLedgerEventById / ExactLedgerOwnsId per binding).
+        local ledgerById = {}
+        local ledgerVisits = 0
+        local function indexList(list, limit)
+            if type(list) ~= "table" then
+                return
+            end
+            local n = math.min(#list, limit)
+            for i = 1, n do
+                ledgerVisits = ledgerVisits + 1
+                local ev = list[i]
+                if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+                    if ledgerById[ev.id] == nil then
+                        ledgerById[ev.id] = ev
+                    end
+                end
+            end
+        end
+        indexList(localRecord.accounting and localRecord.accounting._consumableEvents,
+            maxLedger)
+        indexList(localRecord.accounting and localRecord.accounting._consumableEventArchive,
+            maxArchive)
+        GS._creditAliasPageLedgerVisits =
+            (tonumber(GS._creditAliasPageLedgerVisits) or 0) + ledgerVisits
+
+        local registryPrimary = {}
+        local registry = cfg.txnRegistry
+        if type(registry) == "table" then
+            local limit = math.min(#registry, GS.MAX_TXN_REGISTRY or 512)
+            for i = 1, limit do
+                local row = registry[i]
+                if type(row) == "table" and type(row.txnId) == "string"
+                    and row.txnId ~= ""
+                    and row.status ~= "alias"
+                    and (row.status == "verified" or row.committed == true) then
+                    registryPrimary[row.txnId] = true
+                end
+            end
+        end
+
+        -- Pass 1a: shape/conflict/capacity against existing map; build proposed
+        -- overlay including every incoming binding (order-independent).
+        local pendingInstall = {}
+        local proposed = {}
+        for alias, canon in pairs(map) do
+            if type(alias) == "string" and type(canon) == "string" then
+                proposed[alias] = canon
+            end
+        end
+        local existingN = 0
+        for _ in pairs(map) do
+            existingN = existingN + 1
+        end
+        local projectedN = existingN
+        local any = false
+        for alias, canon in pairs(body.aliases) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return "rejected", "invalid_credit_event_aliases"
+            end
+            any = true
+            local prior = map[alias]
+            if type(prior) == "string" and prior ~= "" and prior ~= canon then
+                return "rejected", "alias_conflict"
+            end
+            -- Incoming overrides for proposed overlay (same-page A→B then B→A).
+            proposed[alias] = canon
+            if prior == canon then
+                -- duplicate binding
+            else
+                if projectedN >= maxN then
+                    return "rejected", "full"
+                end
+                pendingInstall[#pendingInstall + 1] = { alias = alias, canon = canon }
+                projectedN = projectedN + 1
+            end
+        end
+        if not any then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        if #pendingInstall < 1 then
+            return "duplicate", "duplicate"
+        end
+
+        -- Follow the complete proposed overlay. Cycle or depth>8 ⇒ invalid.
+        local function FollowProposed(startId)
+            local cur = startId
+            local seen = { [startId] = true }
+            for _ = 1, 8 do
+                local nextId = proposed[cur]
+                if type(nextId) ~= "string" or nextId == "" or nextId == cur then
+                    return cur, false
+                end
+                if seen[nextId] then
+                    return nextId, true
+                end
+                seen[nextId] = true
+                cur = nextId
+            end
+            return cur, true
+        end
+
+        local function AliasConflictsProposed(alias, canon)
+            -- Owned ledger/registry ids must not be redirected.
+            if ledgerById[alias] ~= nil then
+                return true
+            end
+            if registryPrimary[alias] and alias ~= canon then
+                return true
+            end
+            -- Cycle / invalid chain against the complete proposed overlay.
+            local terminal, bad = FollowProposed(canon)
+            if bad or terminal == alias then
+                return true
+            end
+            local _, aliasBad = FollowProposed(alias)
+            if aliasBad then
+                return true
+            end
+            return false
+        end
+
+        -- Pass 1b: ownership + cycle checks on every new binding using proposed.
+        for i = 1, #pendingInstall do
+            local alias = pendingInstall[i].alias
+            local canon = pendingInstall[i].canon
+            if AliasConflictsProposed(alias, canon) then
+                return "rejected", "alias_conflict"
+            end
+        end
+
+        -- Pass 2: commit all bindings atomically, then one coalesced wake.
+        if GS.BeginLocalDurableNotifyBatch then
+            GS.BeginLocalDurableNotifyBatch()
+        end
+        local installed = {}
+        local ok = true
+        for i = 1, #pendingInstall do
+            local alias = pendingInstall[i].alias
+            local canon = pendingInstall[i].canon
+            local wrote = false
+            if GS.RememberCreditEventAlias then
+                wrote = GS.RememberCreditEventAlias(localRecord, alias, canon) and true or false
+            else
+                map[alias] = canon
+                wrote = true
+            end
+            if not wrote then
+                ok = false
+                break
+            end
+            installed[#installed + 1] = pendingInstall[i]
+        end
+        if not ok then
+            for i = 1, #installed do
+                map[installed[i].alias] = nil
+            end
+            if GS.EndLocalDurableNotifyBatch then
+                GS.EndLocalDurableNotifyBatch()
+            end
+            return "rejected", "full"
+        end
+        if GS.WakePendingCorrectionsAfterAliasPage then
+            GS.WakePendingCorrectionsAfterAliasPage(
+                localRecord, installed, ledgerById)
+        elseif GS.WakePendingCorrectionsAfterAlias then
+            -- Fallback: still migrate each binding; prefer page helper above.
+            for i = 1, #installed do
+                GS.WakePendingCorrectionsAfterAlias(
+                    localRecord, installed[i].canon, installed[i].alias, nil)
+            end
+        end
+        if GS._NotifyLocalDurableChange then
+            GS._NotifyLocalDurableChange("remote-op")
+        end
+        if GS.EndLocalDurableNotifyBatch then
+            GS.EndLocalDurableNotifyBatch()
+        end
+        return "accepted", nil
+    end
+
     return "rejected", "unsupported_kind"
 end
 
@@ -3543,8 +4103,28 @@ local function IsRemoteGuildInfoReason(reason)
     return reason == "remote" or reason:sub(1, 7) == "remote-"
 end
 
+--- Invalidate accepted credit projection + in-flight owner scratch when Guild
+-- Info readiness/identity inputs change, then bounded Ensure/redrive while ready
+-- (#459 / discussion_r4480420558). Does not promote witnesses or mutate GS
+-- ledger/ops by itself.
+local function RefreshCreditProjectionAfterGuildInfo(record, ready)
+    if type(record) ~= "table" then
+        return
+    end
+    -- Invalidate also cancels any in-flight authorized local save retain.
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if ready and GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {})
+    end
+end
+
 local function RunGuildInfoPendingReevaluate(reason, becameReady)
     local record = select(1, GS:GetCurrentRecord())
+    -- Identity/readiness inputs feed credit attribution; refresh projection
+    -- before witness reevaluation so Logs/Rankings never keep a stale stamp.
+    RefreshCreditProjectionAfterGuildInfo(record, true)
     -- Cheap skip when already ready and nothing unfinished remains.
     if not becameReady
         and type(record) == "table"
@@ -3618,12 +4198,18 @@ local function OnGuildInfoDurableChange(reason)
         elseif SF.GuildInfo and SF.GuildInfo.GetRelationshipReadiness then
             ready = SF.GuildInfo:GetRelationshipReadiness() == "ready"
         end
-        local becameReady = ready and guildInfoLastReady ~= true
+        local priorReady = guildInfoLastReady
+        local becameReady = ready and priorReady ~= true
+        local becameNotReady = (not ready) and priorReady == true
         guildInfoLastReady = ready and true or false
 
         -- Incomplete / synchronizing baselines cannot form independent witness
         -- quorum; skip the full pending scan until readiness flips to ready.
+        -- Still invalidate credit projection so name↔GUID floors do not linger.
         if not ready then
+            if becameNotReady or priorReady == nil then
+                RefreshCreditProjectionAfterGuildInfo(record, false)
+            end
             if GS.NotifyUI then
                 GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
             end
@@ -4825,6 +5411,7 @@ function GS.NotifyLocalDurableChange(reason)
         local valuationCount = ResolveValuationExportCount(record)
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
+        local descId = "gs:desc:" .. record.datasetId
         local desc = {
             kind = "dataset-desc",
             schemaVersion = GS.PROVIDER_SCHEMA,
@@ -4850,8 +5437,12 @@ function GS.NotifyLocalDurableChange(reason)
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,
+            creditEventAliases = {},
+            creditEventAliasCount = 0,
+            creditEventAliasPageCount = 0,
         }
-        UpsertExportBody("gs:desc:" .. record.datasetId, desc)
+        SyncCreditAliasExportPages(record, descId, desc, UpsertExportBody)
+        UpsertExportBody(descId, desc)
         if not exportState.maintIdle then
             ScheduleExportMaintContinuation()
         end
@@ -4868,9 +5459,13 @@ function GS.NotifyLocalDurableChange(reason)
     end
 end
 
--- Test seams for exporter → provider archive regressions (#457).
+-- Test seams for exporter → provider archive regressions (#457 / #459 A).
 GS._BuildArchiveExportBodiesForTest = BuildArchiveExportBodies
 GS._EstimateWireRecordBytesForTest = EstimateWireRecordBytes
+GS._ApplyCreditAliasExportToDescForTest = ApplyCreditAliasExportToDesc
+GS._SyncCreditAliasExportPagesForTest = SyncCreditAliasExportPages
+GS._ClearCreditAliasExportCacheForTest = ClearCreditAliasExportCache
+GS._CreditAliasExportStampForTest = CreditAliasExportStamp
 GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
 GS._ValidateAndApplyForTest = ValidateAndApply
 
