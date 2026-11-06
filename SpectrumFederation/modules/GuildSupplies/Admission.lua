@@ -3073,12 +3073,22 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Changed same-ID credit-alias pages likewise invalidate the snapshot
+        -- (#459 discussion_r4497121459). Count pins alone cannot detect content
+        -- drift; leave the prior active dataset intact.
+        if body.kind == "gs-credit-aliases-page"
+            and adop.records[recordId].kind == "gs-credit-aliases-page" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return "rejected", "id_conflict"
     end
 
     -- Capacity applies only to genuinely new logical record ids. Exact
-    -- duplicates, pinned descriptor replacement, and changed valuation
-    -- source_changed must still run when the buffer is already full.
+    -- duplicates, pinned descriptor replacement, and changed valuation /
+    -- credit-alias source_changed must still run when the buffer is already full.
     if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
         return "rejected", "full"
     end
@@ -3237,7 +3247,13 @@ function GS:BufferAdoptionRecord(recordId, body)
             if DeepEqual(info.pages[page], body) then
                 -- Fall through to same-id duplicate handling below.
             else
-                return "rejected", "id_conflict"
+                -- Content change under an unchanged page id/count pin aborts the
+                -- adoption so a stale buffered page cannot later commit
+                -- (#459 discussion_r4497121459 / valuation source_changed).
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("source_changed")
+                InvalidateAdoptionDeliveryOutcomes("source_changed")
+                return "rejected", "source_changed"
             end
         end
         info.pages[page] = body

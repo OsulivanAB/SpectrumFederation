@@ -3289,13 +3289,19 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
                 -- Capacity full: leave pending; do not mutate credit.
             elseif type(GS.AdmitRemoteOperation) == "function" then
-                local status, reason = GS:AdmitRemoteOperation(body, {
-                    sender = entry.sender,
-                    offlineRecord = record,
-                    preserveAttribution = true,
-                    _creditRedrive = true,
-                })
-                if status == "accepted" or status == "duplicate" then
+                GS._creditRedriveAdmitActive = true
+                local okAdmit, status, reason = pcall(function()
+                    return GS:AdmitRemoteOperation(body, {
+                        sender = entry.sender,
+                        offlineRecord = record,
+                        preserveAttribution = true,
+                        _creditRedrive = true,
+                    })
+                end)
+                GS._creditRedriveAdmitActive = false
+                if not okAdmit then
+                    -- Leave pending; surface via next wake rather than abort wave.
+                elseif status == "accepted" or status == "duplicate" then
                     promoted = promoted + 1
                 elseif status == "pending" and reason == "work_budget" then
                     -- Paced rebuild deferred mid-unit; retry this id next slice.
@@ -3305,6 +3311,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             end
         end
     end
+    GS._creditRedriveAdmitActive = false
     creditRedriveDepth = creditRedriveDepth - 1
     if i <= #snapshot or type(cont.pendingCandidates) == "table" then
         cont.snapshot = snapshot
@@ -3326,6 +3333,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
         if cont.lookupComplete and cont.lookupStamp == CreditRedriveLookupStamp(record) then
             retainedLookup = {
                 lookupById = cont.lookupById,
+                lookupPrimary = cont.lookupPrimary,
                 lookupComplete = true,
                 lookupStamp = cont.lookupStamp,
                 lookupPhase = "done",
@@ -3338,6 +3346,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
             -- Keep fullWake through a follow-up so narrow wakes cannot re-narrow.
             fullWake = followUp and wasFull or false,
             lookupById = retainedLookup and retainedLookup.lookupById or nil,
+            lookupPrimary = retainedLookup and retainedLookup.lookupPrimary or nil,
             lookupComplete = retainedLookup and true or nil,
             lookupStamp = retainedLookup and retainedLookup.lookupStamp or nil,
             lookupPhase = retainedLookup and retainedLookup.lookupPhase or nil,
@@ -6068,6 +6077,9 @@ end
 --- Locate a durable ledger event by id across live + archive lists.
 -- Also resolves trusted donation txn aliases onto the canonical ledger row.
 -- Increments GS._ledgerEventIdLookupVisits per examined row (test/metric).
+-- When a complete, stamp-current paced redrive index exists for this record,
+-- reuse it (including authoritative misses) instead of rescanning lists
+-- (#459 pending re-admission / discussion_r4497075794).
 -- @return event|nil
 function GS.FindLedgerEventById(record, eventId)
     if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
@@ -6076,6 +6088,40 @@ function GS.FindLedgerEventById(record, eventId)
     local function chargeVisit()
         GS._ledgerEventIdLookupVisits =
             (tonumber(GS._ledgerEventIdLookupVisits) or 0) + 1
+    end
+    local function chargeShared(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+    end
+    -- Reuse the complete paced redrive index only during pending re-admission
+    -- nested under RedrivePendingContributorCorrections (flagged explicitly).
+    -- Ordinary Admit/Apply callbacks may share the projection allowance but must
+    -- not treat a retained index as an authoritative miss — ledger rows can land
+    -- without a stamp bump (#459 discussion_r4497075794).
+    do
+        local cont = creditRedriveContinuation[record]
+        if GS._creditRedriveAdmitActive == true
+            and type(cont) == "table" and cont.lookupComplete == true
+            and cont.lookupStamp == CreditRedriveLookupStamp(record)
+            and type(cont.lookupById) == "table" then
+            chargeVisit()
+            chargeShared(1)
+            local hit = cont.lookupById[eventId]
+            if type(hit) == "table" then
+                return hit
+            end
+            local canon = CanonicalFromRedriveIndex(
+                record, eventId, cont.lookupById, cont.lookupPrimary)
+            if type(canon) == "string" and canon ~= "" and canon ~= eventId then
+                hit = cont.lookupById[canon]
+                if type(hit) == "table" then
+                    return hit
+                end
+            end
+            return nil
+        end
     end
     local lists = CreditEventLists(record)
     for li = 1, #lists do
@@ -6805,9 +6851,55 @@ local function IndexCreditEventKeys(byId, event)
     end
 end
 
+--- Fold durable creditEventAliases (survives registry eviction) into byId.
+-- Resolves short alias chains against the map, then binds when the terminal
+-- ledger event is already indexed. Charges one visit per map entry.
+-- Optional shouldYield(visits) aborts mid-fold with the current alias cursor.
+-- @return boolean complete, string|nil resumeAlias, number visits
+local function FoldDurableCreditEventAliasesIntoById(
+    record, byId, visits, shouldYield, resumeAlias)
+    local cfg = record and record.accounting and record.accounting._consumables
+    local map = cfg and cfg.creditEventAliases
+    if type(map) ~= "table" or type(byId) ~= "table" then
+        return true, nil, visits or 0
+    end
+    visits = tonumber(visits) or 0
+    local seenResume = resumeAlias == nil
+    for alias, canon in pairs(map) do
+        if not seenResume then
+            if alias == resumeAlias then
+                seenResume = true
+            end
+        end
+        if seenResume then
+            if shouldYield and shouldYield(visits) then
+                return false, alias, visits
+            end
+            visits = visits + 1
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                local cur = canon
+                for _ = 1, 8 do
+                    local nextId = map[cur]
+                    if type(nextId) == "string" and nextId ~= "" and nextId ~= cur then
+                        cur = nextId
+                    else
+                        break
+                    end
+                end
+                local primary = byId[cur]
+                if type(primary) == "table" then
+                    byId[alias] = primary
+                end
+            end
+        end
+    end
+    return true, nil, visits
+end
+
 --- Scan live+archive once into durable baseline totals and an id/alias index.
 -- Returns totals, byId, rowVisits, relationshipsReady. Callers apply correction
--- deltas in O(1). Alias mapping is one linear registry pass.
+-- deltas in O(1). Alias mapping is one linear registry pass plus durable map.
 local function BuildDurableCreditFloorBaseline(record)
     local relationshipsReady = GS.WitnessRelationshipsReady
         and select(1, GS.WitnessRelationshipsReady(record))
@@ -6891,14 +6983,21 @@ local function BuildDurableCreditFloorBaseline(record)
             end
         end
     end
+    -- Durable bindings survive registry eviction (#459 discussion_r4497121466).
+    local foldOk
+    foldOk, _, visits = FoldDurableCreditEventAliasesIntoById(
+        record, byId, visits, nil, nil)
+    if not foldOk then
+        -- Synchronous builder never yields; treat as complete.
+    end
     return totals, byId, visits, relationshipsReady
 end
 
 --- Paced durable baseline: retain partial totals/byId across slices when the
--- shared callback allowance is exhausted mid-ledger / mid-registry.
--- scratch fields: baselineReady, baselinePhase ("live"|"archive"|"registry"),
+-- shared callback allowance is exhausted mid-ledger / mid-registry / mid-alias-map.
+-- scratch fields: baselineReady, baselinePhase ("live"|"archive"|"registry"|"aliasMap"),
 -- baselineIndex, baselineTotals, baselineById, baselineVisits,
--- baselineRelationshipsReady, baselineResolveCache.
+-- baselineRelationshipsReady, baselineResolveCache, baselineAliasCursor.
 local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn)
     local relationshipsReady = scratch and scratch.baselineRelationshipsReady
     if relationshipsReady == nil then
@@ -6950,7 +7049,7 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
         end
     end
 
-    local function snapshot(nextPhase, nextIndex)
+    local function snapshot(nextPhase, nextIndex, aliasCursor)
         return {
             baselineReady = false,
             baselinePhase = nextPhase,
@@ -6961,6 +7060,7 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
             baselineVisits = visits,
             baselineRelationshipsReady = relationshipsReady,
             baselineResolveCache = resolveCache,
+            baselineAliasCursor = aliasCursor,
         }, visits
     end
 
@@ -7028,6 +7128,17 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
                     return false, snapshot("registry", index)
                 end
             end
+        end
+        phase = "aliasMap"
+        index = 1
+    end
+    if phase == "aliasMap" then
+        local foldOk, resumeAlias
+        foldOk, resumeAlias, visits = FoldDurableCreditEventAliasesIntoById(
+            record, byId, visits, shouldYieldFn,
+            scratch and scratch.baselineAliasCursor)
+        if not foldOk then
+            return false, snapshot("aliasMap", 1, resumeAlias)
         end
     end
     return true, {
@@ -8227,6 +8338,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 baselineVisits = baselineSnap.baselineVisits,
                 baselineRelationshipsReady = baselineSnap.baselineRelationshipsReady,
                 baselineResolveCache = baselineSnap.baselineResolveCache,
+                baselineAliasCursor = baselineSnap.baselineAliasCursor,
                 ownerSpeculative = speculative and true or false,
                 ownerOpId = speculative and extraOp and extraOp.id or nil,
             })

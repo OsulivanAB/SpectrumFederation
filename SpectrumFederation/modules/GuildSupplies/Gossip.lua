@@ -3855,8 +3855,13 @@ local function ValidateAndApply(record, ctx)
         end
         local map = cfg.creditEventAliases
         local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
-        local maxLedger = GS.MAX_LEDGER_EVENTS or 4096
-        local maxArchive = GS.MAX_ARCHIVED_EVENTS or 4096
+        -- Full mixed-list bounds include withdrawal headroom (#457 / #459
+        -- discussion_r4497154750). Donation-only ceilings miss owned rows past
+        -- position MAX_LEDGER_EVENTS when withdrawals occupy earlier slots.
+        local maxLedger = (GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local maxArchive = (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_WITHDRAWAL_EVENTS or 1024)
 
         -- One bounded ledger pass for ownership + canonical event lookup for
         -- the whole page (never FindLedgerEventById / ExactLedgerOwnsId per binding).
