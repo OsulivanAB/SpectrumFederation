@@ -798,7 +798,7 @@ local function Definition()
 							compactColumns = true,
 							removeColumnGap = 6,
 							actionColumnGap = 6,
-							actionTexture = "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
+							actionTexture = "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga",
 							actionTooltip = Loc("GUILD_INFO_PROMOTE_TIP", "Promote this alt to Main"),
 							emptyText = function()
 								if not selectedMainGuid then

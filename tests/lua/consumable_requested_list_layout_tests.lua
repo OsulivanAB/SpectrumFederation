@@ -1220,7 +1220,7 @@ do
         right = {
             title = "Alts",
             compactColumns = true,
-            actionTexture = "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
+            actionTexture = "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga",
             getItems = function()
                 return altItems
             end,

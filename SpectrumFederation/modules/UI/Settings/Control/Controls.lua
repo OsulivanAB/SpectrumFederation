@@ -1822,7 +1822,8 @@ function Controls:AddScrollList(section, opts)
 					r,
 					opts.actionAtlas,
 					actionButtonSize,
-					opts.actionTexture or "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up"
+					opts.actionTexture
+						or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
 				)
 				action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
 				r.Action = action
@@ -2311,7 +2312,8 @@ function Controls:AddSideBySideScrollLists(section, opts)
 						r,
 						listOpts.actionAtlas,
 						actionButtonSize,
-						listOpts.actionTexture or "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up"
+						listOpts.actionTexture
+							or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
 					)
 					action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
 					r.Action = action

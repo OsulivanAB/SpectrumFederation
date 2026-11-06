@@ -6,6 +6,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ### Changed
 - Redesign Main / Alt Assignments into two side-by-side Main and Alts panels with inline promote/unassign (#468)
+- Use a plain green up-arrow icon for Promote to Main (replacing the ornate scrollbar button art)
 
 ## [1.5.19-beta.1] - 2026-11-06
 
