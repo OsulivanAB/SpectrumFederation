@@ -1393,8 +1393,12 @@ function Runtime:OpenRankingsFromReview()
     local win = SF.SettingsWindow
     if win and type(win.ShowPage) == "function" then
         -- Established Settings navigation; respects page availability.
-        -- Must not close the guild bank or Raid Supplies panel. ShowPage Raises
-        -- Settings above same-strata bank/review chrome so Rankings is usable.
+        -- Must not close the guild bank or Raid Supplies panel. Elevate Settings
+        -- to FULLSCREEN_DIALOG so the whole window clears bank-side chrome that
+        -- can sit at or above DIALOG (same-strata Raise is not enough in Retail).
+        if type(win.ElevateAboveBankChrome) == "function" then
+            win:ElevateAboveBankChrome()
+        end
         win:ShowPage("guildSuppliesRankings")
     end
 end

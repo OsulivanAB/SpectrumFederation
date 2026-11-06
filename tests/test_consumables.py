@@ -156,7 +156,8 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "SyncReviewWithGuildBank" in runtime
     assert "HideReviewForBankLifecycle" in runtime
     assert "UIPanelCloseButton" not in runtime
-    # #466: Rankings shortcut reuses Settings ShowPage + Guild Supplies canEdit.
+    # #466: Rankings shortcut elevates Settings above bank chrome, then ShowPage.
+    assert "ElevateAboveBankChrome" in runtime
     assert 'ShowPage("guildSuppliesRankings")' in runtime
     assert "CanViewRankingsShortcut" in runtime
     assert "RaidSuppliesRankings.tga" in runtime

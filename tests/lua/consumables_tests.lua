@@ -325,12 +325,18 @@ local function FrameMock(kind, parent)
 end
 local function noop() end
 for _, name in ipairs({
-    "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
+    "ClearAllPoints", "SetAllPoints", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
     "SetAutoFocus", "SetNumeric", "SetScrollChild",
     "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
+end
+function FrameMethods:SetFrameStrata(strata)
+    self.frameStrata = strata
+end
+function FrameMethods:GetFrameStrata()
+    return self.frameStrata
 end
 function FrameMethods:SetWidth(w)
     self.width = tonumber(w) or 0
@@ -3428,10 +3434,30 @@ local function checkRuntimeReviewRankingsShortcut()
     }
     local settingsFrame = FrameMock("Frame")
     settingsFrame.shown = false
+    settingsFrame.frameStrata = "DIALOG"
+    local elevateCalls = 0
     SF.SettingsWindow = {
         frame = settingsFrame,
-        -- Mirror production ShowPage: show + Raise so Settings sits above
-        -- same-strata Raid Supplies review chrome without closing it (#466).
+        -- Mirror production #466 bank-overlay path: elevate strata, then ShowPage.
+        ElevateAboveBankChrome = function(self)
+            elevateCalls = elevateCalls + 1
+            if self.frame and self.frame.SetFrameStrata then
+                self.frame:SetFrameStrata("FULLSCREEN_DIALOG")
+            end
+            self._elevatedAboveBankChrome = true
+            if self.frame and self.frame.Raise then
+                self.frame:Raise()
+            end
+        end,
+        RestoreNormalFrameStrata = function(self)
+            if not self._elevatedAboveBankChrome then
+                return
+            end
+            self._elevatedAboveBankChrome = false
+            if self.frame and self.frame.SetFrameStrata then
+                self.frame:SetFrameStrata("DIALOG")
+            end
+        end,
         ShowPage = function(self, pageId)
             showPageCalls[#showPageCalls + 1] = pageId
             if self.frame then
@@ -3439,6 +3465,14 @@ local function checkRuntimeReviewRankingsShortcut()
                 if self.frame.Raise then
                     self.frame:Raise()
                 end
+            end
+        end,
+        Hide = function(self)
+            if self.frame then
+                self.frame:Hide()
+            end
+            if self.RestoreNormalFrameStrata then
+                self:RestoreNormalFrameStrata()
             end
         end,
         ApplySettingsWindowOpacity = function() end,
@@ -3531,23 +3565,33 @@ local function checkRuntimeReviewRankingsShortcut()
     assertTrue(btn:IsShown(), "restored canEdit shows the Rankings shortcut again")
 
     showPageCalls = {}
+    elevateCalls = 0
     settingsFrame.raiseCount = 0
     settingsFrame.raised = false
     settingsFrame.shown = false
+    settingsFrame.frameStrata = "DIALOG"
+    SF.SettingsWindow._elevatedAboveBankChrome = nil
     world.bankOpen = true
     assertTrue(review:IsShown(), "bank panel stays open before Rankings navigation")
     btn.scripts.OnClick(btn)
     assertEq(#showPageCalls, 1, "clicking Rankings navigates once")
     assertEq(showPageCalls[1], "guildSuppliesRankings",
         "Rankings shortcut opens the existing guildSuppliesRankings page")
+    assertEq(elevateCalls, 1,
+        "Rankings shortcut elevates Settings above bank chrome before ShowPage")
+    assertEq(settingsFrame.frameStrata, "FULLSCREEN_DIALOG",
+        "Settings uses FULLSCREEN_DIALOG over DIALOG bank/review chrome")
     assertTrue(settingsFrame:IsShown(),
         "Settings/Rankings window is shown when the shortcut is clicked")
-    assertTrue(settingsFrame.raised == true and (settingsFrame.raiseCount or 0) >= 1,
-        "Settings/Rankings is Raised in front of same-strata bank/review chrome")
     assertTrue(review:IsShown(),
         "opening Rankings does not close the Raid Supplies panel")
     assertTrue(world.bankOpen,
         "opening Rankings does not close the guild bank")
+    SF.SettingsWindow:Hide()
+    assertEq(settingsFrame.frameStrata, "DIALOG",
+        "closing Settings restores normal DIALOG strata for later opens")
+    assertTrue(review:IsShown() and world.bankOpen,
+        "closing Settings leaves guild bank and Raid Supplies panel open")
 
     -- Access lost between show and click: hide and do not navigate.
     showPageCalls = {}
