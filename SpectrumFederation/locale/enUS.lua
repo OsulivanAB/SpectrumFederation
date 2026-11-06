@@ -112,6 +112,7 @@ L["GUILD_SUPPLIES_RANKINGS_CREDIT_UNAVAILABLE"] = "Contribution credit is tempor
 L["GUILD_SUPPLIES_HISTORY_CREDIT_UNAVAILABLE"] = "Credit unavailable"
 L["GUILD_SUPPLIES_REASON_CREDIT_UNAVAILABLE"] = "contribution credit is temporarily unavailable while corrections reconcile"
 L["GUILD_SUPPLIES_REASON_WORK_BUDGET"] = "contribution credit is still reconciling — the save will finish shortly"
+L["RAID_SUPPLIES_OPEN_RANKINGS"] = "Open Raid Supplies Rankings."
 L["GUILD_SUPPLIES_TROUBLESHOOTING_NAME"] = "Troubleshooting"
 L["GUILD_SUPPLIES_TROUBLESHOOTING_NAV"] = "Troubleshooting"
 L["GUILD_SUPPLIES_TROUBLESHOOTING_HEADING"] = "Raid Supplies Troubleshooting"

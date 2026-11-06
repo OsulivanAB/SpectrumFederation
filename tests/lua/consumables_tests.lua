@@ -325,12 +325,18 @@ local function FrameMock(kind, parent)
 end
 local function noop() end
 for _, name in ipairs({
-    "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
+    "ClearAllPoints", "SetAllPoints", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
     "SetAutoFocus", "SetNumeric", "SetScrollChild",
     "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
+end
+function FrameMethods:SetFrameStrata(strata)
+    self.frameStrata = strata
+end
+function FrameMethods:GetFrameStrata()
+    return self.frameStrata
 end
 function FrameMethods:SetWidth(w)
     self.width = tonumber(w) or 0
@@ -380,6 +386,10 @@ function FrameMethods:GetText() return self.text end
 function FrameMethods:Show() self.shown = true end
 function FrameMethods:Hide() self.shown = false end
 function FrameMethods:IsShown() return self.shown == true end
+function FrameMethods:Raise()
+    self.raiseCount = (self.raiseCount or 0) + 1
+    self.raised = true
+end
 -- Prefer an explicit visible flag so tests can model a shown child under a
 -- hidden standalone settings parent (IsShown true, IsVisible false).
 function FrameMethods:IsVisible()
@@ -405,11 +415,32 @@ function FrameMethods:CreateTexture()
     local tex = FrameMock("Texture", self)
     tex.texture = nil
     tex.desaturated = false
+    tex.points = {}
     function tex:SetTexture(value) self.texture = value end
     function tex:SetDesaturated(value) self.desaturated = value and true or false end
     function tex:SetTexCoord() end
     function tex:SetColorTexture() end
-    function tex:SetVertexColor() end
+    function tex:SetVertexColor(r, g, b, a)
+        self.vertexColor = { r = r, g = g, b = b, a = a }
+    end
+    function tex:ClearAllPoints()
+        self.points = {}
+        self.anchor = nil
+    end
+    function tex:SetPoint(point, relative, relativePoint, x, y)
+        self.anchor = {
+            point = point,
+            relative = relative,
+            relativePoint = relativePoint,
+            x = x,
+            y = y,
+        }
+        self.points[#self.points + 1] = self.anchor
+    end
+    function tex:SetAllPoints(relative)
+        self.anchor = { point = "ALL", relative = relative }
+        self.points[#self.points + 1] = self.anchor
+    end
     return tex
 end
 function FrameMethods:RegisterForClicks() end
@@ -649,6 +680,8 @@ local function resetRuntime()
     RT.bannerBankNavTimer = nil
     RT.bannerBankNavGen = 0
     RT._reminderDebugFingerprint = nil
+    RT._rankingsShortcutWatch = nil
+    RT._rankingsAuthFrame = nil
     RT.qtyOverrides = {}
     RT.pendingItemLoads = {}
     RT.bagCounts = {}
@@ -3369,6 +3402,235 @@ local function checkRuntimeReviewGuildBankLifecycle()
     unchanged(p, "runtime review guild bank lifecycle")
 end
 
+local function checkRuntimeReviewRankingsShortcut()
+    -- #466: Rankings shortcut visibility mirrors guildSuppliesRankings canEdit,
+    -- navigates via SettingsWindow:ShowPage, and never closes bank/review.
+    local p = runtimeFixture("rt-review-rankings")
+    local uiListeners = {}
+    local impersonationCallbacks = {}
+    local showPageCalls = {}
+    local caps = { canEdit = false, reason = "unauthorized" }
+
+    SF.GuildSupplies = {
+        GetCapabilities = function()
+            return caps
+        end,
+        RegisterUIListener = function(fn)
+            uiListeners[#uiListeners + 1] = fn
+        end,
+        IsLiveActiveForCurrentGuild = function()
+            return false
+        end,
+    }
+    SF.GuildOfficer = {
+        RegisterUIListener = function(fn)
+            uiListeners[#uiListeners + 1] = fn
+        end,
+    }
+    SF.LootHelperImpersonation = {
+        RegisterCallback = function(_, fn)
+            impersonationCallbacks[#impersonationCallbacks + 1] = fn
+        end,
+    }
+    local settingsFrame = FrameMock("Frame")
+    settingsFrame.shown = false
+    settingsFrame.frameStrata = "DIALOG"
+    local elevateCalls = 0
+    SF.SettingsWindow = {
+        frame = settingsFrame,
+        -- Mirror production #466 bank-overlay path: elevate strata, then ShowPage.
+        ElevateAboveBankChrome = function(self)
+            elevateCalls = elevateCalls + 1
+            if self.frame and self.frame.SetFrameStrata then
+                self.frame:SetFrameStrata("FULLSCREEN_DIALOG")
+            end
+            self._elevatedAboveBankChrome = true
+            if self.frame and self.frame.Raise then
+                self.frame:Raise()
+            end
+        end,
+        RestoreNormalFrameStrata = function(self)
+            if not self._elevatedAboveBankChrome then
+                return
+            end
+            self._elevatedAboveBankChrome = false
+            if self.frame and self.frame.SetFrameStrata then
+                self.frame:SetFrameStrata("DIALOG")
+            end
+        end,
+        ShowPage = function(self, pageId)
+            showPageCalls[#showPageCalls + 1] = pageId
+            if self.frame then
+                self.frame:Show()
+                if self.frame.Raise then
+                    self.frame:Raise()
+                end
+            end
+        end,
+        Hide = function(self)
+            if self.frame then
+                self.frame:Hide()
+            end
+            if self.RestoreNormalFrameStrata then
+                self:RestoreNormalFrameStrata()
+            end
+        end,
+        ApplySettingsWindowOpacity = function() end,
+        RegisterSettingsWindowOpacityTarget = function() end,
+    }
+
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(),
+        "rankings shortcut fixture opens the Raid Supplies window")
+    local btn = review.RankingsButton
+    assertTrue(btn ~= nil, "EnsureReview creates the Rankings shortcut button")
+    assertEq(btn.width, 24, "Rankings shortcut uses close-button-sized chrome")
+    assertEq(btn.height, 24, "Rankings shortcut height matches its width")
+    assertEq(btn.template, "SharedButtonExtraSmallTemplate",
+        "Rankings shortcut reuses Blizzard shared red button chrome")
+    assertEq(btn.__sfRankingsRedTemplate, "SharedButtonExtraSmallTemplate",
+        "Rankings shortcut records the shared red template selection")
+    assertTrue(btn.anchor ~= nil
+        and btn.anchor.point == "TOPRIGHT"
+        and btn.anchor.relative == review,
+        "Rankings shortcut anchors to the panel top-right")
+    assertTrue(review.Title ~= nil
+        and review.Title.anchor
+        and review.Title.anchor.point == "TOP"
+        and review.Title.anchor.relative == review,
+        "panel title stays centered while the Rankings shortcut exists")
+    assertEq(countCloseButtons(review), 0,
+        "Rankings shortcut does not add a close button")
+    assertFalse(btn:IsShown(),
+        "unauthorized players do not see the Rankings shortcut")
+    assertTrue(#uiListeners >= 2,
+        "Rankings shortcut watches Guild Supplies and Guild Officer UI listeners")
+    assertTrue(#impersonationCallbacks >= 1,
+        "Rankings shortcut watches Preview as Non-Admin changes")
+    assertTrue(RT._rankingsAuthFrame ~= nil
+        and RT._rankingsAuthFrame.registeredEvents
+        and RT._rankingsAuthFrame.registeredEvents.GUILD_ROSTER_UPDATE,
+        "Rankings shortcut watches guild roster updates")
+
+    caps = { canEdit = true, reason = nil }
+    RT:SyncRankingsShortcut()
+    assertTrue(btn:IsShown(),
+        "authorized officers see the Rankings shortcut")
+    assertTrue(btn.Icon ~= nil and btn.Icon.texture ~= nil
+        and tostring(btn.Icon.texture):find("RaidSuppliesRankings", 1, true),
+        "Rankings shortcut uses the packaged chart icon")
+    assertTrue(btn.Icon.vertexColor ~= nil
+        and math.abs((btn.Icon.vertexColor.r or 0) - 1.00) < 1e-6
+        and math.abs((btn.Icon.vertexColor.g or 0) - 0.82) < 1e-6
+        and math.abs((btn.Icon.vertexColor.b or 0) - 0.18) < 1e-6,
+        "Rankings chart uses WoW gold accent tint against the red button")
+    local iconTopLeft = nil
+    for i = 1, #(btn.Icon.points or {}) do
+        if btn.Icon.points[i].point == "TOPLEFT" then
+            iconTopLeft = btn.Icon.points[i]
+        end
+    end
+    assertTrue(iconTopLeft ~= nil
+        and iconTopLeft.x == 6
+        and iconTopLeft.y == -6,
+        "Rankings chart uses a larger inset for breathing room inside the red chrome")
+
+    caps = { canEdit = false, reason = "preview_non_admin" }
+    for i = 1, #impersonationCallbacks do
+        impersonationCallbacks[i]()
+    end
+    assertFalse(btn:IsShown(),
+        "Preview as Non-Admin hides the Rankings shortcut without a reload")
+
+    caps = { canEdit = true, reason = nil }
+    RT._rankingsAuthFrame.scripts.OnEvent(RT._rankingsAuthFrame, "GUILD_ROSTER_UPDATE")
+    assertTrue(btn:IsShown(),
+        "guild roster eligibility changes reshow the Rankings shortcut")
+
+    caps = nil
+    SF.GuildSupplies.GetCapabilities = function()
+        return nil
+    end
+    RT:SyncRankingsShortcut()
+    assertFalse(btn:IsShown(),
+        "missing authorization information fails closed and hides the shortcut")
+
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = true }
+    end
+    RT:SyncRankingsShortcut()
+    assertTrue(btn:IsShown(), "restored canEdit shows the Rankings shortcut again")
+
+    showPageCalls = {}
+    elevateCalls = 0
+    settingsFrame.raiseCount = 0
+    settingsFrame.raised = false
+    settingsFrame.shown = false
+    settingsFrame.frameStrata = "DIALOG"
+    SF.SettingsWindow._elevatedAboveBankChrome = nil
+    world.bankOpen = true
+    assertTrue(review:IsShown(), "bank panel stays open before Rankings navigation")
+    btn.scripts.OnClick(btn)
+    assertEq(#showPageCalls, 1, "clicking Rankings navigates once")
+    assertEq(showPageCalls[1], "guildSuppliesRankings",
+        "Rankings shortcut opens the existing guildSuppliesRankings page")
+    assertEq(elevateCalls, 1,
+        "Rankings shortcut elevates Settings above bank chrome before ShowPage")
+    assertEq(settingsFrame.frameStrata, "FULLSCREEN_DIALOG",
+        "Settings uses FULLSCREEN_DIALOG over DIALOG bank/review chrome")
+    assertTrue(settingsFrame:IsShown(),
+        "Settings/Rankings window is shown when the shortcut is clicked")
+    assertTrue(review:IsShown(),
+        "opening Rankings does not close the Raid Supplies panel")
+    assertTrue(world.bankOpen,
+        "opening Rankings does not close the guild bank")
+    SF.SettingsWindow:Hide()
+    assertEq(settingsFrame.frameStrata, "DIALOG",
+        "closing Settings restores normal DIALOG strata for later opens")
+    assertTrue(review:IsShown() and world.bankOpen,
+        "closing Settings leaves guild bank and Raid Supplies panel open")
+
+    -- Access lost between show and click: hide and do not navigate.
+    showPageCalls = {}
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = false, reason = "unauthorized" }
+    end
+    btn.scripts.OnClick(btn)
+    assertEq(#showPageCalls, 0,
+        "unauthorized click does not open Rankings")
+    assertFalse(btn:IsShown(),
+        "unauthorized click syncs visibility closed")
+
+    -- Existing configured-tab / bank-close lifecycle is unchanged.
+    SF.GuildSupplies.GetCapabilities = function()
+        return { canEdit = true }
+    end
+    RT:SyncRankingsShortcut()
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab still hides the Raid Supplies window")
+    world.currentTab = 2
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "returning to the configured tab still shows the Raid Supplies window")
+    assertTrue(review.RankingsButton:IsShown(),
+        "authorized Rankings shortcut remains after tab lifecycle")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    assertFalse(review:IsShown(),
+        "closing the Guild Bank still hides the Raid Supplies window")
+
+    SF.GuildSupplies = nil
+    SF.GuildOfficer = nil
+    SF.LootHelperImpersonation = nil
+    SF.SettingsWindow = nil
+    unchanged(p, "runtime review rankings shortcut")
+end
+
 local function startDeposit(line)
     local collected = RT:Collect()
     RT:BeginDeposit(line or collected.plan.lines[1], collected)
@@ -5095,6 +5357,7 @@ checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
 checkRuntimeReviewGuildBankLifecycle()
+checkRuntimeReviewRankingsShortcut()
 checkRuntimeReviewDepositTabSwitch()
 checkRuntimeDeposit()
 checkStaleDepositReview()

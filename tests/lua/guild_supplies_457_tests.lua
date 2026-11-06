@@ -1246,6 +1246,11 @@ do
         function f:Show() f.shown = true end
         function f:IsShown() return f.shown end
         function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:HookScript(k, fn)
+            f.hooks = f.hooks or {}
+            f.hooks[k] = f.hooks[k] or {}
+            f.hooks[k][#f.hooks[k] + 1] = fn
+        end
         function f:GetScript(k) return f.scripts[k] end
         function f:RegisterEvent() end
         function f:UnregisterEvent() end
@@ -1253,6 +1258,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:SetBackdrop() end
         function f:SetBackdropColor() end
         function f:SetText(t)
@@ -2347,6 +2353,7 @@ do
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:Hide() end
         function f:Show() end
         function f:IsShown() return false end
@@ -3065,10 +3072,16 @@ do
         function f:Show() f.shown = true end
         function f:IsShown() return f.shown end
         function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:HookScript(k, fn)
+            f.hooks = f.hooks or {}
+            f.hooks[k] = f.hooks[k] or {}
+            f.hooks[k][#f.hooks[k] + 1] = fn
+        end
         function f:GetScript(k) return f.scripts[k] end
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:RegisterEvent() end
         function f:UnregisterEvent() end
         function f:UnregisterAllEvents() end
@@ -3077,6 +3090,9 @@ do
         function f:SetBackdrop(info) f.backdrop = info end
         function f:SetBackdropColor(r, g, b, a)
             f.backdropColor = { r = r, g = g, b = b, a = a }
+        end
+        function f:SetBackdropBorderColor(r, g, b, a)
+            f.backdropBorderColor = { r = r, g = g, b = b, a = a }
         end
         function f:SetAlpha(a) f.alpha = a end
         function f:GetAlpha() return f.alpha end
@@ -4800,6 +4816,16 @@ do
                 function f:Show() f.shown = true end
                 function f:IsShown() return f.shown end
                 function f:SetScript(k, fn) f.scripts[k] = fn end
+                function f:HookScript(k, fn)
+                    f.hooks = f.hooks or {}
+                    f.hooks[k] = f.hooks[k] or {}
+                    f.hooks[k][#f.hooks[k] + 1] = fn
+                end
+        function f:HookScript(k, fn)
+            f.hooks = f.hooks or {}
+            f.hooks[k] = f.hooks[k] or {}
+            f.hooks[k][#f.hooks[k] + 1] = fn
+        end
                 function f:GetScript(k) return f.scripts[k] end
                 function f:SetText(t)
                     f._text = tostring(t or "")
@@ -4808,6 +4834,7 @@ do
                 function f:GetText() return f._text end
                 function f:Enable() end
                 function f:Disable() end
+                function f:RegisterForClicks() end
                 function f:SetNumeric() end
                 function f:SetAutoFocus() end
                 function f:HasFocus() return f._hasFocus end
@@ -5627,10 +5654,16 @@ do
         function f:Show() f.shown = true end
         function f:IsShown() return f.shown end
         function f:SetScript(k, fn) f.scripts[k] = fn end
+        function f:HookScript(k, fn)
+            f.hooks = f.hooks or {}
+            f.hooks[k] = f.hooks[k] or {}
+            f.hooks[k][#f.hooks[k] + 1] = fn
+        end
         function f:GetScript(k) return f.scripts[k] end
         function f:SetMovable() end
         function f:EnableMouse() end
         function f:RegisterForDrag() end
+        function f:RegisterForClicks() end
         function f:RegisterEvent() end
         function f:UnregisterEvent() end
         function f:UnregisterAllEvents() end
@@ -5641,6 +5674,9 @@ do
         function f:SetBackdrop(info) f.backdrop = info end
         function f:SetBackdropColor(r, g, b, a)
             f.backdropColor = { r = r, g = g, b = b, a = a }
+        end
+        function f:SetBackdropBorderColor(r, g, b, a)
+            f.backdropBorderColor = { r = r, g = g, b = b, a = a }
         end
         function f:SetAlpha(a) f.alpha = a end
         function f:GetAlpha() return f.alpha end
