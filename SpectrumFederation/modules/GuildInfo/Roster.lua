@@ -413,3 +413,177 @@ function GI:GetAssignmentDisplayRows(roster)
     end
     return rows, nil, displayGroups
 end
+
+--- GUID set of characters currently assigned as alts (read-only projection).
+-- Includes alts of departed mains. Does not mutate durable state.
+function GI.GetAssignedAltGuidSet(record)
+    local set = {}
+    if type(record) ~= "table" or type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+        return set
+    end
+    for guid, info in pairs(record.graph.byGuid) do
+        if type(guid) == "string" and type(info) == "table" and info.role == "alt" then
+            set[guid] = info.mainGuid or true
+        end
+    end
+    return set
+end
+
+--- Eligible Main-panel rows for the two-column Assignments UI (#468).
+-- Rostered non-alts only. Incomplete/syncing roster yields no rows (never
+-- treat unknown as departed). Confirmed departed mains are absent because they
+-- are not rostered; their backend relationships are untouched.
+function GI:GetEligibleMainDisplayRows(roster)
+    roster = roster or GI.GetRosterSnapshot()
+    if not roster or not roster.complete then
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+
+    local groups, reason, record = GI:GetRelationshipGroups()
+    if reason == "generation_syncing" then
+        return {}, reason
+    end
+    if groups == nil and reason then
+        return {}, reason
+    end
+
+    local altSet = GI.GetAssignedAltGuidSet(record)
+    local rows = {}
+    local seen = {}
+    for i = 1, #(roster.members or {}) do
+        local member = roster.members[i]
+        local guid = member and member.guid
+        if type(guid) == "string" and guid ~= "" and not seen[guid] and not altSet[guid] then
+            seen[guid] = true
+            local nameRealm = member.nameRealm or guid
+            local classFile = member.classFile
+            rows[#rows + 1] = {
+                id = "main:" .. guid,
+                clusterId = guid,
+                role = "main",
+                guid = guid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile),
+                canRemove = false,
+                canAction = false,
+                sortKey = string.lower(nameRealm),
+            }
+        end
+    end
+    table.sort(rows, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    return rows, nil
+end
+
+--- Alts-panel rows for a selected main (#468).
+-- Only currently rostered alts of that main. Confirmed departed alts are
+-- omitted from the projection; unknown is never treated as departure.
+-- Empty table when no main is selected or the main has no visible alts.
+function GI:GetSelectedAltDisplayRows(mainGuid, roster)
+    roster = roster or GI.GetRosterSnapshot()
+    if type(mainGuid) ~= "string" or mainGuid == "" then
+        return {}, nil
+    end
+    if not roster or not roster.complete then
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+
+    local groups, reason, record = GI:GetRelationshipGroups()
+    if reason == "generation_syncing" then
+        return {}, reason
+    end
+    if groups == nil and reason then
+        return {}, reason
+    end
+
+    local caps = GI:GetCapabilities()
+    local canEdit = caps.canEdit and true or false
+
+    local altGuids = {}
+    local seenAlt = {}
+    if record and record.graph then
+        local group = record.graph.mains and record.graph.mains[mainGuid]
+        if group and type(group.altGuids) == "table" then
+            for i = 1, #group.altGuids do
+                local ag = group.altGuids[i]
+                if type(ag) == "string" and ag ~= "" and not seenAlt[ag] then
+                    seenAlt[ag] = true
+                    altGuids[#altGuids + 1] = ag
+                end
+            end
+        end
+        for guid, info in pairs(record.graph.byGuid or {}) do
+            if type(info) == "table" and info.role == "alt" and info.mainGuid == mainGuid then
+                if type(guid) == "string" and guid ~= "" and not seenAlt[guid] then
+                    seenAlt[guid] = true
+                    altGuids[#altGuids + 1] = guid
+                end
+            end
+        end
+    end
+
+    local rows = {}
+    for i = 1, #altGuids do
+        local ag = altGuids[i]
+        local status, _, memberRow = GI.GetMembershipStatus(ag, roster, record)
+        if status == "in_guild" and memberRow then
+            local nameRealm = memberRow.nameRealm or ag
+            local classFile = memberRow.classFile
+            rows[#rows + 1] = {
+                id = "alt:" .. ag,
+                clusterId = mainGuid,
+                role = "alt",
+                guid = ag,
+                mainGuid = mainGuid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile),
+                canRemove = canEdit,
+                canAction = canEdit,
+                sortKey = string.lower(nameRealm),
+            }
+        elseif status == "unknown" then
+            -- Incomplete roster path: show truthful unknown, never as departed.
+            local nameRealm, classFile = ag, nil
+            if record and record.characters and record.characters[ag] then
+                nameRealm = record.characters[ag].nameRealm or nameRealm
+                classFile = record.characters[ag].classFile
+            end
+            rows[#rows + 1] = {
+                id = "alt:" .. ag,
+                clusterId = mainGuid,
+                role = "alt",
+                guid = ag,
+                mainGuid = mainGuid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile) .. " " .. LocStatus("unknown"),
+                canRemove = canEdit,
+                canAction = false,
+                sortKey = string.lower(nameRealm),
+            }
+        end
+        -- status == "departed": hidden in this UI only; backend relationship retained.
+    end
+    table.sort(rows, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    return rows, nil
+end
+
+--- True when guid is still an eligible Main-panel selection.
+function GI:IsEligibleMainSelection(guid, roster)
+    if type(guid) ~= "string" or guid == "" then
+        return false
+    end
+    local rows = GI:GetEligibleMainDisplayRows(roster)
+    for i = 1, #rows do
+        if rows[i].guid == guid then
+            return true
+        end
+    end
+    return false
+end
+

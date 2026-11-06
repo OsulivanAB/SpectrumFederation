@@ -52,6 +52,6 @@ Gossip publishes one current record, `go-p:current`, kind `guild-officer-policy`
 
 ## Consumers
 
-- **Guild Info.** Assign, move, unassign, Change Main, and history cleanup use the shared threshold for local commits and authenticated remote mutations. Cleanup does not replace the threshold.
+- **Guild Info.** Assign, move, unassign, promote-via-Change Main (Assignments up-arrow), and history cleanup use the shared threshold for local commits and authenticated remote mutations. Cleanup does not replace the threshold.
 - **Guild Supplies.** Configuration, initialization, campaigns, and maintenance use the shared threshold. `permission.editorRankPosition` stays on existing records so historical validation and replica ancestry still work. It does not decide who can edit. Settings shows a historical permission repair control only when that stored permission record is actually corrupt. An unknown officer policy does not show it, and ordinary configured or unconfigured use does not show an editor-rank selector.
 - **Loot Helper.** Adding a new character to an existing profile may grant profile admin once, through the existing admin log, when that character's native guild rank meets the policy. Profile creation, import, hydration, snapshot replay, and remote rebuilds do not grant. Unknown or ambiguous verification adds a regular member. Later demotion, threshold changes, and manual admin removal do not scan or regrant.
