@@ -341,8 +341,9 @@ end
 -- @param parent Frame Parent frame
 -- @param atlas string|nil Atlas name for texture
 -- @param size number|nil Size of button (width/height)
+-- @param texture string|nil Fallback file texture when atlas is nil
 -- @return Button The created button
-local function CreateIconButton(parent, atlas, size)
+local function CreateIconButton(parent, atlas, size, texture)
 	local btn = CreateFrame("Button", nil, parent)
 	btn:SetSize(size or 20, size or 20)
 
@@ -350,8 +351,10 @@ local function CreateIconButton(parent, atlas, size)
 	icon:SetAllPoints(btn)
 	btn.Icon = icon
 
-	if atlas then
+	if type(atlas) == "string" and atlas ~= "" then
 		icon:SetAtlas(atlas, true)
+	elseif type(texture) == "string" and texture ~= "" then
+		icon:SetTexture(texture)
 	end
 
 	local hl = btn:CreateTexture(nil, "HIGHLIGHT")
@@ -1598,9 +1601,13 @@ end
 --       - text: The text to display for the item. (e.g. "|cFF00FF00Osully|r")
 --       - canRemove: Boolean indicating if the remove button should be shown
 --   - onRemove: Function(item) called when an item's remove button is clicked
+--   - onAction: Function(item) optional secondary icon action (e.g. promote)
+--   - actionAtlas / actionTexture: icon for the optional action button
+--   - actionTooltip: optional tooltip for the action button
 --   - height: Height of the scroll list control (default: 160)
 --   - rowHeight: Height of each row in the list (default: 20)
 --   - removeAtlas: Atlas name for the remove button icon (default: "common-icon-redx")
+--   - emptyText: string|function shown when getItems returns no rows
 -- Defaults for the opt-in shared leading column on AddScrollList (#440).
 -- textRightInset matches the non-compact Text RIGHT anchor (-24) so the clamp
 -- reserves drawable remainder after that inset, not only contentWidth - textLeft.
@@ -1667,7 +1674,12 @@ function Controls:AddScrollList(section, opts)
 	local compactColumns = opts.compactColumns and true or false
 	local removeColumnGap = opts.removeColumnGap or 4
 	local removeButtonSize = opts.removeButtonSize or 18
+	local actionButtonSize = opts.actionButtonSize or removeButtonSize
+	local actionColumnGap = opts.actionColumnGap or removeColumnGap
 	local compactTextPadding = opts.compactTextPadding or 10
+	local hasActionSupport = type(opts.onAction) == "function"
+		or type(opts.actionAtlas) == "string"
+		or type(opts.actionTexture) == "string"
 	-- Opt-in. Lists that omit showItemIcons keep the previous text-only layout.
 	local showItemIcons = opts.showItemIcons and true or false
 	local itemIconSize = opts.itemIconSize or 16
@@ -1736,7 +1748,29 @@ function Controls:AddScrollList(section, opts)
 		content:SetHeight(1)
 		scroll:SetScrollChild(content)
 
+		local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:Hide()
+
 		local rows = {}
+
+		local function ResolveEmptyText()
+			local empty = opts.emptyText
+			if type(empty) == "function" then
+				local ok, value = pcall(empty)
+				if ok then
+					empty = value
+				else
+					empty = nil
+				end
+			end
+			if type(empty) ~= "string" then
+				empty = ""
+			end
+			return empty
+		end
 
 		local function EnsureRow(i)
 			if rows[i] then return rows[i] end
@@ -1782,6 +1816,18 @@ function Controls:AddScrollList(section, opts)
 			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
 			remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 			r.Remove = remove
+
+			if hasActionSupport then
+				local action = CreateIconButton(
+					r,
+					opts.actionAtlas,
+					actionButtonSize,
+					opts.actionTexture
+						or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
+				)
+				action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
+				r.Action = action
+			end
 
 			rows[i] = r
 			return r
@@ -1851,7 +1897,16 @@ function Controls:AddScrollList(section, opts)
 				rows[i]:Hide()
 			end
 
-			local contentH = (y > 0) and (y - rowSpacing) or 0
+			local emptyMessage = ResolveEmptyText()
+			local contentH
+			if #items == 0 and emptyMessage ~= "" then
+				emptyText:SetText(emptyMessage)
+				emptyText:Show()
+				contentH = math.max(rowHeight, (emptyText:GetStringHeight() or 0) + 16)
+			else
+				emptyText:Hide()
+				contentH = (y > 0) and (y - rowSpacing) or 0
+			end
 			content:SetHeight(math.max(1, contentH))
 
 			-- Resolve scrollbar before measuring width so the leading-column
@@ -1925,9 +1980,13 @@ function Controls:AddScrollList(section, opts)
 			if showItemIcons and textBudget > 0 then
 				textBudget = math.max(1, textBudget - iconReserve)
 			end
+			local trailingReserve = removeButtonSize + removeColumnGap
+			if hasActionSupport then
+				trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
+			end
 			local compactTextWidth = maxTextWidth + compactTextPadding
 			if compactColumns and textBudget > 0 then
-				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - removeButtonSize - removeColumnGap))
+				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - trailingReserve))
 			end
 
 			for i = 1, #items do
@@ -1936,6 +1995,9 @@ function Controls:AddScrollList(section, opts)
 
 				r.Text:ClearAllPoints()
 				r.Remove:ClearAllPoints()
+				if r.Action then
+					r.Action:ClearAllPoints()
+				end
 				if r.Leading then
 					r.Leading:ClearAllPoints()
 				end
@@ -1957,6 +2019,33 @@ function Controls:AddScrollList(section, opts)
 				else
 					r.Remove:SetAlpha(0.45)
 					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local canAction = hasActionSupport and item.canAction and true or false
+				if r.Action then
+					r.Action:SetShown(canAction)
+					if canAction then
+						local actionEnabled = enabled
+						r.Action:EnableMouse(true)
+						r.Action:SetAlpha(actionEnabled and 1 or 0.45)
+						r.Action:SetScript("OnClick", function()
+							if not actionEnabled then return end
+							if opts.onAction then
+								opts.onAction(item)
+							end
+						end)
+						local tip = opts.actionTooltip
+						if type(tip) == "function" then
+							local ok, value = pcall(tip, item)
+							tip = ok and value or nil
+						end
+						if type(tip) == "string" and tip ~= "" then
+							AttachTooltip(r.Action, tip, tip)
+						end
+					else
+						r.Action:SetAlpha(0.45)
+						r.Action:SetScript("OnClick", nil)
+					end
 				end
 
 				local itemKey = item.clusterId or item.id or item.key or i
@@ -2021,14 +2110,24 @@ function Controls:AddScrollList(section, opts)
 				end
 
 				local textLeft = leadingReserve + iconReserve
+				local rightInset = 24
+				if hasActionSupport then
+					rightInset = removeButtonSize + actionButtonSize + actionColumnGap + removeColumnGap + 4
+				end
 				if compactColumns and availableWidth > 0 then
 					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
 					r.Text:SetWidth(compactTextWidth)
-					r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
+					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
 				else
 					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
-					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
+					r.Text:SetPoint("RIGHT", r, "RIGHT", -rightInset, 0)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
 				end
 			end
 
@@ -2041,6 +2140,396 @@ function Controls:AddScrollList(section, opts)
 		scroll:HookScript("OnSizeChanged", Refresh)
 	end)
 end
+
+--- Two independently scrollable side-by-side lists with panel titles (#468).
+-- Full-width row (no InitRow label column) so Main/Alts panels share the
+-- Assignments section evenly. Each panel reuses AddScrollList semantics via
+-- nested opts tables (`left` / `right`).
+function Controls:AddSideBySideScrollLists(section, opts)
+	opts = opts or {}
+	local gap = opts.gap or 12
+	local titleHeight = opts.titleHeight or 18
+	local panelHeight = opts.panelHeight or opts.height or 220
+	local totalHeight = titleHeight + panelHeight
+	local leftOpts = opts.left or {}
+	local rightOpts = opts.right or {}
+
+	return section:AddRow(totalHeight, function(row)
+		local function BuildPanel(parent, panelOpts, side)
+			local title = parent:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+			title:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+			title:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, 0)
+			title:SetJustifyH("LEFT")
+			title:SetHeight(titleHeight)
+			title:SetText(panelOpts.title or "")
+
+			local host = CreateFrame("Frame", nil, parent)
+			host:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -titleHeight)
+			host:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
+
+			-- Reuse AddScrollList by building into a temporary section-like shim
+			-- that mounts a single fixed-height bordered list without the label column.
+			local listOpts = CopyTable(panelOpts)
+			listOpts.label = nil
+			listOpts.resize = false
+			listOpts.border = listOpts.border ~= false
+			listOpts.height = panelHeight
+			listOpts.maxHeight = panelHeight
+
+			local getItems = listOpts.getItems
+			if type(getItems) ~= "function" then
+				getItems = function() return {} end
+			end
+
+			local rowHeight = listOpts.rowHeight or 20
+			local rowSpacing = listOpts.rowSpacing or 2
+			local compactColumns = listOpts.compactColumns and true or false
+			local removeColumnGap = listOpts.removeColumnGap or 4
+			local removeButtonSize = listOpts.removeButtonSize or 18
+			local actionButtonSize = listOpts.actionButtonSize or removeButtonSize
+			local actionColumnGap = listOpts.actionColumnGap or removeColumnGap
+			local compactTextPadding = listOpts.compactTextPadding or 10
+			local hasActionSupport = type(listOpts.onAction) == "function"
+				or type(listOpts.actionAtlas) == "string"
+				or type(listOpts.actionTexture) == "string"
+			local borderInset = 4
+
+			local box = CreateFrame("Frame", nil, host, "BackdropTemplate")
+			box:SetAllPoints(host)
+			if box.SetBackdrop then
+				box:SetBackdrop({
+					bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+					edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+					tile = true,
+					tileSize = 8,
+					edgeSize = 12,
+					insets = {
+						left = borderInset,
+						right = borderInset,
+						top = borderInset,
+						bottom = borderInset,
+					},
+				})
+				box:SetBackdropColor(0, 0, 0, 0.12)
+				box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+			end
+
+			-- UIPanelScrollFrameTemplate places ScrollBar outside the scroll
+			-- frame to the right. Adjacent panels need an internal gutter, and
+			-- the bar must sit inside the backdrop edgeFile (edgeSize 12) — not
+			-- flush to the outer frame — or arrow/thumb art still bleeds past
+			-- the visible border. Right offset is slightly less inset than the
+			-- content chrome pad so the bar sits a few pixels farther right
+			-- while remaining inside the border stroke.
+			local chromePad = borderInset + 4 -- clears border stroke + small art pad
+			local scrollBarWidth = 18
+			local scrollBarGap = 2
+			local SCROLLBAR_RIGHT_OFFSET = -(borderInset + 2) -- 2px right of chromePad
+			local SCROLLBAR_INSET = (-SCROLLBAR_RIGHT_OFFSET) + scrollBarWidth + scrollBarGap
+			-- Arrow buttons are ~16px; keep the whole bar (arrows+track) inside
+			-- the bordered content area rather than overlapping the edgeFile.
+			local SCROLLBAR_BUTTON_CLEARANCE = 16
+
+			local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
+			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", chromePad, -chromePad)
+			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -SCROLLBAR_INSET, chromePad)
+
+			local sb = scroll.ScrollBar
+			if sb then
+				sb:ClearAllPoints()
+				sb:SetPoint(
+					"TOPRIGHT",
+					box,
+					"TOPRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					-(chromePad + SCROLLBAR_BUTTON_CLEARANCE)
+				)
+				sb:SetPoint(
+					"BOTTOMRIGHT",
+					box,
+					"BOTTOMRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					chromePad + SCROLLBAR_BUTTON_CLEARANCE
+				)
+				if sb.SetWidth then
+					sb:SetWidth(scrollBarWidth)
+				end
+			end
+
+			local content = CreateFrame("Frame", nil, scroll)
+			content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+			content:SetHeight(1)
+			scroll:SetScrollChild(content)
+
+			local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+			emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+			emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+			emptyText:SetJustifyH("LEFT")
+			emptyText:Hide()
+
+			local listRows = {}
+
+			local function ResolveEmptyText()
+				local empty = listOpts.emptyText
+				if type(empty) == "function" then
+					local ok, value = pcall(empty)
+					empty = ok and value or nil
+				end
+				if type(empty) ~= "string" then
+					empty = ""
+				end
+				return empty
+			end
+
+			local function EnsureRow(i)
+				if listRows[i] then
+					return listRows[i]
+				end
+				local r = CreateFrame("Button", nil, content)
+				r:SetHeight(rowHeight)
+				r:RegisterForClicks("LeftButtonUp")
+				r:EnableMouse(true)
+
+				local selected = r:CreateTexture(nil, "BACKGROUND")
+				selected:SetAllPoints()
+				selected:SetColorTexture(0.2, 0.55, 1.0, 0.22)
+				selected:Hide()
+				r.Selected = selected
+
+				local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+				fs:SetPoint("LEFT", r, "LEFT", 4, 0)
+				fs:SetJustifyH("LEFT")
+				if fs.SetWordWrap then fs:SetWordWrap(false) end
+				if fs.SetMaxLines then fs:SetMaxLines(1) end
+				r.Text = fs
+
+				local remove = CreateIconButton(r, listOpts.removeAtlas or "common-icon-redx", removeButtonSize)
+				remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
+				r.Remove = remove
+
+				if hasActionSupport then
+					local action = CreateIconButton(
+						r,
+						listOpts.actionAtlas,
+						actionButtonSize,
+						listOpts.actionTexture
+							or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
+					)
+					action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
+					r.Action = action
+				end
+
+				listRows[i] = r
+				return r
+			end
+
+			local function SetScrollBarShown(show)
+				local sb = scroll.ScrollBar
+				if not sb then
+					return 0
+				end
+				sb:SetShown(show)
+				if not show then
+					scroll:SetVerticalScroll(0)
+					if sb.SetValue then sb:SetValue(0) end
+					if sb.Disable then sb:Disable() end
+					return 0
+				end
+				if sb.Enable then sb:Enable() end
+				return sb:GetWidth() or 20
+			end
+
+			local function RefreshPanel()
+				if host.__sfSidePanelRefreshing then
+					return
+				end
+				host.__sfSidePanelRefreshing = true
+
+				local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
+				local items = getItems() or {}
+				local selectedKey = nil
+				if type(listOpts.getSelectedKey) == "function" then
+					selectedKey = listOpts.getSelectedKey()
+				end
+
+				local y = 0
+				local maxTextWidth = 0
+				for i = 1, #items do
+					local item = items[i]
+					local r = EnsureRow(i)
+					r:ClearAllPoints()
+					r:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+					r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
+					r.Text:SetText(item.text or "")
+					maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)
+					r:Show()
+					y = y + rowHeight + rowSpacing
+				end
+				for i = #items + 1, #listRows do
+					listRows[i]:Hide()
+				end
+
+				local emptyMessage = ResolveEmptyText()
+				local contentH
+				if #items == 0 and emptyMessage ~= "" then
+					emptyText:SetText(emptyMessage)
+					emptyText:Show()
+					contentH = math.max(rowHeight, (emptyText:GetStringHeight() or 0) + 16)
+				else
+					emptyText:Hide()
+					contentH = (y > 0) and (y - rowSpacing) or 0
+				end
+				content:SetHeight(math.max(1, contentH))
+
+				-- Scroll frame already reserves a right gutter for the bar, so
+				-- do not subtract ScrollBar width again from content width.
+				local visibleH = math.max(1, (scroll:GetHeight() or 0))
+				local showScroll = contentH > visibleH
+				SetScrollBarShown(showScroll)
+				local w = scroll:GetWidth() or 0
+				local availableWidth = 0
+				if w > 0 then
+					availableWidth = math.max(1, w - 4)
+					content:SetWidth(availableWidth)
+				end
+
+				local trailingReserve = removeButtonSize + removeColumnGap
+				if hasActionSupport then
+					trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
+				end
+				local compactTextWidth = maxTextWidth + compactTextPadding
+				if compactColumns and availableWidth > 0 then
+					compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - trailingReserve - 8))
+				end
+
+				for i = 1, #items do
+					local item = items[i]
+					local r = listRows[i]
+					r.Text:ClearAllPoints()
+					r.Remove:ClearAllPoints()
+					if r.Action then
+						r.Action:ClearAllPoints()
+					end
+
+					local canRemove = item.canRemove and true or false
+					r.Remove:SetShown(canRemove)
+					r:SetAlpha(enabled and 1 or 0.45)
+					if canRemove then
+						r.Remove:EnableMouse(true)
+						r.Remove:SetAlpha(enabled and 1 or 0.45)
+						r.Remove:SetScript("OnClick", function()
+							if not enabled then return end
+							if listOpts.onRemove then
+								listOpts.onRemove(item)
+							end
+						end)
+					else
+						r.Remove:SetAlpha(0.45)
+						r.Remove:SetScript("OnClick", nil)
+					end
+
+					local canAction = hasActionSupport and item.canAction and true or false
+					if r.Action then
+						r.Action:SetShown(canAction)
+						if canAction then
+							r.Action:EnableMouse(true)
+							r.Action:SetAlpha(enabled and 1 or 0.45)
+							r.Action:SetScript("OnClick", function()
+								if not enabled then return end
+								if listOpts.onAction then
+									listOpts.onAction(item)
+								end
+							end)
+							local tip = listOpts.actionTooltip
+							if type(tip) == "function" then
+								local ok, value = pcall(tip, item)
+								tip = ok and value or nil
+							end
+							if type(tip) == "string" and tip ~= "" then
+								AttachTooltip(r.Action, tip, tip)
+							end
+						else
+							r.Action:SetAlpha(0.45)
+							r.Action:SetScript("OnClick", nil)
+						end
+					end
+
+					local itemKey = item.clusterId or item.id or item.key or i
+					local isSelected = selectedKey ~= nil and selectedKey == itemKey
+					if r.Selected then
+						if isSelected then r.Selected:Show() else r.Selected:Hide() end
+					end
+					if type(listOpts.onSelect) == "function" then
+						r:SetScript("OnClick", function()
+							if not enabled then return end
+							listOpts.onSelect(item, i)
+						end)
+					else
+						r:SetScript("OnClick", nil)
+					end
+
+					local rightInset = trailingReserve + 4
+					r.Remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
+					r.Text:SetPoint("LEFT", r, "LEFT", 4, 0)
+					if compactColumns and availableWidth > 0 then
+						r.Text:SetWidth(compactTextWidth)
+					else
+						r.Text:SetPoint("RIGHT", r, "RIGHT", -rightInset, 0)
+					end
+				end
+
+				host.__sfSidePanelRefreshing = false
+			end
+
+			RefreshPanel()
+			RegisterRefresh(section, RefreshPanel)
+			scroll:HookScript("OnSizeChanged", RefreshPanel)
+			return RefreshPanel
+		end
+
+		local left = CreateFrame("Frame", nil, row)
+		local right = CreateFrame("Frame", nil, row)
+		left:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+		left:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+		right:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+		right:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+
+		local function LayoutPanels()
+			local width = row:GetWidth() or 0
+			if width <= 0 then
+				return
+			end
+			local panelWidth = math.max(80, math.floor((width - gap) / 2))
+			left:SetWidth(panelWidth)
+			right:SetWidth(panelWidth)
+			right:ClearAllPoints()
+			right:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+			right:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			left:ClearAllPoints()
+			left:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			left:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+			left:SetPoint("RIGHT", right, "LEFT", -gap, 0)
+		end
+
+		BuildPanel(left, leftOpts, "left")
+		BuildPanel(right, rightOpts, "right")
+		LayoutPanels()
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, nil)
+			LayoutPanels()
+		end
+		Refresh()
+		RegisterRefresh(section, Refresh)
+		row:HookScript("OnSizeChanged", function()
+			LayoutPanels()
+		end)
+	end)
+end
+
 
 -- Pure gate for consumable goal edits. Used by AddConsumableRequestedList and tests.
 -- Returns true only when a genuine, still-bound edit should invoke onGoalCommit.

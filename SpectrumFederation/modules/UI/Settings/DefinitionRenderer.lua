@@ -212,7 +212,9 @@ function R:Build(panel, pageDef)
 
 			elseif t == "scrollList" then
 				local opts = item
-				if type(opts.onRemove) == "function" or type(opts.onSelect) == "function" then
+				if type(opts.onRemove) == "function"
+					or type(opts.onSelect) == "function"
+					or type(opts.onAction) == "function" then
 					opts = CopyTable(opts)
 					if type(opts.onRemove) == "function" then
 						local fn = opts.onRemove
@@ -226,8 +228,65 @@ function R:Build(panel, pageDef)
 							return fn(MakeCtx(panel, sec), listItem, index)
 						end
 					end
+					if type(opts.onAction) == "function" then
+						local fn = opts.onAction
+						opts.onAction = function(listItem)
+							return fn(MakeCtx(panel, sec), listItem)
+						end
+					end
 				end
 				controls:AddScrollList(sec, opts)
+
+			elseif t == "sideBySideScrollLists" then
+				local opts = item
+				local needsCopy = false
+				local left = opts.left
+				local right = opts.right
+				if type(left) == "table" and (
+					type(left.onRemove) == "function"
+					or type(left.onSelect) == "function"
+					or type(left.onAction) == "function"
+				) then
+					needsCopy = true
+				end
+				if type(right) == "table" and (
+					type(right.onRemove) == "function"
+					or type(right.onSelect) == "function"
+					or type(right.onAction) == "function"
+				) then
+					needsCopy = true
+				end
+				if needsCopy then
+					opts = CopyTable(opts)
+					left = opts.left
+					right = opts.right
+					local function WrapPanelCallbacks(panelOpts)
+						if type(panelOpts) ~= "table" then
+							return
+						end
+						if type(panelOpts.onRemove) == "function" then
+							local fn = panelOpts.onRemove
+							panelOpts.onRemove = function(listItem)
+								return fn(MakeCtx(panel, sec), listItem)
+							end
+						end
+						if type(panelOpts.onSelect) == "function" then
+							local fn = panelOpts.onSelect
+							panelOpts.onSelect = function(listItem, index)
+								return fn(MakeCtx(panel, sec), listItem, index)
+							end
+						end
+						if type(panelOpts.onAction) == "function" then
+							local fn = panelOpts.onAction
+							panelOpts.onAction = function(listItem)
+								return fn(MakeCtx(panel, sec), listItem)
+							end
+						end
+					end
+					WrapPanelCallbacks(left)
+					WrapPanelCallbacks(right)
+				end
+				controls:AddSideBySideScrollLists(sec, opts)
 
 			elseif t == "consumableRequestedList" then
 				local opts = item

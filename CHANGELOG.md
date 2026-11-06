@@ -2,13 +2,20 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.19-beta.2] - 2026-11-06
+## [1.5.19-beta.3] - 2026-11-06
 
 ### Added
 - Add officer Edit contributor for Raid Supplies Logs credit corrections (#459)
 
 ### Changed
 - Page required credit-event aliases across Guild Gossip wire limits for dataset adoption (#459)
+- Reclaim unreferenced credit-event aliases that only share a corrected terminal (#459)
+
+## [1.5.19-beta.2] - 2026-11-06
+
+### Changed
+- Redesign Main / Alt Assignments into two side-by-side Main and Alts panels with inline promote/unassign (#468)
+- Use a plain green up-arrow icon for Promote to Main (replacing the ornate scrollbar button art)
 
 ## [1.5.19-beta.1] - 2026-11-06
 

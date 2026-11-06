@@ -1245,7 +1245,8 @@ do
     assertTrue(type(def) == "table", "Build stores page definition")
 
     local accessGet, assignEnabled, mainResolvedCb, altResolvedCb, mainTextCb, altTextCb
-    local mainEnabled, altEnabled, changeMainSet, changeMainBtnEnabled, unassignRemove
+    local mainEnabled, altEnabled, unassignRemove, promoteAction, dualPanels
+    local obsoleteChangeMainButton, obsoleteChangeMainDropdown
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
             if sec.id == "guildInfoMainAltStatus" and item.type == "display" then
@@ -1255,10 +1256,10 @@ do
                 assignEnabled = item.enabled
             end
             if item.type == "button" and item.buttonText == "Change Main" then
-                changeMainBtnEnabled = item.enabled
+                obsoleteChangeMainButton = item
             end
             if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
-                changeMainSet = item.set
+                obsoleteChangeMainDropdown = item
             end
             if item.type == "autocomplete" and item.label == "Main name" then
                 mainResolvedCb = item.onResolved
@@ -1270,13 +1271,23 @@ do
                 altTextCb = item.onTextChanged
                 altEnabled = item.enabled
             end
+            if item.type == "sideBySideScrollLists" then
+                dualPanels = item
+                if item.right then
+                    unassignRemove = item.right.onRemove
+                    promoteAction = item.right.onAction
+                end
+            end
             if item.type == "scrollList" and type(item.onRemove) == "function" then
-                unassignRemove = item.onRemove
+                unassignRemove = unassignRemove or item.onRemove
             end
         end
     end
     assertTrue(type(accessGet) == "function", "access status get callback")
     assertTrue(type(assignEnabled) == "function", "Assign enabled callback")
+    assertTrue(dualPanels ~= nil, "Assignments uses side-by-side panels")
+    assertTrue(obsoleteChangeMainButton == nil, "old Change Main button removed")
+    assertTrue(obsoleteChangeMainDropdown == nil, "old Change Main dropdown removed")
     assertTrue(not mainEnabled(), "main field disabled while roster incomplete")
     assertTrue(not assignEnabled(), "Assign disabled while roster incomplete")
 
@@ -1317,24 +1328,29 @@ do
     assertEq(world.rosterInfoCalls, scansBefore, "autocomplete keystrokes do not rescan roster")
 
     assign("Alice-Garona", "Bob-Garona")
-    for _, sec in ipairs(def.sections or {}) do
-        for _, item in ipairs(sec.items or {}) do
-            if item.type == "scrollList" and type(item.onSelect) == "function" then
-                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
-            end
-        end
+    assertTrue(type(dualPanels.left.onSelect) == "function", "Main panel onSelect")
+    dualPanels.left.onSelect(nil, { guid = "Player-1-Alice", role = "main", clusterId = "Player-1-Alice" })
+    assertTrue(type(promoteAction) == "function", "alt promote onAction callback")
+    local promoteConfirm
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        promoteConfirm = accept
     end
-    assertTrue(type(changeMainSet) == "function", "Change Main dropdown set callback")
-    assertTrue(not changeMainBtnEnabled(), "Change Main button off before candidate")
-    changeMainSet("Player-1-Bob")
-    assertTrue(changeMainBtnEnabled() == true, "Change Main enables after candidate selection")
+    local msgCtx = { section = { SetMessage = function() end } }
+    promoteAction(msgCtx, { role = "alt", guid = "Player-1-Bob", mainGuid = "Player-1-Alice" })
+    assertTrue(type(promoteConfirm) == "function", "promote opens confirmation")
+    promoteConfirm()
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "main", "up-arrow promote uses ChangeMain")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Bob",
+        "former main becomes alt after promote")
 
+    -- Restore Alice as main for unassign stale-protection coverage.
+    assertEq(GI:ChangeMain("Player-1-Bob", "Player-1-Alice", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "restore Alice as main")
     assertTrue(type(unassignRemove) == "function", "unassign onRemove callback")
     local pendingConfirm
     SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
         pendingConfirm = accept
     end
-    local msgCtx = { section = { SetMessage = function() end } }
     unassignRemove(msgCtx, { role = "alt", guid = "Player-1-Bob", mainGuid = "Player-1-Alice" })
     assertTrue(type(pendingConfirm) == "function", "unassign opens confirmation")
     GI:AssignAlt("Carol-Garona", "Bob-Garona", {
@@ -5758,7 +5774,7 @@ do
 end
 
 do
-    -- 2 — Change Main confirm revalidates roster; departed candidate rejected
+    -- 2 — Promote (Change Main) confirm revalidates roster; departed candidate rejected
     restoreBaseRoster()
     resetDB()
     setActor("Alice-Garona", "Player-1-Alice", 1)
@@ -5773,24 +5789,21 @@ do
     }
     page:Build(panel)
     local def = panel.__sfPageDef
-    local changeMainOnClick, changeMainSet
+    local promoteAction
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
-            if item.type == "button" and item.buttonText == "Change Main" then
-                changeMainOnClick = item.onClick
-            end
-            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
-                changeMainSet = item.set
-            end
-            if item.type == "scrollList" and type(item.onSelect) == "function" then
-                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
+            if item.type == "sideBySideScrollLists" and item.right then
+                promoteAction = item.right.onAction
+                if item.left and item.left.onSelect then
+                    item.left.onSelect(nil, { guid = "Player-1-Alice", clusterId = "Player-1-Alice" })
+                end
             end
         end
     end
-    changeMainSet("Player-1-Bob")
+    assertTrue(type(promoteAction) == "function", "cm promote action present")
     local messages = {}
     local ctx = { section = { SetMessage = function(_, msg) messages[#messages + 1] = msg end } }
-    changeMainOnClick(ctx)
+    promoteAction(ctx, { role = "alt", guid = "Player-1-Bob", mainGuid = "Player-1-Alice" })
     assertTrue(type(captured) == "function", "cm confirm captured")
     -- Bob leaves guild before confirm.
     local kept = {}
@@ -5817,20 +5830,13 @@ do
     def = panel.__sfPageDef
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
-            if item.type == "button" and item.buttonText == "Change Main" then
-                changeMainOnClick = item.onClick
-            end
-            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
-                changeMainSet = item.set
-            end
-            if item.type == "scrollList" and type(item.onSelect) == "function" then
-                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
+            if item.type == "sideBySideScrollLists" and item.right then
+                promoteAction = item.right.onAction
             end
         end
     end
-    changeMainSet("Player-1-Carol")
     SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) captured = accept end
-    changeMainOnClick(ctx)
+    promoteAction(ctx, { role = "alt", guid = "Player-1-Carol", mainGuid = "Player-1-Alice" })
     captured()
     assertEq(select(1, GI:GetCharacterRole("Player-1-Carol")), "main", "cm success Carol is main")
     assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Carol",
@@ -6444,8 +6450,283 @@ do
     assertEq(stillUn.status, "unassigned", "427: true unassigned unchanged")
 end
 
+---------------------------------------------------------------------------
+-- #468 — Two-panel Main / Alts projection and UI wiring
+---------------------------------------------------------------------------
+
+local function guidSetFromRows(rows)
+    local set = {}
+    for i = 1, #(rows or {}) do
+        if rows[i].guid then
+            set[rows[i].guid] = rows[i]
+        end
+    end
+    return set
+end
+
+do
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    -- Unassigned rostered characters appear as mains.
+    local mains, mainReason = GI:GetEligibleMainDisplayRows(GI.GetRosterSnapshot(true))
+    assertNil(mainReason, "468: complete roster mains reason")
+    local byGuid = guidSetFromRows(mains)
+    assertTrue(byGuid["Player-1-Alice"] ~= nil, "468: unassigned Alice is eligible main")
+    assertTrue(byGuid["Player-1-Bob"] ~= nil, "468: unassigned Bob is eligible main")
+    assertTrue(byGuid["Player-1-Carol"] ~= nil, "468: unassigned Carol is eligible main")
+    -- Alphabetical
+    for i = 2, #mains do
+        assertTrue(mains[i - 1].sortKey <= mains[i].sortKey, "468: mains sorted alphabetically")
+    end
+
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "468: assign Bob under Alice")
+    mains = GI:GetEligibleMainDisplayRows(GI.GetRosterSnapshot(true))
+    byGuid = guidSetFromRows(mains)
+    assertTrue(byGuid["Player-1-Alice"] ~= nil, "468: Alice remains eligible main with alts")
+    assertTrue(byGuid["Player-1-Bob"] == nil, "468: assigned alt Bob excluded from Main")
+    assertTrue(byGuid["Player-1-Dave"] ~= nil, "468: rostered Dave with zero alts still a Main")
+
+    -- Alts panel empty until selection; then only selected main's rostered alts.
+    local altsNone = GI:GetSelectedAltDisplayRows(nil, GI.GetRosterSnapshot(true))
+    assertEq(#altsNone, 0, "468: no selection ⇒ empty alts")
+    local altsAlice = GI:GetSelectedAltDisplayRows("Player-1-Alice", GI.GetRosterSnapshot(true))
+    local altSet = guidSetFromRows(altsAlice)
+    assertTrue(altSet["Player-1-Bob"] ~= nil, "468: Bob listed under Alice")
+    assertEq(#altsAlice, 1, "468: only Bob under Alice")
+    assertTrue(altSet["Player-1-Bob"].canAction == true, "468: editor can promote")
+    assertTrue(altSet["Player-1-Bob"].canRemove == true, "468: editor can unassign")
+
+    local altsDave = GI:GetSelectedAltDisplayRows("Player-1-Dave", GI.GetRosterSnapshot(true))
+    assertEq(#altsDave, 0, "468: selected main with no alts ⇒ empty")
+
+    -- Departed main/alt hidden in UI; backend relationships retained.
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "468: assign Eve")
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Eve" and m.guid ~= "Player-1-Alice" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local roster = GI.GetRosterSnapshot(true)
+    assertEq(GI.GetMembershipStatus("Player-1-Eve", roster), "departed", "468: Eve departed")
+    assertEq(GI.GetMembershipStatus("Player-1-Alice", roster), "departed", "468: Alice departed")
+    assertEq(GI:GetCharacterRole("Player-1-Eve"), "alt", "468: departed Eve relationship retained")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "468: Eve still under Alice in backend")
+    mains = GI:GetEligibleMainDisplayRows(roster)
+    byGuid = guidSetFromRows(mains)
+    assertTrue(byGuid["Player-1-Alice"] == nil, "468: departed Alice hidden from Main")
+    assertTrue(byGuid["Player-1-Bob"] == nil, "468: Bob still assigned alt so not a Main")
+    altsAlice = GI:GetSelectedAltDisplayRows("Player-1-Alice", roster)
+    altSet = guidSetFromRows(altsAlice)
+    assertTrue(altSet["Player-1-Eve"] == nil, "468: departed Eve hidden from Alts")
+    assertTrue(altSet["Player-1-Bob"] ~= nil, "468: rostered Bob still visible under departed main selection")
+
+    -- Returning members reappear with preserved relationships.
+    world.guild.members[#world.guild.members + 1] = {
+        name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true, class = "MAGE",
+    }
+    world.guild.members[#world.guild.members + 1] = {
+        name = "Eve-Garona", guid = "Player-1-Eve", rankOrder = 5, online = false, class = "ROGUE",
+    }
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    roster = GI.GetRosterSnapshot(true)
+    mains = GI:GetEligibleMainDisplayRows(roster)
+    byGuid = guidSetFromRows(mains)
+    assertTrue(byGuid["Player-1-Alice"] ~= nil, "468: returning Alice reappears as Main")
+    altsAlice = GI:GetSelectedAltDisplayRows("Player-1-Alice", roster)
+    altSet = guidSetFromRows(altsAlice)
+    assertTrue(altSet["Player-1-Eve"] ~= nil, "468: returning Eve reappears as Alice's alt")
+    assertTrue(altSet["Player-1-Bob"] ~= nil, "468: Bob remains Alice's alt")
+    restoreBaseRoster()
+    pass("468 panel projection: unassigned mains, alt exclusion, departed hide, return")
+end
+
+do
+    -- Incomplete / unknown roster must not invent a complete Main list or departure.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "468 unknown seed")
+    world.guild.rosterComplete = false
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local snap = GI.GetRosterSnapshot(true)
+    assertTrue(not snap.complete, "468: roster incomplete")
+    assertEq(GI.GetMembershipStatus("Player-1-Bob", snap), "unknown",
+        "468: incomplete is unknown not departed")
+    local mains, reason = GI:GetEligibleMainDisplayRows(snap)
+    assertEq(#mains, 0, "468: incomplete roster yields no Main rows")
+    assertEq(reason, "roster_incomplete", "468: incomplete reason")
+    local alts, altReason = GI:GetSelectedAltDisplayRows("Player-1-Alice", snap)
+    assertEq(#alts, 0, "468: incomplete roster yields no Alt rows")
+    assertEq(altReason, "roster_incomplete", "468: alt incomplete reason")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "468: backend relationship unchanged while roster incomplete")
+    world.guild.rosterComplete = true
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    restoreBaseRoster()
+    pass("468 incomplete roster safety")
+end
+
+do
+    -- UI selection, empty state, permissions, promote/unassign wiring, obsolete controls.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "468 ui seed Bob")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "468 ui seed Carol")
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    page:Build(panel)
+    local def = panel.__sfPageDef
+    local dual, obsoleteButton, obsoleteDropdown
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "sideBySideScrollLists" then
+                dual = item
+            end
+            if item.type == "button" and item.buttonText == "Change Main" then
+                obsoleteButton = true
+            end
+            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
+                obsoleteDropdown = true
+            end
+        end
+    end
+    assertTrue(dual ~= nil and dual.left and dual.right, "468: dual panels defined")
+    assertTrue(not obsoleteButton and not obsoleteDropdown, "468: obsolete Change Main UI gone")
+    assertEq(dual.left.title, "Main", "468: Main panel title")
+    assertEq(dual.right.title, "Alts", "468: Alts panel title")
+
+    local mainItems = dual.left.getItems()
+    local mainSet = guidSetFromRows(mainItems)
+    assertTrue(mainSet["Player-1-Alice"] ~= nil, "468 ui: Alice in Main panel")
+    assertTrue(mainSet["Player-1-Bob"] == nil, "468 ui: Bob excluded from Main panel")
+    assertTrue(mainSet["Player-1-Dave"] ~= nil, "468 ui: unassigned Dave in Main panel")
+
+    local emptyBefore = dual.right.emptyText()
+    assertTrue(type(emptyBefore) == "string" and emptyBefore:find("Select", 1, true) ~= nil,
+        "468 ui: empty state before selection got=" .. tostring(emptyBefore))
+    assertEq(#dual.right.getItems(), 0, "468 ui: alts empty before selection")
+
+    dual.left.onSelect(nil, { guid = "Player-1-Alice", clusterId = "Player-1-Alice" })
+    assertEq(dual.left.getSelectedKey(), "Player-1-Alice", "468 ui: selection retained")
+    local altItems = dual.right.getItems()
+    assertTrue(#altItems >= 2, "468 ui: alts populate after selection")
+    local emptyAfter = dual.right.emptyText()
+    -- Selected with alts: emptyText is the no-alts message but list is non-empty.
+    assertTrue(type(emptyAfter) == "string", "468 ui: emptyText callable after selection")
+
+    dual.left.onSelect(nil, { guid = "Player-1-Dave", clusterId = "Player-1-Dave" })
+    assertEq(#dual.right.getItems(), 0, "468 ui: Dave has no alts")
+    assertTrue(dual.right.emptyText():find("No assigned", 1, true) ~= nil,
+        "468 ui: no-alts empty state")
+
+    dual.left.onSelect(nil, { guid = "Player-1-Alice", clusterId = "Player-1-Alice" })
+    -- Read-only: demote actor so Caps.canEdit is false.
+    setActor("Alice-Garona", "Player-1-Alice", 4)
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    page:Refresh(panel)
+    altItems = dual.right.getItems()
+    for i = 1, #altItems do
+        assertTrue(not altItems[i].canRemove, "468 ui: read-only cannot remove")
+        assertTrue(not altItems[i].canAction, "468 ui: read-only cannot promote")
+    end
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    page:Refresh(panel)
+
+    -- Promote Carol via up-arrow; Bob remains alt of Carol; selection moves.
+    local captured
+    SF.SettingsUI.Dialogs.Confirm = function(_, msg, _, accept)
+        assertTrue(type(msg) == "string" and msg:find("Carol", 1, true) ~= nil,
+            "468 ui: promote confirm names new main")
+        assertTrue(msg:find("Alice", 1, true) ~= nil, "468 ui: promote confirm names old main")
+        captured = accept
+    end
+    dual.right.onAction({ section = { SetMessage = function() end } }, {
+        role = "alt", guid = "Player-1-Carol", mainGuid = "Player-1-Alice",
+    })
+    assertTrue(type(captured) == "function", "468 ui: promote confirm captured")
+    captured()
+    assertEq(GI:GetCharacterRole("Player-1-Carol"), "main", "468 ui: Carol promoted")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Carol",
+        "468 ui: Alice demoted to alt")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "468 ui: sibling Bob preserved under Carol")
+    assertEq(dual.left.getSelectedKey(), "Player-1-Carol", "468 ui: selection follows promote")
+    mainItems = dual.left.getItems()
+    mainSet = guidSetFromRows(mainItems)
+    assertTrue(mainSet["Player-1-Carol"] ~= nil, "468 ui: new main in Main list")
+    assertTrue(mainSet["Player-1-Alice"] == nil, "468 ui: former main excluded as alt")
+    altItems = dual.right.getItems()
+    local altSet = guidSetFromRows(altItems)
+    assertTrue(altSet["Player-1-Alice"] ~= nil, "468 ui: Alice in Alts of Carol")
+    assertTrue(altSet["Player-1-Bob"] ~= nil, "468 ui: Bob in Alts of Carol")
+
+    -- Unassign removes only the intended alt.
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) if accept then accept() end end
+    dual.right.onRemove({ section = { SetMessage = function() end } }, {
+        role = "alt", guid = "Player-1-Bob", mainGuid = "Player-1-Carol",
+    })
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "468 ui: Bob unassigned")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Carol",
+        "468 ui: Alice still under Carol after Bob unassign")
+    altItems = dual.right.getItems()
+    altSet = guidSetFromRows(altItems)
+    assertTrue(altSet["Player-1-Bob"] == nil, "468 ui: Bob gone from Alts after unassign")
+    assertTrue(altSet["Player-1-Alice"] ~= nil, "468 ui: Alice remains in Alts")
+
+    -- Local refresh after relationship update keeps panels coherent without stale Bob.
+    GI.NotifyUI("local")
+    page:Refresh(panel)
+    mainSet = guidSetFromRows(dual.left.getItems())
+    assertTrue(mainSet["Player-1-Bob"] ~= nil, "468 ui: unassigned Bob returns to Main list")
+    assertTrue(mainSet["Player-1-Alice"] == nil, "468 ui: Alice still alt not Main")
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) if accept then accept() end end
+    pass("468 UI selection/empty/permissions/promote/unassign/refresh")
+end
+
+do
+    -- Generation syncing must not present a false complete Main list.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "468 sync seed")
+    local record = select(1, GI:GetCurrentRecord())
+    record.baseline = record.baseline or {}
+    record.baseline.complete = false
+    record.baseline.memberCount = 99
+    record.baseline.groupCount = 99
+    record.baseline.contentFp = "not-yet"
+    local mains, reason = GI:GetEligibleMainDisplayRows(GI.GetRosterSnapshot(true))
+    assertEq(#mains, 0, "468: generation_syncing hides Main projection")
+    assertEq(reason, "generation_syncing", "468: syncing reason")
+    local alts, altReason = GI:GetSelectedAltDisplayRows("Player-1-Alice", GI.GetRosterSnapshot(true))
+    assertEq(#alts, 0, "468: generation_syncing hides Alt projection")
+    assertEq(altReason, "generation_syncing", "468: alt syncing reason")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "468: syncing does not wipe durable relationships")
+    record.baseline.complete = true
+    record.baseline.memberCount = countKeys(record.members)
+    record.baseline.groupCount = countKeys(record.groups)
+    record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+    pass("468 generation_syncing projection safety")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
 end
 os.exit(0)
+
