@@ -3419,6 +3419,10 @@ local function checkRuntimeReviewRankingsShortcut()
     assertTrue(btn ~= nil, "EnsureReview creates the Rankings shortcut button")
     assertEq(btn.width, 24, "Rankings shortcut uses close-button-sized chrome")
     assertEq(btn.height, 24, "Rankings shortcut height matches its width")
+    assertEq(btn.template, "SharedButtonExtraSmallTemplate",
+        "Rankings shortcut reuses Blizzard shared red button chrome")
+    assertEq(btn.__sfRankingsRedTemplate, "SharedButtonExtraSmallTemplate",
+        "Rankings shortcut records the shared red template selection")
     assertTrue(btn.anchor ~= nil
         and btn.anchor.point == "TOPRIGHT"
         and btn.anchor.relative == review,

@@ -160,6 +160,7 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert 'ShowPage("guildSuppliesRankings")' in runtime
     assert "CanViewRankingsShortcut" in runtime
     assert "RaidSuppliesRankings.tga" in runtime
+    assert "SharedButtonExtraSmallTemplate" in runtime
     assert (
         REPO_ROOT
         / "SpectrumFederation"

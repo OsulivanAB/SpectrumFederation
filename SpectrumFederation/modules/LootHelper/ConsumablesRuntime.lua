@@ -1283,9 +1283,13 @@ local REVIEW_MOBILE_WIDTH = 140
 local REVIEW_RANKINGS_BTN_SIZE = 24
 local REVIEW_RANKINGS_BTN_INSET_X = 14
 local REVIEW_RANKINGS_BTN_INSET_Y = -10
+-- Keep the chart graphic inset inside the red button chrome.
+local REVIEW_RANKINGS_ICON_INSET = 4
 -- Packaged chart icon: no durable Blizzard small chart chrome texture was suitable.
 local REVIEW_RANKINGS_ICON =
     "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\RaidSuppliesRankings.tga"
+-- Blizzard SharedXML red three-slice chrome (128-RedButton art kit).
+local REVIEW_RANKINGS_BTN_TEMPLATE = "SharedButtonExtraSmallTemplate"
 
 -- Same effective Rankings gate as Settings page `guildSuppliesRankings`
 -- (`available` / CanViewRankings): shared Guild Supplies canEdit, fail closed.
@@ -1368,6 +1372,70 @@ function Runtime:OpenRankingsFromReview()
     end
 end
 
+local function PlaceRankingsIcon(icon, btn, pressed)
+    if not icon or not btn then
+        return
+    end
+    local inset = REVIEW_RANKINGS_ICON_INSET
+    local dx, dy = 0, 0
+    if pressed then
+        dx, dy = 1, -1
+    end
+    if icon.ClearAllPoints then
+        icon:ClearAllPoints()
+    end
+    if icon.SetPoint then
+        icon:SetPoint("TOPLEFT", btn, "TOPLEFT", inset + dx, -(inset) + dy)
+        icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -(inset) + dx, inset + dy)
+    elseif icon.SetAllPoints then
+        icon:SetAllPoints(btn)
+    end
+end
+
+local function BindRankingsScript(btn, script, fn, preferHook)
+    if not btn or type(fn) ~= "function" then
+        return
+    end
+    if preferHook and type(btn.HookScript) == "function" then
+        btn:HookScript(script, fn)
+        return
+    end
+    if type(btn.SetScript) == "function" then
+        btn:SetScript(script, fn)
+    end
+end
+
+local function ApplyRankingsRedChromeFallback(btn)
+    if not btn then
+        return
+    end
+    -- Approximate Blizzard's shared red action chrome when the template is unavailable.
+    if btn.SetBackdrop then
+        btn:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true,
+            tileSize = 8,
+            edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 },
+        })
+    end
+    if btn.SetBackdropColor then
+        btn:SetBackdropColor(0.45, 0.06, 0.06, 0.95)
+    end
+    if btn.SetBackdropBorderColor then
+        btn:SetBackdropBorderColor(0.85, 0.22, 0.18, 1)
+    end
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    if highlight.SetAllPoints then
+        highlight:SetAllPoints(btn)
+    end
+    if highlight.SetColorTexture then
+        highlight:SetColorTexture(1, 0.35, 0.28, 0.22)
+    end
+    btn.Highlight = highlight
+end
+
 function Runtime:EnsureRankingsShortcut(frame)
     if not frame then
         return nil
@@ -1376,7 +1444,22 @@ function Runtime:EnsureRankingsShortcut(frame)
         return frame.RankingsButton
     end
 
-    local btn = CreateFrame("Button", nil, frame)
+    -- Prefer Blizzard SharedXML red three-slice chrome (128-RedButton), the same
+    -- art kit behind SharedButton*Template / Talent red buttons.
+    local btn
+    local usedTemplate = false
+    if type(CreateFrame) == "function" then
+        local ok, created = pcall(CreateFrame, "Button", nil, frame, REVIEW_RANKINGS_BTN_TEMPLATE)
+        if ok and created then
+            btn = created
+            usedTemplate = true
+        end
+    end
+    if not btn then
+        btn = CreateFrame("Button", nil, frame, "BackdropTemplate")
+        ApplyRankingsRedChromeFallback(btn)
+    end
+
     btn:SetSize(REVIEW_RANKINGS_BTN_SIZE, REVIEW_RANKINGS_BTN_SIZE)
     btn:SetPoint(
         "TOPRIGHT",
@@ -1385,51 +1468,43 @@ function Runtime:EnsureRankingsShortcut(frame)
         -REVIEW_RANKINGS_BTN_INSET_X,
         REVIEW_RANKINGS_BTN_INSET_Y
     )
-    btn:EnableMouse(true)
-    btn:RegisterForClicks("LeftButtonUp")
+    if btn.EnableMouse then
+        btn:EnableMouse(true)
+    end
+    if btn.RegisterForClicks then
+        btn:RegisterForClicks("LeftButtonUp")
+    end
+    if btn.SetText then
+        -- Shared red templates are text buttons; keep chrome and show only the chart.
+        btn:SetText("")
+    end
     btn:Hide()
+    btn.__sfRankingsRedTemplate = usedTemplate and REVIEW_RANKINGS_BTN_TEMPLATE or "BackdropFallback"
 
     local icon = btn:CreateTexture(nil, "ARTWORK")
-    if icon.SetAllPoints then
-        icon:SetAllPoints(btn)
-    end
     if icon.SetTexture then
         icon:SetTexture(REVIEW_RANKINGS_ICON)
     end
     if icon.SetTexCoord then
         icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     end
+    PlaceRankingsIcon(icon, btn, false)
     btn.Icon = icon
 
-    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
-    if highlight.SetAllPoints then
-        highlight:SetAllPoints(btn)
-    end
-    if highlight.SetColorTexture then
-        highlight:SetColorTexture(1, 1, 1, 0.18)
-    end
-    btn.Highlight = highlight
-
-    btn:SetScript("OnMouseDown", function()
+    -- Hook mouse scripts so Blizzard three-slice pressed/highlight chrome still runs.
+    BindRankingsScript(btn, "OnMouseDown", function()
         if icon.SetVertexColor then
-            icon:SetVertexColor(0.75, 0.75, 0.75, 1)
+            icon:SetVertexColor(0.82, 0.82, 0.82, 1)
         end
-        if icon.ClearAllPoints and icon.SetPoint then
-            icon:ClearAllPoints()
-            icon:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
-            icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 1, -1)
-        end
-    end)
-    btn:SetScript("OnMouseUp", function()
+        PlaceRankingsIcon(icon, btn, true)
+    end, true)
+    BindRankingsScript(btn, "OnMouseUp", function()
         if icon.SetVertexColor then
             icon:SetVertexColor(1, 1, 1, 1)
         end
-        if icon.ClearAllPoints and icon.SetAllPoints then
-            icon:ClearAllPoints()
-            icon:SetAllPoints(btn)
-        end
-    end)
-    btn:SetScript("OnEnter", function(owner)
+        PlaceRankingsIcon(icon, btn, false)
+    end, true)
+    BindRankingsScript(btn, "OnEnter", function(owner)
         if not GameTooltip then
             return
         end
@@ -1441,19 +1516,16 @@ function Runtime:EnsureRankingsShortcut(frame)
             1
         )
         GameTooltip:Show()
-    end)
-    btn:SetScript("OnLeave", function()
+    end, true)
+    BindRankingsScript(btn, "OnLeave", function()
         if icon.SetVertexColor then
             icon:SetVertexColor(1, 1, 1, 1)
         end
-        if icon.ClearAllPoints and icon.SetAllPoints then
-            icon:ClearAllPoints()
-            icon:SetAllPoints(btn)
-        end
+        PlaceRankingsIcon(icon, btn, false)
         if GameTooltip and GameTooltip.Hide then
             GameTooltip:Hide()
         end
-    end)
+    end, true)
     btn:SetScript("OnClick", function()
         self:OpenRankingsFromReview()
     end)
