@@ -2214,16 +2214,22 @@ function Controls:AddSideBySideScrollLists(section, opts)
 			end
 
 			-- UIPanelScrollFrameTemplate places ScrollBar outside the scroll
-			-- frame to the right. In adjacent panels that overhang crosses into
-			-- the neighbor, so reserve an internal gutter and re-anchor the bar
-			-- inside this panel (same approach as PageBuilder).
-			local SCROLLBAR_INSET = 24
-			local SCROLLBAR_RIGHT_OFFSET = -2
-			local SCROLLBAR_BUTTON_CLEARANCE = 8
+			-- frame to the right. Adjacent panels need an internal gutter, and
+			-- the bar must sit inside the backdrop edgeFile (edgeSize 12) — not
+			-- flush to the outer frame — or arrow/thumb art still bleeds past
+			-- the visible border.
+			local chromePad = borderInset + 4 -- clears border stroke + small art pad
+			local scrollBarWidth = 18
+			local scrollBarGap = 2
+			local SCROLLBAR_INSET = chromePad + scrollBarWidth + scrollBarGap
+			local SCROLLBAR_RIGHT_OFFSET = -chromePad
+			-- Arrow buttons are ~16px; keep the whole bar (arrows+track) inside
+			-- the bordered content area rather than overlapping the edgeFile.
+			local SCROLLBAR_BUTTON_CLEARANCE = 16
 
 			local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
-			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", borderInset, -borderInset)
-			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -SCROLLBAR_INSET, borderInset)
+			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", chromePad, -chromePad)
+			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -SCROLLBAR_INSET, chromePad)
 
 			local sb = scroll.ScrollBar
 			if sb then
@@ -2233,15 +2239,18 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					box,
 					"TOPRIGHT",
 					SCROLLBAR_RIGHT_OFFSET,
-					-(borderInset + SCROLLBAR_BUTTON_CLEARANCE)
+					-(chromePad + SCROLLBAR_BUTTON_CLEARANCE)
 				)
 				sb:SetPoint(
 					"BOTTOMRIGHT",
 					box,
 					"BOTTOMRIGHT",
 					SCROLLBAR_RIGHT_OFFSET,
-					borderInset + SCROLLBAR_BUTTON_CLEARANCE
+					chromePad + SCROLLBAR_BUTTON_CLEARANCE
 				)
+				if sb.SetWidth then
+					sb:SetWidth(scrollBarWidth)
+				end
 			end
 
 			local content = CreateFrame("Frame", nil, scroll)

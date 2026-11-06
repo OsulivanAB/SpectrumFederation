@@ -1165,10 +1165,13 @@ do
         end
     end
 
-    local SCROLLBAR_INSET = 24
-    local SCROLLBAR_RIGHT_OFFSET = -2
     local borderInset = 4
-    local buttonClearance = 8
+    local chromePad = borderInset + 4
+    local scrollBarWidth = 18
+    local scrollBarGap = 2
+    local SCROLLBAR_INSET = chromePad + scrollBarWidth + scrollBarGap
+    local SCROLLBAR_RIGHT_OFFSET = -chromePad
+    local buttonClearance = 16
 
     local panel = CreateFrame("Frame")
     panel:SetSize(700, 400)
@@ -1306,10 +1309,16 @@ do
     fireEvent(leftScroll, "OnSizeChanged", 280, 200)
     fireEvent(rightScroll, "OnSizeChanged", 280, 200)
 
+    local leftTopLeft = pointAnchor(leftScroll, "TOPLEFT")
+    local rightTopLeft = pointAnchor(rightScroll, "TOPLEFT")
     local leftBottomRight = pointAnchor(leftScroll, "BOTTOMRIGHT")
     local rightBottomRight = pointAnchor(rightScroll, "BOTTOMRIGHT")
     assertTrue(leftBottomRight ~= nil, "468-layout: left scroll has BOTTOMRIGHT")
     assertTrue(rightBottomRight ~= nil, "468-layout: right scroll has BOTTOMRIGHT")
+    assertEq(leftTopLeft.x, chromePad,
+        "468-layout: left scroll clears top-left border chrome")
+    assertEq(rightTopLeft.x, chromePad,
+        "468-layout: right scroll clears top-left border chrome")
     assertEq(leftBottomRight.x, -SCROLLBAR_INSET,
         "468-layout: left scroll reserves internal scrollbar gutter")
     assertEq(rightBottomRight.x, -SCROLLBAR_INSET,
@@ -1318,6 +1327,8 @@ do
         "468-layout: left scroll anchors to its own box")
     assertEq(rightBottomRight.relativeTo, rightBox,
         "468-layout: right scroll anchors to its own box")
+    assertTrue(SCROLLBAR_INSET >= chromePad + scrollBarWidth,
+        "468-layout: gutter fits chrome pad plus scrollbar width")
 
     local function assertBarInsidePanel(scroll, box, label)
         local sb = scroll.ScrollBar
@@ -1329,13 +1340,19 @@ do
         assertEq(bottom.relativeTo, box, label .. " scrollbar BOTTOMRIGHT relative to panel box")
         assertEq(top.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar stays inside right edge")
         assertEq(bottom.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar bottom stays inside right edge")
-        assertEq(top.y, -(borderInset + buttonClearance),
+        assertTrue(top.x <= -chromePad,
+            label .. " scrollbar right edge clears border chrome pad")
+        assertEq(top.y, -(chromePad + buttonClearance),
             label .. " scrollbar top aligns with content clearance")
-        assertEq(bottom.y, borderInset + buttonClearance,
+        assertEq(bottom.y, chromePad + buttonClearance,
             label .. " scrollbar bottom aligns with content clearance")
+        assertTrue(math.abs(top.y) >= chromePad + 16,
+            label .. " top clearance fits 16px arrow buttons inside the border")
         -- Must not be anchored outside via the scroll frame's TOPRIGHT (Blizzard default).
         assertTrue(top.relativeTo ~= scroll,
             label .. " scrollbar is not overhanging from the scroll frame")
+        assertEq(sb:GetWidth(), scrollBarWidth,
+            label .. " scrollbar width matches reserved gutter")
     end
 
     assertBarInsidePanel(leftScroll, leftBox, "468-layout left")
