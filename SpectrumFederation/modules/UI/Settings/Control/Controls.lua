@@ -2217,12 +2217,14 @@ function Controls:AddSideBySideScrollLists(section, opts)
 			-- frame to the right. Adjacent panels need an internal gutter, and
 			-- the bar must sit inside the backdrop edgeFile (edgeSize 12) — not
 			-- flush to the outer frame — or arrow/thumb art still bleeds past
-			-- the visible border.
+			-- the visible border. Right offset is slightly less inset than the
+			-- content chrome pad so the bar sits a few pixels farther right
+			-- while remaining inside the border stroke.
 			local chromePad = borderInset + 4 -- clears border stroke + small art pad
 			local scrollBarWidth = 18
 			local scrollBarGap = 2
-			local SCROLLBAR_INSET = chromePad + scrollBarWidth + scrollBarGap
-			local SCROLLBAR_RIGHT_OFFSET = -chromePad
+			local SCROLLBAR_RIGHT_OFFSET = -(borderInset + 2) -- 2px right of chromePad
+			local SCROLLBAR_INSET = (-SCROLLBAR_RIGHT_OFFSET) + scrollBarWidth + scrollBarGap
 			-- Arrow buttons are ~16px; keep the whole bar (arrows+track) inside
 			-- the bordered content area rather than overlapping the edgeFile.
 			local SCROLLBAR_BUTTON_CLEARANCE = 16

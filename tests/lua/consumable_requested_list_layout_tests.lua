@@ -1169,8 +1169,8 @@ do
     local chromePad = borderInset + 4
     local scrollBarWidth = 18
     local scrollBarGap = 2
-    local SCROLLBAR_INSET = chromePad + scrollBarWidth + scrollBarGap
-    local SCROLLBAR_RIGHT_OFFSET = -chromePad
+    local SCROLLBAR_RIGHT_OFFSET = -(borderInset + 2)
+    local SCROLLBAR_INSET = (-SCROLLBAR_RIGHT_OFFSET) + scrollBarWidth + scrollBarGap
     local buttonClearance = 16
 
     local panel = CreateFrame("Frame")
@@ -1340,8 +1340,10 @@ do
         assertEq(bottom.relativeTo, box, label .. " scrollbar BOTTOMRIGHT relative to panel box")
         assertEq(top.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar stays inside right edge")
         assertEq(bottom.x, SCROLLBAR_RIGHT_OFFSET, label .. " scrollbar bottom stays inside right edge")
-        assertTrue(top.x <= -chromePad,
-            label .. " scrollbar right edge clears border chrome pad")
+        assertTrue(top.x <= -(borderInset + 2),
+            label .. " scrollbar right edge clears border stroke")
+        assertTrue(top.x > -chromePad,
+            label .. " scrollbar is nudged right of content chrome pad")
         assertEq(top.y, -(chromePad + buttonClearance),
             label .. " scrollbar top aligns with content clearance")
         assertEq(bottom.y, chromePad + buttonClearance,
