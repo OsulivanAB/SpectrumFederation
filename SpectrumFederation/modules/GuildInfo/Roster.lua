@@ -594,3 +594,137 @@ function GI:IsEligibleMainSelection(guid, roster)
     return false
 end
 
+--- Assignments list-search candidates: visible mains + visible alts (#UI).
+-- Reuses GetEligibleMainDisplayRows / GetSelectedAltDisplayRows so departed
+-- hiding and incomplete-roster safety stay identical to the panels. Requires a
+-- non-whitespace `prefix` (empty/whitespace ⇒ no suggestions, matching assign
+-- autocomplete). Filters case-insensitively by Name-Realm / short name and caps
+-- results by `limit`. Session UI only — never mutates relationships.
+function GI:GetListSearchCandidates(roster, prefix, limit)
+    roster = roster or GI.GetRosterSnapshot()
+    limit = math.max(1, math.min(tonumber(limit) or 48, 64))
+    local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
+    -- Autocomplete UX: do not dump the full roster on empty focus/clear.
+    if q == "" then
+        return {}, nil
+    end
+
+    local mains, mainReason = GI:GetEligibleMainDisplayRows(roster)
+    if mainReason == "generation_syncing" or mainReason == "roster_incomplete" then
+        return {}, mainReason
+    end
+    if type(mains) ~= "table" then
+        return {}, mainReason
+    end
+
+    local function nameMatches(nameRealm)
+        if type(nameRealm) ~= "string" then
+            return false
+        end
+        local nameLower = string.lower(nameRealm)
+        local short = nameLower:match("^([^-]+)") or nameLower
+        return nameLower:sub(1, #q) == q
+            or short:sub(1, #q) == q
+            or nameLower:find(q, 1, true) ~= nil
+    end
+
+    local out = {}
+    local seen = {}
+    for i = 1, #mains do
+        local row = mains[i]
+        local guid = row and row.guid
+        if type(guid) == "string" and guid ~= "" and not seen[guid] and nameMatches(row.nameRealm) then
+            seen[guid] = true
+            out[#out + 1] = {
+                value = guid,
+                guid = guid,
+                nameRealm = row.nameRealm,
+                classFile = row.classFile,
+                role = "main",
+                mainGuid = guid,
+                label = row.text or GI.ColorizeName(row.nameRealm, row.classFile),
+                text = row.nameRealm,
+                sortKey = row.sortKey or string.lower(row.nameRealm or guid),
+            }
+        end
+    end
+
+    local groups = GI:GetRelationshipGroups()
+    if type(groups) == "table" then
+        for i = 1, #groups do
+            local group = groups[i]
+            local mainGuid = group and group.mainGuid
+            if type(mainGuid) == "string" and mainGuid ~= "" then
+                local alts = GI:GetSelectedAltDisplayRows(mainGuid, roster)
+                for j = 1, #(alts or {}) do
+                    local row = alts[j]
+                    local guid = row and row.guid
+                    if type(guid) == "string" and guid ~= "" and not seen[guid] and nameMatches(row.nameRealm) then
+                        seen[guid] = true
+                        out[#out + 1] = {
+                            value = guid,
+                            guid = guid,
+                            nameRealm = row.nameRealm,
+                            classFile = row.classFile,
+                            role = "alt",
+                            mainGuid = row.mainGuid or mainGuid,
+                            label = row.text or GI.ColorizeName(row.nameRealm, row.classFile),
+                            text = row.nameRealm,
+                            sortKey = row.sortKey or string.lower(row.nameRealm or guid),
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(out, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    if #out > limit then
+        local trimmed = {}
+        for i = 1, limit do
+            trimmed[i] = out[i]
+        end
+        return trimmed, nil
+    end
+    return out, nil
+end
+
+--- Resolve a list-search selection to the main to display and optional alt highlight.
+-- Returns mainGuid, highlightAltGuid|nil, status ("ok"|"not_visible"|"invalid").
+-- Does not mutate durable Guild Info state.
+function GI:ResolveListSearchSelection(guid, roster)
+    if type(guid) ~= "string" or guid == "" then
+        return nil, nil, "invalid"
+    end
+    roster = roster or GI.GetRosterSnapshot()
+
+    local role, linkedMain = GI:GetCharacterRole(guid)
+    if role == "alt" then
+        local mainGuid = linkedMain
+        if type(mainGuid) ~= "string" or mainGuid == "" then
+            return nil, nil, "not_visible"
+        end
+        -- Prefer showing the alt when it is still in the selected-main projection.
+        local alts = GI:GetSelectedAltDisplayRows(mainGuid, roster)
+        for i = 1, #(alts or {}) do
+            if alts[i].guid == guid then
+                return mainGuid, guid, "ok"
+            end
+        end
+        -- Departed/hidden alt: still focus the associated main when that main is
+        -- an eligible Main-panel row; otherwise report not_visible.
+        if GI:IsEligibleMainSelection(mainGuid, roster) then
+            return mainGuid, nil, "ok"
+        end
+        return nil, nil, "not_visible"
+    end
+
+    -- Main-with-alts, solo/unassigned eligible main, or any other Main-panel row.
+    if GI:IsEligibleMainSelection(guid, roster) then
+        return guid, nil, "ok"
+    end
+    return nil, nil, "not_visible"
+end
+

@@ -46,6 +46,11 @@ local altText = ""
 local mainResolved = nil -- { guid, nameRealm, classFile }
 local altResolved = nil
 local selectedMainGuid = nil -- ephemeral Main-panel selection (#468)
+-- Assignments list search (session-only; never mutates relationships).
+local listSearchText = ""
+local listSearchFilterMainGuid = nil -- when set, Main panel shows only this main
+local listSearchHighlightAltGuid = nil -- when set, Alts panel highlights this alt
+local listSearchStatus = nil -- optional banner after unresolved/empty selection
 
 local function BeginRenderPass()
 	passCache = {}
@@ -377,14 +382,112 @@ end
 
 --- Keep Main selection valid after roster/relationship updates (#468).
 local function NormalizeMainSelection(roster)
-	if not selectedMainGuid then
-		return
-	end
 	local g = GI()
-	if g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(selectedMainGuid, roster) then
+	if selectedMainGuid then
+		if not (g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(selectedMainGuid, roster)) then
+			selectedMainGuid = nil
+		end
+	end
+	-- Drop search filter/highlight when the focused main is no longer eligible.
+	if listSearchFilterMainGuid then
+		if not (g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(listSearchFilterMainGuid, roster)) then
+			listSearchFilterMainGuid = nil
+			listSearchHighlightAltGuid = nil
+		elseif listSearchHighlightAltGuid then
+			-- Drop alt highlight if that alt is no longer under the filtered main.
+			local stillVisible = false
+			if g and g.GetSelectedAltDisplayRows then
+				local alts = g:GetSelectedAltDisplayRows(listSearchFilterMainGuid, roster)
+				for i = 1, #(alts or {}) do
+					if alts[i].guid == listSearchHighlightAltGuid then
+						stillVisible = true
+						break
+					end
+				end
+			end
+			if not stillVisible then
+				listSearchHighlightAltGuid = nil
+			end
+		end
+	end
+end
+
+local function ClearListSearch(opts)
+	opts = opts or {}
+	listSearchText = ""
+	listSearchFilterMainGuid = nil
+	listSearchHighlightAltGuid = nil
+	listSearchStatus = nil
+	if opts.refresh ~= false then
+		QueueFormRefresh()
+	end
+end
+
+--- Apply a list-search suggestion without mutating Guild Info relationships.
+local function ApplyListSearchSelection(item)
+	local g = GI()
+	if not item or not item.guid or not g or not g.ResolveListSearchSelection then
+		listSearchStatus = Loc(
+			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
+			"That character has no visible Main/Alt group right now."
+		)
+		QueueFormRefresh()
 		return
 	end
-	selectedMainGuid = nil
+	local mainGuid, highlightAlt, status = g:ResolveListSearchSelection(item.guid, Roster())
+	if status ~= "ok" or not mainGuid then
+		listSearchFilterMainGuid = nil
+		listSearchHighlightAltGuid = nil
+		listSearchStatus = Loc(
+			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
+			"That character has no visible Main/Alt group right now."
+		)
+		QueueFormRefresh()
+		return
+	end
+	listSearchText = item.nameRealm or item.text or listSearchText
+	listSearchFilterMainGuid = mainGuid
+	listSearchHighlightAltGuid = highlightAlt
+	selectedMainGuid = mainGuid
+	listSearchStatus = nil
+	QueueFormRefresh()
+end
+
+local function ListSearchSuggestions(prefix)
+	local g = GI()
+	if not g or not g.GetListSearchCandidates then
+		return {}
+	end
+	local rows = g:GetListSearchCandidates(Roster(), prefix, 48)
+	return rows or {}
+end
+
+local function CopyCharacterName(ctx, item)
+	if not item then
+		return
+	end
+	local nameRealm = item.nameRealm
+	if type(nameRealm) ~= "string" or nameRealm == "" then
+		return
+	end
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local message = Loc(
+		"GUILD_INFO_COPY_NAME_PROMPT",
+		"Press Ctrl+C to copy this character name (addons cannot write the clipboard on Retail)."
+	)
+	local closeText = Loc("GUILD_INFO_COPY_NAME_CLOSE", "Close")
+	if dialogs and dialogs.ShowCopyableText then
+		dialogs:ShowCopyableText(message, nameRealm, closeText)
+		return
+	end
+	-- Fallback for harnesses without StaticPopup: reuse Prompt highlight path.
+	if dialogs and dialogs.Prompt then
+		dialogs:Prompt(message, closeText, nameRealm, function() end)
+		return
+	end
+	if ctx and ctx.section and ctx.section.SetMessage then
+		ctx.section:SetMessage(nameRealm, "info")
+	end
 end
 
 local function PromoteAltToMain(ctx, altItem)
@@ -815,6 +918,69 @@ local function Definition()
 				title = Loc("GUILD_INFO_SECTION_LIST", "Assignments"),
 				items = {
 					{
+						type = "display",
+						label = Loc("GUILD_INFO_LIST_SEARCH_STATUS_LABEL", "Search"),
+						visible = function()
+							return type(listSearchStatus) == "string" and listSearchStatus ~= ""
+						end,
+						get = function()
+							return listSearchStatus or ""
+						end,
+					},
+					{
+						type = "autocomplete",
+						label = Loc("GUILD_INFO_LIST_SEARCH", "Find character"),
+						hint = Loc(
+							"GUILD_INFO_LIST_SEARCH_HINT",
+							"Type to search mains and alts"
+						),
+						width = 240,
+						maxLetters = 96,
+						maxSuggestions = 48,
+						maxDropdownHeight = 220,
+						emptySuggestionsText = Loc(
+							"GUILD_INFO_LIST_SEARCH_NO_MATCH",
+							"No matching mains or alts."
+						),
+						enabled = function()
+							return Caps().canRead
+						end,
+						get = function()
+							return listSearchText
+						end,
+						set = function(v)
+							listSearchText = tostring(v or "")
+						end,
+						getSuggestions = function(_, prefix)
+							return ListSearchSuggestions(prefix or listSearchText)
+						end,
+						onResolved = function(_, item)
+							if item and item.guid then
+								ApplyListSearchSelection(item)
+							end
+						end,
+						onTextChanged = function(_, text)
+							listSearchText = text or ""
+							-- Typing only filters the dropdown; lists change on select/clear.
+							listSearchStatus = nil
+							QueueFormRefresh()
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_INFO_LIST_SEARCH_CLEAR_LABEL", "Clear search"),
+						buttonText = Loc("GUILD_INFO_LIST_SEARCH_CLEAR", "Clear"),
+						width = 100,
+						enabled = function()
+							return listSearchText ~= ""
+								or listSearchFilterMainGuid ~= nil
+								or listSearchHighlightAltGuid ~= nil
+						end,
+						onClick = function()
+							ClearListSearch()
+						end,
+					},
+					{
 						type = "sideBySideScrollLists",
 						panelHeight = 220,
 						gap = 12,
@@ -828,6 +994,10 @@ local function Definition()
 							height = 220,
 							compactColumns = true,
 							removeColumnGap = 6,
+							copyTooltip = Loc(
+								"GUILD_INFO_COPY_NAME_TIP",
+								"Copy Name-Realm"
+							),
 							getItems = function()
 								local gi = GI()
 								if not gi or not gi.GetEligibleMainDisplayRows then
@@ -835,8 +1005,17 @@ local function Definition()
 								end
 								local roster = Roster()
 								NormalizeMainSelection(roster)
-								local rows = gi:GetEligibleMainDisplayRows(roster)
-								return rows or {}
+								local rows = gi:GetEligibleMainDisplayRows(roster) or {}
+								if not listSearchFilterMainGuid then
+									return rows
+								end
+								local filtered = {}
+								for i = 1, #rows do
+									if rows[i].guid == listSearchFilterMainGuid then
+										filtered[#filtered + 1] = rows[i]
+									end
+								end
+								return filtered
 							end,
 							getSelectedKey = function()
 								return selectedMainGuid
@@ -844,9 +1023,20 @@ local function Definition()
 							onSelect = function(_, item)
 								if item and item.guid then
 									selectedMainGuid = item.guid
+									-- Manual Main click clears alt highlight but keeps
+									-- an active search filter only when it still matches.
+									listSearchHighlightAltGuid = nil
+									if listSearchFilterMainGuid
+										and listSearchFilterMainGuid ~= item.guid then
+										listSearchFilterMainGuid = nil
+										listSearchText = ""
+									end
 									-- Selection-only: refresh controls without roster rescan.
 									RefreshPageControls()
 								end
+							end,
+							onCopy = function(ctx, item)
+								CopyCharacterName(ctx, item)
 							end,
 						},
 						right = {
@@ -859,6 +1049,10 @@ local function Definition()
 							actionColumnGap = 6,
 							actionTexture = "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga",
 							actionTooltip = Loc("GUILD_INFO_PROMOTE_TIP", "Promote this alt to Main"),
+							copyTooltip = Loc(
+								"GUILD_INFO_COPY_NAME_TIP",
+								"Copy Name-Realm"
+							),
 							emptyText = function()
 								if not selectedMainGuid then
 									return Loc("GUILD_INFO_ALTS_SELECT_MAIN",
@@ -874,6 +1068,9 @@ local function Definition()
 								end
 								local rows = gi:GetSelectedAltDisplayRows(selectedMainGuid, Roster())
 								return rows or {}
+							end,
+							getSelectedKey = function()
+								return listSearchHighlightAltGuid
 							end,
 							onAction = function(ctx, item)
 								PromoteAltToMain(ctx, item)
@@ -902,6 +1099,9 @@ local function Definition()
 								else
 									commit()
 								end
+							end,
+							onCopy = function(ctx, item)
+								CopyCharacterName(ctx, item)
 							end,
 						},
 					},
@@ -1045,6 +1245,8 @@ end
 function Page:OnHide()
 	refreshQueued = false
 	rosterInvalidatePending = false
+	-- Drop ephemeral search filter when leaving the page; relationships untouched.
+	ClearListSearch({ refresh = false })
 end
 
 EnsureRosterListener()
