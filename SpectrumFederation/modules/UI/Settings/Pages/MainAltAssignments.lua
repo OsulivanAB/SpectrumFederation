@@ -932,11 +932,16 @@ local function Definition()
 						label = Loc("GUILD_INFO_LIST_SEARCH", "Find character"),
 						hint = Loc(
 							"GUILD_INFO_LIST_SEARCH_HINT",
-							"Search mains and alts; select to focus that group"
+							"Type to search mains and alts"
 						),
 						width = 240,
 						maxLetters = 96,
 						maxSuggestions = 48,
+						maxDropdownHeight = 220,
+						emptySuggestionsText = Loc(
+							"GUILD_INFO_LIST_SEARCH_NO_MATCH",
+							"No matching mains or alts."
+						),
 						enabled = function()
 							return Caps().canRead
 						end,

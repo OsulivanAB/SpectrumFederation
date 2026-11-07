@@ -41478,6 +41478,7 @@ do
         end,
         -- Production path: bound set only (no redundant onTextChanged).
         maxSuggestions = 8,
+        allowEmptyPrefix = true,
     })
     local attrEdit, qtyEdit, applyBtn
     for i = connectedBefore + 1, #created do

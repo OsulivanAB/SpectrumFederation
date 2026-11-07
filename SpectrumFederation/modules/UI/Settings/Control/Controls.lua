@@ -4814,18 +4814,44 @@ end
 -- @param section table Section to add row into
 -- @param opts table Options: label, get/set or unbound getText/setText,
 --   getSuggestions(prefix)->[{value,label,text}], onResolved(item|nil),
---   maxSuggestions, width, visible/enabled
+--   maxSuggestions, maxDropdownHeight (default 220, clamped 80–250),
+--   emptySuggestionsText, allowEmptyPrefix, width, visible/enabled
 -- @return Frame The created row
 function Controls:AddAutocomplete(section, opts)
 	opts = opts or {}
-	-- Cap raised to 64 so Assignments list-search can offer a fuller unfiltered
-	-- dropdown; assign fields should keep a small explicit maxSuggestions.
+	-- Cap raised to 64 so Assignments list-search can return more matches;
+	-- the dropdown itself is height-capped and scrollable.
 	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 64))
+	local maxDropdownHeight = tonumber(opts.maxDropdownHeight) or 220
+	if maxDropdownHeight < 80 then
+		maxDropdownHeight = 80
+	elseif maxDropdownHeight > 250 then
+		maxDropdownHeight = 250
+	end
+	local allowEmptyPrefix = opts.allowEmptyPrefix and true or false
+	local suggestionRowHeight = 20
+	local dropPad = 4
+	local scrollBarWidth = 18
+	local scrollBarGap = 2
 	local bound = false
 	local get, set
 	if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
 		bound = true
 		get, set = ResolveGetSet(opts)
+	end
+
+	local function TrimmedPrefix(prefix)
+		if type(prefix) ~= "string" then
+			return ""
+		end
+		if strtrim then
+			return strtrim(prefix)
+		end
+		return (prefix:match("^%s*(.-)%s*$")) or prefix
+	end
+
+	local function IsBlankPrefix(prefix)
+		return TrimmedPrefix(prefix) == ""
 	end
 
 	return section:AddRow(26, function(row)
@@ -4870,12 +4896,65 @@ function Controls:AddAutocomplete(section, opts)
 			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 		end
 
+		local scroll = CreateFrame("ScrollFrame", nil, drop, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+		scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -dropPad, dropPad)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local emptyLabel = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyLabel:SetPoint("TOPLEFT", content, "TOPLEFT", 6, -4)
+		emptyLabel:SetPoint("TOPRIGHT", content, "TOPRIGHT", -6, -4)
+		emptyLabel:SetJustifyH("LEFT")
+		emptyLabel:Hide()
+
 		local suggestionButtons = {}
 		local ignore = false
 		local resolvedValue = nil
+		local selectingSuggestion = false
 
 		local function HideDrop()
 			drop:Hide()
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(0)
+			end
+			local sb = scroll.ScrollBar
+			if sb and sb.SetValue then
+				sb:SetValue(0)
+			end
+		end
+
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then
+				return 0
+			end
+			if sb.SetShown then
+				sb:SetShown(show)
+			elseif show and sb.Show then
+				sb:Show()
+			elseif (not show) and sb.Hide then
+				sb:Hide()
+			end
+			if not show then
+				if scroll.SetVerticalScroll then
+					scroll:SetVerticalScroll(0)
+				end
+				if sb.SetValue then
+					sb:SetValue(0)
+				end
+				if sb.Disable then
+					sb:Disable()
+				end
+				return 0
+			end
+			if sb.Enable then
+				sb:Enable()
+			end
+			return sb.GetWidth and sb:GetWidth() or scrollBarWidth
 		end
 
 		local function NotifyResolved(item)
@@ -4889,6 +4968,9 @@ function Controls:AddAutocomplete(section, opts)
 			if not item then
 				return
 			end
+			-- Guard focus-loss hide so ClearFocus after click cannot race the
+			-- selection (dropdown click steals edit focus on Retail).
+			selectingSuggestion = true
 			ignore = true
 			local text = item.text or item.label or tostring(item.value or "")
 			edit:SetText(text)
@@ -4902,14 +4984,15 @@ function Controls:AddAutocomplete(section, opts)
 			NotifyResolved(item)
 			HideDrop()
 			edit:ClearFocus()
+			selectingSuggestion = false
 		end
 
 		local function EnsureSuggestionButton(i)
 			if suggestionButtons[i] then
 				return suggestionButtons[i]
 			end
-			local btn = CreateFrame("Button", nil, drop)
-			btn:SetHeight(20)
+			local btn = CreateFrame("Button", nil, content)
+			btn:SetHeight(suggestionRowHeight)
 			local fs = btn:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", btn, "LEFT", 6, 0)
 			fs:SetPoint("RIGHT", btn, "RIGHT", -6, 0)
@@ -4926,8 +5009,46 @@ function Controls:AddAutocomplete(section, opts)
 			btn:SetScript("OnLeave", function()
 				hl:Hide()
 			end)
+			-- MouseDown selects before EditBox focus-loss hide runs.
+			btn:SetScript("OnMouseDown", function()
+				selectingSuggestion = true
+			end)
 			suggestionButtons[i] = btn
 			return btn
+		end
+
+		local function LayoutDrop(contentHeight)
+			local fieldWidth = edit:GetWidth() or CONTROL_WIDTH
+			local innerHeight = math.max(suggestionRowHeight, contentHeight)
+			local frameHeight = math.min(innerHeight + (dropPad * 2), maxDropdownHeight)
+			local showScroll = (innerHeight + (dropPad * 2)) > maxDropdownHeight
+			drop:SetWidth(fieldWidth)
+			drop:SetHeight(frameHeight)
+			drop:ClearAllPoints()
+			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", 0, -2)
+			drop:SetPoint("TOPRIGHT", edit, "BOTTOMRIGHT", 0, -2)
+
+			local sbWidth = SetScrollBarShown(showScroll)
+			local rightInset = dropPad
+			if showScroll then
+				rightInset = dropPad + sbWidth + scrollBarGap
+				local sb = scroll.ScrollBar
+				if sb then
+					sb:ClearAllPoints()
+					sb:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -2, -(dropPad + 14))
+					sb:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -2, dropPad + 14)
+					if sb.SetWidth then
+						sb:SetWidth(scrollBarWidth)
+					end
+				end
+			end
+			scroll:ClearAllPoints()
+			scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+			scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -rightInset, dropPad)
+
+			local contentWidth = math.max(1, fieldWidth - dropPad - rightInset)
+			content:SetWidth(contentWidth)
+			content:SetHeight(math.max(1, innerHeight))
 		end
 
 		local function ShowSuggestions(prefix)
@@ -4936,33 +5057,59 @@ function Controls:AddAutocomplete(section, opts)
 				HideDrop()
 				return
 			end
-			local items = getSuggestions(prefix) or {}
-			if #items == 0 then
+			-- Default autocomplete UX: empty/whitespace focus does not open a
+			-- full-roster popup. Opt in with allowEmptyPrefix (e.g. attribution).
+			if IsBlankPrefix(prefix) and not allowEmptyPrefix then
 				HideDrop()
 				return
 			end
-			local width = edit:GetWidth() or CONTROL_WIDTH
-			local y = 4
+
+			local items = getSuggestions(prefix) or {}
 			local count = math.min(#items, maxSuggestions)
+			emptyLabel:Hide()
+
+			if count == 0 then
+				if IsBlankPrefix(prefix) then
+					HideDrop()
+					return
+				end
+				-- Nonempty query with no matches: compact empty state.
+				for i = 1, #suggestionButtons do
+					suggestionButtons[i]:Hide()
+				end
+				local emptyText = opts.emptySuggestionsText
+				if type(emptyText) ~= "string" or emptyText == "" then
+					emptyText = "No matches"
+				end
+				emptyLabel:SetText(emptyText)
+				emptyLabel:Show()
+				local emptyHeight = math.max(
+					suggestionRowHeight,
+					(emptyLabel.GetStringHeight and emptyLabel:GetStringHeight()) or suggestionRowHeight
+				) + 8
+				LayoutDrop(emptyHeight)
+				drop:Show()
+				return
+			end
+
+			local y = 0
 			for i = 1, count do
 				local item = items[i]
 				local btn = EnsureSuggestionButton(i)
 				btn:ClearAllPoints()
-				btn:SetPoint("TOPLEFT", drop, "TOPLEFT", 4, -y)
-				btn:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -4, -y)
+				btn:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+				btn:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 				btn.Text:SetText(item.label or item.text or tostring(item.value or ""))
 				btn:SetScript("OnClick", function()
 					SelectItem(item)
 				end)
 				btn:Show()
-				y = y + 20
+				y = y + suggestionRowHeight
 			end
 			for i = count + 1, #suggestionButtons do
 				suggestionButtons[i]:Hide()
 			end
-			drop:SetSize(width + 8, y + 4)
-			drop:ClearAllPoints()
-			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", -4, -2)
+			LayoutDrop(y)
 			drop:Show()
 		end
 
@@ -4987,9 +5134,16 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		edit:SetScript("OnEditFocusLost", function()
-			-- Delay hide so suggestion clicks register.
+			-- Delay hide so suggestion clicks register; skip while a suggestion
+			-- MouseDown/OnClick is in flight.
+			if selectingSuggestion then
+				return
+			end
 			if C_Timer and C_Timer.After then
 				C_Timer.After(0.15, function()
+					if selectingSuggestion then
+						return
+					end
 					if not edit:HasFocus() then
 						HideDrop()
 					end
@@ -5052,13 +5206,16 @@ function Controls:AddAutocomplete(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, { edit })
 			local c = enabled and 1 or 0.6
 			edit:SetTextColor(c, c, c)
-			if not enabled then
+			-- Clear / external refresh with blank text must dismiss suggestions.
+			if (not enabled) or (IsBlankPrefix(text) and not allowEmptyPrefix) then
 				HideDrop()
 			end
 		end
 
 		row.__sfAutocompleteEdit = edit
 		row.__sfAutocompleteHide = HideDrop
+		row.__sfAutocompleteDrop = drop
+		row.__sfAutocompleteShow = ShowSuggestions
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)

@@ -7081,22 +7081,24 @@ do
     assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "search: seed Carol under Alice")
 
     local roster = GI.GetRosterSnapshot(true)
-    local allCandidates = GI:GetListSearchCandidates(roster, "", 48)
-    local byGuid = guidSetFromRows(allCandidates)
-    assertTrue(byGuid["Player-1-Alice"] ~= nil, "search: empty prefix includes main Alice")
-    assertTrue(byGuid["Player-1-Bob"] ~= nil, "search: empty prefix includes alt Bob")
-    assertTrue(byGuid["Player-1-Dave"] ~= nil, "search: empty prefix includes unassigned Dave")
-    assertTrue(byGuid["Player-1-Carol"] ~= nil, "search: empty prefix includes alt Carol")
+    local emptyCandidates = GI:GetListSearchCandidates(roster, "", 48)
+    assertEq(#emptyCandidates, 0, "search: empty prefix yields no suggestions")
+    local wsCandidates = GI:GetListSearchCandidates(roster, "   ", 48)
+    assertEq(#wsCandidates, 0, "search: whitespace-only prefix yields no suggestions")
 
     local filtered = GI:GetListSearchCandidates(roster, "bo", 48)
     local filteredSet = guidSetFromRows(filtered)
     assertTrue(filteredSet["Player-1-Bob"] ~= nil, "search: prefix matches Bob")
     assertTrue(filteredSet["Player-2-Bob"] ~= nil, "search: prefix matches Bob-Area52")
     assertTrue(filteredSet["Player-1-Alice"] == nil, "search: prefix bo excludes Alice")
+    assertTrue(filteredSet["Player-1-Carol"] == nil, "search: prefix bo excludes Carol")
 
     local caseFiltered = GI:GetListSearchCandidates(roster, "AlIcE", 48)
     assertTrue(guidSetFromRows(caseFiltered)["Player-1-Alice"] ~= nil,
         "search: case-insensitive name match")
+
+    local noMatch = GI:GetListSearchCandidates(roster, "zzzz-nomatch", 48)
+    assertEq(#noMatch, 0, "search: unmatched prefix yields empty list")
 
     local mainGuid, highlight, status = GI:ResolveListSearchSelection("Player-1-Alice", roster)
     assertEq(status, "ok", "search: resolve main ok")
@@ -7126,10 +7128,10 @@ do
     roster = GI.GetRosterSnapshot(true)
     assertEq(GI.GetMembershipStatus("Player-1-Carol", roster), "departed", "search: Carol departed")
     assertEq(GI:GetCharacterRole("Player-1-Carol"), "alt", "search: departed Carol relationship retained")
-    local afterDepart = guidSetFromRows(GI:GetListSearchCandidates(roster, "", 48))
+    local afterDepart = guidSetFromRows(GI:GetListSearchCandidates(roster, "a", 48))
     assertTrue(afterDepart["Player-1-Carol"] == nil, "search: departed Carol hidden from candidates")
     assertTrue(afterDepart["Player-1-Bob"] ~= nil, "search: rostered Bob still searchable")
-    assertTrue(afterDepart["Player-1-Alice"] ~= nil, "search: Alice still searchable")
+    assertTrue(afterDepart["Player-1-Alice"] ~= nil, "search: Alice still searchable via nonempty prefix")
 
     -- Filtering/resolution must not mutate durable assignments.
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "search: resolve does not unassign Bob")
@@ -7166,14 +7168,24 @@ do
     assertTrue(dual ~= nil and dual.left and dual.right, "search ui: dual panels present")
     assertTrue(type(dual.left.onCopy) == "function", "search ui: Main onCopy wired")
     assertTrue(type(dual.right.onCopy) == "function", "search ui: Alts onCopy wired")
+    assertEq(search.maxDropdownHeight, 220, "search ui: dropdown height capped")
+    assertTrue(type(search.emptySuggestionsText) == "string" and search.emptySuggestionsText ~= "",
+        "search ui: empty-results copy configured")
+    assertTrue(not search.allowEmptyPrefix, "search ui: empty focus must not open suggestions")
 
     local beforeMains = #dual.left.getItems()
     assertTrue(beforeMains >= 2, "search ui: unfiltered Main list has multiple rows")
 
-    local suggestions = search.getSuggestions(nil, "")
+    assertEq(#(search.getSuggestions(nil, "") or {}), 0,
+        "search ui: empty prefix yields no suggestions")
+    assertEq(#(search.getSuggestions(nil, "   ") or {}), 0,
+        "search ui: whitespace prefix yields no suggestions")
+    local suggestions = search.getSuggestions(nil, "bo")
     local sugSet = guidSetFromRows(suggestions)
-    assertTrue(sugSet["Player-1-Alice"] ~= nil, "search ui: empty suggestions include Alice")
-    assertTrue(sugSet["Player-1-Bob"] ~= nil, "search ui: empty suggestions include Bob")
+    assertTrue(sugSet["Player-1-Bob"] ~= nil, "search ui: typed prefix includes Bob")
+    assertTrue(sugSet["Player-1-Alice"] == nil, "search ui: typed prefix excludes Alice")
+    assertEq(#(search.getSuggestions(nil, "zzzz-nomatch") or {}), 0,
+        "search ui: unmatched typed prefix is empty")
 
     local roleBefore = GI:GetCharacterRole("Player-1-Bob")
     search.onResolved(nil, {

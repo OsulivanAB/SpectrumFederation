@@ -596,13 +596,19 @@ end
 
 --- Assignments list-search candidates: visible mains + visible alts (#UI).
 -- Reuses GetEligibleMainDisplayRows / GetSelectedAltDisplayRows so departed
--- hiding and incomplete-roster safety stay identical to the panels. Optional
--- `prefix` filters case-insensitively by Name-Realm / short name. Empty prefix
--- returns the unfiltered candidate set (still capped by `limit`). Session UI
--- only — never mutates relationships.
+-- hiding and incomplete-roster safety stay identical to the panels. Requires a
+-- non-whitespace `prefix` (empty/whitespace ⇒ no suggestions, matching assign
+-- autocomplete). Filters case-insensitively by Name-Realm / short name and caps
+-- results by `limit`. Session UI only — never mutates relationships.
 function GI:GetListSearchCandidates(roster, prefix, limit)
     roster = roster or GI.GetRosterSnapshot()
     limit = math.max(1, math.min(tonumber(limit) or 48, 64))
+    local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
+    -- Autocomplete UX: do not dump the full roster on empty focus/clear.
+    if q == "" then
+        return {}, nil
+    end
+
     local mains, mainReason = GI:GetEligibleMainDisplayRows(roster)
     if mainReason == "generation_syncing" or mainReason == "roster_incomplete" then
         return {}, mainReason
@@ -611,11 +617,7 @@ function GI:GetListSearchCandidates(roster, prefix, limit)
         return {}, mainReason
     end
 
-    local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
     local function nameMatches(nameRealm)
-        if q == "" then
-            return true
-        end
         if type(nameRealm) ~= "string" then
             return false
         end
