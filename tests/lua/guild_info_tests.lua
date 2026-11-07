@@ -7051,6 +7051,214 @@ do
     pass("472 suggestion readiness reuse / empty-record / solo-main")
 end
 
+---------------------------------------------------------------------------
+-- Assignments list search + hover-copy wiring (session UI only)
+---------------------------------------------------------------------------
+
+local function findListSearchControls(def)
+    local search, clearBtn, dual
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "autocomplete" and item.label == "Find character" then
+                search = item
+            end
+            if item.type == "button" and item.buttonText == "Clear" then
+                clearBtn = item
+            end
+            if item.type == "sideBySideScrollLists" then
+                dual = item
+            end
+        end
+    end
+    return search, clearBtn, dual
+end
+
+do
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "search: seed Bob under Alice")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "search: seed Carol under Alice")
+
+    local roster = GI.GetRosterSnapshot(true)
+    local allCandidates = GI:GetListSearchCandidates(roster, "", 48)
+    local byGuid = guidSetFromRows(allCandidates)
+    assertTrue(byGuid["Player-1-Alice"] ~= nil, "search: empty prefix includes main Alice")
+    assertTrue(byGuid["Player-1-Bob"] ~= nil, "search: empty prefix includes alt Bob")
+    assertTrue(byGuid["Player-1-Dave"] ~= nil, "search: empty prefix includes unassigned Dave")
+    assertTrue(byGuid["Player-1-Carol"] ~= nil, "search: empty prefix includes alt Carol")
+
+    local filtered = GI:GetListSearchCandidates(roster, "bo", 48)
+    local filteredSet = guidSetFromRows(filtered)
+    assertTrue(filteredSet["Player-1-Bob"] ~= nil, "search: prefix matches Bob")
+    assertTrue(filteredSet["Player-2-Bob"] ~= nil, "search: prefix matches Bob-Area52")
+    assertTrue(filteredSet["Player-1-Alice"] == nil, "search: prefix bo excludes Alice")
+
+    local caseFiltered = GI:GetListSearchCandidates(roster, "AlIcE", 48)
+    assertTrue(guidSetFromRows(caseFiltered)["Player-1-Alice"] ~= nil,
+        "search: case-insensitive name match")
+
+    local mainGuid, highlight, status = GI:ResolveListSearchSelection("Player-1-Alice", roster)
+    assertEq(status, "ok", "search: resolve main ok")
+    assertEq(mainGuid, "Player-1-Alice", "search: main resolves to self")
+    assertNil(highlight, "search: main has no alt highlight")
+
+    mainGuid, highlight, status = GI:ResolveListSearchSelection("Player-1-Bob", roster)
+    assertEq(status, "ok", "search: resolve alt ok")
+    assertEq(mainGuid, "Player-1-Alice", "search: alt resolves to Alice")
+    assertEq(highlight, "Player-1-Bob", "search: alt highlights Bob")
+
+    mainGuid, highlight, status = GI:ResolveListSearchSelection("Player-1-Dave", roster)
+    assertEq(status, "ok", "search: unassigned resolves ok")
+    assertEq(mainGuid, "Player-1-Dave", "search: unassigned focuses self as main")
+    assertNil(highlight, "search: unassigned has no alt highlight")
+
+    -- Departed alt stays in backend but is omitted from search candidates.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Carol" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    roster = GI.GetRosterSnapshot(true)
+    assertEq(GI.GetMembershipStatus("Player-1-Carol", roster), "departed", "search: Carol departed")
+    assertEq(GI:GetCharacterRole("Player-1-Carol"), "alt", "search: departed Carol relationship retained")
+    local afterDepart = guidSetFromRows(GI:GetListSearchCandidates(roster, "", 48))
+    assertTrue(afterDepart["Player-1-Carol"] == nil, "search: departed Carol hidden from candidates")
+    assertTrue(afterDepart["Player-1-Bob"] ~= nil, "search: rostered Bob still searchable")
+    assertTrue(afterDepart["Player-1-Alice"] ~= nil, "search: Alice still searchable")
+
+    -- Filtering/resolution must not mutate durable assignments.
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "search: resolve does not unassign Bob")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "search: Bob remains under Alice after resolve")
+
+    restoreBaseRoster()
+    pass("list search candidates/resolve/departed-hide/no-mutation")
+end
+
+do
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "search ui: seed Bob")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "search ui: seed Carol")
+
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    local capturedCopy
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.ShowCopyableText = function(_, message, copyText, closeText)
+        capturedCopy = { message = message, copyText = copyText, closeText = closeText }
+        return true
+    end
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) if accept then accept() end end
+
+    page:Build(panel)
+    local def = panel.__sfPageDef
+    local search, clearBtn, dual = findListSearchControls(def)
+    assertTrue(search ~= nil, "search ui: Find character autocomplete present")
+    assertTrue(clearBtn ~= nil, "search ui: Clear button present")
+    assertTrue(dual ~= nil and dual.left and dual.right, "search ui: dual panels present")
+    assertTrue(type(dual.left.onCopy) == "function", "search ui: Main onCopy wired")
+    assertTrue(type(dual.right.onCopy) == "function", "search ui: Alts onCopy wired")
+
+    local beforeMains = #dual.left.getItems()
+    assertTrue(beforeMains >= 2, "search ui: unfiltered Main list has multiple rows")
+
+    local suggestions = search.getSuggestions(nil, "")
+    local sugSet = guidSetFromRows(suggestions)
+    assertTrue(sugSet["Player-1-Alice"] ~= nil, "search ui: empty suggestions include Alice")
+    assertTrue(sugSet["Player-1-Bob"] ~= nil, "search ui: empty suggestions include Bob")
+
+    local roleBefore = GI:GetCharacterRole("Player-1-Bob")
+    search.onResolved(nil, {
+        guid = "Player-1-Bob",
+        nameRealm = "Bob-Garona",
+        classFile = "WARRIOR",
+    })
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), roleBefore,
+        "search ui: selecting search hit does not mutate relationships")
+    assertEq(dual.left.getSelectedKey(), "Player-1-Alice", "search ui: selects associated main")
+    local filteredMains = dual.left.getItems()
+    assertEq(#filteredMains, 1, "search ui: Main list filtered to one")
+    assertEq(filteredMains[1].guid, "Player-1-Alice", "search ui: filtered main is Alice")
+    assertEq(dual.right.getSelectedKey(), "Player-1-Bob", "search ui: highlights selected alt")
+    local altItems = dual.right.getItems()
+    local altSet = guidSetFromRows(altItems)
+    assertTrue(altSet["Player-1-Bob"] ~= nil, "search ui: Bob still listed under Alice")
+    assertTrue(altSet["Player-1-Carol"] ~= nil, "search ui: sibling Carol still listed")
+
+    -- Clear restores full Main list; selection may remain on Alice.
+    assertTrue(clearBtn.enabled(), "search ui: Clear enabled while filtered")
+    clearBtn.onClick()
+    assertEq(#dual.left.getItems(), beforeMains, "search ui: Clear restores full Main list")
+    assertNil(dual.right.getSelectedKey(), "search ui: Clear drops alt highlight")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "search ui: Clear does not mutate Bob")
+    assertTrue(not clearBtn.enabled(), "search ui: Clear disabled after clear")
+
+    -- Selecting a main via search focuses that main with no alt highlight.
+    search.onResolved(nil, {
+        guid = "Player-1-Alice",
+        nameRealm = "Alice-Garona",
+        classFile = "MAGE",
+    })
+    assertEq(#dual.left.getItems(), 1, "search ui: main selection filters Main list")
+    assertNil(dual.right.getSelectedKey(), "search ui: main selection has no alt highlight")
+
+    -- Unassigned character focuses alone with empty alts.
+    clearBtn.onClick()
+    search.onResolved(nil, {
+        guid = "Player-1-Dave",
+        nameRealm = "Dave-Garona",
+        classFile = "HUNTER",
+    })
+    filteredMains = dual.left.getItems()
+    assertEq(#filteredMains, 1, "search ui: unassigned filters to one main")
+    assertEq(filteredMains[1].guid, "Player-1-Dave", "search ui: unassigned focuses Dave")
+    assertEq(#dual.right.getItems(), 0, "search ui: unassigned has no alts")
+
+    clearBtn.onClick()
+    dual.left.onSelect(nil, { guid = "Player-1-Alice", clusterId = "Player-1-Alice" })
+    capturedCopy = nil
+    dual.left.onCopy({ section = { SetMessage = function() end } }, {
+        guid = "Player-1-Alice",
+        nameRealm = "Alice-Garona",
+    })
+    assertTrue(capturedCopy ~= nil, "search ui: Main copy opens dialog")
+    assertEq(capturedCopy.copyText, "Alice-Garona", "search ui: Main copy uses Name-Realm")
+    assertTrue(type(capturedCopy.message) == "string" and capturedCopy.message:find("Ctrl%+C", 1) ~= nil,
+        "search ui: copy prompt mentions Ctrl+C")
+
+    capturedCopy = nil
+    dual.right.onCopy({ section = { SetMessage = function() end } }, {
+        guid = "Player-1-Bob",
+        nameRealm = "Bob-Garona",
+        role = "alt",
+        mainGuid = "Player-1-Alice",
+    })
+    assertEq(capturedCopy.copyText, "Bob-Garona", "search ui: Alts copy uses Name-Realm")
+
+    -- Typing-only does not filter lists until selection.
+    clearBtn.onClick()
+    dual.left.onSelect(nil, { guid = "Player-1-Alice", clusterId = "Player-1-Alice" })
+    local mainsBeforeType = #dual.left.getItems()
+    search.onTextChanged(nil, "bo")
+    assertEq(#dual.left.getItems(), mainsBeforeType,
+        "search ui: typing alone does not filter Main list")
+
+    page:OnHide()
+    assertEq(#dual.left.getItems(), beforeMains,
+        "search ui: OnHide clears search filter")
+
+    restoreBaseRoster()
+    pass("list search UI select/clear/copy/no-mutation")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

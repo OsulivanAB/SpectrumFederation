@@ -157,6 +157,8 @@ Schema-2 (epochless) wires are rejected. Remote admission requires a transport-a
 | `GI:GetAssignmentDisplayRows(roster)` | Legacy grouped Settings rows with membership status |
 | `GI:GetEligibleMainDisplayRows(roster)` | Two-panel Main list: rostered non-alts (hides departed; incomplete roster yields no rows) |
 | `GI:GetSelectedAltDisplayRows(mainGuid, roster)` | Two-panel Alts list for one main (rostered alts only; departed hidden) |
+| `GI:GetListSearchCandidates(roster[, prefix[, limit]])` | Session UI search pool: visible mains + visible alts (same departed hide) |
+| `GI:ResolveListSearchSelection(guid[, roster])` | Map a search hit to `mainGuid` + optional alt highlight; no mutations |
 | `GI.CountRetainedState([record])` | Bound diagnostics (members/groups/tombstones) |
 
 Future Loot Helper / Guild Supplies integration may **read** these APIs. They must not become the authority for those systems in this ticket.
@@ -167,6 +169,8 @@ Future Loot Helper / Guild Supplies integration may **read** these APIs. They mu
 
 - Class-colored roster autocomplete (offline-inclusive), snapshot refreshed on roster/guild events while visible. Main and Alt fields filter suggestions by current Guild Info role before the visible-results cap (#470).
 - Assignments uses two side-by-side scroll panels (**Main** / **Alts**). Main lists every rostered non-alt (including characters with no alts) and hides confirmed departed mains. Alts shows the selected main's currently rostered alts with promote (up-arrow → existing `ChangeMain`) and unassign (X) controls for editors. Departed relationships stay in backend state.
+- Assignments **Find character** search is session-only UI state: suggestions reuse the same visible Main/Alt projections (departed remain hidden), selecting a main or alt focuses that main's group (alts highlight when an alt was chosen), and Clear restores the full Main list without mutating relationships, persistence, or Gossip.
+- Hover **Copy Name-Realm** icons on Main/Alt rows open a highlighted EditBox dialog for Ctrl+C. Retail protects `CopyToClipboard()` from addons, so the dialog is the supported copy path.
 - Feedback via section banners only (no normal game Chat).
 
 ## Validation

@@ -2192,6 +2192,9 @@ function Controls:AddSideBySideScrollLists(section, opts)
 			local hasActionSupport = type(listOpts.onAction) == "function"
 				or type(listOpts.actionAtlas) == "string"
 				or type(listOpts.actionTexture) == "string"
+			local hasCopySupport = type(listOpts.onCopy) == "function"
+			local copyButtonSize = listOpts.copyButtonSize or 16
+			local copyColumnGap = listOpts.copyColumnGap or removeColumnGap
 			local borderInset = 4
 
 			local box = CreateFrame("Frame", nil, host, "BackdropTemplate")
@@ -2319,6 +2322,21 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Action = action
 				end
 
+				if hasCopySupport then
+					-- Always allocated so showing on hover never shifts text/layout.
+					local copy = CreateIconButton(
+						r,
+						listOpts.copyAtlas,
+						copyButtonSize,
+						listOpts.copyTexture or "Interface\\Buttons\\UI-GuildButton-PublicNote-Up"
+					)
+					local copyAnchor = r.Action or remove
+					copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
+					copy:SetAlpha(0)
+					copy:EnableMouse(true)
+					r.Copy = copy
+				end
+
 				listRows[i] = r
 				return r
 			end
@@ -2397,6 +2415,10 @@ function Controls:AddSideBySideScrollLists(section, opts)
 				if hasActionSupport then
 					trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
 				end
+				if hasCopySupport then
+					-- Reserve space even while alpha=0 so hover cannot reflow text.
+					trailingReserve = trailingReserve + copyButtonSize + copyColumnGap
+				end
 				local compactTextWidth = maxTextWidth + compactTextPadding
 				if compactColumns and availableWidth > 0 then
 					compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - trailingReserve - 8))
@@ -2409,6 +2431,9 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Remove:ClearAllPoints()
 					if r.Action then
 						r.Action:ClearAllPoints()
+					end
+					if r.Copy then
+						r.Copy:ClearAllPoints()
 					end
 
 					local canRemove = item.canRemove and true or false
@@ -2454,7 +2479,56 @@ function Controls:AddSideBySideScrollLists(section, opts)
 						end
 					end
 
-					local itemKey = item.clusterId or item.id or item.key or i
+					if r.Copy then
+						-- Keep the button shown (layout reserved) but invisible until hover.
+						r.Copy:Show()
+						r.Copy:SetAlpha(0)
+						r.Copy:EnableMouse(enabled and true or false)
+						r.Copy:SetScript("OnClick", function()
+							if not enabled then return end
+							if listOpts.onCopy then
+								listOpts.onCopy(item)
+							end
+						end)
+						local copyTip = listOpts.copyTooltip
+						if type(copyTip) == "function" then
+							local ok, value = pcall(copyTip, item)
+							copyTip = ok and value or nil
+						end
+						if type(copyTip) ~= "string" or copyTip == "" then
+							copyTip = "Copy name"
+						end
+						r.Copy:SetScript("OnEnter", function(self)
+							self:SetAlpha(1)
+							if GameTooltip then
+								GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+								GameTooltip:SetText(copyTip, 1, 1, 1)
+								GameTooltip:Show()
+							end
+						end)
+						r.Copy:SetScript("OnLeave", function(self)
+							if GameTooltip then
+								GameTooltip:Hide()
+							end
+							if not (r.IsMouseOver and r:IsMouseOver()) then
+								self:SetAlpha(0)
+							end
+						end)
+						r:SetScript("OnEnter", function()
+							if r.Copy then
+								r.Copy:SetAlpha(1)
+							end
+						end)
+						r:SetScript("OnLeave", function()
+							if r.Copy and not (r.Copy.IsMouseOver and r.Copy:IsMouseOver()) then
+								r.Copy:SetAlpha(0)
+							end
+						end)
+					end
+
+					-- Prefer guid so Alts-panel rows can highlight a single alt
+					-- without selecting every sibling that shares clusterId/mainGuid.
+					local itemKey = item.guid or item.clusterId or item.id or item.key or i
 					local isSelected = selectedKey ~= nil and selectedKey == itemKey
 					if r.Selected then
 						if isSelected then r.Selected:Show() else r.Selected:Hide() end
@@ -2472,6 +2546,10 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
 					if r.Action then
 						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
+					if r.Copy then
+						local copyAnchor = r.Action or r.Remove
+						r.Copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
 					end
 					r.Text:SetPoint("LEFT", r, "LEFT", 4, 0)
 					if compactColumns and availableWidth > 0 then
@@ -4740,7 +4818,9 @@ end
 -- @return Frame The created row
 function Controls:AddAutocomplete(section, opts)
 	opts = opts or {}
-	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 16))
+	-- Cap raised to 64 so Assignments list-search can offer a fuller unfiltered
+	-- dropdown; assign fields should keep a small explicit maxSuggestions.
+	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 64))
 	local bound = false
 	local get, set
 	if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
