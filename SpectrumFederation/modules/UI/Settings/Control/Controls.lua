@@ -4916,14 +4916,33 @@ function Controls:AddAutocomplete(section, opts)
 		local resolvedValue = nil
 		local selectingSuggestion = false
 
-		local function HideDrop()
-			drop:Hide()
+		local function ResetSuggestionScroll()
 			if scroll.SetVerticalScroll then
 				scroll:SetVerticalScroll(0)
 			end
 			local sb = scroll.ScrollBar
 			if sb and sb.SetValue then
 				sb:SetValue(0)
+			end
+		end
+
+		local function HideDrop()
+			drop:Hide()
+			ResetSuggestionScroll()
+		end
+
+		-- Clear the MouseDown selection guard. Used after a completed click and
+		-- after a cancelled press (drag off / release without OnClick).
+		local function ClearSelectingSuggestion(hideIfUnfocused)
+			if not selectingSuggestion then
+				if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+					HideDrop()
+				end
+				return
+			end
+			selectingSuggestion = false
+			if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+				HideDrop()
 			end
 		end
 
@@ -4940,12 +4959,7 @@ function Controls:AddAutocomplete(section, opts)
 				sb:Hide()
 			end
 			if not show then
-				if scroll.SetVerticalScroll then
-					scroll:SetVerticalScroll(0)
-				end
-				if sb.SetValue then
-					sb:SetValue(0)
-				end
+				ResetSuggestionScroll()
 				if sb.Disable then
 					sb:Disable()
 				end
@@ -5009,9 +5023,22 @@ function Controls:AddAutocomplete(section, opts)
 			btn:SetScript("OnLeave", function()
 				hl:Hide()
 			end)
-			-- MouseDown selects before EditBox focus-loss hide runs.
+			-- MouseDown arms the focus-loss guard before EditBox blur runs.
 			btn:SetScript("OnMouseDown", function()
 				selectingSuggestion = true
+			end)
+			-- MouseUp always follows a press, even when the pointer is released
+			-- outside the button (no OnClick). Defer so a successful OnClick /
+			-- SelectItem can clear the guard first in the same release.
+			btn:SetScript("OnMouseUp", function()
+				local function afterRelease()
+					ClearSelectingSuggestion(true)
+				end
+				if C_Timer and C_Timer.After then
+					C_Timer.After(0, afterRelease)
+				else
+					afterRelease()
+				end
 			end)
 			suggestionButtons[i] = btn
 			return btn
@@ -5067,6 +5094,9 @@ function Controls:AddAutocomplete(section, opts)
 			local items = getSuggestions(prefix) or {}
 			local count = math.min(#items, maxSuggestions)
 			emptyLabel:Hide()
+			-- Always restart at the top when suggestion contents change so a
+			-- scrolled large set cannot hide leading matches of the next query.
+			ResetSuggestionScroll()
 
 			if count == 0 then
 				if IsBlankPrefix(prefix) then
@@ -5134,21 +5164,22 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		edit:SetScript("OnEditFocusLost", function()
-			-- Delay hide so suggestion clicks register; skip while a suggestion
-			-- MouseDown/OnClick is in flight.
-			if selectingSuggestion then
-				return
-			end
+			-- Delay hide so suggestion clicks register. The selectingSuggestion
+			-- guard is self-clearing: a cancelled MouseDown (no OnClick) must
+			-- not leave it true forever and pin the UIParent dropdown open.
 			if C_Timer and C_Timer.After then
 				C_Timer.After(0.15, function()
 					if selectingSuggestion then
-						return
+						-- Press still in flight or cancelled without MouseUp;
+						-- clear the guard and dismiss if focus did not return.
+						selectingSuggestion = false
 					end
 					if not edit:HasFocus() then
 						HideDrop()
 					end
 				end)
 			else
+				selectingSuggestion = false
 				HideDrop()
 			end
 			if bound then
@@ -5216,6 +5247,8 @@ function Controls:AddAutocomplete(section, opts)
 		row.__sfAutocompleteHide = HideDrop
 		row.__sfAutocompleteDrop = drop
 		row.__sfAutocompleteShow = ShowSuggestions
+		row.__sfAutocompleteScroll = scroll
+		row.__sfAutocompleteResetScroll = ResetSuggestionScroll
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)

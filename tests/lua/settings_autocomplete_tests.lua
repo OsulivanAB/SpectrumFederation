@@ -37,6 +37,36 @@ strtrim = strtrim or function(s)
     return (tostring(s or ""):match("^%s*(.-)%s*$")) or ""
 end
 
+-- Deferred timers so focus-loss delay and MouseUp After(0) ordering can be tested.
+local timerQueue = {}
+C_Timer = {
+    After = function(delay, fn)
+        if type(fn) == "function" then
+            timerQueue[#timerQueue + 1] = { delay = tonumber(delay) or 0, fn = fn }
+        end
+    end,
+}
+local function flushTimers(maxDelay)
+    maxDelay = tonumber(maxDelay) or math.huge
+    local keep = {}
+    local run = {}
+    for i = 1, #timerQueue do
+        local entry = timerQueue[i]
+        if entry.delay <= maxDelay then
+            run[#run + 1] = entry
+        else
+            keep[#keep + 1] = entry
+        end
+    end
+    table.sort(run, function(a, b)
+        return a.delay < b.delay
+    end)
+    timerQueue = keep
+    for i = 1, #run do
+        run[i].fn()
+    end
+end
+
 local created = {}
 
 local function makeRegion(objectType, name, parent, template)
@@ -55,6 +85,8 @@ local function makeRegion(objectType, name, parent, template)
         _alpha = 1,
         _children = {},
         focused = false,
+        _scroll = 0,
+        _value = 0,
         ScrollBar = nil,
         scrollChild = nil,
         Instructions = nil,
@@ -160,7 +192,18 @@ local function makeRegion(objectType, name, parent, template)
     function region:SetScrollChild(child)
         self.scrollChild = child
     end
-    function region:SetVerticalScroll() end
+    function region:SetVerticalScroll(v)
+        self._scroll = tonumber(v) or 0
+    end
+    function region:GetVerticalScroll()
+        return self._scroll or 0
+    end
+    function region:SetValue(v)
+        self._value = tonumber(v) or 0
+    end
+    function region:GetValue()
+        return self._value or 0
+    end
     function region:SetJustifyH() end
     function region:SetWordWrap() end
     function region:GetStringHeight()
@@ -203,7 +246,6 @@ local function makeRegion(objectType, name, parent, template)
         function region.ScrollBar:IsShown()
             return self._shown
         end
-        function region.ScrollBar:SetValue() end
         function region.ScrollBar:Enable() end
         function region.ScrollBar:Disable() end
     end
@@ -412,6 +454,105 @@ end
 assertTrue(clicked, "suggestion button clicked")
 assertTrue(not drop:IsShown(), "selecting a suggestion closes dropdown")
 assertTrue(resolved ~= nil and resolved.value == "Player01-Garona", "selection resolves chosen character")
+flushTimers() -- drain deferred MouseUp / focus-loss work from the click
+
+local scrollFrame = nil
+for i = 1, #created do
+    local obj = created[i]
+    if obj.__sfAutocompleteScroll then
+        scrollFrame = obj.__sfAutocompleteScroll
+        break
+    end
+end
+assertTrue(scrollFrame ~= nil, "autocomplete scroll frame exposed on row")
+
+local function findSuggestionButton(label)
+    for i = 1, #created do
+        local obj = created[i]
+        if obj.objectType == "Button" and obj.Text then
+            local text = tostring(obj.Text._text or (obj.Text.GetText and obj.Text:GetText()) or "")
+            if text == label and obj._scripts.OnMouseDown then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+-- Cancelled suggestion press: MouseDown then MouseUp without OnClick must not
+-- leave selectingSuggestion stuck (dropdown must dismiss when unfocused).
+resolved = nil
+edit:TypeText("Player02")
+assertTrue(drop:IsShown(), "cancelled-click setup opens dropdown")
+local cancelBtn = findSuggestionButton("Player02-Garona")
+assertTrue(cancelBtn ~= nil, "cancelled-click target suggestion exists")
+cancelBtn._scripts.OnMouseDown(cancelBtn)
+edit:ClearFocus()
+assertTrue(not edit:HasFocus(), "edit loses focus after cancelled press starts")
+-- Release outside the button (no OnClick). Deferred MouseUp clears the guard.
+cancelBtn._scripts.OnMouseUp(cancelBtn)
+flushTimers(0)
+assertTrue(not drop:IsShown(), "cancelled suggestion press dismisses dropdown after MouseUp")
+assertTrue(resolved == nil, "cancelled suggestion press does not resolve")
+
+-- Focus-loss path also clears a stuck guard even if MouseUp never fired.
+edit:TypeText("Player03")
+assertTrue(drop:IsShown(), "focus-loss cancel setup opens dropdown")
+local stuckBtn = findSuggestionButton("Player03-Garona")
+assertTrue(stuckBtn ~= nil, "focus-loss cancel target exists")
+stuckBtn._scripts.OnMouseDown(stuckBtn)
+edit:ClearFocus()
+flushTimers(0.15)
+assertTrue(not drop:IsShown(), "focus-loss timer dismisses after cancelled MouseDown without MouseUp")
+
+-- Normal selection still works after a cancelled press.
+resolved = nil
+edit:TypeText("Player04")
+assertTrue(drop:IsShown(), "normal selection reopen after cancelled press")
+local okBtn = findSuggestionButton("Player04-Garona")
+assertTrue(okBtn ~= nil, "normal selection target exists")
+okBtn._scripts.OnMouseDown(okBtn)
+okBtn:Click()
+if okBtn._scripts.OnMouseUp then
+    okBtn._scripts.OnMouseUp(okBtn)
+end
+flushTimers()
+assertTrue(not drop:IsShown(), "normal selection closes dropdown after cancelled-press sequence")
+assertTrue(resolved ~= nil and resolved.value == "Player04-Garona", "normal selection resolves after cancelled-press sequence")
+
+-- Scroll position resets when suggestion results change.
+edit:TypeText("player")
+assertTrue(drop:IsShown(), "scroll-reset large list opens")
+assertTrue(scrollFrame.ScrollBar and scrollFrame.ScrollBar:IsShown(), "large list shows scrollbar")
+scrollFrame:SetVerticalScroll(120)
+scrollFrame.ScrollBar:SetValue(120)
+assertEq(scrollFrame:GetVerticalScroll(), 120, "scroll primed away from top")
+
+-- large → large (still overflowing; "playe" still matches all 40)
+edit:TypeText("playe")
+assertEq(scrollFrame:GetVerticalScroll(), 0, "large-to-large resets vertical scroll")
+assertEq(scrollFrame.ScrollBar:GetValue(), 0, "large-to-large resets scrollbar value")
+assertTrue(scrollFrame.ScrollBar:IsShown(), "large-to-large keeps scrollbar")
+assertTrue((drop:GetHeight() or 0) <= 220, "large-to-large keeps height cap")
+
+-- large → small (fits without scrollbar)
+scrollFrame:SetVerticalScroll(80)
+scrollFrame.ScrollBar:SetValue(80)
+edit:TypeText("Player01")
+assertEq(scrollFrame:GetVerticalScroll(), 0, "large-to-small resets vertical scroll")
+assertEq(scrollFrame.ScrollBar:GetValue(), 0, "large-to-small resets scrollbar value")
+assertTrue(not scrollFrame.ScrollBar:IsShown(), "large-to-small hides scrollbar")
+assertTrue(drop:IsShown(), "large-to-small keeps dropdown open")
+
+-- large → no results
+edit:TypeText("player")
+scrollFrame:SetVerticalScroll(90)
+scrollFrame.ScrollBar:SetValue(90)
+edit:TypeText("zzzz-nomatch")
+assertEq(scrollFrame:GetVerticalScroll(), 0, "large-to-empty resets vertical scroll")
+assertEq(scrollFrame.ScrollBar:GetValue(), 0, "large-to-empty resets scrollbar value")
+assertTrue(drop:IsShown(), "large-to-empty keeps empty-results dropdown")
+assertTrue((drop:GetHeight() or 0) <= 220, "large-to-empty stays height-capped")
 
 -- allowEmptyPrefix still supports Guild Supplies-style empty menus.
 created = {}
