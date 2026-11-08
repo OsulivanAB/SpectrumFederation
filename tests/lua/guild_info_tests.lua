@@ -7263,12 +7263,162 @@ do
     assertEq(#dual.left.getItems(), mainsBeforeType,
         "search ui: typing alone does not filter Main list")
 
-    page:OnHide()
-    assertEq(#dual.left.getItems(), beforeMains,
-        "search ui: OnHide clears search filter")
-
     restoreBaseRoster()
     pass("list search UI select/clear/copy/no-mutation")
+end
+
+do
+    -- Search pool rebuild is bounded: one build per roster/relationship fingerprint,
+    -- not per group or per keystroke. Invalidate on roster/relationship change.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "search pool: seed Bob")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "search pool: seed Carol")
+    assertEq(assign("Dave-Garona", "Eve-Garona"), "accepted", "search pool: seed Dave/Eve")
+
+    GI.InvalidateRosterSnapshot()
+    GI.ResetListSearchPoolRebuildCount()
+    local groupsCalls = 0
+    local altRowsCalls = 0
+    local origGroups = GI.GetRelationshipGroups
+    local origAltRows = GI.GetSelectedAltDisplayRows
+    GI.GetRelationshipGroups = function(self, ...)
+        groupsCalls = groupsCalls + 1
+        return origGroups(self, ...)
+    end
+    GI.GetSelectedAltDisplayRows = function(self, ...)
+        altRowsCalls = altRowsCalls + 1
+        return origAltRows(self, ...)
+    end
+
+    local first = GI:GetListSearchCandidates(GI.GetRosterSnapshot(true), "a", 48)
+    local rebuildsAfterFirst = GI.GetListSearchPoolRebuildCount()
+    local groupsAfterFirst = groupsCalls
+    assertTrue(rebuildsAfterFirst >= 1, "search pool: first query builds pool")
+    assertTrue(#first >= 2, "search pool: first query returns matches")
+    assertEq(altRowsCalls, 0,
+        "search pool: keystroke path does not call GetSelectedAltDisplayRows")
+
+    groupsCalls = 0
+    local second = GI:GetListSearchCandidates(GI.GetRosterSnapshot(true), "bo", 48)
+    local third = GI:GetListSearchCandidates(GI.GetRosterSnapshot(true), "ca", 48)
+    assertEq(GI.GetListSearchPoolRebuildCount(), rebuildsAfterFirst,
+        "search pool: subsequent keystrokes reuse pool")
+    assertTrue(guidSetFromRows(second)["Player-1-Bob"] ~= nil, "search pool: reuse still filters Bob")
+    assertTrue(guidSetFromRows(third)["Player-1-Carol"] ~= nil, "search pool: reuse still filters Carol")
+    -- Cache-key check may peek relationships once per query, but must not scale
+    -- with relationship group count (2 groups here ⇒ would be ≥2 per call before).
+    assertTrue(groupsCalls <= 3,
+        "search pool: relationship peeks bounded across keystrokes got=" .. tostring(groupsCalls))
+    assertEq(altRowsCalls, 0, "search pool: still no per-group alt projection calls")
+
+    -- Roster invalidation forces rebuild.
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local beforeInvalidateRebuilds = GI.GetListSearchPoolRebuildCount()
+    local afterInvalidate = GI:GetListSearchCandidates(GI.GetRosterSnapshot(true), "a", 48)
+    assertTrue(GI.GetListSearchPoolRebuildCount() > beforeInvalidateRebuilds,
+        "search pool: roster invalidate rebuilds pool")
+    assertTrue(#afterInvalidate >= 1, "search pool: rebuilt pool still searchable")
+
+    -- Relationship mutation without roster invalidate also rebuilds (revision key).
+    local beforeAssignRebuilds = GI.GetListSearchPoolRebuildCount()
+    assertEq(assign("Alice-Garona", "Bob-Area52"), "accepted", "search pool: new assignment")
+    -- Bob-Area52 guid is Player-2-Bob
+    local afterAssign = GI:GetListSearchCandidates(GI.GetRosterSnapshot(true), "bob-area", 48)
+    assertTrue(GI.GetListSearchPoolRebuildCount() > beforeAssignRebuilds,
+        "search pool: relationship change rebuilds pool")
+    assertTrue(guidSetFromRows(afterAssign)["Player-2-Bob"] ~= nil,
+        "search pool: rebuilt pool includes newly assigned alt")
+
+    GI.GetRelationshipGroups = origGroups
+    GI.GetSelectedAltDisplayRows = origAltRows
+    restoreBaseRoster()
+    pass("list search pool rebuild bounds and invalidation")
+end
+
+do
+    -- Real panel Hide/Show lifecycle resets search without refreshing while hidden.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "search hide: seed Bob")
+
+    local page = ensureSettingsPageLoaded()
+    local hooks = {}
+    local panel = {
+        _visible = true,
+        __sfPageDef = nil,
+        IsVisible = function(self)
+            return self._visible and true or false
+        end,
+        HookScript = function(self, ev, fn)
+            hooks[ev] = hooks[ev] or {}
+            hooks[ev][#hooks[ev] + 1] = fn
+        end,
+        Show = function(self)
+            self._visible = true
+            for i = 1, #(hooks.OnShow or {}) do
+                hooks.OnShow[i](self)
+            end
+        end,
+        Hide = function(self)
+            self._visible = false
+            for i = 1, #(hooks.OnHide or {}) do
+                hooks.OnHide[i](self)
+            end
+        end,
+    }
+
+    local refreshCount = 0
+    local origRefresh = page.Refresh
+    page.Refresh = function(self, ...)
+        refreshCount = refreshCount + 1
+        return origRefresh(self, ...)
+    end
+
+    page:Build(panel)
+    assertTrue(type(hooks.OnHide) == "table" and #hooks.OnHide >= 1,
+        "search hide: panel OnHide hook installed")
+    assertTrue(type(hooks.OnShow) == "table" and #hooks.OnShow >= 1,
+        "search hide: panel OnShow hook installed")
+
+    local def = panel.__sfPageDef
+    local search, clearBtn, dual = findListSearchControls(def)
+    assertTrue(search ~= nil and dual ~= nil, "search hide: controls present")
+    local beforeMains = #dual.left.getItems()
+
+    search.onResolved(nil, {
+        guid = "Player-1-Bob",
+        nameRealm = "Bob-Garona",
+        classFile = "WARRIOR",
+    })
+    assertEq(#dual.left.getItems(), 1, "search hide: filtered before navigate")
+    assertEq(dual.right.getSelectedKey(), "Player-1-Bob", "search hide: alt highlighted before navigate")
+    assertTrue(clearBtn.enabled(), "search hide: Clear enabled before navigate")
+
+    local refreshesBeforeHide = refreshCount
+    panel:Hide()
+    assertEq(refreshCount, refreshesBeforeHide,
+        "search hide: panel Hide does not refresh while hidden")
+    assertEq(#dual.left.getItems(), beforeMains,
+        "search hide: Hide clears Main filter via panel OnHide")
+    assertNil(dual.right.getSelectedKey(), "search hide: Hide clears alt highlight")
+    assertTrue(not clearBtn.enabled(), "search hide: Clear disabled after Hide")
+    assertEq(search.get(), "", "search hide: search text cleared after Hide")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "search hide: Hide does not mutate relationships")
+
+    -- Returning to the page refreshes with the cleared session state.
+    panel:Show()
+    assertTrue(refreshCount > refreshesBeforeHide, "search hide: Show queues refresh")
+    assertEq(#dual.left.getItems(), beforeMains, "search hide: return shows full Main list")
+    assertNil(dual.right.getSelectedKey(), "search hide: return has no alt highlight")
+
+    page.Refresh = origRefresh
+    restoreBaseRoster()
+    pass("list search panel hide/show lifecycle reset")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

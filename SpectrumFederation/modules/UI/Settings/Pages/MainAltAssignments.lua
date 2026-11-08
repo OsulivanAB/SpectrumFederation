@@ -1226,6 +1226,11 @@ function Page:Build(panel)
 		panel:HookScript("OnShow", function()
 			QueueRefresh()
 		end)
+		-- StandaloneWindow hides the panel on page switch without dispatching
+		-- Page:OnHide; hook the real panel lifecycle so search state resets.
+		panel:HookScript("OnHide", function()
+			Page:OnHide()
+		end)
 	end
 end
 
@@ -1246,6 +1251,7 @@ function Page:OnHide()
 	refreshQueued = false
 	rosterInvalidatePending = false
 	-- Drop ephemeral search filter when leaving the page; relationships untouched.
+	-- refresh=false: do not schedule control refresh while the panel is hidden.
 	ClearListSearch({ refresh = false })
 end
 
