@@ -221,21 +221,28 @@ function GI.BuildRosterSnapshot()
         return nil, "not_a_member"
     end
 
-    function snap:Suggest(prefix, limit)
+    --- Prefix/substring name suggestions from the current roster.
+    -- Optional `predicate(row)` is applied before counting toward `limit` so
+    -- role eligibility (and similar filters) cannot hide later eligible matches
+    -- behind the visible-results cap (#470).
+    function snap:Suggest(prefix, limit, predicate)
         limit = math.max(1, math.min(tonumber(limit) or 12, 32))
         local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
         local out = {}
         if q == "" then
             return out
         end
+        local filter = type(predicate) == "function" and predicate or nil
         for i = 1, #self.members do
             local row = self.members[i]
             local nameLower = string.lower(row.nameRealm)
             local short = nameLower:match("^([^-]+)") or nameLower
             if nameLower:sub(1, #q) == q or short:sub(1, #q) == q or nameLower:find(q, 1, true) then
-                out[#out + 1] = row
-                if #out >= limit then
-                    break
+                if not filter or filter(row) then
+                    out[#out + 1] = row
+                    if #out >= limit then
+                        break
+                    end
                 end
             end
         end

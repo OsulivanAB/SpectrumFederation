@@ -177,18 +177,77 @@ local function ReportStatus(ctx, status, reason, extra)
 	RefreshPageControls()
 end
 
-local function SuggestionItems(prefix)
+--- Role classification from an already-validated Guild Info record (#470/#472).
+-- Mirrors GI:GetCharacterRole solo-main semantics without re-entering
+-- GetCurrentRecord / ValidateGuildRecord per candidate.
+-- nil record (ready + not_configured) ⇒ every GUID is unassigned.
+local function RoleFromValidatedRecord(record, guid)
+	if type(guid) ~= "string" or guid == "" then
+		return nil
+	end
+	if not record or type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+		return nil
+	end
+	local info = record.graph.byGuid[guid]
+	if not info then
+		return nil
+	end
+	-- Solo main (no alts) is not a displayed relationship role.
+	if info.role == "main" then
+		local mainGroup = record.graph.mains and record.graph.mains[guid]
+		if not mainGroup or #(mainGroup.altGuids or {}) == 0 then
+			return nil
+		end
+	end
+	return info.role, info.mainGuid
+end
+
+--- Autocomplete suggestions for the Main or Alt field (#470).
+-- `field` is "main" or "alt". Role eligibility uses the Guild Info graph and is
+-- applied before the visible-results cap. Relationship readiness/validation is
+-- captured once per request; candidates use the validated record's graph.
+local function SuggestionItems(prefix, field)
 	local g = GI()
 	local roster = Roster()
 	if not roster or not roster.complete or not roster.Suggest then
 		return {}
 	end
-	local rows = roster:Suggest(prefix, 10)
+	-- Fail closed while relationship readiness is unknown/syncing; do not treat
+	-- missing roles as unassigned. ready + nil record is empty/unconfigured and
+	-- keeps every roster candidate eligible as unassigned.
+	if not g or not g.GetRelationshipReadiness then
+		return {}
+	end
+	local readiness, record = g:GetRelationshipReadiness()
+	if readiness ~= "ready" then
+		return {}
+	end
+
+	local excludeGuid = nil
+	if field == "main" and altResolved and altResolved.guid then
+		excludeGuid = altResolved.guid
+	elseif field == "alt" and mainResolved and mainResolved.guid then
+		excludeGuid = mainResolved.guid
+	end
+
+	local rows = roster:Suggest(prefix, 10, function(row)
+		if excludeGuid and row.guid == excludeGuid then
+			return false
+		end
+		-- "main" = main with ≥1 alts; "alt" = assigned alt;
+		-- nil = unassigned or solo main (eligible for both fields).
+		local role = RoleFromValidatedRecord(record, row.guid)
+		if field == "main" then
+			return role ~= "alt"
+		end
+		return role ~= "main"
+	end)
+
 	local out = {}
 	for i = 1, #rows do
 		local row = rows[i]
 		local label = row.nameRealm
-		if g and g.ColorizeName then
+		if g.ColorizeName then
 			label = g.ColorizeName(row.nameRealm, row.classFile)
 		end
 		out[#out + 1] = {
@@ -677,7 +736,7 @@ local function Definition()
 							mainText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or mainText)
+							return SuggestionItems(prefix or mainText, "main")
 						end,
 						onResolved = function(_, item)
 							if item then
@@ -712,7 +771,7 @@ local function Definition()
 							altText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or altText)
+							return SuggestionItems(prefix or altText, "alt")
 						end,
 						onResolved = function(_, item)
 							if item then
