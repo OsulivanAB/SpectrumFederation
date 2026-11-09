@@ -12335,6 +12335,164 @@ do
     assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
         "459-AR: retained credit preserved")
 
+    local function drainAliasTimers(maxSlices)
+        maxSlices = maxSlices or 256
+        local slices = 0
+        while slices < maxSlices do
+            slices = slices + 1
+            if #timers > 0 then
+                if not runOneDueTimer() then
+                    flushTimers()
+                end
+            else
+                break
+            end
+        end
+        flushTimers()
+    end
+    local function saturateWithJunk(targetCfg, keepKeys)
+        keepKeys = keepKeys or {}
+        local filled = aliasCount(targetCfg.creditEventAliases)
+        local n = 1
+        while filled < maxA do
+            local junk = string.format("ctx:ar-dep-junk-%04d", n)
+            if targetCfg.creditEventAliases[junk] == nil and not keepKeys[junk] then
+                targetCfg.creditEventAliases[junk] =
+                    string.format("ctx:ar-dep-junk-canon-%04d", n)
+                filled = filled + 1
+            end
+            n = n + 1
+        end
+        assertEq(aliasCount(targetCfg.creditEventAliases), maxA,
+            "459-AR-dep: map saturated")
+    end
+    local function seedPendingAliasCorrection(target, aliasId, canonId, opId, itemId)
+        local cctx = select(1, GS:GetCurrentContext())
+        local pendOp = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = cctx.guildKey,
+            datasetId = target.datasetId,
+            campaignId = target.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = aliasId,
+            value = {
+                eventId = aliasId, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = itemId,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 3,
+            baseTargetRevision = target.datasetId,
+            basePolicyRevision = target.permission and target.permission.revisionId,
+            baseCampaignId = target.currentCampaignId,
+        }
+        local stP, rP = GS:AdmitRemoteOperation(pendOp, {
+            sender = "Alice-Garona", offlineRecord = target, preserveAttribution = true,
+        })
+        assertEq(stP, "pending",
+            "459-AR-dep: " .. opId .. " pending got "
+                .. tostring(stP) .. "/" .. tostring(rP))
+        assertEq(rP, "pending_event",
+            "459-AR-dep: " .. opId .. " pending_event")
+        return pendOp
+    end
+
+    -- Saturation: pre-existing unreferenced A→C; page repeats A→C and adds B→A.
+    -- Protect must keep A (duplicate) so B resolves through C
+    -- (#459 discussion_r4515070762).
+    local dep1 = seedLiveCampaignWithItem(99921, 40)
+    local don1 = injectProductionDonation(dep1, {
+        id = "ctx:ar-dep1-c", itemId = 99921, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don1.txnId = "ctx:ar-dep1-c"
+    local cfg1 = dep1.accounting._consumables
+    cfg1.txnRegistry = {}
+    cfg1.creditEventAliases = {
+        ["ctx:ar-dep1-a"] = "ctx:ar-dep1-c",
+    }
+    saturateWithJunk(cfg1, { ["ctx:ar-dep1-a"] = true })
+    seedPendingAliasCorrection(
+        dep1, "ctx:ar-dep1-b", "ctx:ar-dep1-c", "ar-dep1-corr", 99921)
+    local stDep1, rDep1 = providerAliasPage(dep1,
+        "gs:cea:" .. dep1.datasetId .. ":p1", {
+            kind = "gs-credit-aliases-page",
+            datasetId = dep1.datasetId,
+            page = 1, pageCount = 1,
+            aliases = {
+                ["ctx:ar-dep1-a"] = "ctx:ar-dep1-c",
+                ["ctx:ar-dep1-b"] = "ctx:ar-dep1-a",
+            },
+        }, "Alice-Garona")
+    assertTrue(stDep1 == "accepted" or stDep1 == "duplicate",
+        "459-AR-dep1: page accepted got "
+            .. tostring(stDep1) .. "/" .. tostring(rDep1))
+    assertEq(cfg1.creditEventAliases["ctx:ar-dep1-a"], "ctx:ar-dep1-c",
+        "459-AR-dep1: duplicate A→C survived reclaim")
+    local b1 = cfg1.creditEventAliases["ctx:ar-dep1-b"]
+    assertTrue(b1 == "ctx:ar-dep1-a" or b1 == "ctx:ar-dep1-c",
+        "459-AR-dep1: B bound toward C got " .. tostring(b1))
+    assertEq(GS.CanonicalCreditEventId(dep1, "ctx:ar-dep1-b"), "ctx:ar-dep1-c",
+        "459-AR-dep1: B resolves to canonical C")
+    drainAliasTimers(256)
+    assertTrue(dep1.operations.records["ar-dep1-corr"] ~= nil,
+        "459-AR-dep1: pending correction accepted")
+    assertTrue(dep1.operations.pending == nil
+            or dep1.operations.pending["ar-dep1-corr"] == nil,
+        "459-AR-dep1: pending cleared")
+    assertEq(cfg1.creditEventAliases["ctx:ar-dep1-a"], "ctx:ar-dep1-c",
+        "459-AR-dep1: A→C still present after settle")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(dep1, don1)), "Bob-Garona",
+        "459-AR-dep1: effective credit Bob via B→A→C")
+
+    -- Saturation: page contains only B→A; pre-existing A→C must still be kept
+    -- as the dependency closure of the incoming overlay.
+    local dep2 = seedLiveCampaignWithItem(99922, 40)
+    local don2 = injectProductionDonation(dep2, {
+        id = "ctx:ar-dep2-c", itemId = 99922, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don2.txnId = "ctx:ar-dep2-c"
+    local cfg2dep = dep2.accounting._consumables
+    cfg2dep.txnRegistry = {}
+    cfg2dep.creditEventAliases = {
+        ["ctx:ar-dep2-a"] = "ctx:ar-dep2-c",
+    }
+    saturateWithJunk(cfg2dep, { ["ctx:ar-dep2-a"] = true })
+    seedPendingAliasCorrection(
+        dep2, "ctx:ar-dep2-b", "ctx:ar-dep2-c", "ar-dep2-corr", 99922)
+    local stDep2, rDep2 = providerAliasPage(dep2,
+        "gs:cea:" .. dep2.datasetId .. ":p1", {
+            kind = "gs-credit-aliases-page",
+            datasetId = dep2.datasetId,
+            page = 1, pageCount = 1,
+            aliases = {
+                ["ctx:ar-dep2-b"] = "ctx:ar-dep2-a",
+            },
+        }, "Alice-Garona")
+    assertTrue(stDep2 == "accepted" or stDep2 == "duplicate",
+        "459-AR-dep2: page accepted got "
+            .. tostring(stDep2) .. "/" .. tostring(rDep2))
+    assertEq(cfg2dep.creditEventAliases["ctx:ar-dep2-a"], "ctx:ar-dep2-c",
+        "459-AR-dep2: pre-existing A→C survived reclaim")
+    local b2 = cfg2dep.creditEventAliases["ctx:ar-dep2-b"]
+    assertTrue(b2 == "ctx:ar-dep2-a" or b2 == "ctx:ar-dep2-c",
+        "459-AR-dep2: B bound toward C got " .. tostring(b2))
+    assertEq(GS.CanonicalCreditEventId(dep2, "ctx:ar-dep2-b"), "ctx:ar-dep2-c",
+        "459-AR-dep2: B resolves to canonical C")
+    drainAliasTimers(256)
+    assertTrue(dep2.operations.records["ar-dep2-corr"] ~= nil,
+        "459-AR-dep2: pending correction accepted")
+    assertTrue(dep2.operations.pending == nil
+            or dep2.operations.pending["ar-dep2-corr"] == nil,
+        "459-AR-dep2: pending cleared")
+    assertEq(cfg2dep.creditEventAliases["ctx:ar-dep2-a"], "ctx:ar-dep2-c",
+        "459-AR-dep2: A→C still present after settle")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(dep2, don2)), "Bob-Garona",
+        "459-AR-dep2: effective credit Bob via B→A→C")
+
     -- Rejected conflicting page must not mutate (including no opportunistic prune).
     local record2 = seedLiveCampaignWithItem(9993, 40)
     injectProductionDonation(record2, {

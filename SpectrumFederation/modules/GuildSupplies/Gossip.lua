@@ -3993,8 +3993,11 @@ local function ValidateAndApply(record, ctx)
             end
         end
 
-        -- Pass 1c: capacity against reclaimable unused slots. Protect incoming
-        -- aliases and retained required bindings; never prune before reject.
+        -- Pass 1c: capacity against reclaimable unused slots. Protect every
+        -- incoming binding (including duplicates omitted from pendingInstall)
+        -- plus the bounded dependency closure through the proposed overlay, and
+        -- retained required bindings. Never prune before reject
+        -- (#459 discussion_r4507532462 / r4515070762).
         local protect = {}
         if GS.CollectRequiredCreditEventAliases then
             local required = GS.CollectRequiredCreditEventAliases(localRecord)
@@ -4004,11 +4007,32 @@ local function ValidateAndApply(record, ctx)
                 end
             end
         end
+        for alias in pairs(body.aliases) do
+            if type(alias) == "string" and alias ~= "" then
+                protect[alias] = true
+                -- Close through proposed intermediates (B→A with pre-existing
+                -- A→C must keep A even when A is only a duplicate on this page).
+                local cur = alias
+                local seen = { [alias] = true }
+                for _ = 1, 8 do
+                    local nextId = proposed[cur]
+                    if type(nextId) ~= "string" or nextId == "" or nextId == cur then
+                        break
+                    end
+                    if seen[nextId] then
+                        break
+                    end
+                    seen[nextId] = true
+                    if proposed[nextId] ~= nil then
+                        protect[nextId] = true
+                    end
+                    cur = nextId
+                end
+            end
+        end
         local newSlots = 0
         for i = 1, #pendingInstall do
-            local alias = pendingInstall[i].alias
-            protect[alias] = true
-            if map[alias] == nil then
+            if map[pendingInstall[i].alias] == nil then
                 newSlots = newSlots + 1
             end
         end
