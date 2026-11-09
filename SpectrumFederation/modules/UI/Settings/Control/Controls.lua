@@ -5164,22 +5164,20 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		edit:SetScript("OnEditFocusLost", function()
-			-- Delay hide so suggestion clicks register. The selectingSuggestion
-			-- guard is self-clearing: a cancelled MouseDown (no OnClick) must
-			-- not leave it true forever and pin the UIParent dropdown open.
+			-- Delay hide so suggestion clicks register. Keep an active
+			-- MouseDown press protected until MouseUp/OnClick; cancelled
+			-- releases clear via OnMouseUp → ClearSelectingSuggestion.
 			if C_Timer and C_Timer.After then
 				C_Timer.After(0.15, function()
 					if selectingSuggestion then
-						-- Press still in flight or cancelled without MouseUp;
-						-- clear the guard and dismiss if focus did not return.
-						selectingSuggestion = false
+						-- Press still held: do not clear or hide yet.
+						return
 					end
 					if not edit:HasFocus() then
 						HideDrop()
 					end
 				end)
-			else
-				selectingSuggestion = false
+			elseif not selectingSuggestion then
 				HideDrop()
 			end
 			if bound then

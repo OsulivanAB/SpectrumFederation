@@ -479,46 +479,66 @@ local function findSuggestionButton(label)
     return nil
 end
 
--- Cancelled suggestion press: MouseDown then MouseUp without OnClick must not
--- leave selectingSuggestion stuck (dropdown must dismiss when unfocused).
+-- Held press across the focus-loss delay must still select on release/click.
 resolved = nil
 edit:TypeText("Player02")
+assertTrue(drop:IsShown(), "held-press setup opens dropdown")
+local heldBtn = findSuggestionButton("Player02-Garona")
+assertTrue(heldBtn ~= nil, "held-press target suggestion exists")
+heldBtn._scripts.OnMouseDown(heldBtn)
+edit:ClearFocus()
+assertTrue(not edit:HasFocus(), "edit loses focus while suggestion is held")
+flushTimers(0.15)
+assertTrue(drop:IsShown(), "focus-loss timer keeps dropdown open while press is held")
+assertTrue(resolved == nil, "held press does not resolve before release")
+heldBtn:Click()
+if heldBtn._scripts.OnMouseUp then
+    heldBtn._scripts.OnMouseUp(heldBtn)
+end
+flushTimers()
+assertTrue(not drop:IsShown(), "held press selects and closes dropdown after release")
+assertTrue(resolved ~= nil and resolved.value == "Player02-Garona", "held press resolves chosen character")
+
+-- Cancelled suggestion press: MouseDown, drag away, MouseUp without OnClick.
+resolved = nil
+edit:TypeText("Player03")
 assertTrue(drop:IsShown(), "cancelled-click setup opens dropdown")
-local cancelBtn = findSuggestionButton("Player02-Garona")
+local cancelBtn = findSuggestionButton("Player03-Garona")
 assertTrue(cancelBtn ~= nil, "cancelled-click target suggestion exists")
 cancelBtn._scripts.OnMouseDown(cancelBtn)
 edit:ClearFocus()
 assertTrue(not edit:HasFocus(), "edit loses focus after cancelled press starts")
+flushTimers(0.15)
+assertTrue(drop:IsShown(), "focus-loss timer does not treat held cancel as finished")
 -- Release outside the button (no OnClick). Deferred MouseUp clears the guard.
 cancelBtn._scripts.OnMouseUp(cancelBtn)
 flushTimers(0)
 assertTrue(not drop:IsShown(), "cancelled suggestion press dismisses dropdown after MouseUp")
 assertTrue(resolved == nil, "cancelled suggestion press does not resolve")
 
--- Focus-loss path also clears a stuck guard even if MouseUp never fired.
-edit:TypeText("Player03")
-assertTrue(drop:IsShown(), "focus-loss cancel setup opens dropdown")
-local stuckBtn = findSuggestionButton("Player03-Garona")
-assertTrue(stuckBtn ~= nil, "focus-loss cancel target exists")
-stuckBtn._scripts.OnMouseDown(stuckBtn)
-edit:ClearFocus()
-flushTimers(0.15)
-assertTrue(not drop:IsShown(), "focus-loss timer dismisses after cancelled MouseDown without MouseUp")
-
--- Normal selection still works after a cancelled press.
+-- Normal quick click still selects.
 resolved = nil
 edit:TypeText("Player04")
-assertTrue(drop:IsShown(), "normal selection reopen after cancelled press")
-local okBtn = findSuggestionButton("Player04-Garona")
-assertTrue(okBtn ~= nil, "normal selection target exists")
-okBtn._scripts.OnMouseDown(okBtn)
-okBtn:Click()
-if okBtn._scripts.OnMouseUp then
-    okBtn._scripts.OnMouseUp(okBtn)
+assertTrue(drop:IsShown(), "quick-click setup opens dropdown")
+local quickBtn = findSuggestionButton("Player04-Garona")
+assertTrue(quickBtn ~= nil, "quick-click target exists")
+quickBtn._scripts.OnMouseDown(quickBtn)
+quickBtn:Click()
+if quickBtn._scripts.OnMouseUp then
+    quickBtn._scripts.OnMouseUp(quickBtn)
 end
 flushTimers()
-assertTrue(not drop:IsShown(), "normal selection closes dropdown after cancelled-press sequence")
-assertTrue(resolved ~= nil and resolved.value == "Player04-Garona", "normal selection resolves after cancelled-press sequence")
+assertTrue(not drop:IsShown(), "quick click closes dropdown")
+assertTrue(resolved ~= nil and resolved.value == "Player04-Garona", "quick click resolves chosen character")
+
+-- Outside click (focus loss without a suggestion press) dismisses suggestions.
+resolved = nil
+edit:TypeText("Player05")
+assertTrue(drop:IsShown(), "outside-click setup opens dropdown")
+edit:ClearFocus()
+flushTimers(0.15)
+assertTrue(not drop:IsShown(), "outside click dismisses suggestions after focus-loss delay")
+assertTrue(resolved == nil, "outside click does not resolve a suggestion")
 
 -- Scroll position resets when suggestion results change.
 edit:TypeText("player")
