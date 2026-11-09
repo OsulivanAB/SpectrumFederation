@@ -168,6 +168,71 @@ function Dialogs:Prompt(message, acceptText, defaultText, onAccept)
     }) ~= nil
 end
 
+-- Retail addons cannot call protected CopyToClipboard(). Present a focused,
+-- highlighted EditBox so the player can Ctrl+C the plain Name-Realm string.
+local COPYABLE_KEY = "SF_SETTINGS_COPYABLE_TEXT"
+
+if not StaticPopupDialogs[COPYABLE_KEY] then
+    StaticPopupDialogs[COPYABLE_KEY] = {
+        text = "%s",
+        button1 = OKAY,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        preferredIndex = 3,
+        hasEditBox = true,
+        editBoxWidth = 260,
+
+        OnShow = function(self, data)
+            local editBox = self.editBox or self.EditBox
+            if not editBox then return end
+            editBox:SetAutoFocus(true)
+            local text = data and data.copyText or ""
+            editBox:SetText(text)
+            if editBox.HighlightText then
+                editBox:HighlightText()
+            end
+            if editBox.SetCursorPosition then
+                editBox:SetCursorPosition(0)
+            end
+        end,
+
+        OnAccept = function() end,
+
+        EditBoxOnEnterPressed = function(self)
+            local parent = self:GetParent()
+            if parent then
+                parent:Hide()
+            end
+        end,
+
+        EditBoxOnEscapePressed = function(self)
+            local parent = self:GetParent()
+            if parent then
+                parent:Hide()
+            end
+        end,
+    }
+end
+
+--- Show a copyable Name-Realm (or other plain text) dialog.
+-- @param message string Instruction shown above the edit box
+-- @param copyText string Plain text to select for Ctrl+C
+-- @param closeText string|nil Button label (defaults to OKAY / Close)
+-- @return boolean True if the dialog was shown
+function Dialogs:ShowCopyableText(message, copyText, closeText)
+    if type(copyText) ~= "string" or copyText == "" then
+        return false
+    end
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Showing copyable text dialog")
+    end
+    StaticPopupDialogs[COPYABLE_KEY].button1 = closeText or OKAY or "Close"
+    return StaticPopup_Show(COPYABLE_KEY, message or "", nil, {
+        copyText = copyText,
+    }) ~= nil
+end
+
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
 -- Keep inserted content close to the default StaticPopup text width (290) so the dialog doesn't expand/warp.
 local TRANSFER_CONTENT_WIDTH = 290

@@ -2192,6 +2192,9 @@ function Controls:AddSideBySideScrollLists(section, opts)
 			local hasActionSupport = type(listOpts.onAction) == "function"
 				or type(listOpts.actionAtlas) == "string"
 				or type(listOpts.actionTexture) == "string"
+			local hasCopySupport = type(listOpts.onCopy) == "function"
+			local copyButtonSize = listOpts.copyButtonSize or 16
+			local copyColumnGap = listOpts.copyColumnGap or removeColumnGap
 			local borderInset = 4
 
 			local box = CreateFrame("Frame", nil, host, "BackdropTemplate")
@@ -2319,6 +2322,21 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Action = action
 				end
 
+				if hasCopySupport then
+					-- Always allocated so showing on hover never shifts text/layout.
+					local copy = CreateIconButton(
+						r,
+						listOpts.copyAtlas,
+						copyButtonSize,
+						listOpts.copyTexture or "Interface\\Buttons\\UI-GuildButton-PublicNote-Up"
+					)
+					local copyAnchor = r.Action or remove
+					copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
+					copy:SetAlpha(0)
+					copy:EnableMouse(true)
+					r.Copy = copy
+				end
+
 				listRows[i] = r
 				return r
 			end
@@ -2397,6 +2415,10 @@ function Controls:AddSideBySideScrollLists(section, opts)
 				if hasActionSupport then
 					trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
 				end
+				if hasCopySupport then
+					-- Reserve space even while alpha=0 so hover cannot reflow text.
+					trailingReserve = trailingReserve + copyButtonSize + copyColumnGap
+				end
 				local compactTextWidth = maxTextWidth + compactTextPadding
 				if compactColumns and availableWidth > 0 then
 					compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - trailingReserve - 8))
@@ -2409,6 +2431,9 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Remove:ClearAllPoints()
 					if r.Action then
 						r.Action:ClearAllPoints()
+					end
+					if r.Copy then
+						r.Copy:ClearAllPoints()
 					end
 
 					local canRemove = item.canRemove and true or false
@@ -2454,7 +2479,56 @@ function Controls:AddSideBySideScrollLists(section, opts)
 						end
 					end
 
-					local itemKey = item.clusterId or item.id or item.key or i
+					if r.Copy then
+						-- Keep the button shown (layout reserved) but invisible until hover.
+						r.Copy:Show()
+						r.Copy:SetAlpha(0)
+						r.Copy:EnableMouse(enabled and true or false)
+						r.Copy:SetScript("OnClick", function()
+							if not enabled then return end
+							if listOpts.onCopy then
+								listOpts.onCopy(item)
+							end
+						end)
+						local copyTip = listOpts.copyTooltip
+						if type(copyTip) == "function" then
+							local ok, value = pcall(copyTip, item)
+							copyTip = ok and value or nil
+						end
+						if type(copyTip) ~= "string" or copyTip == "" then
+							copyTip = "Copy name"
+						end
+						r.Copy:SetScript("OnEnter", function(self)
+							self:SetAlpha(1)
+							if GameTooltip then
+								GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+								GameTooltip:SetText(copyTip, 1, 1, 1)
+								GameTooltip:Show()
+							end
+						end)
+						r.Copy:SetScript("OnLeave", function(self)
+							if GameTooltip then
+								GameTooltip:Hide()
+							end
+							if not (r.IsMouseOver and r:IsMouseOver()) then
+								self:SetAlpha(0)
+							end
+						end)
+						r:SetScript("OnEnter", function()
+							if r.Copy then
+								r.Copy:SetAlpha(1)
+							end
+						end)
+						r:SetScript("OnLeave", function()
+							if r.Copy and not (r.Copy.IsMouseOver and r.Copy:IsMouseOver()) then
+								r.Copy:SetAlpha(0)
+							end
+						end)
+					end
+
+					-- Prefer guid so Alts-panel rows can highlight a single alt
+					-- without selecting every sibling that shares clusterId/mainGuid.
+					local itemKey = item.guid or item.clusterId or item.id or item.key or i
 					local isSelected = selectedKey ~= nil and selectedKey == itemKey
 					if r.Selected then
 						if isSelected then r.Selected:Show() else r.Selected:Hide() end
@@ -2472,6 +2546,10 @@ function Controls:AddSideBySideScrollLists(section, opts)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
 					if r.Action then
 						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
+					if r.Copy then
+						local copyAnchor = r.Action or r.Remove
+						r.Copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
 					end
 					r.Text:SetPoint("LEFT", r, "LEFT", 4, 0)
 					if compactColumns and availableWidth > 0 then
@@ -4736,16 +4814,50 @@ end
 -- @param section table Section to add row into
 -- @param opts table Options: label, get/set or unbound getText/setText,
 --   getSuggestions(prefix)->[{value,label,text}], onResolved(item|nil),
---   maxSuggestions, width, visible/enabled
+--   maxSuggestions, maxDropdownHeight (default 220, clamped 80–250),
+--   emptySuggestionsText, allowEmptyPrefix, width, visible/enabled
 -- @return Frame The created row
 function Controls:AddAutocomplete(section, opts)
 	opts = opts or {}
-	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 16))
+	-- Cap raised to 64 so Assignments list-search can return more matches;
+	-- the dropdown itself is height-capped and scrollable.
+	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 64))
+	local maxDropdownHeight = tonumber(opts.maxDropdownHeight) or 220
+	if maxDropdownHeight < 80 then
+		maxDropdownHeight = 80
+	elseif maxDropdownHeight > 250 then
+		maxDropdownHeight = 250
+	end
+	local allowEmptyPrefix = opts.allowEmptyPrefix and true or false
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
+	local suggestionRowHeight = 20
+	local dropPad = 4
+	local scrollBarWidth = 18
+	local scrollBarGap = 2
 	local bound = false
 	local get, set
 	if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
 		bound = true
 		get, set = ResolveGetSet(opts)
+	end
+
+	local function TrimmedPrefix(prefix)
+		if type(prefix) ~= "string" then
+			return ""
+		end
+		if strtrim then
+			return strtrim(prefix)
+		end
+		return (prefix:match("^%s*(.-)%s*$")) or prefix
+	end
+
+	local function IsBlankPrefix(prefix)
+		return TrimmedPrefix(prefix) == ""
 	end
 
 	return section:AddRow(26, function(row)
@@ -4790,12 +4902,79 @@ function Controls:AddAutocomplete(section, opts)
 			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 		end
 
+		local scroll = CreateFrame("ScrollFrame", nil, drop, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+		scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -dropPad, dropPad)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local emptyLabel = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyLabel:SetPoint("TOPLEFT", content, "TOPLEFT", 6, -4)
+		emptyLabel:SetPoint("TOPRIGHT", content, "TOPRIGHT", -6, -4)
+		emptyLabel:SetJustifyH("LEFT")
+		emptyLabel:Hide()
+
 		local suggestionButtons = {}
 		local ignore = false
 		local resolvedValue = nil
+		local selectingSuggestion = false
+
+		local function ResetSuggestionScroll()
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(0)
+			end
+			local sb = scroll.ScrollBar
+			if sb and sb.SetValue then
+				sb:SetValue(0)
+			end
+		end
 
 		local function HideDrop()
 			drop:Hide()
+			ResetSuggestionScroll()
+		end
+
+		-- Clear the MouseDown selection guard. Used after a completed click and
+		-- after a cancelled press (drag off / release without OnClick).
+		local function ClearSelectingSuggestion(hideIfUnfocused)
+			if not selectingSuggestion then
+				if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+					HideDrop()
+				end
+				return
+			end
+			selectingSuggestion = false
+			if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+				HideDrop()
+			end
+		end
+
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then
+				return 0
+			end
+			if sb.SetShown then
+				sb:SetShown(show)
+			elseif show and sb.Show then
+				sb:Show()
+			elseif (not show) and sb.Hide then
+				sb:Hide()
+			end
+			if not show then
+				ResetSuggestionScroll()
+				if sb.Disable then
+					sb:Disable()
+				end
+				return 0
+			end
+			if sb.Enable then
+				sb:Enable()
+			end
+			return sb.GetWidth and sb:GetWidth() or scrollBarWidth
 		end
 
 		local function NotifyResolved(item)
@@ -4809,6 +4988,9 @@ function Controls:AddAutocomplete(section, opts)
 			if not item then
 				return
 			end
+			-- Guard focus-loss hide so ClearFocus after click cannot race the
+			-- selection (dropdown click steals edit focus on Retail).
+			selectingSuggestion = true
 			ignore = true
 			local text = item.text or item.label or tostring(item.value or "")
 			edit:SetText(text)
@@ -4822,14 +5004,15 @@ function Controls:AddAutocomplete(section, opts)
 			NotifyResolved(item)
 			HideDrop()
 			edit:ClearFocus()
+			selectingSuggestion = false
 		end
 
 		local function EnsureSuggestionButton(i)
 			if suggestionButtons[i] then
 				return suggestionButtons[i]
 			end
-			local btn = CreateFrame("Button", nil, drop)
-			btn:SetHeight(20)
+			local btn = CreateFrame("Button", nil, content)
+			btn:SetHeight(suggestionRowHeight)
 			local fs = btn:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", btn, "LEFT", 6, 0)
 			fs:SetPoint("RIGHT", btn, "RIGHT", -6, 0)
@@ -4846,8 +5029,59 @@ function Controls:AddAutocomplete(section, opts)
 			btn:SetScript("OnLeave", function()
 				hl:Hide()
 			end)
+			-- MouseDown arms the focus-loss guard before EditBox blur runs.
+			btn:SetScript("OnMouseDown", function()
+				selectingSuggestion = true
+			end)
+			-- MouseUp always follows a press, even when the pointer is released
+			-- outside the button (no OnClick). Defer so a successful OnClick /
+			-- SelectItem can clear the guard first in the same release.
+			btn:SetScript("OnMouseUp", function()
+				local function afterRelease()
+					ClearSelectingSuggestion(true)
+				end
+				if C_Timer and C_Timer.After then
+					C_Timer.After(0, afterRelease)
+				else
+					afterRelease()
+				end
+			end)
 			suggestionButtons[i] = btn
 			return btn
+		end
+
+		local function LayoutDrop(contentHeight)
+			local fieldWidth = edit:GetWidth() or CONTROL_WIDTH
+			local innerHeight = math.max(suggestionRowHeight, contentHeight)
+			local frameHeight = math.min(innerHeight + (dropPad * 2), maxDropdownHeight)
+			local showScroll = (innerHeight + (dropPad * 2)) > maxDropdownHeight
+			drop:SetWidth(fieldWidth)
+			drop:SetHeight(frameHeight)
+			drop:ClearAllPoints()
+			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", 0, -2)
+			drop:SetPoint("TOPRIGHT", edit, "BOTTOMRIGHT", 0, -2)
+
+			local sbWidth = SetScrollBarShown(showScroll)
+			local rightInset = dropPad
+			if showScroll then
+				rightInset = dropPad + sbWidth + scrollBarGap
+				local sb = scroll.ScrollBar
+				if sb then
+					sb:ClearAllPoints()
+					sb:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -2, -(dropPad + 14))
+					sb:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -2, dropPad + 14)
+					if sb.SetWidth then
+						sb:SetWidth(scrollBarWidth)
+					end
+				end
+			end
+			scroll:ClearAllPoints()
+			scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+			scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -rightInset, dropPad)
+
+			local contentWidth = math.max(1, fieldWidth - dropPad - rightInset)
+			content:SetWidth(contentWidth)
+			content:SetHeight(math.max(1, innerHeight))
 		end
 
 		local function ShowSuggestions(prefix)
@@ -4856,33 +5090,62 @@ function Controls:AddAutocomplete(section, opts)
 				HideDrop()
 				return
 			end
-			local items = getSuggestions(prefix) or {}
-			if #items == 0 then
+			-- Default autocomplete UX: empty/whitespace focus does not open a
+			-- full-roster popup. Opt in with allowEmptyPrefix (e.g. attribution).
+			if IsBlankPrefix(prefix) and not allowEmptyPrefix then
 				HideDrop()
 				return
 			end
-			local width = edit:GetWidth() or CONTROL_WIDTH
-			local y = 4
+
+			local items = getSuggestions(prefix) or {}
 			local count = math.min(#items, maxSuggestions)
+			emptyLabel:Hide()
+			-- Always restart at the top when suggestion contents change so a
+			-- scrolled large set cannot hide leading matches of the next query.
+			ResetSuggestionScroll()
+
+			if count == 0 then
+				if IsBlankPrefix(prefix) then
+					HideDrop()
+					return
+				end
+				-- Nonempty query with no matches: compact empty state.
+				for i = 1, #suggestionButtons do
+					suggestionButtons[i]:Hide()
+				end
+				local emptyText = opts.emptySuggestionsText
+				if type(emptyText) ~= "string" or emptyText == "" then
+					emptyText = Loc("SETTINGS_AUTOCOMPLETE_NO_MATCHES", "No matches")
+				end
+				emptyLabel:SetText(emptyText)
+				emptyLabel:Show()
+				local emptyHeight = math.max(
+					suggestionRowHeight,
+					(emptyLabel.GetStringHeight and emptyLabel:GetStringHeight()) or suggestionRowHeight
+				) + 8
+				LayoutDrop(emptyHeight)
+				drop:Show()
+				return
+			end
+
+			local y = 0
 			for i = 1, count do
 				local item = items[i]
 				local btn = EnsureSuggestionButton(i)
 				btn:ClearAllPoints()
-				btn:SetPoint("TOPLEFT", drop, "TOPLEFT", 4, -y)
-				btn:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -4, -y)
+				btn:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+				btn:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 				btn.Text:SetText(item.label or item.text or tostring(item.value or ""))
 				btn:SetScript("OnClick", function()
 					SelectItem(item)
 				end)
 				btn:Show()
-				y = y + 20
+				y = y + suggestionRowHeight
 			end
 			for i = count + 1, #suggestionButtons do
 				suggestionButtons[i]:Hide()
 			end
-			drop:SetSize(width + 8, y + 4)
-			drop:ClearAllPoints()
-			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", -4, -2)
+			LayoutDrop(y)
 			drop:Show()
 		end
 
@@ -4907,14 +5170,20 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		edit:SetScript("OnEditFocusLost", function()
-			-- Delay hide so suggestion clicks register.
+			-- Delay hide so suggestion clicks register. Keep an active
+			-- MouseDown press protected until MouseUp/OnClick; cancelled
+			-- releases clear via OnMouseUp → ClearSelectingSuggestion.
 			if C_Timer and C_Timer.After then
 				C_Timer.After(0.15, function()
+					if selectingSuggestion then
+						-- Press still held: do not clear or hide yet.
+						return
+					end
 					if not edit:HasFocus() then
 						HideDrop()
 					end
 				end)
-			else
+			elseif not selectingSuggestion then
 				HideDrop()
 			end
 			if bound then
@@ -4972,13 +5241,18 @@ function Controls:AddAutocomplete(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, { edit })
 			local c = enabled and 1 or 0.6
 			edit:SetTextColor(c, c, c)
-			if not enabled then
+			-- Clear / external refresh with blank text must dismiss suggestions.
+			if (not enabled) or (IsBlankPrefix(text) and not allowEmptyPrefix) then
 				HideDrop()
 			end
 		end
 
 		row.__sfAutocompleteEdit = edit
 		row.__sfAutocompleteHide = HideDrop
+		row.__sfAutocompleteDrop = drop
+		row.__sfAutocompleteShow = ShowSuggestions
+		row.__sfAutocompleteScroll = scroll
+		row.__sfAutocompleteResetScroll = ResetSuggestionScroll
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)
