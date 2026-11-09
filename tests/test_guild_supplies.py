@@ -160,10 +160,18 @@ def test_guild_supplies_soft_delete_465():
         )
     assert "0 failed" in result.stdout
     assert "465: PROVIDER_SCHEMA is 7" in result.stdout
-    assert "465: floor reason player_negative got" in result.stdout
+    assert "465: delete succeeds with debt" in result.stdout
+    assert "465: signed personal debt −8" in result.stdout
+    assert "465: explicit repair restores zero" in result.stdout
     assert "465: personal restored to 10" in result.stdout
     assert "465: pending delete promoted after event" in result.stdout
     assert "465: preview reason got preview_non_admin" in result.stdout
+    assert "465-xevt: A debt −10" in result.stdout
+    assert "465-xevt2: debt survives reload" in result.stdout
+    assert "465-xevt-repair: zero after explicit adjustment" in result.stdout
+    assert "465-alias: reobservation alias stays deleted" in result.stdout
+    assert "465-adopt-del: commit got accepted/nil" in result.stdout
+    assert "465-adopt-corr: credit not reinstated" in result.stdout
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")

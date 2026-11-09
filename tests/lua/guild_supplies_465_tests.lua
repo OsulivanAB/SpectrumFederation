@@ -1223,7 +1223,8 @@ do
 end
 
 do
-    -- Floor: donation +10 and adjustment -8; deleting +10 rejected.
+    -- Deletion creates signed debt; contribution projection stays readable;
+    -- officer repairs with an explicit adjustment (#465 owner decision).
     local record = seedLiveCampaignWithItem(9202, 100)
     injectProductionDonation(record, {
         id = "floor-don", itemId = 9202, quantity = 10,
@@ -1235,12 +1236,22 @@ do
     })
     assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9202), 2,
         "465: personal 10-8=2")
-    local op, st, reason = GS:NewSoftDeleteOperation("floor-don")
-    assertNil(op, "465: unsafe floor prepare rejected")
-    -- Item total is also 2; removing +10 fails the item floor first (same reject).
-    assertTrue(reason == "item_negative" or reason == "player_negative",
-        "465: floor reason player_negative got " .. tostring(reason))
-    assertTrue(not GS.IsEventSoftDeleted(record, "floor-don"), "465: not deleted after reject")
+    local op = select(1, GS:NewSoftDeleteOperation("floor-don"))
+    assertTrue(op ~= nil, "465: delete +10 against −8 is prepared")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "465: delete succeeds with debt")
+    assertTrue(GS.IsEventSoftDeleted(record, "floor-don"), "465: donation deleted")
+    local personal, personalErr = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", 9202)
+    assertEq(personalErr, nil, "465: projection readable with debt got " .. tostring(personalErr))
+    assertEq(personal, -8, "465: signed personal debt −8")
+    local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[9202]) or 0, -8, "465: item total debt −8")
+    local repair, repairSt, repairReason = GS:NewAdjustmentOperation(9202, 8, "Alice-Garona")
+    assertTrue(repair ~= nil,
+        "465: prepare repair adjustment got " .. tostring(repairSt) .. "/" .. tostring(repairReason))
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465: repair adjustment applied")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9202), 0,
+        "465: explicit repair restores zero")
 end
 
 do
@@ -1264,7 +1275,7 @@ do
 end
 
 do
-    -- Effective credit used for floors: corrected donation +10, adj -8 on new credit.
+    -- Effective attribution: delete corrected donation leaving Bob with −8 debt.
     local record = seedLiveCampaignWithItem(9204, 100)
     injectProductionDonation(record, {
         id = "eff-don", itemId = 9204, quantity = 10,
@@ -1279,10 +1290,15 @@ do
     })
     assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9204), 2,
         "465: Bob effective personal 2")
-    local op, st, reason = GS:NewSoftDeleteOperation("eff-don")
-    assertNil(op, "465: floor uses effective Bob credit")
-    assertTrue(reason == "item_negative" or reason == "player_negative",
-        "465: effective floor reason got " .. tostring(reason))
+    local op = select(1, GS:NewSoftDeleteOperation("eff-don"))
+    assertTrue(op ~= nil, "465: delete uses effective credit but floors do not block")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "465: delete corrected donation")
+    local bob, bobErr = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", 9204)
+    assertEq(bobErr, nil, "465: Bob projection readable")
+    assertEq(bob, -8, "465: Bob signed debt −8 after delete")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9204), 0,
+        "465: Alice remains emptied")
 end
 
 do
@@ -1430,19 +1446,10 @@ do
 end
 
 do
-    -- Concurrent floor conflict: pending delete promotes after conflicting adj removed.
+    -- Missing-event soft-delete stays pending then promotes (floors are not a dependency).
     local record = seedLiveCampaignWithItem(9210, 100)
-    injectProductionDonation(record, {
-        id = "race-don", itemId = 9210, quantity = 10,
-        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
-    })
-    injectProductionAdjustment(record, {
-        id = "race-adj", itemId = 9210, quantity = -8,
-        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
-    })
-    -- Remote soft-delete of donation while -8 exists → pending floor.
     local remoteDel = {
-        schemaVersion = 1,
+        schemaVersion = GS.OP_SCHEMA_VERSION,
         id = "gs1:race-del:" .. tostring(world.time),
         guildKey = select(1, GS:GetCurrentContext()).guildKey,
         datasetId = record.datasetId,
@@ -1467,17 +1474,27 @@ do
     local st, reason = GS:AdmitRemoteOperation(remoteDel, {
         sender = "Bob-Garona", offlineRecord = record, preserveAttribution = true,
     })
-    assertEq(st, "pending", "465: race delete pending floor got " .. tostring(st) .. "/" .. tostring(reason))
-    assertTrue(not GS.IsEventSoftDeleted(record, "race-don"), "465: not deleted while floor fails")
-    local adjDel = select(1, GS:NewSoftDeleteOperation("race-adj"))
-    assertEq(GS:ApplyStagedConfigOperation(adjDel), "accepted", "465: remove conflicting adj")
+    assertEq(st, "pending",
+        "465: missing-event delete pending got " .. tostring(st) .. "/" .. tostring(reason))
+    injectProductionDonation(record, {
+        id = "race-don", itemId = 9210, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(record, {
+        id = "race-adj", itemId = 9210, quantity = -8,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
     flushTimers()
-    if GS.RedrivePendingSoftDeletes then
+    if GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, { eventId = "race-don" })
+    elseif GS.RedrivePendingSoftDeletes then
         GS.RedrivePendingSoftDeletes(record, { eventId = "race-don" })
     end
     flushTimers()
     assertTrue(GS.IsEventSoftDeleted(record, "race-don"),
-        "465: pending delete promoted after adj removed")
+        "465: missing-event delete promoted after ledger arrives")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9210), -8,
+        "465: debt remains after late delete promotion")
 end
 
 do
@@ -1698,21 +1715,122 @@ do
         assertTrue(type(entry) == "table", label .. ": projection entry")
         assertEq(entry.revisionId, "del-win-late", label .. ": projection winner")
         assertEq(entry.actorName, "Carol-Garona", label .. ": winning actor")
-        -- Adoption completeness: replay loser under sourceAcceptedSet.
-        local stAd, rAd = GS:AdmitRemoteOperation(early, {
-            sender = "Bob-Garona", offlineRecord = record, preserveAttribution = true,
-            adoptionReplay = true,
-            sourceAcceptedSet = { ["del-lose-early"] = true },
-        })
-        assertTrue(stAd == "accepted" or stAd == "duplicate",
-            label .. ": adoption loser replay got " .. tostring(stAd) .. "/" .. tostring(rAd))
-        assertTrue(record.operations.records["del-lose-early"] ~= nil,
-            label .. ": loser survives adoption replay")
-        assertEq(record.operations.heads[tKey], "del-win-late",
-            label .. ": head unchanged after adoption loser")
     end
     assertBothOrders("465-P2-win-first", true)
     assertBothOrders("465-P2-lose-first", false)
+end
+
+do
+    -- Fresh-target adoption: winner-first source export → adopt into empty target.
+    local record = seedLiveCampaignWithItem(9230, 40)
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "adopt-del-don", itemId = 9230, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local function makeDel(id, ts, actorName, actorGuid)
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.SOFT_DELETE_EVENT,
+            target = "adopt-del-don",
+            value = {
+                eventId = "adopt-del-don", eventKind = "donation",
+                itemId = 9230, quantity = 5,
+                attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            },
+            actorGuid = actorGuid,
+            actorName = actorName,
+            timestamp = ts,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+    local late = makeDel("adopt-del-win", world.time + 10, "Alice-Garona", "Player-1-Alice")
+    local early = makeDel("adopt-del-lose", world.time + 1, "Alice-Garona", "Player-1-Alice")
+    local function admitSettle(op)
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        local g = 0
+        while st == "pending" and g < 64 do
+            if not runOneDueTimer() then break end
+            st, r = GS:AdmitRemoteOperation(op, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+            g = g + 1
+        end
+        return st, r
+    end
+    local stW, rW = admitSettle(late)
+    assertTrue(stW == "accepted" or stW == "duplicate",
+        "465-adopt-del: winner first st=" .. tostring(stW) .. "/" .. tostring(rW))
+    local stL, rL = admitSettle(early)
+    assertTrue(stL == "accepted" or stL == "duplicate",
+        "465-adopt-del: loser retained st=" .. tostring(stL) .. "/" .. tostring(rL))
+    assertTrue(record.operations.records["adopt-del-lose"] ~= nil, "465-adopt-del: source loser")
+    assertTrue(record.operations.records["adopt-del-win"] ~= nil, "465-adopt-del: source winner")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-adopt-del: export bodies n=" .. tostring(#exportBodies))
+    local sawWin, sawLose = false, false
+    for i = 1, #exportBodies do
+        local b = exportBodies[i].body
+        local op = b and b.op
+        if type(op) == "table" and op.id == "adopt-del-win" then sawWin = true end
+        if type(op) == "table" and op.id == "adopt-del-lose" then sawLose = true end
+    end
+    assertTrue(sawWin, "465-adopt-del: winner exported")
+    assertTrue(sawLose, "465-adopt-del: loser exported")
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-adopt-del: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-adopt-del: transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while stAdopt == "pending" and gAdopt < 128 do
+        if not runOneDueTimer() then
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        else
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(stAdopt, "accepted",
+        "465-adopt-del: commit got " .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "465-adopt-del: adopted record")
+    assertTrue(adopted.operations.records["adopt-del-win"] ~= nil, "465-adopt-del: winner on target")
+    assertTrue(adopted.operations.records["adopt-del-lose"] ~= nil, "465-adopt-del: loser on target")
+    assertTrue(GS.IsEventSoftDeleted(adopted, "adopt-del-don"), "465-adopt-del: event deleted")
+    local tKey = GS.SoftDeleteTargetKey(adopted, "adopt-del-don")
+    assertEq(adopted.operations.heads[tKey], "adopt-del-win", "465-adopt-del: winning head")
+    local entry = adopted.eventDeletions and adopted.eventDeletions["adopt-del-don"]
+    assertTrue(type(entry) == "table", "465-adopt-del: projection")
+    assertEq(entry.actorName, "Alice-Garona", "465-adopt-del: winning actor")
+    assertEq(don.id, "adopt-del-don", "465-adopt-del: source donation id stable")
 end
 
 do
@@ -1749,14 +1867,77 @@ do
     assertNil(localCorr, "465-corr-del: new local edit rejected")
     assertEq(localReason, "already_deleted",
         "465-corr-del: local reason already_deleted got " .. tostring(localReason))
-    -- Adoption replay of the same prior correction remains complete.
-    local stAd, rAd = GS:AdmitRemoteOperation(corrSnap, {
-        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
-        adoptionReplay = true,
-        sourceAcceptedSet = { [corr.id] = true },
+end
+
+do
+    -- Fresh-target adoption: delete-first then absent prior correction.
+    local record = seedLiveCampaignWithItem(9231, 40)
+    injectProductionDonation(record, {
+        id = "adopt-corr-don", itemId = 9231, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
     })
-    assertTrue(stAd == "accepted" or stAd == "duplicate",
-        "465-corr-del: adoption correction replay got " .. tostring(stAd) .. "/" .. tostring(rAd))
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "adopt-corr-don", "Bob-Garona", "Player-1-Bob"))
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-adopt-corr: correction")
+    local del = select(1, GS:NewSoftDeleteOperation("adopt-corr-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-adopt-corr: delete")
+    assertTrue(record.operations.records[corr.id] ~= nil, "465-adopt-corr: source corr")
+    assertTrue(record.operations.records[del.id] ~= nil, "465-adopt-corr: source del")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-adopt-corr: export bodies")
+    local sourceDataset = record.datasetId
+    local corrId, delId = corr.id, del.id
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-adopt-corr: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-adopt-corr: transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while stAdopt == "pending" and gAdopt < 128 do
+        if not runOneDueTimer() then
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        else
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(stAdopt, "accepted",
+        "465-adopt-corr: commit got " .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(adopted.operations.records[corrId] ~= nil, "465-adopt-corr: correction history")
+    assertTrue(adopted.operations.records[delId] ~= nil, "465-adopt-corr: delete history")
+    assertTrue(GS.IsEventSoftDeleted(adopted, "adopt-corr-don"), "465-adopt-corr: deleted")
+    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", 9231), 0,
+        "465-adopt-corr: credit not reinstated")
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(adopted)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(adopted, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(adopted, "adopt-corr-don"),
+        "465-adopt-corr: delete survives reload")
+    assertTrue(adopted.operations.records[corrId] ~= nil,
+        "465-adopt-corr: correction survives reload")
 end
 
 do
@@ -1780,26 +1961,33 @@ do
 end
 
 do
-    -- Alias + reload reconstruction: soft-delete bound to canonical id survives
-    -- alias lookup and runtime reload projection rebuild.
+    -- Production alias install + late reobservation alias must not resurrect credit.
     local record = seedLiveCampaignWithItem(9224, 40)
-    injectProductionDonation(record, {
-        id = "alias-canon", itemId = 9224, quantity = 3,
+    local don = injectProductionDonation(record, {
+        id = "ctx:alias-canon", itemId = 9224, quantity = 3,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
     })
-    local cfg = record.accounting._consumables
-    cfg.creditEventAliases = cfg.creditEventAliases or {}
-    cfg.creditEventAliases["alias-alt"] = "alias-canon"
-    cfg.txnRegistry = cfg.txnRegistry or {}
-    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
-        txnId = "alias-alt", eventId = "alias-canon", itemId = 9224, quantity = 3,
-    }
-    local del = select(1, GS:NewSoftDeleteOperation("alias-alt"))
+    don.txnId = "ctx:alias-canon"
+    assertTrue(GS._AddTxnAlias(record, "ctx:alias-canon", "ctx:alias-alt", don),
+        "465-alias: production alias installed")
+    local del = select(1, GS:NewSoftDeleteOperation("ctx:alias-alt"))
     assertTrue(del ~= nil, "465-alias: prepare via alias")
     assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-alias: apply")
-    assertTrue(GS.IsEventSoftDeleted(record, "alias-canon"), "465-alias: canonical deleted")
-    assertTrue(GS.IsEventSoftDeleted(record, "alias-alt"), "465-alias: alias deleted")
-    -- Simulate /reload: clear runtime caches and rebuild projections.
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-canon"), "465-alias: canonical deleted")
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-alt"), "465-alias: alias deleted")
+    -- Late reobservation discovers another alias for the same occurrence.
+    assertTrue(GS._AddTxnAlias(record, "ctx:alias-canon", "ctx:alias-reobs", don),
+        "465-alias: reobservation alias installed")
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-reobs"),
+        "465-alias: reobservation alias stays deleted")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9224), 0,
+        "465-alias: credit not restored by reobservation")
     simulateRuntimeReload()
     if GS.InvalidateEventDeletionProjection then
         GS.InvalidateEventDeletionProjection(record)
@@ -1807,20 +1995,17 @@ do
     if GS.EnsureEventDeletionProjection then
         GS.EnsureEventDeletionProjection(record, nil)
     end
-    assertTrue(GS.IsEventSoftDeleted(record, "alias-canon"),
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-canon"),
         "465-alias: canonical deleted after reload rebuild")
-    assertTrue(GS.IsEventSoftDeleted(record, "alias-alt"),
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-alt"),
         "465-alias: alias deleted after reload rebuild")
-    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9224), 0,
-        "465-alias: credit excluded after reload")
+    assertTrue(GS.IsEventSoftDeleted(record, "ctx:alias-reobs"),
+        "465-alias: reobs alias deleted after reload")
 end
 
 do
-    -- Cross-event concurrent deletes (assessment #4): two +10 donations, −10
-    -- adjustment, independent deletions of different donations. Pending-on-floor
-    -- alone leaves peers idle with different effective deleted sets. This test
-    -- demonstrates the divergence; product alternatives are reported in the PR
-    -- rather than silently changing permanent-deletion / balance / authority rules.
+    -- Cross-event concurrent deletes converge: both +10 donations deleted against
+    -- −10 adjustment leave −10 everywhere; officer repairs with +10 (#465).
     local function seedConflictPeer(itemId)
         local record = seedLiveCampaignWithItem(itemId, 100)
         injectProductionDonation(record, {
@@ -1837,16 +2022,6 @@ do
         })
         return record
     end
-    local peerA = seedConflictPeer(9225)
-    local delA = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
-    assertEq(GS:ApplyStagedConfigOperation(delA), "accepted", "465-xevt: A deletes D1")
-    local snapA = select(1, GS._SnapshotPublicOp(delA))
-
-    local peerB = seedConflictPeer(9225)
-    local delB = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
-    assertEq(GS:ApplyStagedConfigOperation(delB), "accepted", "465-xevt: B deletes D2")
-    local snapB = select(1, GS._SnapshotPublicOp(delB))
-
     local function rebind(body, record)
         local out = {}
         for k, v in pairs(body) do out[k] = v end
@@ -1858,24 +2033,46 @@ do
         out.baseTargetRevision = record.datasetId
         return out
     end
+    local function deletedSet(record)
+        return {
+            d1 = GS.IsEventSoftDeleted(record, "xevt-d1") and true or false,
+            d2 = GS.IsEventSoftDeleted(record, "xevt-d2") and true or false,
+        }
+    end
+    local function assertConverged(label, peerA, peerB, itemId)
+        flushTimers()
+        local setA, setB = deletedSet(peerA), deletedSet(peerB)
+        assertTrue(setA.d1 and setA.d2, label .. ": A deleted {D1,D2}")
+        assertTrue(setB.d1 and setB.d2, label .. ": B deleted {D1,D2}")
+        local totA, errA = GS.PersonalContributorItemTotal(
+            peerA, "Alice-Garona", "Player-1-Alice", itemId)
+        local totB, errB = GS.PersonalContributorItemTotal(
+            peerB, "Alice-Garona", "Player-1-Alice", itemId)
+        assertEq(errA, nil, label .. ": A readable")
+        assertEq(errB, nil, label .. ": B readable")
+        assertEq(totA, -10, label .. ": A debt −10")
+        assertEq(totB, -10, label .. ": B debt −10")
+        assertTrue(peerA.operations.records and peerB.operations.records,
+            label .. ": ops tables present")
+    end
 
-    local stAB, rAB = GS:AdmitRemoteOperation(rebind(snapB, peerA), {
+    local peerA = seedConflictPeer(9225)
+    local delA = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(delA), "accepted", "465-xevt: A deletes D1")
+    local snapA = select(1, GS._SnapshotPublicOp(delA))
+    local peerB = seedConflictPeer(9225)
+    local delB = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
+    assertEq(GS:ApplyStagedConfigOperation(delB), "accepted", "465-xevt: B deletes D2")
+    local snapB = select(1, GS._SnapshotPublicOp(delB))
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapB, peerA), {
         sender = "Alice-Garona", offlineRecord = peerA, preserveAttribution = true,
-    })
-    local stBA, rBA = GS:AdmitRemoteOperation(rebind(snapA, peerB), {
+    })), "accepted", "465-xevt: A accepts B's D2 delete")
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapA, peerB), {
         sender = "Alice-Garona", offlineRecord = peerB, preserveAttribution = true,
-    })
-    flushTimers()
-    assertEq(stAB, "pending",
-        "465-xevt: A keeps B's D2 delete pending got " .. tostring(stAB) .. "/" .. tostring(rAB))
-    assertEq(stBA, "pending",
-        "465-xevt: B keeps A's D1 delete pending got " .. tostring(stBA) .. "/" .. tostring(rBA))
-    assertTrue(GS.IsEventSoftDeleted(peerA, "xevt-d1"), "465-xevt: A effective {D1}")
-    assertTrue(not GS.IsEventSoftDeleted(peerA, "xevt-d2"), "465-xevt: A D2 not effective")
-    assertTrue(GS.IsEventSoftDeleted(peerB, "xevt-d2"), "465-xevt: B effective {D2}")
-    assertTrue(not GS.IsEventSoftDeleted(peerB, "xevt-d1"), "465-xevt: B D1 not effective")
-    -- Opposite delivery order of the same public bodies yields the same
-    -- asymmetric pending disposition (still divergent across peers).
+    })), "accepted", "465-xevt: B accepts A's D1 delete")
+    assertConverged("465-xevt", peerA, peerB, 9225)
+
+    -- Opposite delivery order.
     local peerA2 = seedConflictPeer(9226)
     local delA2 = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
     assertEq(GS:ApplyStagedConfigOperation(delA2), "accepted", "465-xevt2: A deletes D1")
@@ -1884,23 +2081,45 @@ do
     local delB2 = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
     assertEq(GS:ApplyStagedConfigOperation(delB2), "accepted", "465-xevt2: B deletes D2")
     local snapB2 = select(1, GS._SnapshotPublicOp(delB2))
-    -- Deliver A→B first this time, then B→A.
     assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapA2, peerB2), {
         sender = "Alice-Garona", offlineRecord = peerB2, preserveAttribution = true,
-    })), "pending", "465-xevt2: B receives D1 delete pending")
+    })), "accepted", "465-xevt2: B accepts D1 delete first")
     assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapB2, peerA2), {
         sender = "Alice-Garona", offlineRecord = peerA2, preserveAttribution = true,
-    })), "pending", "465-xevt2: A receives D2 delete pending")
-    flushTimers()
-    assertTrue(GS.IsEventSoftDeleted(peerA2, "xevt-d1") and not GS.IsEventSoftDeleted(peerA2, "xevt-d2"),
-        "465-xevt2: A still effective {D1} after opposite order")
-    assertTrue(GS.IsEventSoftDeleted(peerB2, "xevt-d2") and not GS.IsEventSoftDeleted(peerB2, "xevt-d1"),
-        "465-xevt2: B still effective {D2} after opposite order")
-    -- Numeric totals can match (both 0) while deleted sets differ — assert sets.
-    assertEq(
-        GS.PersonalContributorItemTotal(peerA, "Alice-Garona", "Player-1-Alice", 9225),
-        GS.PersonalContributorItemTotal(peerB, "Alice-Garona", "Player-1-Alice", 9225),
-        "465-xevt: numeric totals can agree while sets diverge")
+    })), "accepted", "465-xevt2: A accepts D2 delete second")
+    assertConverged("465-xevt2", peerA2, peerB2, 9226)
+
+    -- Reload reconstruction on peer A2, then explicit repair to zero.
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(peerA2)
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(peerA2)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peerA2, nil)
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(peerA2, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(peerA2, "xevt-d1") and GS.IsEventSoftDeleted(peerA2, "xevt-d2"),
+        "465-xevt2: deleted set survives reload rebuild")
+    assertEq(GS.PersonalContributorItemTotal(peerA2, "Alice-Garona", "Player-1-Alice", 9226), -10,
+        "465-xevt2: debt survives reload")
+    -- Repair on a live current record (peerA2 may be offline after seed of later peers).
+    local repairPeer = seedConflictPeer(9227)
+    local d1 = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
+    local d2 = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
+    assertEq(GS:ApplyStagedConfigOperation(d1), "accepted", "465-xevt-repair: delete D1")
+    assertEq(GS:ApplyStagedConfigOperation(d2), "accepted", "465-xevt-repair: delete D2")
+    assertEq(GS.PersonalContributorItemTotal(repairPeer, "Alice-Garona", "Player-1-Alice", 9227), -10,
+        "465-xevt-repair: debt −10")
+    local repair = select(1, GS:NewAdjustmentOperation(9227, 10, "Alice-Garona"))
+    assertTrue(repair ~= nil, "465-xevt-repair: prepare +10")
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465-xevt-repair: apply +10")
+    assertEq(GS.PersonalContributorItemTotal(repairPeer, "Alice-Garona", "Player-1-Alice", 9227), 0,
+        "465-xevt-repair: zero after explicit adjustment")
 end
 
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))

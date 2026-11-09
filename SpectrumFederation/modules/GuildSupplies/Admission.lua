@@ -1426,8 +1426,9 @@ local function ClassifyStaleBase(record, op, targetKey)
         return "apply", nil
     end
 
-    -- #465 soft-delete: LWW per delete:<eventId>; floor failures stay pending
-    -- like adjustments. Never open Troubleshooting conflicts.
+    -- #465 soft-delete: LWW per delete:<eventId>. Missing-event dependencies
+    -- stay pending; negative balances are not pending. Never open Troubleshooting
+    -- conflicts.
     if op.kind == GS.KIND.SOFT_DELETE_EVENT then
         local headId = ops.heads and ops.heads[targetKey]
         local headBody = headId and ops.records and ops.records[headId]
@@ -8753,11 +8754,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     releaseCreditBudget()
                     return stPend, reasonPend
                 end
-                -- #465: soft-delete-before-event or floor failure stays pending.
+                -- #465: soft-delete-before-event stays pending. Negative balances
+                -- are not pending dependencies (owner decision: honor deletions).
                 if stored.kind == GS.KIND.SOFT_DELETE_EVENT
                     and (err == "pending_event" or err == "missing_event"
-                        or err == "not_credited" or err == "item_negative"
-                        or err == "player_negative" or err == "credit_unavailable") then
+                        or err == "not_credited") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(

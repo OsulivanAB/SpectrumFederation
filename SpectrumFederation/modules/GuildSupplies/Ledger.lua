@@ -9067,7 +9067,11 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 local entry = ordered[i]
                 local op = entry.op
                 local event = entry.event
-                if event.gsProductionCredit == true then
+                -- Soft-deleted events keep accepted correction history but must
+                -- not activate credit heads or floor deltas (#465).
+                if event.gsProductionCredit == true
+                    and not (GS.IsEventSoftDeleted
+                        and GS.IsEventSoftDeleted(record, event)) then
                     local newName, newGuid, bindErr = BindCorrectionNewIdentity(
                         record, event, op.value.attributed, op.value.attributedGuid)
                     if bindErr == "work_budget" then
@@ -9329,32 +9333,46 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     AccumulateCreditProjectionSliceWork(workUnits)
     writeScratch(nil)
     finishOwnedBudget()
-    -- Final invariant: never leave a stale active map and never mark a negative
-    -- projection verified. On failure, clear heads and cache under the stamp;
-    -- ResolveEffectiveCreditIdentity returns CREDIT_UNAVAILABLE (not durable).
-    -- Bounded selector may leave a conflict unresolved even when some subset
-    -- would verify — consumers must treat failure as unavailable, not as proof
-    -- that no valid set exists.
+    -- Final invariant: never leave a stale active map. Correction-created
+    -- negatives still fail closed as CREDIT_UNAVAILABLE (#459). Soft-delete
+    -- debt may leave a durable negative baseline with no repairable correction
+    -- set (#465 owner decision): publish the residual active map so personal
+    -- totals stay readable and officers can apply an explicit adjustment.
     if not TotalsAllNonNegative(totals) then
-        MarkAcceptedCreditInvalid(record)
-        record.creditCorrections = {}
-        creditProjectionCache[record] = {
-            stamp = stamp,
-            ok = false,
-            err = "player_negative",
-        }
-        return false, "player_negative", {
-            activeIds = {},
-            rowVisits = rowVisits,
-            bucketVisits = bucketVisits,
-            floorVisits = floorVisits,
-            candidateTrials = candidateTrials,
-            traversalVisits = traversalVisits,
-            structureCopyVisits = structureCopyVisits,
-            workUnits = workUnits,
-            deactivations = GS._creditProjectionDeactivations,
-            lookupMisses = lookupMisses,
-        }
+        local baselineNeg = false
+        if type(baselineTotals) == "table" then
+            baselineNeg = not TotalsAllNonNegative(baselineTotals)
+        end
+        if not baselineNeg then
+            MarkAcceptedCreditInvalid(record)
+            record.creditCorrections = {}
+            creditProjectionCache[record] = {
+                stamp = stamp,
+                ok = false,
+                err = "player_negative",
+            }
+            return false, "player_negative", {
+                activeIds = {},
+                rowVisits = rowVisits,
+                bucketVisits = bucketVisits,
+                floorVisits = floorVisits,
+                candidateTrials = candidateTrials,
+                traversalVisits = traversalVisits,
+                structureCopyVisits = structureCopyVisits,
+                workUnits = workUnits,
+                deactivations = GS._creditProjectionDeactivations,
+                lookupMisses = lookupMisses,
+            }
+        end
+        -- Prefer the durable soft-delete baseline when residual active heads
+        -- still make floors worse than empty (do not reinstate deleted credit).
+        local emptyScore = TotalsNegScore(baselineTotals)
+        local activeScore = TotalsNegScore(totals)
+        if activeScore < emptyScore then
+            activeMap = {}
+            activeIds = {}
+            totals = CloneCreditProjectionTotals(baselineTotals)
+        end
     end
     local nActive = 0
     for _ in pairs(activeMap) do
@@ -9870,8 +9888,10 @@ end
 ---------------------------------------------------------------------------
 -- Soft-delete projection (#465)
 -- Authority: accepted soft-delete-event ops. Ledger evidence stays intact.
--- Guarantee: deleted rows leave Logs/progress/rankings/floors; deletion wins
--- over contributor corrections; floor failures stay pending (like adjustments).
+-- Guarantee: deleted rows leave Logs/progress/rankings; deletion wins over
+-- contributor corrections. Authorized deletions are honored even when they
+-- create signed negative balances; officers repair debt with explicit
+-- adjustments. Missing-event dependencies stay pending; floors do not.
 ---------------------------------------------------------------------------
 
 GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
@@ -10073,58 +10093,6 @@ function GS.IsEventSoftDeleted(record, eventOrId)
     return type(map[eventOrId]) == "table"
 end
 
---- Soft-delete floor: removing signed qty must leave item/personal totals >= 0.
--- Withdrawals have no accounting effect. Negative adjustments restore quantity.
-function GS.SoftDeleteFloorOk(record, event)
-    if type(record) ~= "table" or type(event) ~= "table" then
-        return false, "invalid_event"
-    end
-    if IsWithdrawalLedgerEvent(event) then
-        return true
-    end
-    local isDonation = IsDonationLedgerEvent(event)
-    local isAdjustment = IsAdjustmentLedgerEvent(event)
-    if not isDonation and not isAdjustment then
-        return false, "invalid_event"
-    end
-    local itemId = tonumber(event.itemId)
-    local qty = tonumber(event.quantity)
-    if not IsItemId(itemId) or not qty or qty ~= qty or qty ~= math.floor(qty) or qty == 0 then
-        return false, "invalid_event"
-    end
-    local campaignId = event.campaignId or record.currentCampaignId
-    if type(campaignId) ~= "string" or campaignId == "" then
-        return false, "no_campaign"
-    end
-    -- Item total currently includes this event; removing subtracts signed qty.
-    local currentItem = ItemTotal(record, itemId, campaignId)
-    if currentItem - qty < 0 then
-        return false, "item_negative"
-    end
-    -- Personal floor uses effective credit (corrections applied).
-    local creditName, creditGuid, _, creditStatus = nil, nil, nil, nil
-    if GS.ResolveEffectiveCreditIdentity then
-        creditName, creditGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
-        if creditStatus == GS.CREDIT_UNAVAILABLE then
-            return false, GS.CREDIT_UNAVAILABLE
-        end
-    else
-        creditName, creditGuid = DurableCreditIdentity(event)
-    end
-    if creditName or creditGuid then
-        local personal, personalErr = GS.PersonalContributorItemTotal(
-            record, creditName, creditGuid, itemId, campaignId)
-        if personalErr == GS.CREDIT_UNAVAILABLE then
-            return false, GS.CREDIT_UNAVAILABLE
-        end
-        personal = tonumber(personal) or 0
-        if personal - qty < 0 then
-            return false, "player_negative"
-        end
-    end
-    return true
-end
-
 local function SoftDeleteEventKind(event)
     if IsWithdrawalLedgerEvent(event) then
         return "withdrawal"
@@ -10216,13 +10184,8 @@ function GS.ValidateSoftDeletePrepare(record, op, opts)
             return false, "stale_campaign"
         end
     end
-    -- Idempotent: already deleted is accepted as duplicate at apply, not a prepare error.
-    if not opts.skipFloor then
-        local floorOk, floorErr = GS.SoftDeleteFloorOk(record, event)
-        if not floorOk then
-            return false, floorErr or "item_negative"
-        end
-    end
+    -- #465: authorized deletions are honored even when they create signed
+    -- negative item/personal balances. Floors are not deletion eligibility.
     return true, nil, {
         event = event,
         eventKind = eventKind,
@@ -10258,15 +10221,14 @@ function GS.BuildSoftDeleteValue(record, eventId, opts)
     if GS.IsEventSoftDeleted(record, event) then
         return nil, "already_deleted"
     end
-    local floorOk, floorErr = GS.SoftDeleteFloorOk(record, event)
-    if not floorOk then
-        return nil, floorErr or "item_negative"
-    end
-    local creditName, creditGuid, _, creditStatus = nil, nil, nil, nil
+    local creditName, creditGuid = nil, nil
     if eventKind ~= "withdrawal" and GS.ResolveEffectiveCreditIdentity then
-        creditName, creditGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
-        if creditStatus == GS.CREDIT_UNAVAILABLE then
-            return nil, GS.CREDIT_UNAVAILABLE
+        local status
+        creditName, creditGuid, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+        -- Deletion metadata must not fail closed on temporary credit reconstruction;
+        -- fall back to durable identity for the confirmation snapshot.
+        if status == GS.CREDIT_UNAVAILABLE or (not creditName and not creditGuid) then
+            creditName, creditGuid = DurableCreditIdentity(event)
         end
     elseif eventKind == "withdrawal" then
         creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
@@ -10325,15 +10287,12 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     local isLocal = opts.localProductionAuthority or opts.localWrite or false
     local ok, err = GS.ValidateSoftDeletePrepare(record, op, {
         localPrepare = isLocal,
-        -- Remote: still enforce floors; stay pending on failure (unlike corrections).
-        skipFloor = false,
         remoteAdmit = not isLocal,
         allowMissingEvent = not isLocal,
     })
     if not ok then
         return false, err or "invalid_value"
     end
-    -- Preview into projection; floors already checked.
     if not GS.RebuildEventDeletionProjection(record, op) then
         return false, "invalid_value"
     end
@@ -10481,11 +10440,12 @@ local function ScheduleSoftDeleteRedriveContinuation(record, opts)
     end
 end
 
---- Redrive pending soft-delete ops after ledger/floor changes (#465).
+--- Redrive pending soft-delete ops after ledger/dependency changes (#465).
 -- Non-reentrant: nested admits coalesce into a bounded After(0) continuation
 -- with attempt budget. Retained senders are reauthenticated through ordinary
--- AdmitRemoteOperation. Floor-blocked entries stay pending and the wave becomes
--- idle once the snapshot drains (external wakes resume).
+-- AdmitRemoteOperation. Missing-event/not-credited entries stay pending; floors
+-- are not deletion dependencies. A no-progress drain becomes idle; promotions
+-- or external wakes schedule one more paced pass.
 -- @return promotedCount, attemptCount
 function GS.RedrivePendingSoftDeletes(record, opts)
     if type(opts) == "string" then
@@ -10550,7 +10510,7 @@ function GS.RedrivePendingSoftDeletes(record, opts)
                 and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
                 -- Capacity full: leave pending.
             elseif type(GS.AdmitRemoteOperation) == "function" then
-                local okAdmit, status = pcall(function()
+                local okAdmit, statusOrErr = pcall(function()
                     return GS:AdmitRemoteOperation(body, {
                         sender = entry.sender,
                         offlineRecord = waveOpts.offlineRecord or opts and opts.offlineRecord,
@@ -10559,12 +10519,18 @@ function GS.RedrivePendingSoftDeletes(record, opts)
                     })
                 end)
                 if not okAdmit then
-                    -- Leave pending; surface via next wake.
-                elseif status == "accepted" or status == "duplicate" then
+                    -- Leave pending; report unexpected errors (do not claim a
+                    -- later wake surfaces them).
+                    if SF.Debug then
+                        SF.Debug("GuildSupplies",
+                            "soft-delete redrive admit error: %s",
+                            tostring(statusOrErr))
+                    end
+                elseif statusOrErr == "accepted" or statusOrErr == "duplicate" then
                     promoted = promoted + 1
                 end
-                -- Floor-blocked / missing-event pending stays in ops.pending via
-                -- Admit; wave continues and becomes idle after the snapshot.
+                -- Missing-event pending stays in ops.pending via Admit; wave
+                -- continues and becomes idle after a no-progress drain.
             end
         end
     end
@@ -10578,6 +10544,11 @@ function GS.RedrivePendingSoftDeletes(record, opts)
         ScheduleSoftDeleteRedriveContinuation(record, nil)
     else
         local followUp = cont.followUpWake == true
+        -- Actual promotions can justify one more paced pass for dependency
+        -- siblings; a no-progress blocked pass becomes idle (#465).
+        if promoted > 0 then
+            followUp = true
+        end
         local wasFull = cont.fullWake == true
         local retainedOpts = waveOpts
         if wasFull and not followUp then

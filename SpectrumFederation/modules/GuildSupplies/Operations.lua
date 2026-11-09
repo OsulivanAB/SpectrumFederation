@@ -2072,7 +2072,7 @@ function GS:ApplyStagedConfigOperation(op, context)
         elseif GS.RebuildEventDeletionProjection then
             GS.RebuildEventDeletionProjection(record, nil)
         end
-        -- Soft-delete changes floors: wake pending deletes and credit corrections.
+        -- Soft-delete changes signed accounting: wake pending deletes and credit.
         if GS.InvalidateCreditCorrectionProjection then
             GS.InvalidateCreditCorrectionProjection(record)
         end
