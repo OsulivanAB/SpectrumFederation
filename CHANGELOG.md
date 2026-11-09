@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.19-beta.4] - 2026-11-09
+
+### Added
+- Add Guild Mains/Alts character search and hover-to-copy
+
 ## [1.5.19-beta.3] - 2026-11-06
 
 ### Changed
