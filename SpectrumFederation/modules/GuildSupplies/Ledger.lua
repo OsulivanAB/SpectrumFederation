@@ -7005,6 +7005,24 @@ local function TotalsAllNonNegative(totals)
     return true
 end
 
+--- True when every negative bucket is no worse than the soft-delete baseline (#465).
+-- Permitted deletion-created debt does not force correction prune/fallback.
+-- Correction-created worsening beyond baseline still fails this check.
+local function TotalsRespectBaselineDebt(totals, baselineTotals)
+    baselineTotals = baselineTotals or {}
+    for key, total in pairs(totals or {}) do
+        GS._creditProjectionFloorVisits =
+            (tonumber(GS._creditProjectionFloorVisits) or 0) + 1
+        if total < 0 then
+            local base = tonumber(baselineTotals[key]) or 0
+            if total < base then
+                return false
+            end
+        end
+    end
+    return true
+end
+
 --- Sum of negative totals (0 when all nonnegative). Higher is better when pruning.
 -- Prefer maintaining score via TotalsAdd(..., scoreBox) during conflict trials.
 local function TotalsNegScore(totals)
@@ -7019,20 +7037,26 @@ local function TotalsNegScore(totals)
     return score
 end
 
---- Item ids that currently have any negative personal floor bucket.
+--- Item ids whose active totals are worse than the soft-delete baseline (#465).
+-- Used by empty-set fallback so permitted baseline debt does not deactivate
+-- unrelated surviving corrections on the same item.
 -- Keys are "g:guid\0itemId\0campaign" or "n:name\0itemId\0campaign".
 -- Lua 5.1 patterns cannot match embedded NULs — use plain find/sub.
-local function ItemIdsWithNegativeTotals(totals)
+local function ItemIdsWorseThanBaseline(totals, baselineTotals)
+    baselineTotals = baselineTotals or {}
     local bad = {}
-    for key, total in pairs(totals) do
+    for key, total in pairs(totals or {}) do
         if total < 0 and type(key) == "string" then
-            local first = key:find("\0", 1, true)
-            if first then
-                local second = key:find("\0", first + 1, true)
-                if second then
-                    local itemId = tonumber(key:sub(first + 1, second - 1))
-                    if itemId then
-                        bad[itemId] = true
+            local base = tonumber(baselineTotals[key]) or 0
+            if total < base then
+                local first = key:find("\0", 1, true)
+                if first then
+                    local second = key:find("\0", first + 1, true)
+                    if second then
+                        local itemId = tonumber(key:sub(first + 1, second - 1))
+                        if itemId then
+                            bad[itemId] = true
+                        end
                     end
                 end
             end
@@ -9146,14 +9170,18 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
     end
     -- Soft yield before prune when baseline/activate already spent the allowance.
+    -- Soft-delete baseline debt alone does not require prune (#465).
     if (not reusedFallback) and shouldYield(CreditProjectionWorkNow(rowVisits))
-        and not TotalsAllNonNegative(totals) then
+        and not TotalsRespectBaselineDebt(totals, baselineTotals) then
         return deferProjection("pre_prune")
     end
     -- Conflict rule: drop the head whose removal most improves personal floors.
     -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
     -- A yield mid-scan preserves scan progress; never commit a prefix winner.
-    while (not reusedFallback) and not TotalsAllNonNegative(totals) do
+    -- Compare against soft-delete baseline debt so surviving corrections are not
+    -- pruned merely because another deletion left a negative bucket (#465).
+    while (not reusedFallback)
+        and not TotalsRespectBaselineDebt(totals, baselineTotals) do
         if not scanState then
             if shouldYield(CreditProjectionWorkNow(rowVisits)) then
                 return deferProjection("prune")
@@ -9272,10 +9300,12 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
     end
     -- Local empty-set fallback: when single-head prune stalls, drop remaining
-    -- heads only for item groups that still have negative floors. Independent
-    -- deduction-supporting corrections on other items are preserved.
-    if not TotalsAllNonNegative(totals) then
-        local badItems = ItemIdsWithNegativeTotals(totals)
+    -- heads only for item groups whose active totals are worse than the
+    -- soft-delete baseline. Permitted baseline debt alone must not deactivate
+    -- surviving same-item corrections (#465). Independent deduction-supporting
+    -- corrections on other items remain preserved.
+    if not TotalsRespectBaselineDebt(totals, baselineTotals) then
+        local badItems = ItemIdsWorseThanBaseline(totals, baselineTotals)
         if type(scratch) == "table" and scratch.fallbackReady == true
             and type(scratch.fallbackBadItems) == "table" then
             badItems = scratch.fallbackBadItems
@@ -9335,43 +9365,45 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     finishOwnedBudget()
     -- Final invariant: never leave a stale active map. Correction-created
     -- negatives still fail closed as CREDIT_UNAVAILABLE (#459). Soft-delete
-    -- debt may leave a durable negative baseline with no repairable correction
-    -- set (#465 owner decision): publish the residual active map so personal
-    -- totals stay readable and officers can apply an explicit adjustment.
+    -- baseline debt may remain with an otherwise valid active correction map
+    -- (#465): publish so personal totals stay readable and officers can apply
+    -- an explicit adjustment without undoing unrelated surviving corrections.
     if not TotalsAllNonNegative(totals) then
-        local baselineNeg = false
-        if type(baselineTotals) == "table" then
-            baselineNeg = not TotalsAllNonNegative(baselineTotals)
-        end
-        if not baselineNeg then
-            MarkAcceptedCreditInvalid(record)
-            record.creditCorrections = {}
-            creditProjectionCache[record] = {
-                stamp = stamp,
-                ok = false,
-                err = "player_negative",
-            }
-            return false, "player_negative", {
-                activeIds = {},
-                rowVisits = rowVisits,
-                bucketVisits = bucketVisits,
-                floorVisits = floorVisits,
-                candidateTrials = candidateTrials,
-                traversalVisits = traversalVisits,
-                structureCopyVisits = structureCopyVisits,
-                workUnits = workUnits,
-                deactivations = GS._creditProjectionDeactivations,
-                lookupMisses = lookupMisses,
-            }
-        end
-        -- Prefer the durable soft-delete baseline when residual active heads
-        -- still make floors worse than empty (do not reinstate deleted credit).
-        local emptyScore = TotalsNegScore(baselineTotals)
-        local activeScore = TotalsNegScore(totals)
-        if activeScore < emptyScore then
-            activeMap = {}
-            activeIds = {}
-            totals = CloneCreditProjectionTotals(baselineTotals)
+        if TotalsRespectBaselineDebt(totals, baselineTotals) then
+            -- Permitted soft-delete debt with surviving corrections intact.
+        else
+            local baselineNeg = type(baselineTotals) == "table"
+                and not TotalsAllNonNegative(baselineTotals)
+            if not baselineNeg then
+                MarkAcceptedCreditInvalid(record)
+                record.creditCorrections = {}
+                creditProjectionCache[record] = {
+                    stamp = stamp,
+                    ok = false,
+                    err = "player_negative",
+                }
+                return false, "player_negative", {
+                    activeIds = {},
+                    rowVisits = rowVisits,
+                    bucketVisits = bucketVisits,
+                    floorVisits = floorVisits,
+                    candidateTrials = candidateTrials,
+                    traversalVisits = traversalVisits,
+                    structureCopyVisits = structureCopyVisits,
+                    workUnits = workUnits,
+                    deactivations = GS._creditProjectionDeactivations,
+                    lookupMisses = lookupMisses,
+                }
+            end
+            -- Prefer the durable soft-delete baseline when residual active heads
+            -- still make floors worse than empty (do not reinstate deleted credit).
+            local emptyScore = TotalsNegScore(baselineTotals)
+            local activeScore = TotalsNegScore(totals)
+            if activeScore < emptyScore then
+                activeMap = {}
+                activeIds = {}
+                totals = CloneCreditProjectionTotals(baselineTotals)
+            end
         end
     end
     local nActive = 0
@@ -10491,51 +10523,60 @@ function GS.RedrivePendingSoftDeletes(record, opts)
     softDeleteRedriveDepth = softDeleteRedriveDepth + 1
     GS._softDeleteRedriveAdmitActive = true
     local i = startIndex
-    while i <= #snapshot do
-        if attempts >= maxAttempts then
-            break
-        end
-        attempts = attempts + 1
-        local id = snapshot[i]
-        i = i + 1
-        local entry = pending[id]
-        local body = entry and entry.body
-        if type(body) ~= "table" then
-            -- Already removed or malformed; attempt still counts.
-        elseif type(entry.sender) ~= "string" or entry.sender == "" then
-            -- Leave pending until an authenticated sender is known.
-        else
-            local alreadyAccepted = ops.records and ops.records[id]
-            if not alreadyAccepted and GS._AcceptedCount
-                and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
-                -- Capacity full: leave pending.
-            elseif type(GS.AdmitRemoteOperation) == "function" then
-                local okAdmit, statusOrErr = pcall(function()
-                    return GS:AdmitRemoteOperation(body, {
-                        sender = entry.sender,
-                        offlineRecord = waveOpts.offlineRecord or opts and opts.offlineRecord,
-                        preserveAttribution = true,
-                        _softDeleteRedrive = true,
-                    })
-                end)
-                if not okAdmit then
-                    -- Leave pending; report unexpected errors (do not claim a
-                    -- later wake surfaces them).
-                    if SF.Debug then
-                        SF.Debug("GuildSupplies",
-                            "soft-delete redrive admit error: %s",
-                            tostring(statusOrErr))
+    local admitErr = nil
+    local waveOk, waveErr = pcall(function()
+        while i <= #snapshot do
+            if attempts >= maxAttempts then
+                break
+            end
+            attempts = attempts + 1
+            local id = snapshot[i]
+            i = i + 1
+            local entry = pending[id]
+            local body = entry and entry.body
+            if type(body) ~= "table" then
+                -- Already removed or malformed; attempt still counts.
+            elseif type(entry.sender) ~= "string" or entry.sender == "" then
+                -- Leave pending until an authenticated sender is known.
+            else
+                local alreadyAccepted = ops.records and ops.records[id]
+                if not alreadyAccepted and GS._AcceptedCount
+                    and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
+                    -- Capacity full: leave pending.
+                elseif type(GS.AdmitRemoteOperation) == "function" then
+                    local okAdmit, statusOrErr = pcall(function()
+                        return GS:AdmitRemoteOperation(body, {
+                            sender = entry.sender,
+                            offlineRecord = waveOpts.offlineRecord
+                                or opts and opts.offlineRecord,
+                            preserveAttribution = true,
+                            _softDeleteRedrive = true,
+                        })
+                    end)
+                    if not okAdmit then
+                        -- Leave pending; report after re-entry guards clear.
+                        admitErr = statusOrErr
+                    elseif statusOrErr == "accepted" or statusOrErr == "duplicate" then
+                        promoted = promoted + 1
                     end
-                elseif statusOrErr == "accepted" or statusOrErr == "duplicate" then
-                    promoted = promoted + 1
+                    -- Missing-event pending stays in ops.pending via Admit; wave
+                    -- continues and becomes idle after a no-progress drain.
                 end
-                -- Missing-event pending stays in ops.pending via Admit; wave
-                -- continues and becomes idle after a no-progress drain.
             end
         end
-    end
+    end)
+    -- Always clear re-entry guards before any fallible diagnostic reporting so
+    -- a logger mistake cannot strand depth>0 scheduling (#465 P1).
     GS._softDeleteRedriveAdmitActive = false
     softDeleteRedriveDepth = softDeleteRedriveDepth - 1
+    if not waveOk then
+        admitErr = admitErr or waveErr
+    end
+    if admitErr and SF.Debug and SF.Debug.Error then
+        SF.Debug:Error("GUILD_SUPPLIES",
+            "soft-delete redrive admit error: %s",
+            tostring(admitErr))
+    end
     if i <= #snapshot then
         cont.snapshot = snapshot
         cont.index = i

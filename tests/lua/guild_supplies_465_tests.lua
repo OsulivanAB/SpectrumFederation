@@ -2122,6 +2122,253 @@ do
         "465-xevt-repair: zero after explicit adjustment")
 end
 
+do
+    -- Surviving correction must stay active when a different deletion creates
+    -- soft-delete baseline debt on the same item (Alice/Bob/Carol #465).
+    local itemId = 9232
+    local record = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(record, {
+        id = "surv-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionDonation(record, {
+        id = "surv-d2", itemId = itemId, quantity = 10,
+        actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "surv-d2", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-surv: prepare D2→Bob correction")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-surv: apply correction")
+    injectProductionAdjustment(record, {
+        id = "surv-adj", itemId = itemId, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), 0,
+        "465-surv: Alice before delete")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-surv: Bob before delete")
+    assertEq(GS.PersonalContributorItemTotal(record, "Carol-Garona", "Player-1-Carol", itemId), 0,
+        "465-surv: Carol before delete")
+    local del = select(1, GS:NewSoftDeleteOperation("surv-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-surv: delete D1")
+    assertTrue(GS.IsEventSoftDeleted(record, "surv-d1"), "465-surv: D1 deleted")
+    assertTrue(not GS.IsEventSoftDeleted(record, "surv-d2"), "465-surv: D2 survives")
+    local alice, aliceErr = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", itemId)
+    local bob, bobErr = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", itemId)
+    local carol, carolErr = GS.PersonalContributorItemTotal(
+        record, "Carol-Garona", "Player-1-Carol", itemId)
+    assertEq(aliceErr, nil, "465-surv: Alice readable with debt")
+    assertEq(bobErr, nil, "465-surv: Bob readable")
+    assertEq(carolErr, nil, "465-surv: Carol readable")
+    assertEq(alice, -10, "465-surv: Alice debt −10")
+    assertEq(bob, 10, "465-surv: Bob keeps corrected credit")
+    assertEq(carol, 0, "465-surv: Carol remains emptied")
+    assertTrue(type(record.creditCorrections) == "table"
+        and type(record.creditCorrections["surv-d2"]) == "table",
+        "465-surv: D2 correction remains active")
+    assertEq(record.creditCorrections["surv-d2"].attributed, "Bob-Garona",
+        "465-surv: active head credits Bob")
+    -- New local edits to the deleted row still fail closed.
+    local localCorr, _, localReason = GS:NewContributorCorrectionOperation(
+        "surv-d1", "Bob-Garona", "Player-1-Bob")
+    assertNil(localCorr, "465-surv: edit deleted D1 rejected")
+    assertEq(localReason, "already_deleted",
+        "465-surv: deleted edit reason got " .. tostring(localReason))
+
+    -- Reload reconstruction keeps the surviving correction + debt.
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(record, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(record, "surv-d1"), "465-surv: D1 deleted after reload")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-surv: Alice debt after reload")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-surv: Bob credit after reload")
+    assertTrue(type(record.creditCorrections["surv-d2"]) == "table",
+        "465-surv: active correction after reload")
+
+    -- Reordered remote replay: delete first, then prior correction, on a peer
+    -- that starts without either op installed.
+    local corrSnap = select(1, GS._SnapshotPublicOp(corr))
+    local delSnap = select(1, GS._SnapshotPublicOp(del))
+    local peer = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(peer, {
+        id = "surv-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionDonation(peer, {
+        id = "surv-d2", itemId = itemId, quantity = 10,
+        actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+    })
+    injectProductionAdjustment(peer, {
+        id = "surv-adj", itemId = itemId, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        return out
+    end
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "465-surv: peer delete-first")
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(corrSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "465-surv: peer correction after delete")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-surv: peer Alice debt")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-surv: peer Bob keeps correction")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Carol-Garona", "Player-1-Carol", itemId), 0,
+        "465-surv: peer Carol emptied")
+    assertTrue(type(peer.creditCorrections) == "table"
+        and type(peer.creditCorrections["surv-d2"]) == "table",
+        "465-surv: peer D2 correction active")
+
+    -- Explicit Alice +10 repairs debt without changing Bob's credit.
+    local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, "Alice-Garona"))
+    assertTrue(repair ~= nil, "465-surv: prepare Alice +10")
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465-surv: apply Alice +10")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), 0,
+        "465-surv: Alice repaired to zero")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-surv: Bob unchanged after Alice repair")
+end
+
+do
+    -- Soft-delete redrive: forced admit exception uses SF.Debug:Error, clears
+    -- re-entry guards, retains pending work, then drains successfully and idles.
+    local record = seedLiveCampaignWithItem(9233, 200)
+    local ctx = select(1, GS:GetCurrentContext())
+    record.operations.pending = record.operations.pending or {}
+    local pendingIds = {}
+    for i = 1, 3 do
+        local donId = string.format("sd-ex-don-%02d", i)
+        injectProductionDonation(record, {
+            id = donId, itemId = 9233, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        local id = string.format("sd-ex-del-%02d", i)
+        pendingIds[#pendingIds + 1] = id
+        record.operations.pending[id] = {
+            id = id,
+            sender = "Alice-Garona",
+            reason = "pending_event",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = id,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.SOFT_DELETE_EVENT,
+                target = donId,
+                value = {
+                    eventId = donId,
+                    eventKind = "donation",
+                    itemId = 9233,
+                    quantity = 2,
+                    attributed = "Alice-Garona",
+                    attributedGuid = "Player-1-Alice",
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = world.time + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
+    if GS._ClearSoftDeleteRedriveContinuationForTest then
+        GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    end
+    world.debugLogs = {}
+    SF.Debug:SetEnabled(true)
+    local realAdmit = GS.AdmitRemoteOperation
+    local calls = 0
+    GS.AdmitRemoteOperation = function(self, body, opts)
+        calls = calls + 1
+        if calls == 1 then
+            error("forced soft-delete redrive admit failure")
+        end
+        return realAdmit(self, body, opts)
+    end
+    local promoted1, attempts1 = GS.RedrivePendingSoftDeletes(record, {
+        itemId = 9233, maxAttempts = 8,
+    })
+    GS.AdmitRemoteOperation = realAdmit
+    assertEq(GS._softDeleteRedriveAdmitActive, false,
+        "465-ex: admit guard cleared after exception")
+    assertTrue(attempts1 >= 1, "465-ex: wave attempted admits")
+    assertTrue(promoted1 >= 0, "465-ex: promoted count readable")
+    local sawDiag = false
+    for i = 1, #world.debugLogs do
+        local e = world.debugLogs[i]
+        if e and e.level == "ERROR"
+            and type(e.msg) == "string"
+            and e.msg:find("forced soft%-delete redrive admit failure", 1, false) then
+            sawDiag = true
+            break
+        end
+    end
+    assertTrue(sawDiag, "465-ex: SF.Debug:Error recorded admit failure")
+    local stillPending = 0
+    for i = 1, #pendingIds do
+        if record.operations.pending[pendingIds[i]] then
+            stillPending = stillPending + 1
+        end
+    end
+    assertTrue(stillPending >= 1, "465-ex: failed admit left pending work")
+    -- Subsequent eligible drain succeeds and becomes idle.
+    if GS._ClearSoftDeleteRedriveContinuationForTest then
+        GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    end
+    timers = {}
+    GS.RedrivePendingSoftDeletes(record, { itemId = 9233, maxAttempts = 8 })
+    local slices = 0
+    while slices < 16 do
+        if not runOneDueTimer() then
+            break
+        end
+        slices = slices + 1
+    end
+    flushTimers()
+    local remaining = 0
+    for id, entry in pairs(record.operations.pending or {}) do
+        local body = entry and entry.body
+        if type(body) == "table" and body.kind == GS.KIND.SOFT_DELETE_EVENT then
+            remaining = remaining + 1
+        end
+    end
+    assertEq(remaining, 0, "465-ex: subsequent drain cleared pending")
+    assertTrue(#timers == 0, "465-ex: idle after successful drain")
+    assertEq(GS._softDeleteRedriveAdmitActive, false, "465-ex: idle guard cleared")
+    for i = 1, 3 do
+        assertTrue(GS.IsEventSoftDeleted(record, string.format("sd-ex-don-%02d", i)),
+            "465-ex: donation soft-deleted " .. i)
+    end
+    SF.Debug:SetEnabled(false)
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
