@@ -667,6 +667,9 @@ L["GUILD_SUPPLIES_EDITOR_RANK_RECOVER_TIP"] = "Repairs a corrupt stored permissi
 L["GUILD_SUPPLIES_EDITOR_RANK_DISABLED"] = "Who can edit follows the shared officer rank. This control only repairs a corrupt stored permission record."
 L["GUILD_SUPPLIES_DISABLED_POLICY_UNKNOWN"] = "Officer rank is not available yet, so Guild Supplies setup stays disabled."
 
+-- Shared Settings autocomplete empty-results fallback
+L["SETTINGS_AUTOCOMPLETE_NO_MATCHES"] = "No matches"
+
 -- General → UI Customization: Settings Window Opacity (#418)
 L["SETTINGS_WINDOW_OPACITY_LABEL"] = "Settings Window Opacity"
 L["SETTINGS_WINDOW_OPACITY_TOOLTIP"] = "Adjust the opacity of the settings window background only. Text and controls stay fully opaque. 100% is fully opaque; lower values show more of the game underneath."

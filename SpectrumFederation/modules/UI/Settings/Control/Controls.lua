@@ -4829,6 +4829,12 @@ function Controls:AddAutocomplete(section, opts)
 		maxDropdownHeight = 250
 	end
 	local allowEmptyPrefix = opts.allowEmptyPrefix and true or false
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
 	local suggestionRowHeight = 20
 	local dropPad = 4
 	local scrollBarWidth = 18
@@ -5109,7 +5115,7 @@ function Controls:AddAutocomplete(section, opts)
 				end
 				local emptyText = opts.emptySuggestionsText
 				if type(emptyText) ~= "string" or emptyText == "" then
-					emptyText = "No matches"
+					emptyText = Loc("SETTINGS_AUTOCOMPLETE_NO_MATCHES", "No matches")
 				end
 				emptyLabel:SetText(emptyText)
 				emptyLabel:Show()

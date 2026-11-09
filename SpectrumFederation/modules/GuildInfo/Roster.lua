@@ -644,6 +644,10 @@ local function BuildListSearchPool(roster, groups, record)
 
     local candidates = {}
     local seen = {}
+    -- Mains eligible for the Main panel in this same pass. Alts whose linked
+    -- main is absent (e.g. departed) stay out of the search UI without mutating
+    -- the underlying relationship record.
+    local visibleMainGuids = {}
 
     -- Visible mains: rostered non-alts (same as GetEligibleMainDisplayRows).
     local altSet = GI.GetAssignedAltGuidSet(record)
@@ -652,6 +656,7 @@ local function BuildListSearchPool(roster, groups, record)
         local guid = member and member.guid
         if type(guid) == "string" and guid ~= "" and not seen[guid] and not altSet[guid] then
             seen[guid] = true
+            visibleMainGuids[guid] = true
             local nameRealm = member.nameRealm or guid
             local classFile = member.classFile
             candidates[#candidates + 1] = {
@@ -669,11 +674,12 @@ local function BuildListSearchPool(roster, groups, record)
     end
 
     -- Visible alts: one pass over relationship groups using the shared record.
+    -- Only include alts whose associated main is still a visible Main-panel row.
     if type(groups) == "table" then
         for i = 1, #groups do
             local group = groups[i]
             local mainGuid = group and group.mainGuid
-            if type(mainGuid) == "string" and mainGuid ~= "" then
+            if type(mainGuid) == "string" and mainGuid ~= "" and visibleMainGuids[mainGuid] then
                 local altGuids = {}
                 local seenAlt = {}
                 if type(group.altGuids) == "table" then
@@ -843,6 +849,11 @@ function GI:ResolveListSearchSelection(guid, roster)
         if type(mainGuid) ~= "string" or mainGuid == "" then
             return nil, nil, "not_visible"
         end
+        -- Recheck main visibility at selection time so stale suggestions whose
+        -- main has since left the Main panel cannot focus an invisible group.
+        if not GI:IsEligibleMainSelection(mainGuid, roster) then
+            return nil, nil, "not_visible"
+        end
         -- Prefer showing the alt when it is still in the selected-main projection.
         local alts = GI:GetSelectedAltDisplayRows(mainGuid, roster)
         for i = 1, #(alts or {}) do
@@ -850,12 +861,8 @@ function GI:ResolveListSearchSelection(guid, roster)
                 return mainGuid, guid, "ok"
             end
         end
-        -- Departed/hidden alt: still focus the associated main when that main is
-        -- an eligible Main-panel row; otherwise report not_visible.
-        if GI:IsEligibleMainSelection(mainGuid, roster) then
-            return mainGuid, nil, "ok"
-        end
-        return nil, nil, "not_visible"
+        -- Departed/hidden alt: still focus the associated eligible main.
+        return mainGuid, nil, "ok"
     end
 
     -- Main-with-alts, solo/unassigned eligible main, or any other Main-panel row.

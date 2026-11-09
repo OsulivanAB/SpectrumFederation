@@ -267,6 +267,9 @@ end
 UIParent = makeRegion("Frame", "UIParent")
 
 -- Minimal Controls host: Style OpaqueMenu + Controls AddAutocomplete only.
+local localeTable = {
+    SETTINGS_AUTOCOMPLETE_NO_MATCHES = "Localized No Matches",
+}
 local SF = {
     SettingsUI = {},
     SettingsStore = {
@@ -275,7 +278,28 @@ local SF = {
         end,
         Set = function() end,
     },
+    L = localeTable,
+    LocaleText = function(key, default)
+        local value = localeTable[key]
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+        return default or tostring(key or "")
+    end,
 }
+
+local function findFontStringText(needle)
+    for i = 1, #created do
+        local obj = created[i]
+        if obj.objectType == "FontString" then
+            local text = tostring(obj._text or "")
+            if text == needle then
+                return text
+            end
+        end
+    end
+    return nil
+end
 
 do
     local chunk = assert(loadfile("SpectrumFederation/modules/UI/Settings/Style.lua"))
@@ -417,6 +441,8 @@ assertTrue(sb:IsShown(), "scrollbar shown for overflowing suggestion list")
 edit:TypeText("zzzz-nomatch")
 assertTrue(drop:IsShown(), "unmatched query shows empty-results dropdown")
 assertTrue((drop:GetHeight() or 0) <= 220, "empty-results dropdown stays capped")
+assertEq(findFontStringText("No matches"), "No matches",
+    "caller emptySuggestionsText override is preserved")
 
 -- Clearing closes suggestions.
 edit:TypeText("")
@@ -573,6 +599,73 @@ assertEq(scrollFrame:GetVerticalScroll(), 0, "large-to-empty resets vertical scr
 assertEq(scrollFrame.ScrollBar:GetValue(), 0, "large-to-empty resets scrollbar value")
 assertTrue(drop:IsShown(), "large-to-empty keeps empty-results dropdown")
 assertTrue((drop:GetHeight() or 0) <= 220, "large-to-empty stays height-capped")
+
+-- Default empty-results label routes through SF.LocaleText when no override.
+created = {}
+textValue = ""
+section = makeSection()
+Controls:AddAutocomplete(section, {
+    label = "FindDefault",
+    width = 240,
+    maxSuggestions = 8,
+    maxDropdownHeight = 220,
+    get = function()
+        return textValue
+    end,
+    set = function(v)
+        textValue = tostring(v or "")
+    end,
+    getSuggestions = function()
+        return {}
+    end,
+})
+edit, drop = nil, nil
+for i = 1, #created do
+    local obj = created[i]
+    if obj.__sfAutocompleteEdit then
+        edit = obj.__sfAutocompleteEdit
+        drop = obj.__sfAutocompleteDrop
+        break
+    end
+end
+edit:TypeText("zzzz-nomatch")
+assertTrue(drop:IsShown(), "localized empty-results dropdown opens")
+assertEq(findFontStringText("Localized No Matches"), "Localized No Matches",
+    "default empty-results uses SETTINGS_AUTOCOMPLETE_NO_MATCHES via LocaleText")
+
+-- Incomplete localization tables still fall back to the English default.
+local savedLocale = localeTable.SETTINGS_AUTOCOMPLETE_NO_MATCHES
+localeTable.SETTINGS_AUTOCOMPLETE_NO_MATCHES = nil
+created = {}
+textValue = ""
+section = makeSection()
+Controls:AddAutocomplete(section, {
+    label = "FindFallback",
+    width = 240,
+    maxSuggestions = 8,
+    get = function()
+        return textValue
+    end,
+    set = function(v)
+        textValue = tostring(v or "")
+    end,
+    getSuggestions = function()
+        return {}
+    end,
+})
+edit, drop = nil, nil
+for i = 1, #created do
+    local obj = created[i]
+    if obj.__sfAutocompleteEdit then
+        edit = obj.__sfAutocompleteEdit
+        drop = obj.__sfAutocompleteDrop
+        break
+    end
+end
+edit:TypeText("zzzz-nomatch")
+assertEq(findFontStringText("No matches"), "No matches",
+    "missing locale key falls back to English default")
+localeTable.SETTINGS_AUTOCOMPLETE_NO_MATCHES = savedLocale
 
 -- allowEmptyPrefix still supports Guild Supplies-style empty menus.
 created = {}

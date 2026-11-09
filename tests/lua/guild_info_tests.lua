@@ -7143,6 +7143,58 @@ do
 end
 
 do
+    -- Departed main + rostered alt: omit alt from search; reject stale resolve;
+    -- retain underlying relationship.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "invisible-main: seed Bob under Alice")
+
+    local roster = GI.GetRosterSnapshot(true)
+    assertTrue(guidSetFromRows(GI:GetListSearchCandidates(roster, "bo", 48))["Player-1-Bob"] ~= nil,
+        "invisible-main: Bob searchable while Alice is visible")
+
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Alice" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    roster = GI.GetRosterSnapshot(true)
+
+    assertEq(GI.GetMembershipStatus("Player-1-Alice", roster), "departed",
+        "invisible-main: Alice departed")
+    assertEq(GI.GetMembershipStatus("Player-1-Bob", roster), "in_guild",
+        "invisible-main: Bob still rostered")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "invisible-main: Bob remains alt under Alice")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "invisible-main: relationship retained after Alice departed")
+
+    local afterMainDepart = guidSetFromRows(GI:GetListSearchCandidates(roster, "bo", 48))
+    assertTrue(afterMainDepart["Player-1-Bob"] == nil,
+        "invisible-main: Bob omitted when Alice is not Main-panel visible")
+    assertTrue(afterMainDepart["Player-1-Alice"] == nil,
+        "invisible-main: departed Alice omitted from candidates")
+
+    local mainGuid, highlight, status = GI:ResolveListSearchSelection("Player-1-Bob", roster)
+    assertEq(status, "not_visible", "invisible-main: stale Bob selection rejects")
+    assertNil(mainGuid, "invisible-main: stale resolve returns no main")
+    assertNil(highlight, "invisible-main: stale resolve returns no highlight")
+
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "invisible-main: reject path does not mutate Bob role")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "invisible-main: reject path retains Alice link")
+
+    restoreBaseRoster()
+    pass("list search invisible-main alt omit and stale resolve")
+end
+
+do
     restoreBaseRoster()
     resetDB()
     setActor("Alice-Garona", "Player-1-Alice", 1)
@@ -7263,6 +7315,58 @@ do
     assertEq(#dual.left.getItems(), mainsBeforeType,
         "search ui: typing alone does not filter Main list")
 
+    -- Selection outcomes emit SF.Debug INFO/WARN; typing stays silent.
+    local debugEvents = {}
+    local prevDebug = SF.Debug
+    SF.Debug = {
+        _enabled = true,
+        IsEnabled = function(self) return self._enabled end,
+        Info = function(_, cat, fmt, ...)
+            debugEvents[#debugEvents + 1] = {
+                level = "INFO",
+                cat = cat,
+                msg = string.format(tostring(fmt or ""), ...),
+            }
+        end,
+        Warn = function(_, cat, fmt, ...)
+            debugEvents[#debugEvents + 1] = {
+                level = "WARN",
+                cat = cat,
+                msg = string.format(tostring(fmt or ""), ...),
+            }
+        end,
+        Verbose = function() end,
+        Error = function() end,
+    }
+    debugEvents = {}
+    search.onTextChanged(nil, "bo")
+    search.getSuggestions(nil, "bo")
+    assertEq(#debugEvents, 0, "search ui: typing/suggestions do not debug-log")
+
+    clearBtn.onClick()
+    debugEvents = {}
+    search.onResolved(nil, {
+        guid = "Player-1-Bob",
+        nameRealm = "Bob-Garona",
+        classFile = "WARRIOR",
+    })
+    assertTrue(#debugEvents >= 1 and debugEvents[1].level == "INFO",
+        "search ui: successful selection logs INFO")
+    assertEq(debugEvents[1].cat, "GUILD_INFO", "search ui: selection debug uses GUILD_INFO")
+    assertTrue(tostring(debugEvents[1].msg):find("Player%-1%-Bob", 1) ~= nil
+            or tostring(debugEvents[1].msg):find("Player%-1%-Alice", 1) ~= nil,
+        "search ui: success log names selected character/main")
+
+    debugEvents = {}
+    search.onResolved(nil, {
+        guid = "Player-missing",
+        nameRealm = "Missing-Garona",
+    })
+    assertTrue(#debugEvents >= 1 and debugEvents[1].level == "WARN",
+        "search ui: not-visible selection logs WARN")
+    assertEq(debugEvents[1].cat, "GUILD_INFO", "search ui: failure debug uses GUILD_INFO")
+
+    SF.Debug = prevDebug
     restoreBaseRoster()
     pass("list search UI select/clear/copy/no-mutation")
 end

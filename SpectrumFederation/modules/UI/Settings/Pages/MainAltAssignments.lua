@@ -8,6 +8,18 @@ local function Loc(key, default)
 	return default or key
 end
 
+local function DebugInfo(fmt, ...)
+	if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+		SF.Debug:Info("GUILD_INFO", fmt, ...)
+	end
+end
+
+local function DebugWarn(fmt, ...)
+	if SF.Debug and SF.Debug.Warn and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+		SF.Debug:Warn("GUILD_INFO", fmt, ...)
+	end
+end
+
 SF.SettingsUI:RegisterCategory({
 	id = "guildInfo",
 	name = Loc("GUILD_INFO_CATEGORY_NAME", "Guild Settings"),
@@ -431,6 +443,10 @@ local function ApplyListSearchSelection(item)
 			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
 			"That character has no visible Main/Alt group right now."
 		)
+		DebugWarn(
+			"List search selection rejected: invalid item (guid=%s)",
+			tostring(item and item.guid)
+		)
 		QueueFormRefresh()
 		return
 	end
@@ -442,6 +458,11 @@ local function ApplyListSearchSelection(item)
 			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
 			"That character has no visible Main/Alt group right now."
 		)
+		DebugWarn(
+			"List search selection not visible: guid=%s status=%s",
+			tostring(item.guid),
+			tostring(status or "unknown")
+		)
 		QueueFormRefresh()
 		return
 	end
@@ -450,6 +471,18 @@ local function ApplyListSearchSelection(item)
 	listSearchHighlightAltGuid = highlightAlt
 	selectedMainGuid = mainGuid
 	listSearchStatus = nil
+	if highlightAlt then
+		DebugInfo(
+			"List search selected alt guid=%s → main=%s",
+			tostring(item.guid),
+			tostring(mainGuid)
+		)
+	else
+		DebugInfo(
+			"List search selected main guid=%s",
+			tostring(mainGuid)
+		)
+	end
 	QueueFormRefresh()
 end
 
