@@ -2,6 +2,15 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.19-beta.5] - 2026-11-09
+
+### Added
+- Add officer Edit contributor for Raid Supplies Logs credit corrections (#459)
+
+### Changed
+- Page required credit-event aliases across Guild Gossip wire limits for dataset adoption (#459)
+- Reclaim unreferenced credit-event aliases that only share a corrected terminal (#459)
+
 ## [1.5.19-beta.4] - 2026-11-09
 
 ### Added

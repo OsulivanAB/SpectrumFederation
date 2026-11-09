@@ -10,13 +10,14 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- Wire schema for the Guild Supplies Gossip provider.
 -- 2: valuation-aware wire (#397). 3: Guild Info witness/attribution (#427).
 -- 4: attributed adjustment unitCopper on ledger events (#447 rankings).
--- Older schema-3 peers drop unknown unitCopper when reconstructing stored
--- events and can relay that stripped history; they are incompatible under
--- Guild Gossip's strict equality. Persisted GS.SCHEMA_VERSION stays independent.
--- #457 Quick Withdraw recipes + informational withdrawal receipts require a
--- strict provider gate so mixed-version peers cannot partially sync unknown
--- shapes. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 5
+-- 5: Quick Withdraw recipes/withdrawal receipts (#457) on released beta.
+-- 6: combined #457 + officer correct-contributor (#459). Schema 5 peers do
+-- not understand corrections; advertising 5 for the combined protocol would
+-- let them pass Guild Gossip's strict equality and then reject
+-- correct-contributor as unsupported_kind while computing stale credit.
+-- Older schemas are incompatible under GG equality and must update before
+-- sync/adoption resumes. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 6
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -41,6 +42,9 @@ GS.MAX_WIRE_RECORD_BYTES = 2048
 GS.MAX_ARCHIVE_PAGE_ITEMS = 64
 GS.MAX_ARCHIVE_PAGE_COUNT = 512
 GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
+-- Required credit-event alias pages for adoption (#459 A). Worst case one
+-- binding per page under the 2048-byte wrapper-inclusive wire budget.
+GS.MAX_CREDIT_ALIAS_PAGE_COUNT = 512
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -1227,6 +1231,24 @@ local function CurrentTargetRevision(record, targetKey)
     return record.datasetId
 end
 
+--- Target key for admission/classify/store. Contributor corrections use the
+-- canonical donation id so alias-targeted ops share one LWW head (#459).
+local function OperationTargetKey(record, op)
+    if type(op) ~= "table" then
+        return nil
+    end
+    if op.kind == GS.KIND.START_CAMPAIGN then
+        return GS.CAMPAIGN_TARGET_KEY
+    end
+    if op.kind == GS.KIND.CORRECT_CONTRIBUTOR and GS.CorrectionTargetKey then
+        return GS.CorrectionTargetKey(record, op.target)
+    end
+    if GS._TargetKey then
+        return GS._TargetKey(op.kind, op.target)
+    end
+    return nil
+end
+
 local function HasAcceptedId(ops, id)
     return type(ops.records) == "table" and type(ops.records[id]) == "table"
 end
@@ -1303,14 +1325,28 @@ local function ClassifyStaleBase(record, op, targetKey)
             and headBody.id == policyNow then
             return "conflict", "divergent_edit"
         end
-        -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
-        if HasAcceptedId(ops, op.basePolicyRevision) then
-            return "obsolete", "stale_policy"
+        -- #459 C: contributor corrections authored under an older accepted policy
+        -- must still converge when the transport sender is currently authorized.
+        -- Do not treat known superseded policy bases as permanent stale_policy
+        -- rejection (mirrors campaign-head exemption). Missing predecessors stay
+        -- pending. Other kinds keep obsolete/stale_policy.
+        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            if not HasAcceptedId(ops, op.basePolicyRevision)
+                and op.basePolicyRevision ~= record.datasetId then
+                return "pending", "missing_policy_predecessor"
+            end
+            -- Known older/current-dataset policy base: fall through to target
+            -- causality (apply / stale_credit / conflict) under current authority.
+        else
+            -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
+            if HasAcceptedId(ops, op.basePolicyRevision) then
+                return "obsolete", "stale_policy"
+            end
+            if op.basePolicyRevision == record.datasetId then
+                return "obsolete", "stale_policy"
+            end
+            return "pending", "missing_policy_predecessor"
         end
-        if op.basePolicyRevision == record.datasetId then
-            return "obsolete", "stale_policy"
-        end
-        return "pending", "missing_policy_predecessor"
     end
     if (op.baseCampaignId or nil) ~= (campaignNow or nil)
         or (op.kind ~= GS.KIND.START_CAMPAIGN
@@ -1334,11 +1370,13 @@ local function ClassifyStaleBase(record, op, targetKey)
             end
             return "conflict", "campaign_conflict"
         end
-        -- #424: rename authorship campaignId/baseCampaignId are prepare-time current.
-        -- After rollover a valid rename for an existing (often archived) target must
-        -- still reach LWW rather than permanent stale_campaign rejection. Do not
-        -- relax campaign-head causality for any other kind.
-        if op.kind ~= GS.KIND.RENAME_CAMPAIGN then
+        -- #424 / #459: rename and contributor-correction authorship campaignId /
+        -- baseCampaignId are prepare-time current. After rollover, accepted
+        -- corrections must still replay (and renames must still LWW) rather than
+        -- permanent stale_campaign rejection. Do not relax campaign-head
+        -- causality for any other kind.
+        if op.kind ~= GS.KIND.RENAME_CAMPAIGN
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR then
             -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
             local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
             local headBody = headId and ops.records[headId]
@@ -1365,6 +1403,20 @@ local function ClassifyStaleBase(record, op, targetKey)
     -- #388 adjustments: append-only with commit-time floor checks. Do not open
     -- config-style divergent conflicts; incompatible negatives stay pending.
     if op.kind == GS.KIND.ADJUST_QUANTITY then
+        return "apply", nil
+    end
+
+    -- #459 contributor corrections: LWW per credit:<eventId>; floor failures
+    -- stay pending like adjustments. Never open Troubleshooting conflicts.
+    if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) == "table" and headBody.id ~= op.id then
+            if not (GS.CreditCorrectionRevisionWins
+                and GS.CreditCorrectionRevisionWins(op, headBody)) then
+                return "obsolete", "stale_credit"
+            end
+        end
         return "apply", nil
     end
 
@@ -1927,6 +1979,55 @@ local function PreferArchiveHistoricalContext(existing, assembled)
 end
 
 
+--- Merge inline descriptor aliases with buffered gs-credit-aliases-page bodies.
+-- @return table|nil map, string|nil err
+local function AssembleCreditAliasesFromAdoption(adop, desc)
+    local map = {}
+    local function absorb(incoming)
+        if incoming == nil then
+            return true
+        end
+        if type(incoming) ~= "table" then
+            return false, "invalid_credit_event_aliases"
+        end
+        for alias, canon in pairs(incoming) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return false, "invalid_credit_event_aliases"
+            end
+            local prior = map[alias]
+            if type(prior) == "string" and prior ~= "" and prior ~= canon then
+                return false, "alias_conflict"
+            end
+            map[alias] = canon
+        end
+        return true
+    end
+    local ok, err = absorb(desc and desc.creditEventAliases)
+    if not ok then
+        return nil, err
+    end
+    local info = adop and adop._creditAliasIndex
+    local expectPages = tonumber(desc and desc.creditEventAliasPageCount) or 0
+    if expectPages > 0 then
+        if type(info) ~= "table" or type(info.pages) ~= "table" then
+            return nil, "incomplete_transfer"
+        end
+        for page = 1, expectPages do
+            local pageBody = info.pages[page]
+            if type(pageBody) ~= "table" then
+                return nil, "incomplete_transfer"
+            end
+            ok, err = absorb(pageBody.aliases)
+            if not ok then
+                return nil, err
+            end
+        end
+    end
+    return map, nil
+end
+
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
     local adop = GS._adoption
@@ -2062,6 +2163,53 @@ function GS:IsAdoptionTransferComplete()
                     if type(info.pages[page]) ~= "table" then
                         return false, "incomplete_transfer"
                     end
+                end
+            end
+        end
+    end
+    -- Required credit-event alias transfer (#459 A): when the source advertises
+    -- a count, inline and/or paged bindings must assemble to exactly that set.
+    local hasAliasManifest = desc.creditEventAliasCount ~= nil
+    if hasAliasManifest then
+        local expectAliasCount = tonumber(desc.creditEventAliasCount)
+        local expectAliasPages = tonumber(desc.creditEventAliasPageCount) or 0
+        if expectAliasCount == nil
+            or expectAliasCount ~= math.floor(expectAliasCount)
+            or expectAliasCount < 0
+            or expectAliasPages ~= math.floor(expectAliasPages)
+            or expectAliasPages < 0 then
+            return false, "incomplete_transfer"
+        end
+        if adop.pinnedCreditEventAliasCount ~= nil
+            and adop.pinnedCreditEventAliasCount ~= expectAliasCount then
+            return false, "source_changed"
+        end
+        if adop.pinnedCreditEventAliasPageCount ~= nil
+            and adop.pinnedCreditEventAliasPageCount ~= expectAliasPages then
+            return false, "source_changed"
+        end
+        local assembled, assembleErr = AssembleCreditAliasesFromAdoption(adop, desc)
+        if not assembled then
+            return false, assembleErr or "incomplete_transfer"
+        end
+        local n = 0
+        for _ in pairs(assembled) do
+            n = n + 1
+        end
+        if n ~= expectAliasCount then
+            return false, "incomplete_transfer"
+        end
+        if expectAliasPages > 0 then
+            local info = adop._creditAliasIndex
+            if type(info) ~= "table" or type(info.pages) ~= "table" then
+                return false, "incomplete_transfer"
+            end
+            if info.pageCount and info.pageCount ~= expectAliasPages then
+                return false, "incomplete_transfer"
+            end
+            for page = 1, expectAliasPages do
+                if type(info.pages[page]) ~= "table" then
+                    return false, "incomplete_transfer"
                 end
             end
         end
@@ -2256,6 +2404,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _confirmEnvelopes = {},
         _confirmByTarget = {},
         _archiveIndex = {},
+        _creditAliasIndex = { pages = {}, pageCount = nil },
         -- Incremental receive-stage completeness (avoids full-history recounts).
         _bufCounts = {
             acceptedOps = 0,
@@ -2288,6 +2437,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedAcceptedLedgerCount = nil,
         pinnedDonationEvidenceCount = nil,
         pinnedValuationCount = nil,
+        pinnedCreditEventAliasCount = nil,
+        pinnedCreditEventAliasPageCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2777,6 +2928,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local ledger = tonumber(descBody.acceptedLedgerCount)
         local donEv = tonumber(descBody.donationEvidenceCount)
         local valuations = tonumber(descBody.valuationCount)
+        local aliasCount = tonumber(descBody.creditEventAliasCount)
+        local aliasPages = tonumber(descBody.creditEventAliasPageCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2850,6 +3003,28 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Credit-alias manifest pins (#459 A). Omission after pin is source_changed;
+        -- older descriptors that never advertised stay unpinned.
+        if adop.pinnedCreditEventAliasCount == nil then
+            if aliasCount ~= nil then
+                adop.pinnedCreditEventAliasCount = aliasCount
+            end
+        elseif aliasCount == nil or aliasCount ~= adop.pinnedCreditEventAliasCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedCreditEventAliasPageCount == nil then
+            if aliasPages ~= nil then
+                adop.pinnedCreditEventAliasPageCount = aliasPages
+            end
+        elseif aliasPages == nil or aliasPages ~= adop.pinnedCreditEventAliasPageCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return nil
     end
 
@@ -2898,12 +3073,22 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Changed same-ID credit-alias pages likewise invalidate the snapshot
+        -- (#459 discussion_r4497121459). Count pins alone cannot detect content
+        -- drift; leave the prior active dataset intact.
+        if body.kind == "gs-credit-aliases-page"
+            and adop.records[recordId].kind == "gs-credit-aliases-page" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return "rejected", "id_conflict"
     end
 
     -- Capacity applies only to genuinely new logical record ids. Exact
-    -- duplicates, pinned descriptor replacement, and changed valuation
-    -- source_changed must still run when the buffer is already full.
+    -- duplicates, pinned descriptor replacement, and changed valuation /
+    -- credit-alias source_changed must still run when the buffer is already full.
     if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
         return "rejected", "full"
     end
@@ -3022,6 +3207,57 @@ function GS:BufferAdoptionRecord(recordId, body)
         info.recipePages[page] = body
         info.recipePageCount = info.recipePageCount or pc
         adop._archiveIndex[body.campaignId] = info
+    elseif body.kind == "gs-credit-aliases-page" then
+        local maxPages = GS.MAX_CREDIT_ALIAS_PAGE_COUNT or 512
+        if type(body.datasetId) ~= "string" or body.datasetId ~= adop.sourceDatasetId then
+            return "rejected", "invalid_operation"
+        end
+        if type(body.aliases) ~= "table" then
+            return "rejected", "invalid_credit_event_aliases"
+        end
+        for alias, canon in pairs(body.aliases) do
+            if type(alias) ~= "string" or alias == ""
+                or type(canon) ~= "string" or canon == ""
+                or alias == canon then
+                return "rejected", "invalid_credit_event_aliases"
+            end
+        end
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxPages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._creditAliasIndex = adop._creditAliasIndex or { pages = {}, pageCount = nil }
+        local info = adop._creditAliasIndex
+        if info.pageCount and info.pageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        -- Conflict against a descriptor that already pinned a different pageCount.
+        if adop.pinnedCreditEventAliasPageCount ~= nil
+            and adop.pinnedCreditEventAliasPageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.pages[page]) == "table" then
+            if DeepEqual(info.pages[page], body) then
+                -- Fall through to same-id duplicate handling below.
+            else
+                -- Content change under an unchanged page id/count pin aborts the
+                -- adoption so a stale buffered page cannot later commit
+                -- (#459 discussion_r4497121459 / valuation source_changed).
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("source_changed")
+                InvalidateAdoptionDeliveryOutcomes("source_changed")
+                return "rejected", "source_changed"
+            end
+        end
+        info.pages[page] = body
+        info.pageCount = info.pageCount or pc
     end
 
     -- Reject malformed / unmintable gs-valuation before buffering/counting.
@@ -3130,6 +3366,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                     baselineEstablished = false,
                 },
                 txnRegistry = {},
+                creditEventAliases = {},
             },
             _consumableEvents = {},
             _consumableEventArchive = {},
@@ -3149,6 +3386,52 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
         confirmationRefs = {},
         migration = nil,
     }
+end
+
+--- Install validated credit-event alias bindings from an adoption descriptor
+-- (plus any gs-credit-aliases-page bodies) onto a fresh bootstrap record before
+-- op replay. Rejects conflicting redirections and oversized payloads; does not
+-- rewrite immutable op bodies (#459 A).
+-- @return boolean ok, string|nil err
+local function InstallCreditEventAliasesFromDesc(temp, desc, adop)
+    if type(temp) ~= "table" or type(temp.accounting) ~= "table" then
+        return false, "invalid_record"
+    end
+    local cfg = temp.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false, "invalid_record"
+    end
+    if type(cfg.creditEventAliases) ~= "table" then
+        cfg.creditEventAliases = {}
+    end
+    -- Older descriptors omit the alias manifest entirely.
+    if desc and desc.creditEventAliasCount == nil and desc.creditEventAliases == nil
+        and (tonumber(desc.creditEventAliasPageCount) or 0) < 1 then
+        return true
+    end
+    local incoming, assembleErr = AssembleCreditAliasesFromAdoption(adop, desc)
+    if not incoming then
+        return false, assembleErr or "incomplete_transfer"
+    end
+    local map = cfg.creditEventAliases
+    local maxN = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+    local n = 0
+    for alias, canon in pairs(incoming) do
+        n = n + 1
+        if n > maxN then
+            return false, "full"
+        end
+        local prior = map[alias]
+        if type(prior) == "string" and prior ~= "" and prior ~= canon then
+            return false, "alias_conflict"
+        end
+        map[alias] = canon
+    end
+    local declared = tonumber(desc and desc.creditEventAliasCount)
+    if declared ~= nil and declared ~= n then
+        return false, "incomplete_transfer"
+    end
+    return true
 end
 
 --- Persist untrusted/evidence bodies into the offline record so Commit's
@@ -3193,10 +3476,7 @@ local function DurableRetainOnRecord(record, op, reason, boundary, opts)
     -- Always classify: foreign evidence that shares ancestry with the current
     -- head must open an explicit conflict, including when it arrived before the
     -- accepted sibling and was initially stored as plain pending.
-    local targetKey = GS._TargetKey and GS._TargetKey(op.kind, op.target)
-    if op.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, op)
     if targetKey then
         local class, classReason = ClassifyStaleBase(record, op, targetKey)
         if class == "conflict" or (ops.openConflicts and ops.openConflicts[targetKey]) then
@@ -5693,6 +5973,14 @@ function GS:CommitDatasetAdoption()
     bootstrapPos = bootNorm
 
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
+    -- Transfer required credit-event alias bindings before op replay so
+    -- alias-targeted winners/losers resolve on a fresh dataset (#459 A).
+    do
+        local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc, adop)
+        if not aliasOk then
+            return "rejected", aliasErr or "invalid_credit_event_aliases"
+        end
+    end
     -- Active source descriptors install their authenticated liveCutover onto the
     -- temporary record before replay/publish so ledger admissions classify against
     -- the original eligibility boundary and atomic publish cannot demote live
@@ -5874,6 +6162,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.SET_EDITOR_RANK
             -- Names are keyed by target campaign id, not by authorship campaign.
             and op.kind ~= GS.KIND.RENAME_CAMPAIGN
+            -- Credit corrections are keyed by event id, not authorship campaign.
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
     end
 
     local promoteOps = {}
@@ -5967,10 +6257,9 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         GS.EstablishCampaignBaseline(shadow.accounting._consumables, header and header.startedAt or nil)
     end
     local function targetKeyOf(op)
-        if GS._TargetKey then
-            return GS._TargetKey(op.kind, op.target)
-        end
-        return tostring(op.kind) .. ":" .. tostring(op.target)
+        return OperationTargetKey(shadow, op)
+            or (GS._TargetKey and GS._TargetKey(op.kind, op.target))
+            or (tostring(op.kind) .. ":" .. tostring(op.target))
     end
     local function applyMut(op)
         if GS._ApplyMutations then
@@ -6329,7 +6618,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     -- succeeds so rollback can restore exact prior conflict/relay/boundary state.
     for i = 1, #(plan.promoteOps or {}) do
         local pop = plan.promoteOps[i]
-        local targetKey = GS._TargetKey and GS._TargetKey(pop.kind, pop.target)
+        local targetKey = OperationTargetKey(record, pop)
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, pop, targetKey)
             promotedIds[#promotedIds + 1] = pop.id
@@ -6545,10 +6834,7 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
         end
     end
 
-    local targetKey = GS._TargetKey and GS._TargetKey(stored.kind, stored.target)
-    if stored.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, stored)
     if not targetKey then
         return "rejected", "invalid_target"
     end
@@ -6564,7 +6850,9 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
     end
     if class == "pending" then
         if GS._AdmitPendingOrConflict then
-            return GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
+            return GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "stale_base",
+                admissionCtx and admissionCtx.sender)
         end
         return "pending", classReason or "stale_base"
     end
@@ -6587,7 +6875,9 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
             meta = { boundaries = { [stored.id] = boundary } }
         end
         if GS._AdmitPendingOrConflict then
-            local st, reason = GS._AdmitPendingOrConflict(ops, stored, classReason or "divergent_edit")
+            local st, reason = GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "divergent_edit",
+                admissionCtx and admissionCtx.sender)
             if st == "rejected" then
                 return st, reason
             end
@@ -6726,10 +7016,7 @@ local function ClassifyConfirmationPromotion(record, authBody, admissionCtx)
         or authBody.kind == GS.KIND.RESOLVE_CONFLICT then
         return "skip"
     end
-    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
-    if authBody.kind == GS.KIND.START_CAMPAIGN then
-        targetKey = GS.CAMPAIGN_TARGET_KEY
-    end
+    local targetKey = OperationTargetKey(record, authBody)
     if not targetKey then
         return "skip"
     end
@@ -6753,7 +7040,7 @@ local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, 
     if type(shadow) ~= "table" or type(authBody) ~= "table" then
         return false, "invalid_operation"
     end
-    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
+    local targetKey = OperationTargetKey(shadow, authBody)
     if authBody.kind == GS.KIND.START_CAMPAIGN then
         targetKey = GS.CAMPAIGN_TARGET_KEY
         shadow.currentCampaignId = authBody.id
@@ -7608,7 +7895,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         return "rejected", "full"
     end
 
-    local targetKey = GS._TargetKey and GS._TargetKey(stored.kind, stored.target)
+    local targetKey = OperationTargetKey(record, stored)
     if not targetKey and stored.kind ~= GS.KIND.CONFIRM_CANDIDATE then
         return "rejected", "invalid_target"
     end
@@ -8036,7 +8323,31 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         local stPend, reasonPend = "pending", classReason or "stale_base"
         if GS._AdmitPendingOrConflict then
-            stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
+            -- Preserve authenticated transport sender for deferred re-admission
+            -- (missing_policy_predecessor / stale_base). Never trust body.actor.
+            stPend, reasonPend = GS._AdmitPendingOrConflict(
+                ops, stored, classReason or "stale_base", admissionCtx.sender)
+        end
+        -- Alias-targeted pending corrections must own a durable binding before
+        -- registry eviction + capacity prune can drop it (#459 A).
+        if (stPend == "pending" or stPend == "duplicate")
+            and stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and GS.EnsureContributorCorrectionDurableAliases
+            and GS.FindLedgerEventById then
+            local pendEvent = GS.FindLedgerEventById(record, stored.target
+                or (stored.value and stored.value.eventId))
+            if type(pendEvent) == "table" then
+                local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(
+                    record, stored, pendEvent)
+                if not aliasOk then
+                    -- Capacity cannot retain the binding: drop pending rather than
+                    -- strand an unresolvable alias-targeted body after eviction.
+                    if ops.pending then
+                        ops.pending[stored.id] = nil
+                    end
+                    return "rejected", aliasErr or "full"
+                end
+            end
         end
         -- Successful durable missing-predecessor / pending evidence must notify
         -- provider maintenance so peers can discover it without a later edit.
@@ -8068,6 +8379,106 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 end
             end
             return "accepted", nil
+        end
+        -- #459: retain LWW-losing corrections without changing the credit head.
+        -- Ordinary authenticated gossip and adoption both keep prior accepted
+        -- evidence under capacity rules (mirrors rename losers on adoption;
+        -- corrections also retain on ordinary gossip so audit survives).
+        -- Scope/timestamp validation runs before retention so wrong-campaign or
+        -- future-skew losers cannot bypass acceptance via the obsolete path (#459 G4/G3).
+        if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and classReason == "stale_credit" then
+            local allowRetain = true
+            if admissionCtx.adoptionReplay then
+                allowRetain = type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+            end
+            if allowRetain then
+                local scopeEvent = nil
+                if GS.ValidateContributorCorrectionScope then
+                    local scopeOk, scopeErr, scopedEvent = GS.ValidateContributorCorrectionScope(
+                        record, stored, {
+                            allowMissingEvent = true,
+                            remoteAdmit = true,
+                        })
+                    if not scopeOk then
+                        if scopeErr == "pending_event" or scopeErr == "missing_event" then
+                            -- Preserve missing-event pending rather than accepted retention.
+                            local stPend, reasonPend = "pending", scopeErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, scopeErr, admissionCtx.sender)
+                            end
+                            -- Same provider notify as ordinary pending retention so
+                            -- warm exporters advertise the body without an unrelated
+                            -- mutation (#459 discussion_r4488855215).
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", scopeErr or classReason or "stale_credit"
+                    end
+                    scopeEvent = scopedEvent
+                end
+                -- Event-kind / production-credit eligibility before any accepted
+                -- loser retention (ordinary + adoption). Keep not_credited pending;
+                -- do not apply local freshness or current-campaign authoring
+                -- (#459 review-5792509439 C / discussion_r4486297807).
+                if scopeEvent and GS.ValidateContributorCorrectionEventEligibility then
+                    local eligOk, eligErr = GS.ValidateContributorCorrectionEventEligibility(
+                        record, stored, scopeEvent)
+                    if not eligOk then
+                        if eligErr == "not_credited" then
+                            local stPend, reasonPend = "pending", eligErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, eligErr, admissionCtx.sender)
+                            end
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", eligErr or "invalid_event"
+                    end
+                end
+                -- Durable alias binding before every accepted retention path,
+                -- including LWW losers (#459 G1 / review-5791986976).
+                if GS.EnsureContributorCorrectionDurableAliases then
+                    local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(
+                        record, stored, scopeEvent)
+                    if not aliasOk then
+                        return "rejected", aliasErr or "full"
+                    end
+                end
+                local newlyRetained = not (ops.records and ops.records[stored.id])
+                if newlyRetained then
+                    if GS._AcceptedCount
+                        and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                        return "rejected", "full"
+                    end
+                    if GS._StoreAccepted then
+                        GS._StoreAccepted(ops, stored, nil)
+                    end
+                end
+                if GS.InvalidateCreditCorrectionProjection then
+                    GS.InvalidateCreditCorrectionProjection(record)
+                end
+                if GS.EnsureCreditCorrectionProjection then
+                    GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+                -- Warm providers must export newly retained older corrections.
+                if newlyRetained and not admissionCtx.adoptionReplay
+                    and GS._NotifyLocalDurableChange then
+                    GS._NotifyLocalDurableChange("remote-correction-history")
+                end
+                return "accepted", nil
+            end
         end
         return "rejected", classReason or "stale_base"
     end
@@ -8163,30 +8574,122 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         GS._pendingCampaignBoundaries[stored.id] = nil
     else
+        -- One outer callback allowance for correction/adjustment admission from
+        -- Apply through post-store wakes (#459 / discussion_r4479259160). Nested
+        -- ingress (redrive) inherits an already-active allowance.
+        local ownedCreditBudget = false
+        local creditKind = stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            or stored.kind == GS.KIND.ADJUST_QUANTITY
+        if creditKind and GS.BeginOuterCreditProjectionCallbackBudget then
+            ownedCreditBudget = GS.BeginOuterCreditProjectionCallbackBudget()
+        end
+        local function releaseCreditBudget()
+            if ownedCreditBudget and GS.EndOuterCreditProjectionCallbackBudget then
+                GS.EndOuterCreditProjectionCallbackBudget(true)
+                ownedCreditBudget = false
+            end
+        end
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(record, stored)
             if not ok then
                 if stored.kind == GS.KIND.ADJUST_QUANTITY
                     and (err == "item_negative" or err == "player_negative"
                         or err == "adjustment_floor" or err == "item_over_goal"
-                        or err == "invalid_quantity") then
+                        or err == "invalid_quantity" or err == "work_budget") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
-                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
+                    end
+                    -- Genuine transient exhaustion: keep the adjustment and reuse
+                    -- correction redrive/continuation rather than terminal reject
+                    -- (#459 review-5792509439 B).
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingContributorCorrections then
+                        GS.RedrivePendingContributorCorrections(record, {
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
                     end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay
                         and GS._NotifyLocalDurableChange then
                         GS._NotifyLocalDurableChange("remote-pending")
                     end
+                    releaseCreditBudget()
                     return stPend, reasonPend
                 end
+                -- #459: correction-before-event stays pending; floor failures are
+                -- accepted inactive via rebuild (skipFloor on remote apply). Still
+                -- pending when the ledger event is missing or not yet credited.
+                if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
+                    and (err == "pending_event" or err == "missing_event"
+                        or err == "not_credited" or err == "work_budget") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
+                    end
+                    -- work_budget: retain authenticated pending and schedule the
+                    -- existing redrive machinery (no redelivery / getter wake).
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingContributorCorrections then
+                        GS.RedrivePendingContributorCorrections(record, {
+                            eventId = stored.target,
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    releaseCreditBudget()
+                    return stPend, reasonPend
+                end
+                releaseCreditBudget()
                 return "rejected", err or "apply_failed"
             end
         end
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, stored, targetKey)
         end
+        if stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+            -- Apply already rebuilt with this op as extraOp; seal the post-store
+            -- stamp instead of a second full rebuild (#459 budget). Nested
+            -- redrive uses the same Seal path. Then wake sibling pendings under
+            -- the shared outer allowance when this is a top-level admit.
+            if GS.SealCreditCorrectionProjection then
+                GS.SealCreditCorrectionProjection(record, true)
+            end
+            if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
+                and GS.RedrivePendingContributorCorrections then
+                GS.RedrivePendingContributorCorrections(record, {
+                    eventId = stored.target,
+                    itemId = stored.value and stored.value.itemId,
+                    _shareCallbackBudget = true,
+                })
+            end
+        elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
+            -- AppendLedgerEvent already Ensure'd under the shared outer allowance.
+            -- StoreAccepted bumps ops generation, so continue Ensure/redrive under
+            -- the same allowance (no second Begin/reset).
+            if not admissionCtx.adoptionReplay then
+                if GS.EnsureThenRedriveCreditCorrections then
+                    GS.EnsureThenRedriveCreditCorrections(record, {
+                        itemId = stored.value and stored.value.itemId,
+                    })
+                elseif GS.EnsureCreditCorrectionProjection then
+                    GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+            elseif GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+        end
+        releaseCreditBudget()
     end
 
     -- Predecessor-late: ordinary accepts must redrive pending confirmations.
@@ -8225,6 +8728,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     })
                 end
             end
+        end
+        -- Durable pending corrections that waited on this policy (C before P)
+        -- wake through authenticated redrive — no redelivery / manual getter.
+        if GS.RedrivePendingContributorCorrections then
+            GS.RedrivePendingContributorCorrections(record, {})
         end
     end
     local guildKey = member.guildKey or (record and record._guildKey)

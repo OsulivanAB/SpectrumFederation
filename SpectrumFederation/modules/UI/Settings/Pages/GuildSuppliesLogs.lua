@@ -38,6 +38,7 @@ local cachedProjectionKey = nil
 local refreshQueued = false
 local rosterFrame = nil
 local passCache = nil
+local OpenEditContributorDialog
 
 local function BeginRenderPass()
 	passCache = {}
@@ -334,21 +335,55 @@ local function BuildProjectedRows()
 		local contributorName
 		local contributorGuid
 		local quantityText
-		if kind == "adjustment" then
-			local credited = event.displayAttributed or event.attributed
+		if event.creditUnavailable then
+			-- Reconstruction blocked: never restore durable donor/attributed (#459).
+			contributorName = Loc("GUILD_SUPPLIES_HISTORY_CREDIT_UNAVAILABLE", "Credit unavailable")
+			contributorGuid = nil
+			if kind == "adjustment" then
+				local qty = tonumber(event.quantity) or 0
+				quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_SIGNED", "%+d"):format(qty)
+			else
+				local qty = math.abs(tonumber(event.quantity) or 0)
+				quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_PLAIN", "%d"):format(qty)
+			end
+		elseif kind == "adjustment" then
+			local hasCorrection = type(event.creditCorrection) == "table"
+			local credited = event.displayAttributed
+			if credited == nil and hasCorrection then
+				credited = event.effectiveAttributed
+			elseif credited == nil then
+				credited = event.effectiveAttributed or event.attributed
+			end
 			if type(credited) == "string" and credited ~= "" then
 				contributorName = credited
-				contributorGuid = event.attributedGuid
+				-- Pair name with effective GUID only; never original attributed GUID
+				-- when a correction cleared or changed identity (#459).
+				contributorGuid = event.effectiveAttributedGuid
+				if not hasCorrection then
+					contributorGuid = event.effectiveAttributedGuid or event.attributedGuid
+				end
 			else
+				-- Legitimate Unassigned while credit projection is available.
 				contributorName = unassigned
 				contributorGuid = nil
 			end
 			local qty = tonumber(event.quantity) or 0
 			quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_SIGNED", "%+d"):format(qty)
 		else
-			contributorName = event.displayActor or event.actor
-				or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
-			contributorGuid = event.actorGuid or event.donorGuid
+			local hasCorrection = type(event.creditCorrection) == "table"
+			contributorName = event.displayActor
+			if contributorName == nil and hasCorrection then
+				contributorName = event.effectiveAttributed
+			elseif contributorName == nil then
+				contributorName = event.effectiveAttributed or event.actor
+					or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+			end
+			if hasCorrection then
+				contributorGuid = event.effectiveAttributedGuid
+			else
+				contributorGuid = event.effectiveAttributedGuid
+					or event.actorGuid or event.donorGuid
+			end
 			local qty = math.abs(tonumber(event.quantity) or 0)
 			quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_PLAIN", "%d"):format(qty)
 		end
@@ -376,6 +411,38 @@ local function BuildProjectedRows()
 				end
 			end
 		end
+		-- Edit only production-credited current-campaign rows (#459).
+		local record = CurrentRecord()
+		local productionOk = event.gsProductionCredit == true
+			or (event.uncredited ~= true and event.gsProductionCredit ~= false
+				and type(event.creditCorrection) == "table")
+		-- Prefer the explicit production flag when present.
+		productionOk = event.gsProductionCredit == true
+		local campaignOk = type(record) == "table"
+			and type(record.currentCampaignId) == "string"
+			and event.campaignId == record.currentCampaignId
+		local canEdit = Caps().canEdit == true
+			and type(event.id) == "string"
+			and event.id ~= ""
+			and productionOk
+			and campaignOk
+			and event.creditUnavailable ~= true
+		local effectiveName = event.effectiveAttributed
+		local effectiveGuid = event.effectiveAttributedGuid
+		if kind == "donation" and effectiveName == nil and effectiveGuid == nil
+			and type(event.creditCorrection) ~= "table" then
+			effectiveName = event.actor
+			effectiveGuid = event.actorGuid or event.donorGuid
+		elseif kind == "adjustment" and effectiveName == nil and effectiveGuid == nil
+			and type(event.creditCorrection) ~= "table" then
+			effectiveName = event.attributed
+			effectiveGuid = event.attributedGuid
+		end
+		-- Concrete character identity for edit prefill; display may be current-main.
+		local concreteName = effectiveName
+		if kind == "adjustment" and concreteName == nil and effectiveGuid == nil then
+			concreteName = nil -- Unassigned
+		end
 		rows[#rows + 1] = {
 			contributor = contributorDisplay,
 			contributorKey = contributorName,
@@ -386,9 +453,694 @@ local function BuildProjectedRows()
 			id = event.id,
 			kind = kind,
 			timestamp = event.timestamp,
+			creditUnavailable = event.creditUnavailable == true or nil,
+			showAction = canEdit,
+			actionLabel = Loc("GUILD_SUPPLIES_LOGS_EDIT_ACTION", "Edit"),
+			onAction = canEdit and OpenEditContributorDialog or nil,
+			_eventKind = kind,
+			_contributorName = contributorName,
+			_effectiveName = concreteName,
+			_effectiveGuid = effectiveGuid,
+			_displayMain = contributorName,
+			_quantityText = quantityText,
+			_itemText = itemText,
+			_gsProductionCredit = productionOk,
+			_campaignId = event.campaignId,
 		}
 	end
 	return finish(rows)
+end
+
+---------------------------------------------------------------------------
+-- Officer Edit contributor (#459). Session-only dialog state; no chat output.
+---------------------------------------------------------------------------
+
+local EDIT_UNASSIGNED = false
+
+local editRosterCache = {
+	guildKey = nil,
+	generation = nil,
+	names = {},
+	byLower = {},
+	guidByLower = {},
+}
+
+-- Session-only editor state captured at open; never persisted (#459).
+local editSession = nil
+-- Confirmation binds to one immutable payload; selection/session changes bump
+-- the token so a stale Confirm callback cannot commit a different edit (#459).
+local confirmGeneration = 0
+local pendingConfirm = nil
+
+local function EditRosterGeneration()
+	local GG = SF.GuildGossip
+	if GG and GG.GetGuildGeneration then
+		return tonumber(GG.GetGuildGeneration()) or 0
+	end
+	return 0
+end
+
+local function InvalidatePendingConfirm()
+	confirmGeneration = confirmGeneration + 1
+	pendingConfirm = nil
+end
+
+local function ClearEditSession()
+	InvalidatePendingConfirm()
+	-- Cancellation contract (#459): page/session replacement drops any in-flight
+	-- authorized local save so timers cannot mutate after the editor left.
+	do
+		local g = GS()
+		local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+		if g and g.CancelLocalContributorCorrectionSave and type(record) == "table" then
+			g.CancelLocalContributorCorrectionSave(record, "session_cleared")
+		end
+	end
+	editSession = nil
+end
+
+local function EnsureEditRosterCache()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local key = (ctx and ctx.guildKey) or "none"
+	local gen = EditRosterGeneration()
+	if editRosterCache.guildKey == key
+		and editRosterCache.generation == gen
+		and type(editRosterCache.names) == "table" then
+		return editRosterCache
+	end
+	local names = {}
+	local byLower = {}
+	local guidByLower = {}
+	if type(GetNumGuildMembers) == "function" and type(GetGuildRosterInfo) == "function" then
+		-- GetNumGuildMembers returns several numbers. Keep only the first before
+		-- tonumber; passing the rest makes Lua treat the second value as a base.
+		local total = GetNumGuildMembers()
+		total = tonumber(total) or 0
+		if total < 0 then
+			total = 0
+		end
+		for i = 1, total do
+			-- Include offline members; GetGuildRosterInfo still returns them.
+			local rosterName, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, rosterGuid =
+				GetGuildRosterInfo(i)
+			local norm = rosterName
+			if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+				norm = SF.NameUtil.NormalizeNameRealm(rosterName) or rosterName
+			end
+			if type(norm) == "string" and norm ~= "" then
+				local lower = string.lower(norm)
+				if not byLower[lower] then
+					byLower[lower] = norm
+					names[#names + 1] = norm
+					if type(rosterGuid) == "string" and rosterGuid ~= "" then
+						guidByLower[lower] = rosterGuid
+					end
+				end
+			end
+		end
+		table.sort(names)
+	end
+	editRosterCache.guildKey = key
+	editRosterCache.generation = gen
+	editRosterCache.names = names
+	editRosterCache.byLower = byLower
+	editRosterCache.guidByLower = guidByLower
+	return editRosterCache
+end
+
+local function ResolveEditAttribution(text, allowUnassigned)
+	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	if trimmed == "" or string.lower(trimmed) == string.lower(unassigned) then
+		if allowUnassigned then
+			return nil, nil, true, nil
+		end
+		return nil, nil, false, "invalid_attribution"
+	end
+	local cache = EnsureEditRosterCache()
+	local lower = string.lower(trimmed)
+	local exact = cache.byLower[lower]
+	if exact then
+		return exact, cache.guidByLower[lower], true, nil
+	end
+	-- Short-name fallback only when the typed text omits a realm. A failed
+	-- exact realm-qualified lookup must not resolve a different realm.
+	local hasRealm = trimmed:find("-", 1, true) ~= nil
+	if hasRealm then
+		return nil, nil, false, "invalid_attribution"
+	end
+	local short = trimmed:match("^([^%-]+)") or trimmed
+	local shortLower = string.lower(short)
+	local unique = nil
+	local uniqueGuid = nil
+	local ambiguous = false
+	for nameLower, norm in pairs(cache.byLower) do
+		local rosterShort = (norm:match("^([^%-]+)") or norm)
+		if string.lower(rosterShort) == shortLower then
+			if unique and unique ~= norm then
+				ambiguous = true
+				break
+			end
+			unique = norm
+			uniqueGuid = cache.guidByLower[nameLower]
+		end
+	end
+	if unique and not ambiguous then
+		return unique, uniqueGuid, true, nil
+	end
+	if ambiguous then
+		return nil, nil, false, "ambiguous_character"
+	end
+	return nil, nil, false, "invalid_attribution"
+end
+
+local function EditAttributionSuggestions(prefix)
+	if type(editSession) ~= "table" then
+		return {}
+	end
+	local cache = EnsureEditRosterCache()
+	local raw = tostring(prefix or "")
+	local needle = string.lower((raw:match("^%s*(.-)%s*$") or ""))
+	local out = {}
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local maxSuggestions = 8
+	if editSession.allowUnassigned then
+		if needle == "" or string.find(string.lower(unassignedLabel), needle, 1, true) == 1 then
+			out[#out + 1] = {
+				value = EDIT_UNASSIGNED,
+				label = unassignedLabel,
+				text = "",
+			}
+		end
+	end
+	local names = cache.names or {}
+	for i = 1, #names do
+		if #out >= maxSuggestions then
+			break
+		end
+		local name = names[i]
+		if needle == "" or string.find(string.lower(name), needle, 1, true) == 1
+			or string.find(string.lower(name:match("^([^%-]+)") or name), needle, 1, true) == 1 then
+			out[#out + 1] = {
+				value = name,
+				label = name,
+				text = name,
+			}
+		end
+	end
+	-- Keep a previously resolved credit visible through temporary roster lag.
+	if editSession.attributionResolved
+		and type(editSession.attributed) == "string"
+		and editSession.attributed ~= "" then
+		local lowerSel = string.lower(editSession.attributed)
+		local present = false
+		for i = 1, #out do
+			if type(out[i].value) == "string" and string.lower(out[i].value) == lowerSel then
+				present = true
+				break
+			end
+		end
+		if not present and (needle == "" or string.find(lowerSel, needle, 1, true) == 1) then
+			out[#out + 1] = {
+				value = editSession.attributed,
+				label = editSession.attributed,
+				text = editSession.attributed,
+			}
+		end
+	end
+	return out
+end
+
+--- Cancel an in-flight authorized local save when the visible recipient changes
+-- away from the confirmed intent (#459 C5). Never let pendingLocalOp commit a
+-- different recipient than the editor currently displays.
+local function CancelPendingLocalSaveOnRecipientChange()
+	if type(editSession) ~= "table" or editSession.pendingLocal ~= true then
+		return
+	end
+	local g = GS()
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if g and g.CancelLocalContributorCorrectionSave and type(record) == "table" then
+		g.CancelLocalContributorCorrectionSave(record, "recipient_changed")
+	end
+	editSession.pendingLocalOp = nil
+	editSession.pendingLocal = nil
+end
+
+local SetEditAttributionFromText
+local function ApplyEditAttributionSuggestion(item)
+	if type(editSession) ~= "table" then
+		return
+	end
+	InvalidatePendingConfirm()
+	if not item then
+		CancelPendingLocalSaveOnRecipientChange()
+		editSession.attributionResolved = false
+		return
+	end
+	if item.value == EDIT_UNASSIGNED or item.value == nil then
+		if editSession.allowUnassigned then
+			if editSession.attributed ~= nil or editSession.attributedGuid ~= nil then
+				CancelPendingLocalSaveOnRecipientChange()
+			end
+			editSession.attributed = nil
+			editSession.attributedGuid = nil
+			editSession.attributionText = ""
+			editSession.attributionResolved = true
+		else
+			CancelPendingLocalSaveOnRecipientChange()
+			editSession.attributionResolved = false
+		end
+		return
+	end
+	if type(item.value) == "string" and item.value ~= "" then
+		local cache = EnsureEditRosterCache()
+		local newGuid = cache.guidByLower[string.lower(item.value)]
+		local g = GS()
+		local changed = true
+		if g and g.CreditIdentitiesEqual then
+			changed = not g.CreditIdentitiesEqual(
+				editSession.attributed, editSession.attributedGuid,
+				item.value, newGuid)
+		else
+			changed = editSession.attributed ~= item.value
+				or editSession.attributedGuid ~= newGuid
+		end
+		if changed then
+			CancelPendingLocalSaveOnRecipientChange()
+		end
+		editSession.attributed = item.value
+		editSession.attributedGuid = newGuid
+		editSession.attributionText = item.text or item.label or item.value
+		editSession.attributionResolved = true
+		return
+	end
+	SetEditAttributionFromText(item.text or item.label or "")
+end
+
+SetEditAttributionFromText = function(v)
+	if type(editSession) ~= "table" then
+		return
+	end
+	-- Changing the reviewed recipient invalidates any open confirmation.
+	InvalidatePendingConfirm()
+	local text = tostring(v or "")
+	editSession.attributionText = text
+	local name, guid, ok = ResolveEditAttribution(text, editSession.allowUnassigned)
+	if ok then
+		local priorName = editSession.attributed
+		local priorGuid = editSession.attributedGuid
+		local g = GS()
+		local changed = true
+		if g and g.CreditIdentitiesEqual then
+			changed = not g.CreditIdentitiesEqual(priorName, priorGuid, name, guid)
+		else
+			changed = priorName ~= name or priorGuid ~= guid
+		end
+		if changed then
+			CancelPendingLocalSaveOnRecipientChange()
+		end
+		editSession.attributed = name
+		editSession.attributedGuid = guid
+		editSession.attributionResolved = true
+		return
+	end
+	-- Preserve prior resolved selection when the typed text still matches it.
+	if editSession.attributionResolved
+		and type(editSession.attributed) == "string"
+		and editSession.attributed ~= ""
+		and string.lower(text:match("^%s*(.-)%s*$") or "") == string.lower(editSession.attributed) then
+		return
+	end
+	-- Unresolved typed text is also a visible recipient change away from the
+	-- confirmed pending intent.
+	CancelPendingLocalSaveOnRecipientChange()
+	editSession.attributionResolved = false
+end
+
+local function ReportLogsStatus(status, reason)
+	local panel = Page.panel
+	local section = panel and panel.__sfPrimarySection
+	local g = GS()
+	local message, severity
+	if g and g.FormatMutationFeedback then
+		message, severity = g.FormatMutationFeedback(status, reason)
+	else
+		message = tostring(status or "rejected")
+		severity = (status == "accepted" and "success")
+			or (status == "duplicate" and "info")
+			or (status == "pending" and "warn")
+			or "error"
+	end
+	if section and section.SetMessage then
+		section:SetMessage(message, severity)
+	end
+	cachedProjectedRows = nil
+	cachedProjectionKey = nil
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function EditSessionStillFresh(session)
+	if type(session) ~= "table" then
+		return false, "stale_credit"
+	end
+	local g = GS()
+	if not g then
+		return false, "api_unavailable"
+	end
+	local ctx = g.GetCurrentContext and g:GetCurrentContext() or nil
+	if not ctx or ctx.guildKey ~= session.guildKey then
+		return false, "stale_guild"
+	end
+	local record = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if type(record) ~= "table" then
+		return false, "not_configured"
+	end
+	if record.datasetId ~= session.datasetId then
+		return false, "dataset_mismatch"
+	end
+	if record.currentCampaignId ~= session.campaignId then
+		return false, "stale_campaign"
+	end
+	local event = g.FindLedgerEventById and g.FindLedgerEventById(record, session.eventId)
+	if not event then
+		return false, "missing_event"
+	end
+	local curName, curGuid, _, creditStatus = nil, nil, nil, nil
+	if g.ResolveEffectiveCreditIdentity then
+		curName, curGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
+	end
+	if creditStatus == (g.CREDIT_UNAVAILABLE or "credit_unavailable") then
+		return false, "credit_unavailable"
+	end
+	-- Genuine Unassigned (nil==nil) stays fresh; unavailable must not look Unassigned.
+	if g.CreditIdentitiesEqual
+		and not g.CreditIdentitiesEqual(
+			curName, curGuid, session.effectiveName, session.effectiveGuid) then
+		return false, "stale_credit"
+	end
+	local tKey = g.CorrectionTargetKey and g.CorrectionTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id))
+	local headId = tKey and record.operations and record.operations.heads
+		and record.operations.heads[tKey]
+	local expected = session.baseTargetRevision
+	local noPriorHead = expected == nil or expected == record.datasetId
+	if noPriorHead then
+		if headId ~= nil then
+			return false, "stale_credit"
+		end
+	elseif expected ~= headId then
+		return false, "stale_credit"
+	end
+	return true, nil, record, event
+end
+
+--- Commit one immutable confirmation payload (not the live mutable session).
+local function CommitCapturedEdit(payload)
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		ClearEditSession()
+		return
+	end
+	if type(payload) ~= "table" then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	-- Stale Confirm callbacks must not apply after selection/session change.
+	if pendingConfirm ~= payload
+		or payload.confirmGeneration ~= confirmGeneration then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	if not payload.attributionResolved then
+		ReportLogsStatus("rejected", "invalid_attribution")
+		return
+	end
+	local fresh, reason = EditSessionStillFresh(payload)
+	if not fresh then
+		ClearEditSession()
+		ReportLogsStatus("rejected", reason or "stale_credit")
+		return
+	end
+	-- Live session must still describe the same reviewed entry/recipient.
+	local session = editSession
+	if type(session) ~= "table"
+		or session.eventId ~= payload.eventId
+		or session.datasetId ~= payload.datasetId
+		or session.campaignId ~= payload.campaignId
+		or session.guildKey ~= payload.guildKey
+		or session.baseTargetRevision ~= payload.baseTargetRevision then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	local g = GS()
+	if g and g.CreditIdentitiesEqual then
+		if not g.CreditIdentitiesEqual(
+			session.attributed, session.attributedGuid,
+			payload.attributed, payload.attributedGuid) then
+			ClearEditSession()
+			ReportLogsStatus("rejected", "stale_credit")
+			return
+		end
+	elseif session.attributed ~= payload.attributed
+		or session.attributedGuid ~= payload.attributedGuid then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	if not g or not g.NewContributorCorrectionOperation then
+		ReportLogsStatus("rejected", "unsupported_kind")
+		return
+	end
+	-- Retain ONE immutable authorized local save identity across work_budget
+	-- slices (#459 / discussion_r4480434323). Do not mint a new operation id.
+	local op = session.pendingLocalOp
+	if type(op) ~= "table" then
+		local status, prepReason
+		op, status, prepReason = g:NewContributorCorrectionOperation(
+			payload.eventId, payload.attributed, payload.attributedGuid)
+		if not op then
+			ClearEditSession()
+			ReportLogsStatus(status or "rejected", prepReason or "invalid_value")
+			return
+		end
+	end
+	-- Reconfirm open-time revision still matches prepare-time head.
+	if op.baseTargetRevision ~= payload.baseTargetRevision then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	local applyStatus, applyReason = g:ApplyStagedConfigOperation(op)
+	if applyStatus == "pending" and applyReason == "work_budget" then
+		-- Keep truthful pending UI; timers complete through the local resume path.
+		session.pendingLocalOp = op
+		session.pendingLocal = true
+		InvalidatePendingConfirm()
+		ReportLogsStatus(applyStatus, applyReason)
+		return
+	end
+	-- Soft-clear session without cancelling an already-accepted local save.
+	InvalidatePendingConfirm()
+	editSession = nil
+	ReportLogsStatus(applyStatus, applyReason)
+end
+
+local function CommitEditSession()
+	local session = editSession
+	if type(session) ~= "table" then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	-- Immediate commit (no dialog): capture the current session as the payload.
+	InvalidatePendingConfirm()
+	local payload = {
+		confirmGeneration = confirmGeneration,
+		eventId = session.eventId,
+		kind = session.kind,
+		allowUnassigned = session.allowUnassigned,
+		effectiveName = session.effectiveName,
+		effectiveGuid = session.effectiveGuid,
+		baseTargetRevision = session.baseTargetRevision,
+		guildKey = session.guildKey,
+		datasetId = session.datasetId,
+		campaignId = session.campaignId,
+		quantityText = session.quantityText,
+		itemText = session.itemText,
+		attributed = session.attributed,
+		attributedGuid = session.attributedGuid,
+		attributionResolved = session.attributionResolved,
+	}
+	pendingConfirm = payload
+	CommitCapturedEdit(payload)
+end
+
+OpenEditContributorDialog = function(eventId, rowData)
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		return
+	end
+	if type(eventId) ~= "string" or eventId == "" then
+		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if not ctx or type(record) ~= "table" then
+		ReportLogsStatus("rejected", "not_ready")
+		return
+	end
+	local event = g.FindLedgerEventById and g.FindLedgerEventById(record, eventId)
+	if not event then
+		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	if event.gsProductionCredit ~= true then
+		ReportLogsStatus("rejected", "not_credited")
+		return
+	end
+	if event.campaignId ~= record.currentCampaignId then
+		ReportLogsStatus("rejected", "stale_campaign")
+		return
+	end
+	local kind = rowData and rowData._eventKind or rowData and rowData.kind
+	if kind ~= "donation" and kind ~= "adjustment" then
+		if event.type == (g.LEDGER_EVENT and g.LEDGER_EVENT.ADJUSTMENT) or event.type == "CONSUMABLE_ADJUSTMENT" then
+			kind = "adjustment"
+		else
+			kind = "donation"
+		end
+	end
+	local allowUnassigned = kind == "adjustment"
+	local effectiveName, effectiveGuid, _, creditStatus = nil, nil, nil, nil
+	if g.ResolveEffectiveCreditIdentity then
+		effectiveName, effectiveGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
+	end
+	if creditStatus == (g.CREDIT_UNAVAILABLE or "credit_unavailable") then
+		ClearEditSession()
+		ReportLogsStatus("rejected", "credit_unavailable")
+		return
+	end
+	local tKey = g.CorrectionTargetKey and g.CorrectionTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.CORRECT_CONTRIBUTOR, event.id))
+	local headRev = tKey and record.operations and record.operations.heads
+		and record.operations.heads[tKey] or nil
+	-- Match CurrentTargetRevision: datasetId stands in when no correction head.
+	local baseRev = headRev or record.datasetId
+	local prefill = effectiveName
+	local prefillGuid = effectiveGuid
+	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	-- Opening another entry invalidates confirmation and any resumable local save.
+	ClearEditSession()
+	editSession = {
+		eventId = event.id,
+		kind = kind,
+		allowUnassigned = allowUnassigned,
+		effectiveName = effectiveName,
+		effectiveGuid = effectiveGuid,
+		displayMain = (rowData and rowData._displayMain) or effectiveName or unassigned,
+		baseTargetRevision = baseRev,
+		guildKey = ctx.guildKey,
+		datasetId = record.datasetId,
+		campaignId = record.currentCampaignId,
+		quantityText = (rowData and rowData._quantityText) or tostring(event.quantity or ""),
+		itemText = (rowData and rowData._itemText) or "",
+		attributed = prefill,
+		attributedGuid = prefillGuid,
+		attributionText = prefill or "",
+		attributionResolved = true,
+	}
+	EnsureEditRosterCache()
+	cachedProjectedRows = nil
+	cachedProjectionKey = nil
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function ConfirmAndSaveEdit()
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		return
+	end
+	local session = editSession
+	if type(session) ~= "table" then
+		ReportLogsStatus("rejected", "stale_credit")
+		return
+	end
+	if not session.attributionResolved then
+		ReportLogsStatus("rejected", "invalid_attribution")
+		return
+	end
+	local fresh, reason = EditSessionStillFresh(session)
+	if not fresh then
+		ClearEditSession()
+		ReportLogsStatus("rejected", reason or "stale_credit")
+		return
+	end
+	-- Unchanged concrete credit (including allowed Unassigned) is a silent
+	-- no-op before confirmation/preparation (#459 discussion_r4507532460).
+	local g = GS()
+	if g and g.CreditIdentitiesEqual
+		and g.CreditIdentitiesEqual(
+			session.attributed, session.attributedGuid,
+			session.effectiveName, session.effectiveGuid) then
+		InvalidatePendingConfirm()
+		ClearEditSession()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+		return
+	end
+	-- Freeze the reviewed recipient/entry before the confirm dialog opens.
+	InvalidatePendingConfirm()
+	local payload = {
+		confirmGeneration = confirmGeneration,
+		eventId = session.eventId,
+		kind = session.kind,
+		allowUnassigned = session.allowUnassigned,
+		effectiveName = session.effectiveName,
+		effectiveGuid = session.effectiveGuid,
+		baseTargetRevision = session.baseTargetRevision,
+		guildKey = session.guildKey,
+		datasetId = session.datasetId,
+		campaignId = session.campaignId,
+		quantityText = session.quantityText,
+		itemText = session.itemText,
+		attributed = session.attributed,
+		attributedGuid = session.attributedGuid,
+		attributionResolved = session.attributionResolved,
+	}
+	pendingConfirm = payload
+	local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not Dialogs or not Dialogs.Confirm then
+		-- Fall back to immediate save when dialogs are unavailable (tests).
+		CommitCapturedEdit(payload)
+		return
+	end
+	local newLabel = payload.attributed
+		or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local current = payload.effectiveName
+		or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local confirm = Loc("GUILD_SUPPLIES_LOGS_EDIT_CONFIRM",
+		"Move contribution credit for %s × %s\nfrom %s\nto %s?\nItem, quantity, and original evidence stay unchanged.")
+		:format(
+			tostring(payload.quantityText),
+			tostring(payload.itemText),
+			tostring(current),
+			tostring(newLabel))
+	Dialogs:Confirm(confirm, Loc("GUILD_SUPPLIES_LOGS_EDIT_SAVE", "Save correction"), function()
+		CommitCapturedEdit(payload)
+	end)
 end
 
 local function FilteredRows()
@@ -582,6 +1334,85 @@ local function Definition()
 						},
 					},
 					{
+						type = "autocomplete",
+						label = Loc("GUILD_SUPPLIES_LOGS_EDIT_LABEL", "Edit contributor"),
+						adminOnly = true,
+						width = 220,
+						maxLetters = 96,
+						maxSuggestions = 8,
+						visible = function()
+							return type(editSession) == "table"
+						end,
+						hint = Loc("GUILD_SUPPLIES_LOGS_EDIT_HINT",
+							"Search guild roster (offline included). Unchanged selection saves nothing."),
+						enabled = function()
+							return Caps().canEdit == true and type(editSession) == "table"
+						end,
+						get = function()
+							if type(editSession) ~= "table" then
+								return ""
+							end
+							if type(editSession.attributionText) == "string" then
+								return editSession.attributionText
+							end
+							return editSession.attributed or ""
+						end,
+						set = function(v)
+							SetEditAttributionFromText(v)
+							if Page.Refresh and Page.panel then
+								Page:Refresh(Page.panel)
+							end
+						end,
+						getSuggestions = function(_, prefix)
+							return EditAttributionSuggestions(prefix)
+						end,
+						onResolved = function(_, item)
+							-- Typing notifies nil before set. Do not refresh here:
+							-- get() still has the prior draft and would rewrite the
+							-- edit mid-keystroke (#459 discussion_r4496331290).
+							-- set refreshes after the draft catches up (Manage pattern).
+							if not item then
+								ApplyEditAttributionSuggestion(nil)
+								return
+							end
+							ApplyEditAttributionSuggestion(item)
+							if Page.Refresh and Page.panel then
+								Page:Refresh(Page.panel)
+							end
+						end,
+					},
+					{
+						type = "buttonRow",
+						adminOnly = true,
+						visible = function()
+							return type(editSession) == "table"
+						end,
+						{
+							text = Loc("GUILD_SUPPLIES_LOGS_EDIT_CONTINUE", "Continue"),
+							width = 100,
+							enabled = function()
+								return Caps().canEdit == true
+									and type(editSession) == "table"
+									and editSession.attributionResolved == true
+							end,
+							onClick = function()
+								ConfirmAndSaveEdit()
+							end,
+						},
+						{
+							text = Loc("GUILD_SUPPLIES_LOGS_EDIT_CANCEL", "Cancel"),
+							width = 90,
+							onClick = function()
+								ClearEditSession()
+								cachedProjectedRows = nil
+								cachedProjectionKey = nil
+								if Page.Refresh and Page.panel then
+									Page:Refresh(Page.panel)
+								end
+							end,
+						},
+					},
+					{
 						type = "logTable",
 						fillHeight = true,
 						minHeight = 280,
@@ -591,17 +1422,23 @@ local function Definition()
 							{
 								key = "contributor",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_CONTRIBUTOR", "Contributor"),
-								width = 200,
+								width = 180,
 							},
 							{
 								key = "quantity",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_QUANTITY", "Quantity"),
-								width = 90,
+								width = 80,
 								justifyH = "RIGHT",
 							},
 							{
 								key = "item",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_ITEM", "Item"),
+							},
+							{
+								key = "editAction",
+								kind = "action",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_EDIT", "Edit"),
+								width = 70,
 							},
 						},
 						emptyText = EmptyLogsText,
@@ -707,6 +1544,27 @@ local function EnsureDurableListener()
 	supplies.RegisterUIListener(function()
 		cachedProjectedRows = nil
 		cachedProjectionKey = nil
+		-- Reconcile resumable local save UI with GS retain / accepted storage.
+		if type(editSession) == "table" and editSession.pendingLocal
+			and type(editSession.pendingLocalOp) == "table" then
+			local g = GS()
+			local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+			local opId = editSession.pendingLocalOp.id
+			local retained = g and g.GetLocalContributorCorrectionSave
+				and g.GetLocalContributorCorrectionSave(record)
+			local accepted = type(record) == "table"
+				and record.operations and record.operations.records
+				and record.operations.records[opId]
+			if accepted then
+				InvalidatePendingConfirm()
+				editSession = nil
+				ReportLogsStatus("accepted")
+			elseif retained == nil then
+				InvalidatePendingConfirm()
+				editSession = nil
+				ReportLogsStatus("rejected", "stale_credit")
+			end
+		end
 		QueueRefresh()
 	end)
 	durableListenerRegistered = true
@@ -735,6 +1593,8 @@ function Page:Build(panel)
 		end)
 		panel:HookScript("OnHide", function()
 			CancelValuationCatchup()
+			-- Page leave cancels any in-flight authorized local save (#459).
+			ClearEditSession()
 		end)
 	end
 	MaybeStartValuationCatchup(panel)
@@ -759,6 +1619,7 @@ function Page:OnHide()
 	refreshQueued = false
 	cachedProjectedRows = nil
 	cachedProjectionKey = nil
+	ClearEditSession()
 	CancelValuationCatchup()
 end
 
@@ -801,6 +1662,53 @@ Page.__sfTest = {
 		local calls = lookup and tonumber(lookup.getCurrentRecordCalls) or 0
 		EndRenderPass()
 		return rows, calls
+	end,
+	OpenEditContributorDialog = OpenEditContributorDialog,
+	ResolveEditAttribution = ResolveEditAttribution,
+	GetEditSession = function()
+		return editSession
+	end,
+	GetPendingConfirm = function()
+		return pendingConfirm
+	end,
+	ClearEditSession = ClearEditSession,
+	InvalidatePendingConfirm = InvalidatePendingConfirm,
+	CommitEditSession = CommitEditSession,
+	CommitCapturedEdit = CommitCapturedEdit,
+	ConfirmAndSaveEdit = ConfirmAndSaveEdit,
+	EnsureEditRosterCache = EnsureEditRosterCache,
+	SetEditAttributionFromText = SetEditAttributionFromText,
+	EditAttributionSuggestions = EditAttributionSuggestions,
+	--- Apply an autocomplete suggestion through the real onResolved path (#459 C5).
+	ResolveEditAttributionSuggestion = ApplyEditAttributionSuggestion,
+	--- Production onResolved(nil) only — must not refresh (#459 4496331290).
+	NotifyEditAttributionResolvedNil = function()
+		ApplyEditAttributionSuggestion(nil)
+	end,
+	--- Production AddAutocomplete OnTextChanged order: onResolved(nil) then set
+	-- (refresh only from set). Used to regress mid-keystroke draft restore
+	-- (#459 discussion_r4496331290).
+	SimulateEditAttributionTextChanged = function(text)
+		ApplyEditAttributionSuggestion(nil)
+		SetEditAttributionFromText(text)
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+	end,
+	--- Production suggestion selection: onResolved(item) then refresh.
+	SimulateEditAttributionSuggestionResolved = function(item)
+		ApplyEditAttributionSuggestion(item)
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+	end,
+	--- Peek the page projection cache without rebuilding (#459 B4).
+	PeekCachedProjectedRows = function()
+		return cachedProjectedRows, cachedProjectionKey
+	end,
+	ClearProjectedRowCache = function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
 	end,
 }
 
