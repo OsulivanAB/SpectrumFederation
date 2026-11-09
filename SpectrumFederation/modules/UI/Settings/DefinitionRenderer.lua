@@ -246,6 +246,7 @@ function R:Build(panel, pageDef)
 					type(left.onRemove) == "function"
 					or type(left.onSelect) == "function"
 					or type(left.onAction) == "function"
+					or type(left.onCopy) == "function"
 				) then
 					needsCopy = true
 				end
@@ -253,6 +254,7 @@ function R:Build(panel, pageDef)
 					type(right.onRemove) == "function"
 					or type(right.onSelect) == "function"
 					or type(right.onAction) == "function"
+					or type(right.onCopy) == "function"
 				) then
 					needsCopy = true
 				end
@@ -279,6 +281,12 @@ function R:Build(panel, pageDef)
 						if type(panelOpts.onAction) == "function" then
 							local fn = panelOpts.onAction
 							panelOpts.onAction = function(listItem)
+								return fn(MakeCtx(panel, sec), listItem)
+							end
+						end
+						if type(panelOpts.onCopy) == "function" then
+							local fn = panelOpts.onCopy
+							panelOpts.onCopy = function(listItem)
 								return fn(MakeCtx(panel, sec), listItem)
 							end
 						end

@@ -562,6 +562,16 @@ L["GUILD_INFO_NAME_HINT"] = "Type a guild member name"
 L["GUILD_INFO_ASSIGN_LABEL"] = "Assign alt to main"
 L["GUILD_INFO_ASSIGN_BUTTON"] = "Assign"
 L["GUILD_INFO_LIST_LABEL"] = "Mains and alts"
+L["GUILD_INFO_LIST_SEARCH"] = "Find character"
+L["GUILD_INFO_LIST_SEARCH_HINT"] = "Type to search mains and alts"
+L["GUILD_INFO_LIST_SEARCH_CLEAR_LABEL"] = "Clear search"
+L["GUILD_INFO_LIST_SEARCH_CLEAR"] = "Clear"
+L["GUILD_INFO_LIST_SEARCH_STATUS_LABEL"] = "Search"
+L["GUILD_INFO_LIST_SEARCH_NO_GROUP"] = "That character has no visible Main/Alt group right now."
+L["GUILD_INFO_LIST_SEARCH_NO_MATCH"] = "No matching mains or alts."
+L["GUILD_INFO_COPY_NAME_TIP"] = "Copy Name-Realm"
+L["GUILD_INFO_COPY_NAME_PROMPT"] = "Press Ctrl+C to copy this character name (addons cannot write the clipboard on Retail)."
+L["GUILD_INFO_COPY_NAME_CLOSE"] = "Close"
 L["GUILD_INFO_PANEL_MAIN"] = "Main"
 L["GUILD_INFO_PANEL_ALTS"] = "Alts"
 L["GUILD_INFO_ALTS_SELECT_MAIN"] = "Select a main to view its alts."
@@ -679,6 +689,9 @@ L["GUILD_SUPPLIES_EDITOR_RANK_RECOVER_CONFIRM"] = "Repair the stored Guild Suppl
 L["GUILD_SUPPLIES_EDITOR_RANK_RECOVER_TIP"] = "Repairs a corrupt stored permission record. It does not choose who can edit Guild Supplies."
 L["GUILD_SUPPLIES_EDITOR_RANK_DISABLED"] = "Who can edit follows the shared officer rank. This control only repairs a corrupt stored permission record."
 L["GUILD_SUPPLIES_DISABLED_POLICY_UNKNOWN"] = "Officer rank is not available yet, so Guild Supplies setup stays disabled."
+
+-- Shared Settings autocomplete empty-results fallback
+L["SETTINGS_AUTOCOMPLETE_NO_MATCHES"] = "No matches"
 
 -- General → UI Customization: Settings Window Opacity (#418)
 L["SETTINGS_WINDOW_OPACITY_LABEL"] = "Settings Window Opacity"
