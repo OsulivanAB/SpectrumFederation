@@ -8694,7 +8694,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
         end
         if GS._ApplyMutations then
-            local ok, err = GS._ApplyMutations(record, stored)
+            local applyOpts = nil
+            if stored.kind == GS.KIND.SOFT_DELETE_EVENT then
+                -- Source-accepted deletions may outlive trimmed base evidence (#465).
+                applyOpts = {
+                    adoptionReplay = admissionCtx.adoptionReplay == true,
+                    sourceAcceptedDelete = admissionCtx.adoptionReplay == true
+                        and type(admissionCtx.sourceAcceptedSet) == "table"
+                        and admissionCtx.sourceAcceptedSet[stored.id] == true,
+                    allowOrphanedAcceptedDelete = admissionCtx.adoptionReplay == true
+                        and type(admissionCtx.sourceAcceptedSet) == "table"
+                        and admissionCtx.sourceAcceptedSet[stored.id] == true,
+                }
+            end
+            local ok, err = GS._ApplyMutations(record, stored, applyOpts)
             if not ok then
                 if stored.kind == GS.KIND.ADJUST_QUANTITY
                     and (err == "item_negative" or err == "player_negative"

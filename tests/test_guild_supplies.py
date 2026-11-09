@@ -174,8 +174,16 @@ def test_guild_supplies_soft_delete_465():
     assert "465-adopt-corr: credit not reinstated" in result.stdout
     assert "465-surv: Bob keeps corrected credit" in result.stdout
     assert "465-surv: Bob unchanged after Alice repair" in result.stdout
-    assert "465-ex: SF.Debug:Error recorded admit failure" in result.stdout
+    assert "465-ex: geterrorhandler received original failure" in result.stdout
+    assert "465-ex: debug OFF produced no SF.Debug logs" in result.stdout
     assert "465-ex: idle after successful drain" in result.stdout
+    assert "465-nodebt: credit_unavailable" in result.stdout
+    assert "465-unrel: player_negative" in result.stdout
+    assert "465-late: canonical C deleted after late alias" in result.stdout
+    assert "465-late: single logical delete head got 1" in result.stdout
+    assert "465-filt: shared canonical lookup charged" in result.stdout
+    assert "465-orphan: deletion projected without base evidence" in result.stdout
+    assert "465-orphan: credit stays excluded" in result.stdout
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")

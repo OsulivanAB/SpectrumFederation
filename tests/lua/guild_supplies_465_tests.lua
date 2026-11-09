@@ -2254,8 +2254,8 @@ do
 end
 
 do
-    -- Soft-delete redrive: forced admit exception uses SF.Debug:Error, clears
-    -- re-entry guards, retains pending work, then drains successfully and idles.
+    -- Soft-delete redrive: forced admit exception reports via geterrorhandler
+    -- with debug OFF, clears re-entry guards, retains pending, then drains idle.
     local record = seedLiveCampaignWithItem(9233, 200)
     local ctx = select(1, GS:GetCurrentContext())
     record.operations.pending = record.operations.pending or {}
@@ -2302,7 +2302,14 @@ do
         GS._ClearSoftDeleteRedriveContinuationForTest(record)
     end
     world.debugLogs = {}
-    SF.Debug:SetEnabled(true)
+    SF.Debug:SetEnabled(false)
+    local capturedErrors = {}
+    local prevHandler = geterrorhandler
+    geterrorhandler = function()
+        return function(err)
+            capturedErrors[#capturedErrors + 1] = err
+        end
+    end
     local realAdmit = GS.AdmitRemoteOperation
     local calls = 0
     GS.AdmitRemoteOperation = function(self, body, opts)
@@ -2316,21 +2323,21 @@ do
         itemId = 9233, maxAttempts = 8,
     })
     GS.AdmitRemoteOperation = realAdmit
+    geterrorhandler = prevHandler
     assertEq(GS._softDeleteRedriveAdmitActive, false,
         "465-ex: admit guard cleared after exception")
     assertTrue(attempts1 >= 1, "465-ex: wave attempted admits")
     assertTrue(promoted1 >= 0, "465-ex: promoted count readable")
-    local sawDiag = false
-    for i = 1, #world.debugLogs do
-        local e = world.debugLogs[i]
-        if e and e.level == "ERROR"
-            and type(e.msg) == "string"
-            and e.msg:find("forced soft%-delete redrive admit failure", 1, false) then
-            sawDiag = true
+    local sawHandler = false
+    for i = 1, #capturedErrors do
+        local msg = tostring(capturedErrors[i] or "")
+        if msg:find("forced soft%-delete redrive admit failure", 1, false) then
+            sawHandler = true
             break
         end
     end
-    assertTrue(sawDiag, "465-ex: SF.Debug:Error recorded admit failure")
+    assertTrue(sawHandler, "465-ex: geterrorhandler received original failure")
+    assertEq(#world.debugLogs, 0, "465-ex: debug OFF produced no SF.Debug logs")
     local stillPending = 0
     for i = 1, #pendingIds do
         if record.operations.pending[pendingIds[i]] then
@@ -2366,7 +2373,301 @@ do
         assertTrue(GS.IsEventSoftDeleted(record, string.format("sd-ex-don-%02d", i)),
             "465-ex: donation soft-deleted " .. i)
     end
-    SF.Debug:SetEnabled(false)
+end
+
+do
+    -- No soft-delete: ordinary invalid Bob −20 accounting stays unavailable (#459).
+    local record = seedLiveCampaignWithItem(9240, 50)
+    injectProductionDonation(record, {
+        id = "nodebt-don", itemId = 9240, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "nodebt-don", "Bob-Garona", "Player-1-Bob"))
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-nodebt: correct Alice→Bob")
+    injectProductionAdjustment(record, {
+        id = "nodebt-adj", itemId = 9240, quantity = -20,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okFail, errFail = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okFail == false, "465-nodebt: rebuild fails")
+    assertEq(errFail, "player_negative", "465-nodebt: player_negative")
+    local bobTotal, bobErr = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", 9240)
+    assertNil(bobTotal, "465-nodebt: Bob total unavailable")
+    assertEq(bobErr, GS.CREDIT_UNAVAILABLE, "465-nodebt: credit_unavailable")
+end
+
+do
+    -- Unrelated soft-delete on another item must not permit Bob −20 debt floors.
+    local record = seedLiveCampaignWithItem(9241, 50)
+    local other = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 92411 }, {
+        itemId = 92411, goal = 20, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(other), "accepted", "465-unrel: add other item")
+    injectProductionDonation(record, {
+        id = "unrel-other", itemId = 92411, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local delOther = select(1, GS:NewSoftDeleteOperation("unrel-other"))
+    assertEq(GS:ApplyStagedConfigOperation(delOther), "accepted", "465-unrel: delete other item")
+    injectProductionDonation(record, {
+        id = "unrel-don", itemId = 9241, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "unrel-don", "Bob-Garona", "Player-1-Bob"))
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-unrel: correct Alice→Bob")
+    injectProductionAdjustment(record, {
+        id = "unrel-adj", itemId = 9241, quantity = -20,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+    })
+    GS.InvalidateCreditCorrectionProjection(record)
+    local okFail, errFail = GS.RebuildCreditCorrectionProjection(record, nil)
+    assertTrue(okFail == false, "465-unrel: rebuild fails")
+    assertEq(errFail, "player_negative", "465-unrel: player_negative")
+end
+
+do
+    -- Late alias binding: delete-before-alias must not revive credit on C.
+    -- Author deletes via alias B; peer receives B while only C is known →
+    -- pending_event; late B→C wake migrates heads and promotes the delete.
+    local author = seedLiveCampaignWithItem(9242, 40)
+    local donA = injectProductionDonation(author, {
+        id = "ctx:late-canon", itemId = 9242, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    donA.txnId = "ctx:late-canon"
+    assertTrue(GS._AddTxnAlias(author, "ctx:late-canon", "ctx:late-alias", donA),
+        "465-late: author alias B for prepare")
+    local del = select(1, GS:NewSoftDeleteOperation("ctx:late-alias"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-late: author delete via B")
+    assertTrue(GS.IsEventSoftDeleted(author, "ctx:late-canon"), "465-late: author C deleted")
+    assertTrue(GS.IsEventSoftDeleted(author, "ctx:late-alias"), "465-late: author B deleted")
+
+    local peer = seedLiveCampaignWithItem(9242, 40)
+    local donP = injectProductionDonation(peer, {
+        id = "ctx:late-canon", itemId = 9242, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    donP.txnId = "ctx:late-canon"
+    local delSnap = select(1, GS._SnapshotPublicOp(del))
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        -- Force target/value to alias B for delete-before-alias delivery.
+        out.target = "ctx:late-alias"
+        if type(out.value) == "table" then
+            local v = {}
+            for vk, vv in pairs(out.value) do v[vk] = vv end
+            v.eventId = "ctx:late-alias"
+            out.value = v
+        end
+        return out
+    end
+    local admitSt, admitReason = GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertEq(admitSt, "pending", "465-late: peer parks delete of unknown B")
+    assertEq(admitReason, "pending_event", "465-late: pending_event reason")
+    assertTrue(peer.operations.pending and peer.operations.pending[del.id] ~= nil,
+        "465-late: delete retained pending")
+    assertTrue(not GS.IsEventSoftDeleted(peer, "ctx:late-canon"),
+        "465-late: C still visible before alias")
+    assertTrue(GS._AddTxnAlias(peer, "ctx:late-canon", "ctx:late-alias", donP),
+        "465-late: peer late alias B→C")
+    flushTimers()
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:late-canon"),
+        "465-late: canonical C deleted after late alias")
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:late-alias"),
+        "465-late: alias B deleted after late alias")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", 9242), 0,
+        "465-late: credit not restored")
+    -- Competing heads must fold onto one terminal delete key.
+    local heads = peer.operations.heads
+    local deleteHeads = 0
+    if type(heads) == "table" then
+        for k in pairs(heads) do
+            if type(k) == "string" and k:sub(1, 7) == "delete:" then
+                deleteHeads = deleteHeads + 1
+            end
+        end
+    end
+    assertTrue(deleteHeads == 1,
+        "465-late: single logical delete head got " .. tostring(deleteHeads))
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(peer)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:late-canon"),
+        "465-late: canonical deleted after reload")
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:late-alias"),
+        "465-late: alias deleted after reload")
+end
+
+do
+    -- Bound soft-delete pending filter: shared lookup, no per-entry history scan.
+    local record = seedLiveCampaignWithItem(9243, 500)
+    local ctx = select(1, GS:GetCurrentContext())
+    -- Inflate archive so a naive FindLedgerEventById per pending would be costly.
+    record.accounting._consumableEventArchive = record.accounting._consumableEventArchive or {}
+    local archive = record.accounting._consumableEventArchive
+    for i = 1, 200 do
+        archive[#archive + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("arch-filler-%03d", i),
+            txnId = string.format("arch-filler-%03d", i),
+            itemId = 9243,
+            quantity = 1,
+            actor = "Alice-Garona",
+            actorGuid = "Player-1-Alice",
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+            generation = 1,
+            timestamp = world.time - 1000 - i,
+        }
+    end
+    record.operations.pending = record.operations.pending or {}
+    for i = 1, 40 do
+        local donId = string.format("filt-don-%02d", i)
+        injectProductionDonation(record, {
+            id = donId, itemId = 9243, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        local id = string.format("filt-del-%02d", i)
+        record.operations.pending[id] = {
+            id = id,
+            sender = "Alice-Garona",
+            reason = "pending_event",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = id,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.SOFT_DELETE_EVENT,
+                target = donId,
+                value = {
+                    eventId = donId, eventKind = "donation", itemId = 9243, quantity = 1,
+                    attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = world.time + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
+    if GS._ClearSoftDeleteRedriveContinuationForTest then
+        GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    end
+    GS._softDeleteRedriveLookupVisits = 0
+    local beforeFind = 0
+    local realFind = GS.FindLedgerEventById
+    GS.FindLedgerEventById = function(...)
+        beforeFind = beforeFind + 1
+        return realFind(...)
+    end
+    GS.RedrivePendingSoftDeletes(record, {
+        eventId = "filt-don-01", maxAttempts = 8, maxFilterVisits = 64,
+    })
+    GS.FindLedgerEventById = realFind
+    flushTimers()
+    assertTrue(beforeFind < 40,
+        "465-filt: filter avoided per-entry FindLedger scans got " .. tostring(beforeFind))
+    assertTrue((tonumber(GS._softDeleteRedriveLookupVisits) or 0) > 0,
+        "465-filt: shared canonical lookup charged")
+    assertTrue(GS.IsEventSoftDeleted(record, "filt-don-01")
+        or (record.operations.pending and next(record.operations.pending)),
+        "465-filt: wake progressed or retained pending")
+end
+
+do
+    -- Orphaned accepted deletion after archive eviction still adopts.
+    local record = seedLiveCampaignWithItem(9244, 40)
+    injectProductionDonation(record, {
+        id = "orphan-don", itemId = 9244, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("orphan-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-orphan: delete")
+    assertTrue(GS.IsEventSoftDeleted(record, "orphan-don"), "465-orphan: deleted")
+    -- Evict the base ledger row while keeping the accepted soft-delete op.
+    local live = record.accounting._consumableEvents
+    local kept = {}
+    for i = 1, #live do
+        if live[i].id ~= "orphan-don" then
+            kept[#kept + 1] = live[i]
+        end
+    end
+    record.accounting._consumableEvents = kept
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    assertNil(GS.FindLedgerEventById(record, "orphan-don"), "465-orphan: evidence gone")
+    assertTrue(record.operations.records[del.id] ~= nil, "465-orphan: delete op retained")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-orphan: export bodies")
+    local sourceDataset = record.datasetId
+    local delId = del.id
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-orphan: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-orphan: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    assertEq(commitSt, "accepted",
+        "465-orphan: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(adopted ~= nil, "465-orphan: adopted record")
+    assertTrue(adopted.operations.records[delId] ~= nil, "465-orphan: delete history")
+    assertTrue(GS.IsEventSoftDeleted(adopted, "orphan-don"),
+        "465-orphan: deletion projected without base evidence")
+    -- Reintroduce matching evidence must not restore credit.
+    injectProductionDonation(adopted, {
+        id = "orphan-don", itemId = 9244, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(adopted)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(adopted, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(adopted, "orphan-don"),
+        "465-orphan: still deleted after evidence returns")
+    assertEq(GS.PersonalContributorItemTotal(adopted, "Alice-Garona", "Player-1-Alice", 9244), 0,
+        "465-orphan: credit stays excluded")
 end
 
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))

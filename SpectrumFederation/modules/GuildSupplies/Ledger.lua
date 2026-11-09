@@ -6496,11 +6496,15 @@ function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, i
     end
     if type(aliasTxnId) == "string" and aliasTxnId ~= "" then
         GS.MigrateCorrectionHeadsForAlias(record, terminal, aliasTxnId, terminal)
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            GS.MigrateSoftDeleteHeadsForAlias(record, terminal, aliasTxnId, terminal)
+        end
     end
     local ops = record.operations
     if type(ops) == "table" and type(ops.heads) == "table" then
         local prefix = "credit:"
         local pending = {}
+        local pendingDeletes = {}
         for targetKey in pairs(ops.heads) do
             if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
                 local id = targetKey:sub(#prefix + 1)
@@ -6510,20 +6514,46 @@ function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, i
                         pending[#pending + 1] = id
                     end
                 end
+            elseif type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                local id = targetKey:sub(8)
+                if id ~= "" and id ~= terminal and id ~= aliasTxnId then
+                    local resolved = ResolveAliasOverlayTerminal(record, id, nil)
+                    if resolved == terminal then
+                        pendingDeletes[#pendingDeletes + 1] = id
+                    end
+                end
             end
         end
         for i = 1, #pending do
             GS.MigrateCorrectionHeadsForAlias(
                 record, terminal, pending[i], terminal)
         end
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            for i = 1, #pendingDeletes do
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, terminal, pendingDeletes[i], terminal)
+            end
+        end
     end
     if GS.InvalidateCreditCorrectionProjection then
         GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
     end
     -- One shared allowance; item filter covers primary and alias txn targets.
     if GS.EnsureThenRedriveCreditCorrections then
         GS.EnsureThenRedriveCreditCorrections(record, {
             itemId = itemId,
+        })
+    end
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {
+            itemId = itemId,
+            _shareCallbackBudget = true,
         })
     end
 end
@@ -6551,6 +6581,10 @@ function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
             terminalsTouched[terminal] = true
             GS.MigrateCorrectionHeadsForAlias(
                 record, terminal, row.alias, terminal)
+            if GS.MigrateSoftDeleteHeadsForAlias then
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, terminal, row.alias, terminal)
+            end
         end
     end
     -- Fold retained upstream heads (e.g. credit:A when A→B→C and B→C arrives)
@@ -6559,6 +6593,7 @@ function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
     if type(ops) == "table" and type(ops.heads) == "table" then
         local prefix = "credit:"
         local pending = {}
+        local pendingDeletes = {}
         for targetKey in pairs(ops.heads) do
             if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
                 local id = targetKey:sub(#prefix + 1)
@@ -6570,19 +6605,47 @@ function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
                         pending[#pending + 1] = { alias = id, terminal = terminal }
                     end
                 end
+            elseif type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                local id = targetKey:sub(8)
+                if id ~= "" then
+                    local terminal = ResolveAliasOverlayTerminal(
+                        record, id, ledgerById)
+                    if type(terminal) == "string" and terminal ~= ""
+                        and terminalsTouched[terminal] and terminal ~= id then
+                        pendingDeletes[#pendingDeletes + 1] = {
+                            alias = id, terminal = terminal,
+                        }
+                    end
+                end
             end
         end
         for i = 1, #pending do
             GS.MigrateCorrectionHeadsForAlias(
                 record, pending[i].terminal, pending[i].alias, pending[i].terminal)
         end
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            for i = 1, #pendingDeletes do
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, pendingDeletes[i].terminal,
+                    pendingDeletes[i].alias, pendingDeletes[i].terminal)
+            end
+        end
     end
     if GS.InvalidateCreditCorrectionProjection then
         GS.InvalidateCreditCorrectionProjection(record)
     end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
     -- No per-binding item filter: one coalesced Ensure/Redrive covers the page.
     if GS.EnsureThenRedriveCreditCorrections then
         GS.EnsureThenRedriveCreditCorrections(record, {})
+    end
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {})
     end
 end
 
@@ -7005,17 +7068,18 @@ local function TotalsAllNonNegative(totals)
     return true
 end
 
---- True when every negative bucket is no worse than the soft-delete baseline (#465).
--- Permitted deletion-created debt does not force correction prune/fallback.
--- Correction-created worsening beyond baseline still fails this check.
-local function TotalsRespectBaselineDebt(totals, baselineTotals)
-    baselineTotals = baselineTotals or {}
+--- True when every negative bucket is no worse than approved soft-delete debt (#465).
+-- `debtFloors[key]` is the permitted negative floor from actual soft-deleted
+-- signed quantities (0 / absent ⇒ must be nonnegative). A raw negative baseline
+-- alone is not permission — ordinary invalid accounting still fails closed.
+local function TotalsRespectDeletionDebt(totals, debtFloors)
+    debtFloors = debtFloors or {}
     for key, total in pairs(totals or {}) do
         GS._creditProjectionFloorVisits =
             (tonumber(GS._creditProjectionFloorVisits) or 0) + 1
         if total < 0 then
-            local base = tonumber(baselineTotals[key]) or 0
-            if total < base then
+            local floor = tonumber(debtFloors[key]) or 0
+            if total < floor then
                 return false
             end
         end
@@ -7037,18 +7101,16 @@ local function TotalsNegScore(totals)
     return score
 end
 
---- Item ids whose active totals are worse than the soft-delete baseline (#465).
--- Used by empty-set fallback so permitted baseline debt does not deactivate
--- unrelated surviving corrections on the same item.
+--- Item ids whose active totals are worse than approved soft-delete debt floors.
 -- Keys are "g:guid\0itemId\0campaign" or "n:name\0itemId\0campaign".
 -- Lua 5.1 patterns cannot match embedded NULs — use plain find/sub.
-local function ItemIdsWorseThanBaseline(totals, baselineTotals)
-    baselineTotals = baselineTotals or {}
+local function ItemIdsWorseThanDeletionDebt(totals, debtFloors)
+    debtFloors = debtFloors or {}
     local bad = {}
     for key, total in pairs(totals or {}) do
         if total < 0 and type(key) == "string" then
-            local base = tonumber(baselineTotals[key]) or 0
-            if total < base then
+            local floor = tonumber(debtFloors[key]) or 0
+            if total < floor then
                 local first = key:find("\0", 1, true)
                 if first then
                     local second = key:find("\0", first + 1, true)
@@ -7063,6 +7125,83 @@ local function ItemIdsWorseThanBaseline(totals, baselineTotals)
         end
     end
     return bad
+end
+
+--- Accumulate soft-delete signed-quantity debt floors for one ledger event.
+-- Uses effective attribution captured on the deletion head when present so
+-- corrected donations create debt on the credited identity (#465). Excluding a
+-- +qty donation lowers that identity by qty; excluding a negative adjustment
+-- raises it. Only net-negative contributions become floors.
+local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsReady, resolveCache)
+    if type(debtFloors) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    if not (GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event)) then
+        return
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    -- Only production-credited donations/adjustments affect personal floors.
+    if event.gsProductionCredit ~= true then
+        return
+    end
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if not isDonation and not isAdjustment then
+        return
+    end
+    if isDonation and not (qty > 0) then
+        return
+    end
+    local creditName, creditGuid = DurableCreditIdentity(event)
+    local delMap = record.eventDeletions
+    local delEntry = nil
+    if type(delMap) == "table" then
+        if type(event.id) == "string" then
+            delEntry = delMap[event.id]
+        end
+        if type(delEntry) ~= "table" and type(event.txnId) == "string" then
+            delEntry = delMap[event.txnId]
+        end
+    end
+    if type(delEntry) == "table" then
+        if delEntry.attributed or delEntry.attributedGuid then
+            creditName = delEntry.attributed
+            creditGuid = delEntry.attributedGuid
+        end
+        if tonumber(delEntry.quantity) then
+            qty = tonumber(delEntry.quantity)
+        end
+    end
+    if isAdjustment and not (creditName or creditGuid) then
+        return
+    end
+    if isDonation and not creditName then
+        return
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    local key = CreditFloorBucketKey(
+        record, creditName, creditGuid, itemId, campaignId,
+        relationshipsReady, resolveCache)
+    -- Excluding this event from baseline removes `qty` from the bucket.
+    TotalsAdd(debtFloors, key, -qty)
+end
+
+local function NormalizeSoftDeleteDebtFloors(debtFloors)
+    if type(debtFloors) ~= "table" then
+        return {}
+    end
+    local out = {}
+    for key, total in pairs(debtFloors) do
+        local n = tonumber(total)
+        if n and n < 0 then
+            out[key] = n
+        end
+    end
+    return out
 end
 
 --- Index a ledger event under id and txnId only (#459).
@@ -7134,6 +7273,7 @@ local function BuildDurableCreditFloorBaseline(record)
     local relationshipsReady = GS.WitnessRelationshipsReady
         and select(1, GS.WitnessRelationshipsReady(record))
     local totals = {}
+    local debtFloors = {}
     local byId = {}
     local visits = 0
     local resolveCache = {}
@@ -7143,6 +7283,9 @@ local function BuildDurableCreditFloorBaseline(record)
         end
         visits = visits + 1
         IndexCreditEventKeys(byId, event)
+        -- Soft-deleted rows leave signed debt floors but never baseline credit.
+        NoteSoftDeleteDebtFloor(
+            debtFloors, record, event, relationshipsReady, resolveCache)
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
             return
@@ -7220,7 +7363,7 @@ local function BuildDurableCreditFloorBaseline(record)
     if not foldOk then
         -- Synchronous builder never yields; treat as complete.
     end
-    return totals, byId, visits, relationshipsReady
+    return totals, byId, visits, relationshipsReady, NormalizeSoftDeleteDebtFloors(debtFloors)
 end
 
 --- Paced durable baseline: retain partial totals/byId across slices when the
@@ -7235,6 +7378,7 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
             and select(1, GS.WitnessRelationshipsReady(record))
     end
     local totals = scratch and scratch.baselineTotals or {}
+    local debtFloors = scratch and scratch.baselineDebtFloors or {}
     local byId = scratch and scratch.baselineById or {}
     local provenance = scratch and scratch.baselineProvenance or {}
     local visits = tonumber(scratch and scratch.baselineVisits) or 0
@@ -7251,6 +7395,9 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
         -- Index name↔GUID provenance once during the paced baseline so activation
         -- BindCharacterIdentity does not rescan the ledger per head (#459).
         NoteCreditProvenanceFromEvent(provenance, event)
+        -- Soft-deleted rows leave signed debt floors but never baseline credit.
+        NoteSoftDeleteDebtFloor(
+            debtFloors, record, event, relationshipsReady, resolveCache)
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
             return
@@ -7285,6 +7432,7 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
             baselinePhase = nextPhase,
             baselineIndex = nextIndex,
             baselineTotals = totals,
+            baselineDebtFloors = debtFloors,
             baselineById = byId,
             baselineProvenance = provenance,
             baselineVisits = visits,
@@ -7374,6 +7522,7 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
     return true, {
         baselineReady = true,
         baselineTotals = totals,
+        baselineDebtFloors = NormalizeSoftDeleteDebtFloors(debtFloors),
         baselineById = byId,
         baselineProvenance = provenance,
         baselineVisits = visits,
@@ -8067,6 +8216,10 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     if type(record) ~= "table" then
         return false, "invalid_value"
     end
+    -- Soft-delete debt floors need a current eventDeletions map before baseline.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
     local ops = record.operations
     local stampEarly = CreditProjectionDependencyStamp(record)
     local priorCache = creditProjectionCache[record]
@@ -8470,11 +8623,13 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- When prune/activate working tables are retained, skip baseline cloning.
     local totals, byId, rowVisits, relationshipsReady, ordered, lookupMisses
     local baselineTotals
+    local deletionDebtFloors = {}
     local resumeActivateIndex = nil
     local resumeRestoreIndex = nil
     if skipToPrune then
         -- Adopt retained private working state below; keep metadata from scratch.
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         byId = scratch.byId
         rowVisits = 0
         relationshipsReady = scratch.relationshipsReady
@@ -8484,6 +8639,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         GS._creditProjectionRowVisits = 0
     elseif skipToActivate then
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         byId = scratch.byId
         rowVisits = 0
         relationshipsReady = scratch.relationshipsReady
@@ -8494,6 +8650,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         GS._creditProjectionRowVisits = 0
     elseif skipToRestore then
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         byId = scratch.byId
         rowVisits = 0
         relationshipsReady = scratch.relationshipsReady
@@ -8504,6 +8661,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         GS._creditProjectionRowVisits = 0
     elseif skipToFallback then
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         byId = scratch.byId
         rowVisits = 0
         relationshipsReady = scratch.relationshipsReady
@@ -8514,6 +8672,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     elseif haveOrderedScratch then
         -- Resume after post_baseline: one charged working clone from baseline.
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         totals = CloneCreditProjectionTotals(scratch.baselineTotals)
         byId = scratch.byId
         rowVisits = 0
@@ -8528,6 +8687,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         and type(scratch.ordered) ~= "table" then
         -- Resume paced winner indexing; keep baseline immutable.
         baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
         totals = CloneCreditProjectionTotals(baselineTotals)
         byId = scratch.byId
         rowVisits = tonumber(scratch.rowVisits) or 0
@@ -8567,6 +8727,9 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 baselinePhase = baselineSnap.baselinePhase,
                 baselineIndex = baselineSnap.baselineIndex,
                 baselineTotals = baselineSnap.baselineTotals,
+                baselineDebtFloors = baselineSnap.baselineDebtFloors,
+                deletionDebtFloors = NormalizeSoftDeleteDebtFloors(
+                    baselineSnap.baselineDebtFloors),
                 baselineById = baselineSnap.baselineById,
                 baselineProvenance = baselineSnap.baselineProvenance,
                 baselineVisits = baselineSnap.baselineVisits,
@@ -8611,6 +8774,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         end
         -- Keep baseline immutable; working totals are a charged clone.
         baselineTotals = baselineSnap.baselineTotals
+        deletionDebtFloors = NormalizeSoftDeleteDebtFloors(
+            baselineSnap.baselineDebtFloors)
         totals = CloneCreditProjectionTotals(baselineTotals)
         byId = baselineSnap.baselineById
         local baselineProvenance = baselineSnap.baselineProvenance
@@ -8639,6 +8804,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                     stamp = stampEarly,
                     candidates = scratch and scratch.candidates or candidates,
                     baselineTotals = baselineTotals,
+                deletionDebtFloors = deletionDebtFloors,
                     baselineProvenance = baselineProvenance,
                     byId = byId,
                     rowVisits = rowVisits,
@@ -8753,6 +8919,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
                 stamp = stampEarly,
                 candidates = candidates,
                 baselineTotals = baselineTotals or totals,
+                deletionDebtFloors = deletionDebtFloors,
                 byId = byId,
                 rowVisits = rowVisits,
                 relationshipsReady = relationshipsReady,
@@ -8829,6 +8996,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             writeScratch({
                 stamp = stampEarly,
                 baselineTotals = baselineTotals,
+                deletionDebtFloors = deletionDebtFloors,
                 byId = byId,
                 rowVisits = rowVisits,
                 relationshipsReady = relationshipsReady,
@@ -8918,6 +9086,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         writeScratch({
             stamp = stamp,
             baselineTotals = baseSnap,
+                deletionDebtFloors = deletionDebtFloors,
             byId = byId,
             rowVisits = rowVisits,
             relationshipsReady = relationshipsReady,
@@ -9172,7 +9341,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- Soft yield before prune when baseline/activate already spent the allowance.
     -- Soft-delete baseline debt alone does not require prune (#465).
     if (not reusedFallback) and shouldYield(CreditProjectionWorkNow(rowVisits))
-        and not TotalsRespectBaselineDebt(totals, baselineTotals) then
+        and not TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
         return deferProjection("pre_prune")
     end
     -- Conflict rule: drop the head whose removal most improves personal floors.
@@ -9181,7 +9350,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- Compare against soft-delete baseline debt so surviving corrections are not
     -- pruned merely because another deletion left a negative bucket (#465).
     while (not reusedFallback)
-        and not TotalsRespectBaselineDebt(totals, baselineTotals) do
+        and not TotalsRespectDeletionDebt(totals, deletionDebtFloors) do
         if not scanState then
             if shouldYield(CreditProjectionWorkNow(rowVisits)) then
                 return deferProjection("prune")
@@ -9304,8 +9473,8 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     -- soft-delete baseline. Permitted baseline debt alone must not deactivate
     -- surviving same-item corrections (#465). Independent deduction-supporting
     -- corrections on other items remain preserved.
-    if not TotalsRespectBaselineDebt(totals, baselineTotals) then
-        local badItems = ItemIdsWorseThanBaseline(totals, baselineTotals)
+    if not TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
+        local badItems = ItemIdsWorseThanDeletionDebt(totals, deletionDebtFloors)
         if type(scratch) == "table" and scratch.fallbackReady == true
             and type(scratch.fallbackBadItems) == "table" then
             badItems = scratch.fallbackBadItems
@@ -9365,45 +9534,39 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     finishOwnedBudget()
     -- Final invariant: never leave a stale active map. Correction-created
     -- negatives still fail closed as CREDIT_UNAVAILABLE (#459). Soft-delete
-    -- baseline debt may remain with an otherwise valid active correction map
-    -- (#465): publish so personal totals stay readable and officers can apply
-    -- an explicit adjustment without undoing unrelated surviving corrections.
+    -- debt floors are scoped to actual deleted signed quantities (#465): a raw
+    -- negative baseline alone is not permission. Publish residual active maps
+    -- only when they respect those deletion floors.
     if not TotalsAllNonNegative(totals) then
-        if TotalsRespectBaselineDebt(totals, baselineTotals) then
+        if TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
             -- Permitted soft-delete debt with surviving corrections intact.
+        elseif type(baselineTotals) == "table"
+            and TotalsRespectDeletionDebt(baselineTotals, deletionDebtFloors) then
+            -- Active heads made floors worse than permitted deletion debt —
+            -- prefer the durable soft-delete baseline (do not reinstate credit).
+            activeMap = {}
+            activeIds = {}
+            totals = CloneCreditProjectionTotals(baselineTotals)
         else
-            local baselineNeg = type(baselineTotals) == "table"
-                and not TotalsAllNonNegative(baselineTotals)
-            if not baselineNeg then
-                MarkAcceptedCreditInvalid(record)
-                record.creditCorrections = {}
-                creditProjectionCache[record] = {
-                    stamp = stamp,
-                    ok = false,
-                    err = "player_negative",
-                }
-                return false, "player_negative", {
-                    activeIds = {},
-                    rowVisits = rowVisits,
-                    bucketVisits = bucketVisits,
-                    floorVisits = floorVisits,
-                    candidateTrials = candidateTrials,
-                    traversalVisits = traversalVisits,
-                    structureCopyVisits = structureCopyVisits,
-                    workUnits = workUnits,
-                    deactivations = GS._creditProjectionDeactivations,
-                    lookupMisses = lookupMisses,
-                }
-            end
-            -- Prefer the durable soft-delete baseline when residual active heads
-            -- still make floors worse than empty (do not reinstate deleted credit).
-            local emptyScore = TotalsNegScore(baselineTotals)
-            local activeScore = TotalsNegScore(totals)
-            if activeScore < emptyScore then
-                activeMap = {}
-                activeIds = {}
-                totals = CloneCreditProjectionTotals(baselineTotals)
-            end
+            MarkAcceptedCreditInvalid(record)
+            record.creditCorrections = {}
+            creditProjectionCache[record] = {
+                stamp = stamp,
+                ok = false,
+                err = "player_negative",
+            }
+            return false, "player_negative", {
+                activeIds = {},
+                rowVisits = rowVisits,
+                bucketVisits = bucketVisits,
+                floorVisits = floorVisits,
+                candidateTrials = candidateTrials,
+                traversalVisits = traversalVisits,
+                structureCopyVisits = structureCopyVisits,
+                workUnits = workUnits,
+                deactivations = GS._creditProjectionDeactivations,
+                lookupMisses = lookupMisses,
+            }
         end
     end
     local nActive = 0
@@ -9939,18 +10102,23 @@ local function EventDeletionDependencyStamp(record)
     if type(live) == "table" then
         ledgerN = #live
     end
-    -- Alias map size so late durable bindings force a rebuild that reindexes
-    -- soft-deleted canonical ids under their aliases (#465).
+    -- Alias remaps (not merely map length) must invalidate the projection (#465).
+    local aliasFp = 0
     local aliasN = 0
     local aliases = record and record.accounting and record.accounting._consumables
         and record.accounting._consumables.creditEventAliases
     if type(aliases) == "table" then
-        for _ in pairs(aliases) do
+        for alias, canon in pairs(aliases) do
             aliasN = aliasN + 1
+            if type(alias) == "string" and type(canon) == "string" then
+                aliasFp = aliasFp + #alias + #canon
+                    + (string.byte(alias, 1) or 0) + (string.byte(canon, 1) or 0)
+            end
         end
     end
+    local mut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
     return tostring(gen) .. ":" .. tostring(orderN) .. ":" .. tostring(ledgerN)
-        .. ":" .. tostring(aliasN)
+        .. ":" .. tostring(aliasN) .. ":" .. tostring(aliasFp) .. ":" .. tostring(mut)
 end
 
 --- Operation-head key for soft-delete-event, bound to the canonical event id.
@@ -9985,12 +10153,67 @@ local function SoftDeleteHeadEntry(op)
         eventKind = eventKind,
         itemId = value and tonumber(value.itemId) or nil,
         quantity = value and tonumber(value.quantity) or nil,
+        -- Effective attribution at deletion time (#465 signed-effect removal).
+        attributed = value and NormName(value.attributed) or nil,
+        attributedGuid = value and ValidGuid(value.attributedGuid) or nil,
     }
 end
 
+--- Fold alias-keyed soft-delete heads onto the terminal canonical (#465).
+-- Mirrors MigrateCorrectionHeadsForAlias: one LWW head per logical event.
+function GS.MigrateSoftDeleteHeadsForAlias(record, primaryTxnId, aliasTxnId, resolvedPrimaryId)
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return
+    end
+    local ops = record.operations
+    if type(ops.heads) ~= "table" then
+        return
+    end
+    local primaryKey
+    if type(resolvedPrimaryId) == "string" and resolvedPrimaryId ~= "" then
+        if GS.ComputeTargetKey and GS.KIND and GS.KIND.SOFT_DELETE_EVENT then
+            primaryKey = GS.ComputeTargetKey(
+                GS.KIND.SOFT_DELETE_EVENT, resolvedPrimaryId)
+        else
+            primaryKey = "delete:" .. resolvedPrimaryId
+        end
+    else
+        primaryKey = GS.SoftDeleteTargetKey
+            and GS.SoftDeleteTargetKey(record, primaryTxnId)
+            or ("delete:" .. tostring(primaryTxnId))
+    end
+    local aliasKey = "delete:" .. tostring(aliasTxnId)
+    if primaryKey == aliasKey then
+        return
+    end
+    local aliasHeadId = ops.heads[aliasKey]
+    if type(aliasHeadId) ~= "string" then
+        return
+    end
+    local primaryHeadId = ops.heads[primaryKey]
+    if type(primaryHeadId) ~= "string" then
+        ops.heads[primaryKey] = aliasHeadId
+        ops.heads[aliasKey] = nil
+        return
+    end
+    if primaryHeadId == aliasHeadId then
+        ops.heads[aliasKey] = nil
+        return
+    end
+    local primaryBody = ops.records and ops.records[primaryHeadId]
+    local aliasBody = ops.records and ops.records[aliasHeadId]
+    if type(aliasBody) == "table" and type(primaryBody) == "table"
+        and GS.SoftDeleteRevisionWins
+        and GS.SoftDeleteRevisionWins(aliasBody, primaryBody) then
+        ops.heads[primaryKey] = aliasHeadId
+    end
+    -- Losing revision stays in records; only the head key is cleared.
+    ops.heads[aliasKey] = nil
+end
+
 --- Rebuild eventDeletions from accepted soft-delete heads (#465).
--- Uses op bodies only — no ledger FindLedgerEventById — so rebuild stays safe
--- under the shared credit-projection callback budget.
+-- Resolves every retained delete target through a shared canonical lookup so
+-- late alias bindings unify onto one LWW head without per-head ledger scans.
 -- @return boolean ok
 function GS.RebuildEventDeletionProjection(record, extraOp)
     if type(record) ~= "table" then
@@ -10000,6 +10223,9 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     local ops = record.operations
     local heads = ops and ops.heads
     local records = ops and ops.records
+    local lookup = GS.BuildCreditCanonicalLookup and GS.BuildCreditCanonicalLookup(record) or nil
+    -- Collect head bodies keyed by terminal canonical id; LWW within each group.
+    local winners = {} -- canon -> { body=, entry=, ids={} }
     if type(heads) == "table" and type(records) == "table" then
         for targetKey, headId in pairs(heads) do
             if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:"
@@ -10008,13 +10234,26 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
                 if type(body) == "table"
                     and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
                     local eventId = body.target or (body.value and body.value.eventId)
+                        or targetKey:sub(8)
                     if type(eventId) == "string" and eventId ~= "" then
-                        local entry = SoftDeleteHeadEntry(body)
-                        map[eventId] = entry
-                        -- Also index the delete: key suffix when it differs.
-                        local suffix = targetKey:sub(8)
-                        if type(suffix) == "string" and suffix ~= "" and suffix ~= eventId then
-                            map[suffix] = entry
+                        local canon = GS.CanonicalCreditEventId
+                            and GS.CanonicalCreditEventId(record, eventId, lookup)
+                            or eventId
+                        local cur = winners[canon]
+                        if type(cur) ~= "table" then
+                            winners[canon] = {
+                                body = body,
+                                entry = SoftDeleteHeadEntry(body),
+                                ids = { eventId, targetKey:sub(8) },
+                            }
+                        else
+                            cur.ids[#cur.ids + 1] = eventId
+                            cur.ids[#cur.ids + 1] = targetKey:sub(8)
+                            if GS.SoftDeleteRevisionWins
+                                and GS.SoftDeleteRevisionWins(body, cur.body) then
+                                cur.body = body
+                                cur.entry = SoftDeleteHeadEntry(body)
+                            end
                         end
                     end
                 end
@@ -10026,30 +10265,67 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         and extraOp.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
         local eventId = extraOp.target or (extraOp.value and extraOp.value.eventId)
         if type(eventId) == "string" and eventId ~= "" then
-            local incumbent = map[eventId]
+            local canon = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, eventId, lookup)
+                or eventId
+            local cur = winners[canon]
             local wins = true
-            if type(incumbent) == "table" and type(incumbent.revisionId) == "string"
-                and incumbent.revisionId ~= extraOp.id then
-                local headBody = records and records[incumbent.revisionId]
-                if type(headBody) == "table" and GS.SoftDeleteRevisionWins then
-                    wins = GS.SoftDeleteRevisionWins(extraOp, headBody)
-                end
+            if type(cur) == "table" and type(cur.body) == "table"
+                and cur.body.id ~= extraOp.id and GS.SoftDeleteRevisionWins then
+                wins = GS.SoftDeleteRevisionWins(extraOp, cur.body)
             end
             if wins then
-                map[eventId] = SoftDeleteHeadEntry(extraOp)
+                winners[canon] = {
+                    body = extraOp,
+                    entry = SoftDeleteHeadEntry(extraOp),
+                    ids = (cur and cur.ids) or { eventId },
+                }
+                local ids = winners[canon].ids
+                ids[#ids + 1] = eventId
             end
         end
     end
-    -- Index durable creditEventAliases onto deleted canonical ids so alias /
-    -- reobservation lookups stay pure map reads on the hot path (#465).
+    -- Publish map at canonical + every known alias / retained id for pure reads.
+    for canon, cur in pairs(winners) do
+        if type(canon) == "string" and canon ~= "" and type(cur.entry) == "table" then
+            map[canon] = cur.entry
+            if type(cur.ids) == "table" then
+                for i = 1, #cur.ids do
+                    local id = cur.ids[i]
+                    if type(id) == "string" and id ~= "" then
+                        map[id] = cur.entry
+                    end
+                end
+            end
+        end
+    end
     local aliases = record.accounting and record.accounting._consumables
         and record.accounting._consumables.creditEventAliases
     if type(aliases) == "table" then
         for alias, canon in pairs(aliases) do
-            if type(alias) == "string" and alias ~= ""
-                and type(canon) == "string" and canon ~= ""
-                and type(map[canon]) == "table" then
-                map[alias] = map[canon]
+            if type(alias) == "string" and alias ~= "" then
+                local terminal = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, alias, lookup)
+                    or canon
+                if type(terminal) == "string" and type(map[terminal]) == "table" then
+                    map[alias] = map[terminal]
+                    if type(canon) == "string" and canon ~= "" then
+                        map[canon] = map[terminal]
+                    end
+                end
+            end
+        end
+    end
+    -- Migrate ops.heads onto terminal keys so future LWW shares one head.
+    if type(heads) == "table" then
+        for canon, cur in pairs(winners) do
+            if type(canon) == "string" and type(cur.ids) == "table" then
+                for i = 1, #cur.ids do
+                    local id = cur.ids[i]
+                    if type(id) == "string" and id ~= "" and id ~= canon then
+                        GS.MigrateSoftDeleteHeadsForAlias(record, canon, id, canon)
+                    end
+                end
             end
         end
     end
@@ -10168,6 +10444,11 @@ function GS.ValidateSoftDeleteScope(record, op, opts)
     end
     local event = GS.FindLedgerEventById(record, eventId)
     if not event then
+        -- Source-accepted deletion whose base evidence aged out of retention:
+        -- keep the authenticated deletion as durable history without credit (#465).
+        if opts.allowOrphanedAcceptedDelete then
+            return true, nil, nil
+        end
         if opts.allowMissingEvent or opts.remoteAdmit then
             return false, "pending_event"
         end
@@ -10182,6 +10463,17 @@ function GS.ValidateSoftDeleteScope(record, op, opts)
 end
 
 function GS.ValidateSoftDeleteEventEligibility(record, op, event)
+    if event == nil then
+        -- Orphaned accepted deletion: eligibility comes from the op value shape.
+        if type(op) == "table" and type(op.value) == "table"
+            and type(op.value.eventKind) == "string" then
+            local kind = op.value.eventKind
+            if kind == "donation" or kind == "adjustment" or kind == "withdrawal" then
+                return true, nil, kind
+            end
+        end
+        return false, "invalid_event"
+    end
     if type(event) ~= "table" then
         return false, "invalid_event"
     end
@@ -10211,6 +10503,9 @@ function GS.ValidateSoftDeletePrepare(record, op, opts)
         return false, eligErr or "invalid_event"
     end
     if opts.localPrepare then
+        if type(event) ~= "table" then
+            return false, "missing_event"
+        end
         if type(record.currentCampaignId) ~= "string"
             or event.campaignId ~= record.currentCampaignId then
             return false, "stale_campaign"
@@ -10221,6 +10516,7 @@ function GS.ValidateSoftDeletePrepare(record, op, opts)
     return true, nil, {
         event = event,
         eventKind = eventKind,
+        orphaned = event == nil and true or nil,
     }
 end
 
@@ -10317,10 +10613,13 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     end
 
     local isLocal = opts.localProductionAuthority or opts.localWrite or false
+    local orphanedAccepted = opts.allowOrphanedAcceptedDelete == true
+        or (opts.adoptionReplay == true and opts.sourceAcceptedDelete == true)
     local ok, err = GS.ValidateSoftDeletePrepare(record, op, {
         localPrepare = isLocal,
         remoteAdmit = not isLocal,
         allowMissingEvent = not isLocal,
+        allowOrphanedAcceptedDelete = orphanedAccepted,
     })
     if not ok then
         return false, err or "invalid_value"
@@ -10345,7 +10644,9 @@ local function IsFullSoftDeleteRedriveWake(opts)
     return type(opts) == "table" and opts.eventId == nil and opts.itemId == nil
 end
 
-local function SoftDeleteRedriveMatch(record, body, waveOpts)
+--- Match pending soft-delete body using a shared canonical lookup (#465).
+-- Never calls FindLedgerEventById per pending entry.
+local function SoftDeleteRedriveMatch(record, body, waveOpts, lookup, filterCanon)
     if type(body) ~= "table"
         or body.kind ~= (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
         return false
@@ -10355,10 +10656,20 @@ local function SoftDeleteRedriveMatch(record, body, waveOpts)
     local matchEvent = true
     if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
         local target = body.target or (body.value and body.value.eventId)
-        local canonOpts = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, eventIdFilter)
-        local canonTarget = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, target)
-        matchEvent = (canonOpts ~= nil and canonTarget ~= nil and canonOpts == canonTarget)
-            or eventIdFilter == target
+        if target == eventIdFilter then
+            matchEvent = true
+        else
+            local canonTarget = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, target, lookup)
+                or target
+            if filterCanon == nil then
+                filterCanon = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, eventIdFilter, lookup)
+                    or eventIdFilter
+            end
+            matchEvent = canonTarget ~= nil and filterCanon ~= nil
+                and canonTarget == filterCanon
+        end
     end
     local matchItem = true
     if itemIdFilter then
@@ -10500,10 +10811,34 @@ function GS.RedrivePendingSoftDeletes(record, opts)
     local snapshot = cont.snapshot
     local startIndex = tonumber(cont.index) or 1
     if type(snapshot) ~= "table" then
+        -- One shared canonical index for the whole filter pass (#465): never
+        -- FindLedgerEventById per pending body before the attempt budget.
+        local lookup = GS.BuildCreditCanonicalLookup
+            and GS.BuildCreditCanonicalLookup(record) or nil
+        GS._softDeleteRedriveLookupVisits =
+            (tonumber(GS._softDeleteRedriveLookupVisits) or 0)
+            + (lookup and tonumber(lookup.visits) or 0)
+        local filterCanon = nil
+        if type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "" then
+            filterCanon = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, waveOpts.eventId, lookup)
+                or waveOpts.eventId
+        end
         local ids = {}
+        local filterVisits = 0
+        local filterBudget = tonumber(waveOpts.maxFilterVisits)
+            or tonumber(GS.SOFT_DELETE_REDRIVE_FILTER_BUDGET)
+            or 256
         for id, entry in pairs(pending) do
+            filterVisits = filterVisits + 1
+            if filterVisits > filterBudget then
+                -- Bound snapshot construction; remaining entries wait for the
+                -- next paced wake rather than scanning unbounded pending.
+                cont.followUpWake = true
+                break
+            end
             local body = entry and entry.body
-            if SoftDeleteRedriveMatch(record, body, waveOpts) then
+            if SoftDeleteRedriveMatch(record, body, waveOpts, lookup, filterCanon) then
                 local reason = entry.reason
                 if reason ~= "untrusted_relay" and reason ~= "evidence" then
                     ids[#ids + 1] = id
@@ -10515,7 +10850,11 @@ function GS.RedrivePendingSoftDeletes(record, opts)
         startIndex = 1
         cont.snapshot = snapshot
         cont.index = 1
-        cont.followUpWake = false
+        cont.lookup = lookup
+        cont.filterCanon = filterCanon
+        if not cont.followUpWake then
+            cont.followUpWake = false
+        end
     end
     local promoted = 0
     local attempts = 0
@@ -10565,17 +10904,23 @@ function GS.RedrivePendingSoftDeletes(record, opts)
             end
         end
     end)
-    -- Always clear re-entry guards before any fallible diagnostic reporting so
-    -- a logger mistake cannot strand depth>0 scheduling (#465 P1).
+    -- Always clear re-entry guards before any fallible reporting so a logger
+    -- mistake cannot strand depth>0 scheduling (#465 P1).
     GS._softDeleteRedriveAdmitActive = false
     softDeleteRedriveDepth = softDeleteRedriveDepth - 1
     if not waveOk then
         admitErr = admitErr or waveErr
     end
-    if admitErr and SF.Debug and SF.Debug.Error then
-        SF.Debug:Error("GUILD_SUPPLIES",
-            "soft-delete redrive admit error: %s",
-            tostring(admitErr))
+    if admitErr then
+        -- Normal clients with debug disabled still need BugGrabber visibility.
+        if geterrorhandler then
+            pcall(geterrorhandler(), admitErr)
+        end
+        if SF.Debug and SF.Debug.Error then
+            SF.Debug:Error("GUILD_SUPPLIES",
+                "soft-delete redrive admit error: %s",
+                tostring(admitErr))
+        end
     end
     if i <= #snapshot then
         cont.snapshot = snapshot
