@@ -811,6 +811,49 @@ local function ValidateGuildRecordStructure(guildKey, record)
                 and entry.eventKind ~= "withdrawal" then
                 return false, "invalid_record_shape"
             end
+            -- Optional #465 verified accounting facts (absent when unverified).
+            if entry.verified ~= nil and entry.verified ~= true and entry.verified ~= false then
+                return false, "invalid_record_shape"
+            end
+            if entry.verified == true then
+                if entry.eventId ~= nil then
+                    if type(entry.eventId) ~= "string" or entry.eventId == ""
+                        or #entry.eventId > GS.MAX_OPERATION_ID then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.itemId ~= nil and not IsFiniteNonnegInt(entry.itemId) then
+                    return false, "invalid_record_shape"
+                end
+                if entry.quantity ~= nil then
+                    local q = tonumber(entry.quantity)
+                    if not q or q ~= q or q == math.huge or q == -math.huge then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.campaignId ~= nil then
+                    if type(entry.campaignId) ~= "string" or entry.campaignId == "" then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributed ~= nil then
+                    if type(entry.attributed) ~= "string" or entry.attributed == ""
+                        or #entry.attributed > 64 then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributedGuid ~= nil then
+                    if type(entry.attributedGuid) ~= "string" or entry.attributedGuid == ""
+                        or #entry.attributedGuid > 64 then
+                        return false, "invalid_guid"
+                    end
+                end
+                if entry.gsProductionCredit ~= nil
+                    and entry.gsProductionCredit ~= true
+                    and entry.gsProductionCredit ~= false then
+                    return false, "invalid_record_shape"
+                end
+            end
         end
     end
     -- Optional #459 contributor correction heads: absent on older saves.

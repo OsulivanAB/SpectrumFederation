@@ -8351,8 +8351,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             stPend, reasonPend = GS._AdmitPendingOrConflict(
                 ops, stored, classReason or "stale_base", admissionCtx.sender)
         end
-        -- Alias-targeted pending corrections must own a durable binding before
-        -- registry eviction + capacity prune can drop it (#459 A).
+        -- Alias-targeted pending corrections/soft-deletes must own a durable
+        -- binding before registry eviction + capacity prune can drop it
+        -- (#459 A / #465 discussion_r4518383396).
         if (stPend == "pending" or stPend == "duplicate")
             and stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
             and GS.EnsureContributorCorrectionDurableAliases
@@ -8370,6 +8371,23 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     end
                     return "rejected", aliasErr or "full"
                 end
+            end
+        end
+        if (stPend == "pending" or stPend == "duplicate")
+            and stored.kind == GS.KIND.SOFT_DELETE_EVENT
+            and GS.EnsureSoftDeleteDurableAliases then
+            local pendEvent = nil
+            if GS.FindLedgerEventById then
+                pendEvent = GS.FindLedgerEventById(record, stored.target
+                    or (stored.value and stored.value.eventId))
+            end
+            local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(
+                record, stored, pendEvent)
+            if not aliasOk then
+                if ops.pending then
+                    ops.pending[stored.id] = nil
+                end
+                return "rejected", aliasErr or "full"
             end
         end
         -- Successful durable missing-predecessor / pending evidence must notify
@@ -8567,6 +8585,15 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                             return stPend, reasonPend
                         end
                         return "rejected", eligErr or "invalid_event"
+                    end
+                end
+                -- Durable alias binding before every accepted retention path,
+                -- including LWW-losing soft-deletes (#465 discussion_r4518383396).
+                if GS.EnsureSoftDeleteDurableAliases then
+                    local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(
+                        record, stored, scopeEvent)
+                    if not aliasOk then
+                        return "rejected", aliasErr or "full"
                     end
                 end
                 local newlyRetained = not (ops.records and ops.records[stored.id])

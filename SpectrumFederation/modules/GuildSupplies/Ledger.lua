@@ -5757,9 +5757,10 @@ local function FollowRequiredAliasTerminal(map, primaryIndex, startId)
 end
 
 --- Collect alias→canonical bindings required by retained accepted corrections
--- and authenticated pending corrections. Prefers head keys (credit:<canon>) and
--- registry/map-backed bodies so reclaim never drops a binding still needed after
--- registry eviction (#459 G1 / review-5792509439 A).
+-- and authenticated pending corrections/soft-deletes. Prefers head keys
+-- (credit:<canon> / delete:<canon>) and registry/map-backed bodies so reclaim
+-- never drops a binding still needed after registry eviction (#459 G1 /
+-- #465 discussion_r4518383396).
 -- Head-derived terminals must not be downgraded by retained operation bodies
 -- (A→C must not become A→B); keep complete necessary edge closure (#459
 -- discussion_r4498359287 / 4498427811).
@@ -5771,6 +5772,7 @@ local function CollectRequiredCreditEventAliases(record)
     end
     local ops = record.operations
     local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local kindDelete = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
     local map = record.accounting and record.accounting._consumables
         and record.accounting._consumables.creditEventAliases
     local cfg = record.accounting and record.accounting._consumables
@@ -5811,8 +5813,8 @@ local function CollectRequiredCreditEventAliases(record)
             headProtected[alias] = true
         end
     end
-    local function noteCorrectionBody(body)
-        if type(body) ~= "table" or body.kind ~= kindCorrect then
+    local function noteCreditTargetBody(body, kind)
+        if type(body) ~= "table" or body.kind ~= kind then
             return
         end
         local tid = body.target
@@ -5835,8 +5837,15 @@ local function CollectRequiredCreditEventAliases(record)
             end
         end
     end
+    local function noteCorrectionBody(body)
+        noteCreditTargetBody(body, kindCorrect)
+    end
+    local function noteSoftDeleteBody(body)
+        noteCreditTargetBody(body, kindDelete)
+    end
     if type(ops.heads) == "table" and type(ops.records) == "table" then
         local prefix = "credit:"
+        local deletePrefix = "delete:"
         for targetKey, headId in pairs(ops.heads) do
             if type(targetKey) == "string" and type(headId) == "string" then
                 local body = ops.records[headId]
@@ -5851,6 +5860,17 @@ local function CollectRequiredCreditEventAliases(record)
                             note(body.value.eventId, canon, true)
                         end
                     end
+                elseif type(body) == "table" and body.kind == kindDelete then
+                    local canon = nil
+                    if targetKey:sub(1, #deletePrefix) == deletePrefix then
+                        canon = targetKey:sub(#deletePrefix + 1)
+                    end
+                    if type(canon) == "string" and canon ~= "" then
+                        note(body.target, canon, true)
+                        if type(body.value) == "table" then
+                            note(body.value.eventId, canon, true)
+                        end
+                    end
                 end
             end
         end
@@ -5858,16 +5878,18 @@ local function CollectRequiredCreditEventAliases(record)
     if type(ops.records) == "table" then
         for _, body in pairs(ops.records) do
             noteCorrectionBody(body)
+            noteSoftDeleteBody(body)
         end
     end
-    -- Authenticated pending corrections also own their alias bindings until they
-    -- settle or are removed (policy-predecessor / work_budget paths).
+    -- Authenticated pending corrections/soft-deletes also own their alias
+    -- bindings until they settle or are removed.
     if type(ops.pending) == "table" then
         for _, entry in pairs(ops.pending) do
             if type(entry) == "table" then
                 local reason = entry.reason
                 if reason ~= "untrusted_relay" and reason ~= "evidence" then
                     noteCorrectionBody(entry.body)
+                    noteSoftDeleteBody(entry.body)
                 end
             end
         end
@@ -6030,6 +6052,43 @@ function GS.EnsureContributorCorrectionDurableAliases(record, op, event)
     return true
 end
 
+--- Ensure durable alias→canonical bindings for soft-delete targets (#465).
+-- Same capacity/reclaim rules as contributor corrections. When `event` is nil,
+-- resolve the terminal through the existing alias overlay so a body still naming
+-- alias B keeps B→C after head migration to delete:C.
+-- @return boolean ok, string|nil err
+function GS.EnsureSoftDeleteDurableAliases(record, op, event)
+    if type(op) ~= "table" then
+        return true
+    end
+    local canon = nil
+    if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
+        canon = event.id
+    else
+        local tid = op.target or (op.value and op.value.eventId)
+        if type(tid) == "string" and tid ~= "" then
+            canon = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, tid) or tid
+        end
+    end
+    if type(canon) ~= "string" or canon == "" then
+        return true
+    end
+    local function requireAlias(aliasId)
+        if type(aliasId) ~= "string" or aliasId == "" or aliasId == canon then
+            return true
+        end
+        local wrote = WriteCreditEventAlias(record, aliasId, canon)
+        return wrote and true or false
+    end
+    if not requireAlias(op.target) then
+        return false, "full"
+    end
+    if not requireAlias(op.value and op.value.eventId) then
+        return false, "full"
+    end
+    return true
+end
+
 --- Persist a trusted alias→canonical credit-event binding that outlives the
 -- bounded txn registry (#459). Re-confirm clears a cached ops validation miss
 -- without requiring a manual ops-generation bump when the binding is unchanged.
@@ -6073,16 +6132,22 @@ function GS.ReconstructCreditEventAliasesFromOps(record)
         return
     end
     local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local kindDelete = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
     local needed = {}
     local prefix = "credit:"
+    local deletePrefix = "delete:"
     for targetKey, headId in pairs(ops.heads) do
         if type(targetKey) == "string" and type(headId) == "string" then
             local body = ops.records[headId]
-            if type(body) == "table" and body.kind == kindCorrect
+            if type(body) == "table"
+                and (body.kind == kindCorrect or body.kind == kindDelete)
                 and type(body.target) == "string" and body.target ~= "" then
                 local canon = nil
-                if targetKey:sub(1, #prefix) == prefix then
+                if body.kind == kindCorrect and targetKey:sub(1, #prefix) == prefix then
                     canon = targetKey:sub(#prefix + 1)
+                elseif body.kind == kindDelete
+                    and targetKey:sub(1, #deletePrefix) == deletePrefix then
+                    canon = targetKey:sub(#deletePrefix + 1)
                 end
                 if type(canon) == "string" and canon ~= "" and canon ~= body.target then
                     if map[body.target] ~= canon then
@@ -7127,11 +7192,47 @@ local function ItemIdsWorseThanDeletionDebt(totals, debtFloors)
     return bad
 end
 
+--- Apply one verified soft-delete debt floor contribution (#465).
+-- Quantity/item/campaign/credited identity must already be VERIFIED — never
+-- arbitrary soft-delete payload snapshots (discussion_r4518378042).
+local function ApplyVerifiedSoftDeleteDebtFloor(
+    debtFloors, record, facts, relationshipsReady, resolveCache)
+    if type(debtFloors) ~= "table" or type(facts) ~= "table" or facts.verified ~= true then
+        return
+    end
+    local eventKind = facts.eventKind
+    if eventKind ~= "donation" and eventKind ~= "adjustment" then
+        return
+    end
+    if facts.gsProductionCredit ~= true then
+        return
+    end
+    local itemId = tonumber(facts.itemId)
+    local qty = tonumber(facts.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    if eventKind == "donation" and not (qty > 0) then
+        return
+    end
+    local creditName = facts.attributed
+    local creditGuid = facts.attributedGuid
+    if eventKind == "adjustment" and not (creditName or creditGuid) then
+        return
+    end
+    if eventKind == "donation" and not creditName then
+        return
+    end
+    local campaignId = facts.campaignId or record.currentCampaignId
+    local key = CreditFloorBucketKey(
+        record, creditName, creditGuid, itemId, campaignId,
+        relationshipsReady, resolveCache)
+    TotalsAdd(debtFloors, key, -qty)
+end
+
 --- Accumulate soft-delete signed-quantity debt floors for one ledger event.
--- Uses effective attribution captured on the deletion head when present so
--- corrected donations create debt on the credited identity (#465). Excluding a
--- +qty donation lowers that identity by qty; excluding a negative adjustment
--- raises it. Only net-negative contributions become floors.
+-- Prefer VERIFIED deletion-head facts when present; otherwise use durable ledger
+-- identity/quantity only — never unvalidated payload attribution/qty.
 local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsReady, resolveCache)
     if type(debtFloors) ~= "table" or type(event) ~= "table" then
         return
@@ -7139,12 +7240,26 @@ local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsR
     if not (GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event)) then
         return
     end
+    local delMap = record.eventDeletions
+    local delEntry = nil
+    if type(delMap) == "table" then
+        if type(event.id) == "string" then
+            delEntry = delMap[event.id]
+        end
+        if type(delEntry) ~= "table" and type(event.txnId) == "string" then
+            delEntry = delMap[event.txnId]
+        end
+    end
+    if type(delEntry) == "table" and delEntry.verified == true then
+        ApplyVerifiedSoftDeleteDebtFloor(
+            debtFloors, record, delEntry, relationshipsReady, resolveCache)
+        return
+    end
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
     if not itemId or qty == 0 then
         return
     end
-    -- Only production-credited donations/adjustments affect personal floors.
     if event.gsProductionCredit ~= true then
         return
     end
@@ -7157,25 +7272,6 @@ local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsR
         return
     end
     local creditName, creditGuid = DurableCreditIdentity(event)
-    local delMap = record.eventDeletions
-    local delEntry = nil
-    if type(delMap) == "table" then
-        if type(event.id) == "string" then
-            delEntry = delMap[event.id]
-        end
-        if type(delEntry) ~= "table" and type(event.txnId) == "string" then
-            delEntry = delMap[event.txnId]
-        end
-    end
-    if type(delEntry) == "table" then
-        if delEntry.attributed or delEntry.attributedGuid then
-            creditName = delEntry.attributed
-            creditGuid = delEntry.attributedGuid
-        end
-        if tonumber(delEntry.quantity) then
-            qty = tonumber(delEntry.quantity)
-        end
-    end
     if isAdjustment and not (creditName or creditGuid) then
         return
     end
@@ -7186,8 +7282,33 @@ local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsR
     local key = CreditFloorBucketKey(
         record, creditName, creditGuid, itemId, campaignId,
         relationshipsReady, resolveCache)
-    -- Excluding this event from baseline removes `qty` from the bucket.
     TotalsAdd(debtFloors, key, -qty)
+end
+
+--- Reconstruct verified deletion debt after ledger evidence eviction (#465).
+-- Counts each canonical verified deletion once; skips ids still present in byId
+-- (those floors were already noted from the retained ledger row).
+local function NoteVerifiedOrphanSoftDeleteDebtFloors(
+    debtFloors, record, byId, relationshipsReady, resolveCache)
+    local map = record and record.eventDeletions
+    if type(map) ~= "table" or type(debtFloors) ~= "table" then
+        return
+    end
+    local seen = {}
+    for id, entry in pairs(map) do
+        if type(entry) == "table" and entry.verified == true then
+            local canon = entry.eventId or id
+            if type(canon) == "string" and canon ~= "" and not seen[canon] then
+                seen[canon] = true
+                local present = type(byId) == "table"
+                    and (byId[canon] ~= nil or byId[id] ~= nil)
+                if not present then
+                    ApplyVerifiedSoftDeleteDebtFloor(
+                        debtFloors, record, entry, relationshipsReady, resolveCache)
+                end
+            end
+        end
+    end
 end
 
 local function NormalizeSoftDeleteDebtFloors(debtFloors)
@@ -7363,6 +7484,9 @@ local function BuildDurableCreditFloorBaseline(record)
     if not foldOk then
         -- Synchronous builder never yields; treat as complete.
     end
+    -- Verified soft-delete debt survives ledger eviction (#465).
+    NoteVerifiedOrphanSoftDeleteDebtFloors(
+        debtFloors, record, byId, relationshipsReady, resolveCache)
     return totals, byId, visits, relationshipsReady, NormalizeSoftDeleteDebtFloors(debtFloors)
 end
 
@@ -7519,6 +7643,9 @@ local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn
             return false, snapshot("aliasMap", 1, resumeAlias)
         end
     end
+    -- Verified soft-delete debt survives ledger eviction (#465).
+    NoteVerifiedOrphanSoftDeleteDebtFloors(
+        debtFloors, record, byId, relationshipsReady, resolveCache)
     return true, {
         baselineReady = true,
         baselineTotals = totals,
@@ -10139,24 +10266,168 @@ function GS.SoftDeleteRevisionWins(incoming, incumbent)
     return GS.RenameRevisionWins and GS.RenameRevisionWins(incoming, incumbent)
 end
 
-local function SoftDeleteHeadEntry(op)
+local function SoftDeleteEventKind(event)
+    if IsWithdrawalLedgerEvent(event) then
+        return "withdrawal"
+    end
+    if IsAdjustmentLedgerEvent(event) then
+        return "adjustment"
+    end
+    if IsDonationLedgerEvent(event) then
+        return "donation"
+    end
+    return nil
+end
+
+--- Durable VERIFIED soft-delete accounting facts (#465). Survives ledger
+-- evidence eviction and projection rebuilds; never invented from raw payload.
+local function EnsureSoftDeleteVerifiedFactsMap(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return nil
+    end
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        cfg = {}
+        record.accounting._consumables = cfg
+    end
+    if type(cfg.softDeleteVerifiedFacts) ~= "table" then
+        cfg.softDeleteVerifiedFacts = {}
+    end
+    return cfg.softDeleteVerifiedFacts
+end
+
+local function RememberSoftDeleteVerifiedFacts(record, facts)
+    if type(facts) ~= "table" or facts.verified ~= true then
+        return
+    end
+    local canon = facts.eventId
+    if type(canon) ~= "string" or canon == "" then
+        return
+    end
+    local map = EnsureSoftDeleteVerifiedFactsMap(record)
+    if not map then
+        return
+    end
+    map[canon] = {
+        verified = true,
+        eventId = canon,
+        eventKind = facts.eventKind,
+        itemId = tonumber(facts.itemId),
+        quantity = tonumber(facts.quantity),
+        campaignId = facts.campaignId,
+        attributed = NormName(facts.attributed),
+        attributedGuid = ValidGuid(facts.attributedGuid),
+        gsProductionCredit = facts.gsProductionCredit == true,
+    }
+end
+
+local function LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    local map = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    if type(map) ~= "table" then
+        return nil
+    end
+    local prior = nil
+    if type(canon) == "string" and canon ~= "" then
+        prior = map[canon]
+    end
+    if type(prior) ~= "table" and type(eventId) == "string" and eventId ~= "" then
+        prior = map[eventId]
+    end
+    if type(prior) == "table" and prior.verified == true then
+        return prior
+    end
+    return nil
+end
+
+--- Bind soft-delete accounting facts to canonical evidence + accepted correction
+-- history. Raw confirmation payload quantity/attribution is never floor authority
+-- (#465 discussion_r4518378042 / r4518383410).
+local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry)
+    if type(event) == "table" then
+        local eventKind = SoftDeleteEventKind(event)
+        if not eventKind then
+            return { verified = false }
+        end
+        local creditName, creditGuid = nil, nil
+        if eventKind == "withdrawal" then
+            creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
+        else
+            -- Read accepted correction heads without EnsureCreditCorrectionProjection:
+            -- Ensure rebuilds soft-delete projections (debt floors) and would re-enter
+            -- DeriveVerified here (#465). Prefer an already-built map; else durable.
+            local map = type(record) == "table" and record.creditCorrections or nil
+            local head = CorrectionHeadForKnownEvent
+                and CorrectionHeadForKnownEvent(record, map, event) or nil
+            if type(head) == "table" then
+                creditName, creditGuid = NormName(head.attributed), ValidGuid(head.attributedGuid)
+            else
+                creditName, creditGuid = DurableCreditIdentity(event)
+            end
+        end
+        local facts = {
+            verified = true,
+            eventId = event.id,
+            eventKind = eventKind,
+            itemId = tonumber(event.itemId),
+            quantity = tonumber(event.quantity),
+            campaignId = event.campaignId,
+            attributed = creditName,
+            attributedGuid = creditGuid,
+            gsProductionCredit = event.gsProductionCredit == true,
+        }
+        RememberSoftDeleteVerifiedFacts(record, facts)
+        return facts
+    end
+    -- Orphaned: retain previously verified facts only — never invent from payload.
+    if type(priorEntry) == "table" and priorEntry.verified == true then
+        return {
+            verified = true,
+            eventId = priorEntry.eventId,
+            eventKind = priorEntry.eventKind,
+            itemId = priorEntry.itemId,
+            quantity = priorEntry.quantity,
+            campaignId = priorEntry.campaignId,
+            attributed = priorEntry.attributed,
+            attributedGuid = priorEntry.attributedGuid,
+            gsProductionCredit = priorEntry.gsProductionCredit == true,
+        }
+    end
     local value = type(op) == "table" and op.value or nil
-    local eventKind = type(value) == "table" and value.eventKind or "donation"
+    local eventKind = type(value) == "table" and value.eventKind or nil
+    if eventKind ~= "donation" and eventKind ~= "adjustment" and eventKind ~= "withdrawal" then
+        eventKind = nil
+    end
+    return {
+        verified = false,
+        eventKind = eventKind,
+    }
+end
+
+local function SoftDeleteHeadEntry(op, facts)
+    facts = type(facts) == "table" and facts or {}
+    local eventKind = facts.eventKind or "donation"
     if eventKind ~= "donation" and eventKind ~= "adjustment" and eventKind ~= "withdrawal" then
         eventKind = "donation"
     end
-    return {
+    local entry = {
         revisionId = op.id,
         deletedAt = tonumber(op.timestamp) or Now(),
         actorName = NormName(op.actorName),
         actorGuid = ValidGuid(op.actorGuid),
         eventKind = eventKind,
-        itemId = value and tonumber(value.itemId) or nil,
-        quantity = value and tonumber(value.quantity) or nil,
-        -- Effective attribution at deletion time (#465 signed-effect removal).
-        attributed = value and NormName(value.attributed) or nil,
-        attributedGuid = value and ValidGuid(value.attributedGuid) or nil,
+        verified = facts.verified == true,
     }
+    if facts.verified == true then
+        entry.eventId = facts.eventId
+        entry.itemId = tonumber(facts.itemId)
+        entry.quantity = tonumber(facts.quantity)
+        entry.campaignId = facts.campaignId
+        entry.attributed = NormName(facts.attributed)
+        entry.attributedGuid = ValidGuid(facts.attributedGuid)
+        entry.gsProductionCredit = facts.gsProductionCredit == true
+    end
+    return entry
 end
 
 --- Fold alias-keyed soft-delete heads onto the terminal canonical (#465).
@@ -10223,7 +10494,39 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     local ops = record.operations
     local heads = ops and ops.heads
     local records = ops and ops.records
+    local priorMap = type(record.eventDeletions) == "table" and record.eventDeletions or nil
     local lookup = GS.BuildCreditCanonicalLookup and GS.BuildCreditCanonicalLookup(record) or nil
+    local function resolveDeleteEvent(eventId, canon)
+        if type(lookup) == "table" and type(lookup.byId) == "table" then
+            local ev = lookup.byId[canon] or lookup.byId[eventId]
+            if type(ev) == "table" then
+                return ev
+            end
+        end
+        if GS.FindLedgerEventById then
+            return GS.FindLedgerEventById(record, canon)
+                or GS.FindLedgerEventById(record, eventId)
+        end
+        return nil
+    end
+    local function priorFactsFor(canon, eventId)
+        if type(priorMap) == "table" then
+            local prior = priorMap[canon] or priorMap[eventId]
+            if type(prior) == "table" and prior.verified == true then
+                return prior
+            end
+        end
+        return LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    end
+    local function entryFor(body, eventId, canon)
+        local event = resolveDeleteEvent(eventId, canon)
+        local facts = DeriveVerifiedSoftDeleteFacts(
+            record, body, event, priorFactsFor(canon, eventId))
+        if facts.verified == true then
+            RememberSoftDeleteVerifiedFacts(record, facts)
+        end
+        return SoftDeleteHeadEntry(body, facts)
+    end
     -- Collect head bodies keyed by terminal canonical id; LWW within each group.
     local winners = {} -- canon -> { body=, entry=, ids={} }
     if type(heads) == "table" and type(records) == "table" then
@@ -10243,7 +10546,7 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
                         if type(cur) ~= "table" then
                             winners[canon] = {
                                 body = body,
-                                entry = SoftDeleteHeadEntry(body),
+                                entry = entryFor(body, eventId, canon),
                                 ids = { eventId, targetKey:sub(8) },
                             }
                         else
@@ -10252,7 +10555,7 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
                             if GS.SoftDeleteRevisionWins
                                 and GS.SoftDeleteRevisionWins(body, cur.body) then
                                 cur.body = body
-                                cur.entry = SoftDeleteHeadEntry(body)
+                                cur.entry = entryFor(body, eventId, canon)
                             end
                         end
                     end
@@ -10277,7 +10580,7 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
             if wins then
                 winners[canon] = {
                     body = extraOp,
-                    entry = SoftDeleteHeadEntry(extraOp),
+                    entry = entryFor(extraOp, eventId, canon),
                     ids = (cur and cur.ids) or { eventId },
                 }
                 local ids = winners[canon].ids
@@ -10399,19 +10702,6 @@ function GS.IsEventSoftDeleted(record, eventOrId)
     end
     -- Avoid CanonicalCreditEventId/FindLedgerEventById on this hot path.
     return type(map[eventOrId]) == "table"
-end
-
-local function SoftDeleteEventKind(event)
-    if IsWithdrawalLedgerEvent(event) then
-        return "withdrawal"
-    end
-    if IsAdjustmentLedgerEvent(event) then
-        return "adjustment"
-    end
-    if IsDonationLedgerEvent(event) then
-        return "donation"
-    end
-    return nil
 end
 
 --- Scope/eligibility for soft-delete prepare/apply (#465).
@@ -10602,6 +10892,13 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
             return false, "stale_delete"
         end
         -- Newer delete replaces head metadata only; accounting already excluded.
+        local event = GS.FindLedgerEventById and GS.FindLedgerEventById(record, eventId)
+        if GS.EnsureSoftDeleteDurableAliases then
+            local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(record, op, event)
+            if not aliasOk then
+                return false, aliasErr or "full"
+            end
+        end
         if not GS.RebuildEventDeletionProjection(record, op) then
             return false, "invalid_value"
         end
@@ -10615,7 +10912,7 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     local isLocal = opts.localProductionAuthority or opts.localWrite or false
     local orphanedAccepted = opts.allowOrphanedAcceptedDelete == true
         or (opts.adoptionReplay == true and opts.sourceAcceptedDelete == true)
-    local ok, err = GS.ValidateSoftDeletePrepare(record, op, {
+    local ok, err, meta = GS.ValidateSoftDeletePrepare(record, op, {
         localPrepare = isLocal,
         remoteAdmit = not isLocal,
         allowMissingEvent = not isLocal,
@@ -10623,6 +10920,13 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     })
     if not ok then
         return false, err or "invalid_value"
+    end
+    local event = meta and meta.event or nil
+    if GS.EnsureSoftDeleteDurableAliases then
+        local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(record, op, event)
+        if not aliasOk then
+            return false, aliasErr or "full"
+        end
     end
     if not GS.RebuildEventDeletionProjection(record, op) then
         return false, "invalid_value"

@@ -2869,6 +2869,472 @@ do
         "465-unk: no unrestricted deletion")
 end
 
+do
+    -- Soft-delete alias ownership: pending delete body names B, late B→C migrates
+    -- head to delete:C, then registry eviction + capacity reclaim must keep B→C
+    -- (#465 discussion_r4518383396).
+    local author = seedLiveCampaignWithItem(9250, 40)
+    local donA = injectProductionDonation(author, {
+        id = "ctx:sd-alias-c", itemId = 9250, quantity = 7,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    donA.txnId = "ctx:sd-alias-c"
+    assertTrue(GS._AddTxnAlias(author, "ctx:sd-alias-c", "ctx:sd-alias-b", donA),
+        "465-sd-alias: author B→C for prepare")
+    local del = select(1, GS:NewSoftDeleteOperation("ctx:sd-alias-b"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-sd-alias: author delete")
+    local delSnap = select(1, GS._SnapshotPublicOp(del))
+
+    local peer = seedLiveCampaignWithItem(9250, 40)
+    local donP = injectProductionDonation(peer, {
+        id = "ctx:sd-alias-c", itemId = 9250, quantity = 7,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    donP.txnId = "ctx:sd-alias-c"
+    local function rebindAliasDelete(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        out.target = "ctx:sd-alias-b"
+        if type(out.value) == "table" then
+            local v = {}
+            for vk, vv in pairs(out.value) do v[vk] = vv end
+            v.eventId = "ctx:sd-alias-b"
+            out.value = v
+        end
+        return out
+    end
+    local admitSt, admitReason = GS:AdmitRemoteOperation(rebindAliasDelete(delSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertEq(admitSt, "pending", "465-sd-alias: peer parks B delete")
+    assertEq(admitReason, "pending_event", "465-sd-alias: pending_event")
+    assertTrue(GS._AddTxnAlias(peer, "ctx:sd-alias-c", "ctx:sd-alias-b", donP),
+        "465-sd-alias: late B→C")
+    flushTimers()
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:sd-alias-c"), "465-sd-alias: C deleted")
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:sd-alias-b"), "465-sd-alias: B deleted")
+    local tKey = GS.SoftDeleteTargetKey(peer, "ctx:sd-alias-c")
+    assertEq(tKey, "delete:ctx:sd-alias-c", "465-sd-alias: terminal head key")
+    assertEq(peer.operations.heads[tKey], del.id, "465-sd-alias: head at delete:C")
+    local stored = peer.operations.records[del.id]
+    assertTrue(type(stored) == "table", "465-sd-alias: body retained")
+    assertEq(stored.target, "ctx:sd-alias-b", "465-sd-alias: body still names B")
+    local cfg = peer.accounting._consumables
+    assertEq(cfg.creditEventAliases["ctx:sd-alias-b"], "ctx:sd-alias-c",
+        "465-sd-alias: durable B→C before reclaim")
+    -- Saturate alias map with junk; required soft-delete binding must survive prune.
+    local maxAliases = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    local junkN = 0
+    for i = 1, maxAliases do
+        local junk = string.format("ctx:sd-junk-%04d", i)
+        if cfg.creditEventAliases[junk] == nil and junk ~= "ctx:sd-alias-b" then
+            cfg.creditEventAliases[junk] = string.format("ctx:sd-junk-canon-%04d", i)
+            junkN = junkN + 1
+        end
+        if junkN >= maxAliases - 2 then
+            break
+        end
+    end
+    cfg.txnRegistry = {}
+    local removed = GS.PruneUnusedCreditEventAliases(peer)
+    assertTrue(tonumber(removed) or 0 >= 0, "465-sd-alias: prune ran")
+    assertEq(cfg.creditEventAliases["ctx:sd-alias-b"], "ctx:sd-alias-c",
+        "465-sd-alias: B→C retained after reclaim")
+    local ctx = select(1, GS:GetCurrentContext())
+    local warmOk, warmErr = GS._ValidateGuildRecordStructure(ctx.guildKey, peer)
+    assertTrue(warmOk, "465-sd-alias: validate after eviction got " .. tostring(warmErr))
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:sd-alias-c"),
+        "465-sd-alias: C stays deleted")
+    assertTrue(GS.IsEventSoftDeleted(peer, "ctx:sd-alias-b"),
+        "465-sd-alias: B resolves deleted")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", 9250), 0,
+        "465-sd-alias: credit stays excluded")
+    for i = 1, 32 do
+        cfg.creditEventAliases[string.format("ctx:sd-extra-%04d", i)] =
+            string.format("ctx:sd-extra-canon-%04d", i)
+    end
+    GS.PruneUnusedCreditEventAliases(peer)
+    assertEq(cfg.creditEventAliases["ctx:sd-alias-b"], "ctx:sd-alias-c",
+        "465-sd-alias: ownership after second reclaim")
+    assertNil(cfg.creditEventAliases["ctx:sd-extra-0001"],
+        "465-sd-alias: unrelated alias reclaimed")
+    -- Fresh adoption export/reload keeps C deleted exactly once.
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-sd-alias: export bodies")
+    local sourceDataset = peer.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-sd-alias: begin adoption")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-sd-alias: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 128 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(commitSt, "accepted",
+        "465-sd-alias: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(GS.IsEventSoftDeleted(adopted, "ctx:sd-alias-c"),
+        "465-sd-alias: adopted C deleted")
+    local deleteHeads = 0
+    for k in pairs(adopted.operations.heads or {}) do
+        if type(k) == "string" and k:sub(1, 7) == "delete:" then
+            deleteHeads = deleteHeads + 1
+        end
+    end
+    assertEq(deleteHeads, 1, "465-sd-alias: single delete head after adoption")
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(adopted)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(adopted, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(adopted, "ctx:sd-alias-c"),
+        "465-sd-alias: deleted after reload")
+end
+
+do
+    -- Altered soft-delete payload must not forge debt floors when evidence exists
+    -- (#465 discussion_r4518378042). Verified facts bind to the real event.
+    local itemId = 9251
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "forge-don", itemId = itemId, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(record, {
+        id = "forge-adj", itemId = itemId, quantity = -3,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local ctx = select(1, GS:GetCurrentContext())
+    local forged = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "forge-del",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.SOFT_DELETE_EVENT,
+        target = "forge-don",
+        value = {
+            eventId = "forge-don", eventKind = "donation",
+            itemId = itemId, quantity = 50,
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 5,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(forged, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })), "accepted", "465-forge: forged-payload delete accepted")
+    assertTrue(GS.IsEventSoftDeleted(record, "forge-don"), "465-forge: deleted")
+    local entry = record.eventDeletions and record.eventDeletions["forge-don"]
+    assertTrue(type(entry) == "table" and entry.verified == true, "465-forge: verified facts")
+    assertEq(entry.quantity, 3, "465-forge: quantity from evidence not payload")
+    assertEq(entry.attributed, "Alice-Garona", "465-forge: attribution from evidence")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), -3,
+        "465-forge: Alice debt −3 from real qty")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-forge: Bob gets no forged floor")
+    -- Ordinary correction that would need the forged floor still fails closed.
+    injectProductionDonation(record, {
+        id = "forge-keep", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr, st, reason = GS:NewContributorCorrectionOperation(
+        "forge-keep", "Bob-Garona", "Player-1-Bob")
+    -- After Alice −3 and +10, Alice is +7; moving +10 to Bob leaves Alice −3 which
+    -- is permitted only as deletion debt — FloorOk uses live balance and rejects.
+    assertNil(corr, "465-forge: unsafe local correction rejected")
+    assertEq(reason, "player_negative",
+        "465-forge: player_negative got " .. tostring(reason) .. "/" .. tostring(st))
+end
+
+do
+    -- Verified deletion debt survives evidence eviction, fresh adoption, reload,
+    -- and an explicit officer repair (#465 discussion_r4518383410).
+    local itemId = 9252
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "vd-don", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(record, {
+        id = "vd-adj", itemId = itemId, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("vd-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-vd: delete")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-vd: debt before eviction")
+    local entry = record.eventDeletions and record.eventDeletions["vd-don"]
+    assertTrue(type(entry) == "table" and entry.verified == true, "465-vd: verified before eviction")
+    assertEq(entry.quantity, 10, "465-vd: verified qty")
+    -- Evict the deleted donation; keep the −10 adjustment.
+    local live = record.accounting._consumableEvents
+    local kept = {}
+    for i = 1, #live do
+        if live[i].id ~= "vd-don" then
+            kept[#kept + 1] = live[i]
+        end
+    end
+    record.accounting._consumableEvents = kept
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    assertNil(GS.FindLedgerEventById(record, "vd-don"), "465-vd: evidence gone")
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    local entry2 = record.eventDeletions and record.eventDeletions["vd-don"]
+    assertTrue(type(entry2) == "table" and entry2.verified == true,
+        "465-vd: verified retained after eviction")
+    assertEq(entry2.quantity, 10, "465-vd: verified qty after eviction")
+    local alice, aliceErr = GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", itemId)
+    assertEq(aliceErr, nil, "465-vd: readable after eviction")
+    assertEq(alice, -10, "465-vd: signed debt after eviction")
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-vd: debt after reload")
+    settleRoster()
+    -- Explicit repair on the source after eviction/reload.
+    local repairSrc = select(1, GS:NewAdjustmentOperation(itemId, 10, "Alice-Garona"))
+    assertTrue(repairSrc ~= nil, "465-vd: prepare source repair")
+    assertEq(GS:ApplyStagedConfigOperation(repairSrc), "accepted", "465-vd: source repair")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), 0,
+        "465-vd: source repaired to zero")
+end
+
+do
+    -- Fresh peer receipt (delete admit) with evidence present, then eviction retains
+    -- verified debt through reload and explicit repair (#465 discussion_r4518383410).
+    local itemId = 9254
+    local author = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(author, {
+        id = "vd2-don", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(author, {
+        id = "vd2-adj", itemId = itemId, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("vd2-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-vd2: author delete")
+    local delSnap = select(1, GS._SnapshotPublicOp(del))
+    local peer = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(peer, {
+        id = "vd2-don", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(peer, {
+        id = "vd2-adj", itemId = itemId, quantity = -10,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        return out
+    end
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "465-vd2: peer admits delete")
+    assertTrue(GS.IsEventSoftDeleted(peer, "vd2-don"), "465-vd2: peer deleted")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-vd2: peer readable debt")
+    local entry = peer.eventDeletions and peer.eventDeletions["vd2-don"]
+    assertTrue(type(entry) == "table" and entry.verified == true, "465-vd2: verified on peer")
+    -- Evict donation evidence; verified facts must keep debt readable.
+    local liveA = peer.accounting._consumableEvents
+    local keptA = {}
+    for i = 1, #liveA do
+        if liveA[i].id ~= "vd2-don" then
+            keptA[#keptA + 1] = liveA[i]
+        end
+    end
+    peer.accounting._consumableEvents = keptA
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(peer)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(peer)
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(peer)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    local aEntry = peer.eventDeletions and peer.eventDeletions["vd2-don"]
+    assertTrue(type(aEntry) == "table" and aEntry.verified == true,
+        "465-vd2: verified after eviction")
+    assertEq(aEntry.quantity, 10, "465-vd2: verified qty after eviction")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-vd2: debt after eviction")
+    simulateRuntimeReload()
+    settleRoster()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(peer)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), -10,
+        "465-vd2: debt after reload")
+    local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, "Alice-Garona"))
+    assertTrue(repair ~= nil, "465-vd2: prepare repair")
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465-vd2: apply repair")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), 0,
+        "465-vd2: repaired to zero")
+end
+
+do
+    -- Paired regressions for discussion_r4518383404 (DO NOT rewrite baseline):
+    -- (1) new local post-delete correction that alone crosses zero is rejected;
+    -- (2) valid correction-before-delete survives delete-first remote replay.
+    local itemId = 9253
+    -- (1) Local reject: D1 +10, D2 +10, Alice −5; delete D1 → Alice +5;
+    -- correcting D2→Bob would leave Alice −5 and must fail FloorOk.
+    local localRec = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(localRec, {
+        id = "pair-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionDonation(localRec, {
+        id = "pair-d2", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(localRec, {
+        id = "pair-adj", itemId = itemId, quantity = -5,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local delLocal = select(1, GS:NewSoftDeleteOperation("pair-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(delLocal), "accepted", "465-pair-local: delete D1")
+    assertEq(GS.PersonalContributorItemTotal(localRec, "Alice-Garona", "Player-1-Alice", itemId), 5,
+        "465-pair-local: Alice +5 after delete")
+    local badCorr, _, badReason = GS:NewContributorCorrectionOperation(
+        "pair-d2", "Bob-Garona", "Player-1-Bob")
+    assertNil(badCorr, "465-pair-local: unsafe correction rejected")
+    assertEq(badReason, "player_negative",
+        "465-pair-local: player_negative got " .. tostring(badReason))
+
+    -- (2) Historical: correct D2→Bob while Alice still has +5, then delete D1.
+    local hist = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(hist, {
+        id = "pair-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionDonation(hist, {
+        id = "pair-d2", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(hist, {
+        id = "pair-adj", itemId = itemId, quantity = -5,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local goodCorr = select(1, GS:NewContributorCorrectionOperation(
+        "pair-d2", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(goodCorr ~= nil, "465-pair-hist: prepare D2→Bob")
+    assertEq(GS:ApplyStagedConfigOperation(goodCorr), "accepted", "465-pair-hist: correct")
+    assertEq(GS.PersonalContributorItemTotal(hist, "Alice-Garona", "Player-1-Alice", itemId), 5,
+        "465-pair-hist: Alice +5 after correction")
+    assertEq(GS.PersonalContributorItemTotal(hist, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-pair-hist: Bob +10 after correction")
+    local delHist = select(1, GS:NewSoftDeleteOperation("pair-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(delHist), "accepted", "465-pair-hist: delete D1")
+    assertEq(GS.PersonalContributorItemTotal(hist, "Alice-Garona", "Player-1-Alice", itemId), -5,
+        "465-pair-hist: Alice −5 authorized debt")
+    assertEq(GS.PersonalContributorItemTotal(hist, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-pair-hist: Bob keeps credit")
+    local corrSnap = select(1, GS._SnapshotPublicOp(goodCorr))
+    local delSnap = select(1, GS._SnapshotPublicOp(delHist))
+    local peer = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(peer, {
+        id = "pair-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionDonation(peer, {
+        id = "pair-d2", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    injectProductionAdjustment(peer, {
+        id = "pair-adj", itemId = itemId, quantity = -5,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+    })
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        return out
+    end
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "465-pair-hist: peer delete-first")
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(corrSnap, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })), "accepted", "465-pair-hist: peer correction after delete")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), -5,
+        "465-pair-hist: peer Alice −5")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-pair-hist: peer Bob +10")
+    assertTrue(type(peer.creditCorrections) == "table"
+        and type(peer.creditCorrections["pair-d2"]) == "table",
+        "465-pair-hist: correction head active")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
