@@ -445,6 +445,10 @@ function GS.EventCountsTowardLiveProgress(record, event)
     if type(event) ~= "table" then
         return false
     end
+    -- #465 soft-deleted donations/adjustments leave progress and personal floors.
+    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+        return false
+    end
     -- #457 informational withdrawals never contribute to progress/rankings.
     if event.type == "withdrawal"
         or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL) then

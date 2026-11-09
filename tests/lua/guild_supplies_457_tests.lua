@@ -871,7 +871,7 @@ end
 -- R6c/R6d: admission scope + provenance-stable identity via real AdmitWithdrawalEvent
 do
     loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
-    assertEq(GS.PROVIDER_SCHEMA, 6, "G: real provider schema after Admission load")
+    assertEq(GS.PROVIDER_SCHEMA, 7, "G: real provider schema after Admission load")
     local function baseEvent(overrides)
         local e = {
             type = "withdrawal",

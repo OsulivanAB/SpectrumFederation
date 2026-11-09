@@ -35,6 +35,8 @@ local KIND = {
     RENAME_CAMPAIGN = "rename-campaign",
     -- #459 officer contributor credit corrections (LWW; ledger evidence untouched)
     CORRECT_CONTRIBUTOR = "correct-contributor",
+    -- #465 officer soft-delete of log entries (LWW; ledger evidence untouched)
+    SOFT_DELETE_EVENT = "soft-delete-event",
 }
 
 GS.KIND = KIND
@@ -391,6 +393,11 @@ local function TargetKey(kind, target)
             return "credit:" .. target
         end
         return nil
+    elseif kind == KIND.SOFT_DELETE_EVENT then
+        if type(target) == "string" and target ~= "" and #target <= GS.MAX_OPERATION_ID then
+            return "delete:" .. target
+        end
+        return nil
     end
     return nil
 end
@@ -445,6 +452,11 @@ end
 
 --- Last-write-wins for correct-contributor (#459). Same ordering as rename.
 function GS.CreditCorrectionRevisionWins(incoming, incumbent)
+    return GS.RenameRevisionWins(incoming, incumbent)
+end
+
+--- Last-write-wins for soft-delete-event (#465). Same ordering as rename.
+function GS.SoftDeleteRevisionWins(incoming, incumbent)
     return GS.RenameRevisionWins(incoming, incumbent)
 end
 
@@ -898,6 +910,57 @@ local function ValidateKindValue(op)
             end
         end
         return true
+    elseif kind == KIND.SOFT_DELETE_EVENT then
+        if type(op.target) ~= "string" or op.target == "" or #op.target > GS.MAX_OPERATION_ID then
+            return false, "invalid_target"
+        end
+        if type(op.value) ~= "table" then
+            return false, "invalid_value"
+        end
+        if type(op.value.eventId) ~= "string" or op.value.eventId == ""
+            or #op.value.eventId > GS.MAX_OPERATION_ID
+            or op.value.eventId ~= op.target then
+            return false, "invalid_target"
+        end
+        if type(op.campaignId) ~= "string" or op.campaignId == "" then
+            return false, "invalid_campaign"
+        end
+        if type(op.baseCampaignId) ~= "string" or op.baseCampaignId == "" then
+            return false, "invalid_base_campaign"
+        end
+        if op.campaignId ~= op.baseCampaignId then
+            return false, "invalid_campaign"
+        end
+        local eventKind = op.value.eventKind
+        if eventKind ~= "donation" and eventKind ~= "adjustment"
+            and eventKind ~= "withdrawal" then
+            return false, "invalid_value"
+        end
+        if op.value.itemId ~= nil then
+            local itemId = tonumber(op.value.itemId)
+            if not itemId or itemId ~= math.floor(itemId) or itemId < 1 then
+                return false, "invalid_value"
+            end
+        end
+        if op.value.quantity ~= nil then
+            local qty = tonumber(op.value.quantity)
+            if not qty or qty ~= qty or qty ~= math.floor(qty) or qty == 0 then
+                return false, "invalid_value"
+            end
+        end
+        if op.value.attributed ~= nil and op.value.attributed ~= "" then
+            if type(op.value.attributed) ~= "string" or #op.value.attributed > 64 then
+                return false, "invalid_attribution"
+            end
+        end
+        if op.value.attributedGuid ~= nil then
+            if type(op.value.attributedGuid) ~= "string"
+                or op.value.attributedGuid == ""
+                or #op.value.attributedGuid > 64 then
+                return false, "invalid_guid"
+            end
+        end
+        return true
     end
     return false, "unsupported_kind"
 end
@@ -1210,6 +1273,72 @@ function GS:NewContributorCorrectionOperation(eventId, attributed, attributedGui
     return op, "accepted", nil
 end
 
+--- Prepare an officer soft-delete of one current-campaign log entry (#465).
+-- Targets a production-credited donation/adjustment or an informational withdrawal.
+-- Ledger evidence is retained; effective accounting excludes the deleted event.
+-- @param eventId string durable ledger event id
+function GS:NewSoftDeleteOperation(eventId)
+    local ctx = GS:GetCurrentContext()
+    if not ctx or not ctx.ready then
+        return nil, "rejected", (ctx and ctx.reason) or "not_ready"
+    end
+    local ts = ServerTime()
+    if not ts then
+        return nil, "rejected", "server_time_unavailable"
+    end
+    if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+        return nil, "rejected", "invalid_target"
+    end
+    local caps = GS:GetCapabilities()
+    if not caps.canEdit then
+        return nil, "rejected", caps.reason or "unauthorized"
+    end
+    local record, recordReason = GS:GetCurrentRecord()
+    if not record then
+        return nil, "rejected", recordReason or "not_configured"
+    end
+    if not GS.BuildSoftDeleteValue then
+        return nil, "rejected", "unsupported_kind"
+    end
+    local value, buildErr = GS.BuildSoftDeleteValue(record, eventId, { localPrepare = true })
+    if not value then
+        return nil, "rejected", buildErr or "invalid_value"
+    end
+    local canonicalTarget = value.eventId
+    local tKey = GS.SoftDeleteTargetKey
+        and GS.SoftDeleteTargetKey(record, canonicalTarget)
+        or TargetKey(KIND.SOFT_DELETE_EVENT, canonicalTarget)
+    if not tKey then
+        return nil, "rejected", "invalid_target"
+    end
+    local id, idErr = GS:_AllocateOperationId(ctx.actorGuid)
+    if not id then
+        return nil, "rejected", idErr or "id_failed"
+    end
+    local op = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = id,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = KIND.SOFT_DELETE_EVENT,
+        target = canonicalTarget,
+        value = value,
+        actorGuid = ctx.actorGuid,
+        actorName = ctx.actorName,
+        timestamp = ts,
+        baseTargetRevision = CurrentTargetRevision(record, tKey),
+        basePolicyRevision = CurrentPolicyRevision(record),
+        baseCampaignId = record.currentCampaignId,
+        _preparedHandleGeneration = ctx.handleGeneration,
+    }
+    local ok, err = ValidateKindValue(op)
+    if not ok then
+        return nil, "rejected", err or "invalid_value"
+    end
+    return op, "accepted", nil
+end
+
 function GS:ValidateConfigOperation(op, context)
     local ok, err = ValidateConfigShape(op)
     if not ok then
@@ -1266,11 +1395,12 @@ function GS:ValidateConfigOperation(op, context)
     -- Compatible prepared local quantity adjustments must not stay permanently
     -- stale after a sibling adjustment advances adjust:<itemId>. Commit-time
     -- floor validation in ApplyAdjustmentMutation remains authoritative.
-    -- Rename-campaign and correct-contributor use deterministic LWW at
-    -- apply/admission (#424 / #459).
+    -- Rename-campaign, correct-contributor, and soft-delete use deterministic
+    -- LWW at apply/admission (#424 / #459 / #465).
     if op.kind ~= KIND.ADJUST_QUANTITY
         and op.kind ~= KIND.RENAME_CAMPAIGN
-        and op.kind ~= KIND.CORRECT_CONTRIBUTOR then
+        and op.kind ~= KIND.CORRECT_CONTRIBUTOR
+        and op.kind ~= KIND.SOFT_DELETE_EVENT then
         local currentRev = CurrentTargetRevision(record, tKey)
         if op.baseTargetRevision ~= currentRev then
             return false, "stale_base"
@@ -1292,6 +1422,18 @@ function GS:ValidateConfigOperation(op, context)
             return false, "unsupported_kind"
         end
         local prepOk, prepErr = GS.ValidateContributorCorrectionPrepare(record, op, {
+            localPrepare = true,
+        })
+        if not prepOk then
+            return false, prepErr or "invalid_value"
+        end
+    end
+
+    if op.kind == KIND.SOFT_DELETE_EVENT then
+        if not GS.ValidateSoftDeletePrepare then
+            return false, "unsupported_kind"
+        end
+        local prepOk, prepErr = GS.ValidateSoftDeletePrepare(record, op, {
             localPrepare = true,
         })
         if not prepOk then
@@ -1655,6 +1797,15 @@ local function ApplyMutations(record, op, opts)
             return false, status or "invalid_value"
         end
         return true, status
+    elseif op.kind == KIND.SOFT_DELETE_EVENT then
+        if not GS.ApplySoftDeleteMutation then
+            return false, "unsupported_kind"
+        end
+        local ok, status = GS.ApplySoftDeleteMutation(record, op, opts)
+        if not ok then
+            return false, status or "invalid_value"
+        end
+        return true, status
     end
     return false, "unsupported_kind"
 end
@@ -1915,6 +2066,29 @@ function GS:ApplyStagedConfigOperation(op, context)
                 itemId = stored.value and stored.value.itemId,
             })
         end
+    elseif stored.kind == KIND.SOFT_DELETE_EVENT then
+        if GS.SealEventDeletionProjection then
+            GS.SealEventDeletionProjection(record, true)
+        elseif GS.RebuildEventDeletionProjection then
+            GS.RebuildEventDeletionProjection(record, nil)
+        end
+        -- Soft-delete changes floors: wake pending deletes and credit corrections.
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(record)
+        end
+        if GS.EnsureCreditCorrectionProjection then
+            GS.EnsureCreditCorrectionProjection(record, nil)
+        end
+        if GS.RedrivePendingSoftDeletes then
+            GS.RedrivePendingSoftDeletes(record, {
+                itemId = stored.value and stored.value.itemId,
+            })
+        end
+        if GS.RedrivePendingContributorCorrections then
+            GS.RedrivePendingContributorCorrections(record, {
+                itemId = stored.value and stored.value.itemId,
+            })
+        end
     elseif stored.kind == KIND.ADJUST_QUANTITY then
         -- Adjustments change durable floors: never Seal(true) an unfinished
         -- reconstruction. Invalidate published validity and Ensure/redrive under
@@ -1933,6 +2107,11 @@ function GS:ApplyStagedConfigOperation(op, context)
                     itemId = stored.value and stored.value.itemId,
                 })
             end
+        end
+        if GS.RedrivePendingSoftDeletes then
+            GS.RedrivePendingSoftDeletes(record, {
+                itemId = stored.value and stored.value.itemId,
+            })
         end
     end
     releaseCreditBudget()
@@ -2283,7 +2462,8 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         or kind == KIND.SET_RECIPE
         or kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS
         or kind == KIND.ADJUST_QUANTITY or kind == KIND.RENAME_CAMPAIGN
-        or kind == KIND.CORRECT_CONTRIBUTOR then
+        or kind == KIND.CORRECT_CONTRIBUTOR
+        or kind == KIND.SOFT_DELETE_EVENT then
         local ok, err = ValidateConfigShape(body)
         if not ok then
             return false, err or "invalid_operations"

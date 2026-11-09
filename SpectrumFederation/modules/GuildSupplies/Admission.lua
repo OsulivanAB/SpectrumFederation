@@ -15,9 +15,11 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- not understand corrections; advertising 5 for the combined protocol would
 -- let them pass Guild Gossip's strict equality and then reject
 -- correct-contributor as unsupported_kind while computing stale credit.
+-- 7: officer soft-delete-event (#465). Schema 6 peers would ignore deletions
+-- while appearing accounting-compatible under GG equality.
 -- Older schemas are incompatible under GG equality and must update before
 -- sync/adoption resumes. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 6
+GS.PROVIDER_SCHEMA = 7
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -1243,6 +1245,9 @@ local function OperationTargetKey(record, op)
     if op.kind == GS.KIND.CORRECT_CONTRIBUTOR and GS.CorrectionTargetKey then
         return GS.CorrectionTargetKey(record, op.target)
     end
+    if op.kind == GS.KIND.SOFT_DELETE_EVENT and GS.SoftDeleteTargetKey then
+        return GS.SoftDeleteTargetKey(record, op.target)
+    end
     if GS._TargetKey then
         return GS._TargetKey(op.kind, op.target)
     end
@@ -1370,13 +1375,14 @@ local function ClassifyStaleBase(record, op, targetKey)
             end
             return "conflict", "campaign_conflict"
         end
-        -- #424 / #459: rename and contributor-correction authorship campaignId /
-        -- baseCampaignId are prepare-time current. After rollover, accepted
-        -- corrections must still replay (and renames must still LWW) rather than
-        -- permanent stale_campaign rejection. Do not relax campaign-head
-        -- causality for any other kind.
+        -- #424 / #459 / #465: rename, contributor-correction, and soft-delete
+        -- authorship campaignId / baseCampaignId are prepare-time current. After
+        -- rollover, accepted corrections/deletes must still replay (and renames
+        -- must still LWW) rather than permanent stale_campaign rejection. Do not
+        -- relax campaign-head causality for any other kind.
         if op.kind ~= GS.KIND.RENAME_CAMPAIGN
-            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR then
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
+            and op.kind ~= GS.KIND.SOFT_DELETE_EVENT then
             -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
             local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
             local headBody = headId and ops.records[headId]
@@ -1415,6 +1421,20 @@ local function ClassifyStaleBase(record, op, targetKey)
             if not (GS.CreditCorrectionRevisionWins
                 and GS.CreditCorrectionRevisionWins(op, headBody)) then
                 return "obsolete", "stale_credit"
+            end
+        end
+        return "apply", nil
+    end
+
+    -- #465 soft-delete: LWW per delete:<eventId>; floor failures stay pending
+    -- like adjustments. Never open Troubleshooting conflicts.
+    if op.kind == GS.KIND.SOFT_DELETE_EVENT then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) == "table" and headBody.id ~= op.id then
+            if not (GS.SoftDeleteRevisionWins
+                and GS.SoftDeleteRevisionWins(op, headBody)) then
+                return "obsolete", "stale_delete"
             end
         end
         return "apply", nil
@@ -6164,6 +6184,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.RENAME_CAMPAIGN
             -- Credit corrections are keyed by event id, not authorship campaign.
             and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
+            -- Soft-deletes are keyed by event id, not authorship campaign (#465).
+            and op.kind ~= GS.KIND.SOFT_DELETE_EVENT
     end
 
     local promoteOps = {}
@@ -8580,6 +8602,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         local ownedCreditBudget = false
         local creditKind = stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
             or stored.kind == GS.KIND.ADJUST_QUANTITY
+            or stored.kind == GS.KIND.SOFT_DELETE_EVENT
         if creditKind and GS.BeginOuterCreditProjectionCallbackBudget then
             ownedCreditBudget = GS.BeginOuterCreditProjectionCallbackBudget()
         end
@@ -8650,6 +8673,24 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     releaseCreditBudget()
                     return stPend, reasonPend
                 end
+                -- #465: soft-delete-before-event or floor failure stays pending.
+                if stored.kind == GS.KIND.SOFT_DELETE_EVENT
+                    and (err == "pending_event" or err == "missing_event"
+                        or err == "not_credited" or err == "item_negative"
+                        or err == "player_negative" or err == "credit_unavailable") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    releaseCreditBudget()
+                    return stPend, reasonPend
+                end
                 releaseCreditBudget()
                 return "rejected", err or "apply_failed"
             end
@@ -8673,6 +8714,29 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     _shareCallbackBudget = true,
                 })
             end
+        elseif stored.kind == GS.KIND.SOFT_DELETE_EVENT then
+            if GS.SealEventDeletionProjection then
+                GS.SealEventDeletionProjection(record, true)
+            end
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            if not admissionCtx.adoptionReplay then
+                if GS.RedrivePendingSoftDeletes then
+                    GS.RedrivePendingSoftDeletes(record, {
+                        itemId = stored.value and stored.value.itemId,
+                    })
+                end
+                if GS.RedrivePendingContributorCorrections then
+                    GS.RedrivePendingContributorCorrections(record, {
+                        itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
+                    })
+                end
+            end
         elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
             -- AppendLedgerEvent already Ensure'd under the shared outer allowance.
             -- StoreAccepted bumps ops generation, so continue Ensure/redrive under
@@ -8684,6 +8748,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     })
                 elseif GS.EnsureCreditCorrectionProjection then
                     GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+                if GS.RedrivePendingSoftDeletes then
+                    GS.RedrivePendingSoftDeletes(record, {
+                        itemId = stored.value and stored.value.itemId,
+                    })
                 end
             elseif GS.EnsureCreditCorrectionProjection then
                 GS.EnsureCreditCorrectionProjection(record, nil)

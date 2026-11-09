@@ -3944,11 +3944,16 @@ function Controls:AddLogTable(section, opts)
 					local button = cell.ActionButton
 					if button then
 						button:SetScript("OnClick", nil)
+						-- Optional per-column field names so a table can host
+						-- more than one action (Edit + Delete) (#465).
+						local showKey = column.showKey or "showAction"
+						local actionKey = column.actionKey or "onAction"
+						local labelKey = column.labelKey or "actionLabel"
 						local show = enabled and type(rowData) == "table"
-							and rowData.showAction == true
-							and type(rowData.onAction) == "function"
+							and rowData[showKey] == true
+							and type(rowData[actionKey]) == "function"
 						if show then
-							local label = rowData.actionLabel
+							local label = rowData[labelKey]
 							if type(label) ~= "string" or label == "" then
 								label = column.label or "Edit"
 							end
@@ -3956,7 +3961,7 @@ function Controls:AddLogTable(section, opts)
 							-- Capture durable id at bind time so recycled frames
 							-- always invoke the newly bound entry.
 							local boundId = rowData.id
-							local boundAction = rowData.onAction
+							local boundAction = rowData[actionKey]
 							button:SetScript("OnClick", function()
 								if type(boundAction) == "function" then
 									boundAction(boundId, dataRow.__sfRowData)

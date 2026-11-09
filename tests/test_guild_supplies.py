@@ -15,6 +15,7 @@ LUA_RENAME_424_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_rename_424_
 LUA_UI_453_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_453_tests.lua"
 LUA_457_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_457_tests.lua"
 LUA_CORRECTION_459_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_459_tests.lua"
+LUA_SOFT_DELETE_465_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_465_tests.lua"
 GS_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildSupplies"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-supplies" / "index.md"
 ADAPTER = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip" / "05_GuildAdapter.lua"
@@ -133,12 +134,36 @@ def test_guild_supplies_contributor_corrections_459():
             f"stderr:\n{result.stderr}"
         )
     assert "0 failed" in result.stdout
-    assert "459: PROVIDER_SCHEMA is 6" in result.stdout
+    assert "459: PROVIDER_SCHEMA is 7" in result.stdout
     assert "459: effective credit is Bob" in result.stdout
     assert "459: floor reason player_negative" in result.stdout
     assert "459: LWW effective Carol" in result.stdout
     assert "459: credit after redrive" in result.stdout
     assert "459: preview reason got preview_non_admin" in result.stdout
+
+
+def test_guild_supplies_soft_delete_465():
+    """Focused #465 officer soft-delete admission/projection coverage."""
+    assert LUA_SOFT_DELETE_465_TESTS.exists()
+    result = subprocess.run(
+        [_lua51(), str(LUA_SOFT_DELETE_465_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Supplies #465 soft-delete tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert "465: PROVIDER_SCHEMA is 7" in result.stdout
+    assert "465: floor reason player_negative got" in result.stdout
+    assert "465: personal restored to 10" in result.stdout
+    assert "465: pending delete promoted after event" in result.stdout
+    assert "465: preview reason got preview_non_admin" in result.stdout
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")

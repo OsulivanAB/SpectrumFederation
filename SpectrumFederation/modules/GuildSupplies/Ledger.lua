@@ -7516,17 +7516,21 @@ function GS.EnsureThenRedriveCreditCorrections(record, redriveOpts)
     if GS.EnsureCreditCorrectionProjection then
         GS.EnsureCreditCorrectionProjection(record, nil)
     end
-    if GS.RedrivePendingContributorCorrections then
-        local opts = type(redriveOpts) == "table" and redriveOpts or {}
-        if opts._shareCallbackBudget ~= true then
-            local shared = {}
-            for k, v in pairs(opts) do
-                shared[k] = v
-            end
-            shared._shareCallbackBudget = true
-            opts = shared
+    local opts = type(redriveOpts) == "table" and redriveOpts or {}
+    if opts._shareCallbackBudget ~= true then
+        local shared = {}
+        for k, v in pairs(opts) do
+            shared[k] = v
         end
+        shared._shareCallbackBudget = true
+        opts = shared
+    end
+    if GS.RedrivePendingContributorCorrections then
         GS.RedrivePendingContributorCorrections(record, opts)
+    end
+    -- #465: ledger/credit wakes also promote pending soft-deletes.
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, opts)
     end
     if owned then
         EndCreditProjectionCallbackBudget()
@@ -9534,6 +9538,13 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     if not eligOk then
         return false, eligErr or "invalid_event"
     end
+    -- #465: deletion wins over contributor editing.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+        return false, "already_deleted"
+    end
     local isDonation = IsDonationLedgerEvent(event)
     local isAdjustment = IsAdjustmentLedgerEvent(event)
     -- Local authoring/commit is current-campaign-only; remote historical replay
@@ -9613,6 +9624,13 @@ function GS.BuildContributorCorrectionValue(record, eventId, attributed, attribu
     end
     if event.gsProductionCredit ~= true then
         return nil, "not_credited"
+    end
+    -- #465: deletion wins over contributor editing.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+        return nil, "already_deleted"
     end
     if opts.localPrepare then
         if type(record.currentCampaignId) ~= "string"
@@ -9830,6 +9848,528 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
         return false, err or "full"
     end
     return true, "accepted"
+end
+
+---------------------------------------------------------------------------
+-- Soft-delete projection (#465)
+-- Authority: accepted soft-delete-event ops. Ledger evidence stays intact.
+-- Guarantee: deleted rows leave Logs/progress/rankings/floors; deletion wins
+-- over contributor corrections; floor failures stay pending (like adjustments).
+---------------------------------------------------------------------------
+
+GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
+
+local eventDeletionCache = setmetatable({}, { __mode = "k" })
+
+local function EventDeletionDependencyStamp(record)
+    local ops = record and record.operations
+    local gen = ops and tonumber(ops.generation) or 0
+    local orderN = ops and ops.order and #ops.order or 0
+    local ledgerN = 0
+    local live = record and record.accounting and record.accounting._consumableEvents
+    if type(live) == "table" then
+        ledgerN = #live
+    end
+    return tostring(gen) .. ":" .. tostring(orderN) .. ":" .. tostring(ledgerN)
+end
+
+--- Operation-head key for soft-delete-event, bound to the canonical event id.
+function GS.SoftDeleteTargetKey(record, target, lookup)
+    if type(target) ~= "string" or target == "" then
+        return nil
+    end
+    local canonical = GS.CanonicalCreditEventId(record, target, lookup) or target
+    if not GS.ComputeTargetKey then
+        return "delete:" .. canonical
+    end
+    return GS.ComputeTargetKey(
+        GS.KIND and GS.KIND.SOFT_DELETE_EVENT, canonical)
+end
+
+--- Soft-delete LWW ordering (same as rename/credit corrections).
+function GS.SoftDeleteRevisionWins(incoming, incumbent)
+    return GS.RenameRevisionWins and GS.RenameRevisionWins(incoming, incumbent)
+end
+
+local function SoftDeleteHeadEntry(op)
+    local value = type(op) == "table" and op.value or nil
+    local eventKind = type(value) == "table" and value.eventKind or "donation"
+    if eventKind ~= "donation" and eventKind ~= "adjustment" and eventKind ~= "withdrawal" then
+        eventKind = "donation"
+    end
+    return {
+        revisionId = op.id,
+        deletedAt = tonumber(op.timestamp) or Now(),
+        actorName = NormName(op.actorName),
+        actorGuid = ValidGuid(op.actorGuid),
+        eventKind = eventKind,
+        itemId = value and tonumber(value.itemId) or nil,
+        quantity = value and tonumber(value.quantity) or nil,
+    }
+end
+
+--- Rebuild eventDeletions from accepted soft-delete heads (#465).
+-- Uses op bodies only — no ledger FindLedgerEventById — so rebuild stays safe
+-- under the shared credit-projection callback budget.
+-- @return boolean ok
+function GS.RebuildEventDeletionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false
+    end
+    local map = {}
+    local ops = record.operations
+    local heads = ops and ops.heads
+    local records = ops and ops.records
+    if type(heads) == "table" and type(records) == "table" then
+        for targetKey, headId in pairs(heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:"
+                and type(headId) == "string" then
+                local body = records[headId]
+                if type(body) == "table"
+                    and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+                    local eventId = body.target or (body.value and body.value.eventId)
+                    if type(eventId) == "string" and eventId ~= "" then
+                        local entry = SoftDeleteHeadEntry(body)
+                        map[eventId] = entry
+                        -- Also index the delete: key suffix when it differs.
+                        local suffix = targetKey:sub(8)
+                        if type(suffix) == "string" and suffix ~= "" and suffix ~= eventId then
+                            map[suffix] = entry
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Speculative local prepare preview: include extraOp before StoreAccepted.
+    if type(extraOp) == "table"
+        and extraOp.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+        local eventId = extraOp.target or (extraOp.value and extraOp.value.eventId)
+        if type(eventId) == "string" and eventId ~= "" then
+            local incumbent = map[eventId]
+            local wins = true
+            if type(incumbent) == "table" and type(incumbent.revisionId) == "string"
+                and incumbent.revisionId ~= extraOp.id then
+                local headBody = records and records[incumbent.revisionId]
+                if type(headBody) == "table" and GS.SoftDeleteRevisionWins then
+                    wins = GS.SoftDeleteRevisionWins(extraOp, headBody)
+                end
+            end
+            if wins then
+                map[eventId] = SoftDeleteHeadEntry(extraOp)
+            end
+        end
+    end
+    record.eventDeletions = map
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = true,
+    }
+    return true
+end
+
+function GS.InvalidateEventDeletionProjection(record)
+    if type(record) ~= "table" then
+        return
+    end
+    eventDeletionCache[record] = nil
+end
+
+function GS.SealEventDeletionProjection(record, ok)
+    if type(record) ~= "table" then
+        return
+    end
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = ok and true or false,
+    }
+end
+
+function GS.EnsureEventDeletionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false
+    end
+    local stamp = EventDeletionDependencyStamp(record)
+    local cache = eventDeletionCache[record]
+    if type(cache) == "table" and cache.stamp == stamp and cache.ok == true
+        and type(extraOp) ~= "table"
+        and type(record.eventDeletions) == "table" then
+        return true
+    end
+    return GS.RebuildEventDeletionProjection(record, extraOp)
+end
+
+--- True when the canonical event is soft-deleted (#465).
+-- Pure map read — do not Ensure/FindLedger here. EventCountsTowardLiveProgress
+-- and credit-floor baselines call this on every row; nested Ensure would charge
+-- the credit-projection work budget and stall paced rebuilds (#459 work_budget).
+-- Callers that need a fresh map (history/rankings/progress entry, apply/admit)
+-- must EnsureEventDeletionProjection first.
+function GS.IsEventSoftDeleted(record, eventOrId)
+    if type(record) ~= "table" then
+        return false
+    end
+    local map = record.eventDeletions
+    if type(map) ~= "table" then
+        return false
+    end
+    if type(eventOrId) == "table" then
+        local eventId = eventOrId.id
+        if type(eventId) == "string" and eventId ~= "" and type(map[eventId]) == "table" then
+            return true
+        end
+        local txnId = eventOrId.txnId
+        if type(txnId) == "string" and txnId ~= "" and txnId ~= eventId
+            and type(map[txnId]) == "table" then
+            return true
+        end
+        return false
+    end
+    if type(eventOrId) ~= "string" or eventOrId == "" then
+        return false
+    end
+    -- Avoid CanonicalCreditEventId/FindLedgerEventById on this hot path.
+    return type(map[eventOrId]) == "table"
+end
+
+--- Soft-delete floor: removing signed qty must leave item/personal totals >= 0.
+-- Withdrawals have no accounting effect. Negative adjustments restore quantity.
+function GS.SoftDeleteFloorOk(record, event)
+    if type(record) ~= "table" or type(event) ~= "table" then
+        return false, "invalid_event"
+    end
+    if IsWithdrawalLedgerEvent(event) then
+        return true
+    end
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if not isDonation and not isAdjustment then
+        return false, "invalid_event"
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity)
+    if not IsItemId(itemId) or not qty or qty ~= qty or qty ~= math.floor(qty) or qty == 0 then
+        return false, "invalid_event"
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return false, "no_campaign"
+    end
+    -- Item total currently includes this event; removing subtracts signed qty.
+    local currentItem = ItemTotal(record, itemId, campaignId)
+    if currentItem - qty < 0 then
+        return false, "item_negative"
+    end
+    -- Personal floor uses effective credit (corrections applied).
+    local creditName, creditGuid, _, creditStatus = nil, nil, nil, nil
+    if GS.ResolveEffectiveCreditIdentity then
+        creditName, creditGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+        if creditStatus == GS.CREDIT_UNAVAILABLE then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+    else
+        creditName, creditGuid = DurableCreditIdentity(event)
+    end
+    if creditName or creditGuid then
+        local personal, personalErr = GS.PersonalContributorItemTotal(
+            record, creditName, creditGuid, itemId, campaignId)
+        if personalErr == GS.CREDIT_UNAVAILABLE then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+        personal = tonumber(personal) or 0
+        if personal - qty < 0 then
+            return false, "player_negative"
+        end
+    end
+    return true
+end
+
+local function SoftDeleteEventKind(event)
+    if IsWithdrawalLedgerEvent(event) then
+        return "withdrawal"
+    end
+    if IsAdjustmentLedgerEvent(event) then
+        return "adjustment"
+    end
+    if IsDonationLedgerEvent(event) then
+        return "donation"
+    end
+    return nil
+end
+
+--- Scope/eligibility for soft-delete prepare/apply (#465).
+function GS.ValidateSoftDeleteScope(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" or type(op.value) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or op.value.eventId
+    if type(eventId) ~= "string" or eventId == "" then
+        return false, "invalid_target"
+    end
+    if type(op.campaignId) ~= "string" or op.campaignId == "" then
+        return false, "invalid_campaign"
+    end
+    if type(op.baseCampaignId) ~= "string" or op.baseCampaignId == "" then
+        return false, "invalid_base_campaign"
+    end
+    if op.campaignId ~= op.baseCampaignId then
+        return false, "invalid_campaign"
+    end
+    local skew = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
+    local ts = tonumber(op.timestamp)
+    local now = Now()
+    if not ts or ts ~= ts or ts < 0 then
+        return false, "invalid_value"
+    end
+    if ts > now + skew then
+        return false, "invalid_value"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        if opts.allowMissingEvent or opts.remoteAdmit then
+            return false, "pending_event"
+        end
+        return false, "missing_event"
+    end
+    -- Authored campaign must match the event's campaign (historical remote OK).
+    if type(event.campaignId) == "string" and event.campaignId ~= ""
+        and event.campaignId ~= op.campaignId then
+        return false, "stale_campaign"
+    end
+    return true, nil, event
+end
+
+function GS.ValidateSoftDeleteEventEligibility(record, op, event)
+    if type(event) ~= "table" then
+        return false, "invalid_event"
+    end
+    local kind = SoftDeleteEventKind(event)
+    if not kind then
+        return false, "invalid_event"
+    end
+    if type(op.value) == "table" and type(op.value.eventKind) == "string"
+        and op.value.eventKind ~= kind then
+        return false, "invalid_value"
+    end
+    -- Donations/adjustments require production credit; withdrawals are informational.
+    if kind ~= "withdrawal" and event.gsProductionCredit ~= true then
+        return false, "not_credited"
+    end
+    return true, nil, kind
+end
+
+function GS.ValidateSoftDeletePrepare(record, op, opts)
+    opts = opts or {}
+    local scopeOk, scopeErr, event = GS.ValidateSoftDeleteScope(record, op, opts)
+    if not scopeOk then
+        return false, scopeErr or "invalid_value"
+    end
+    local eligOk, eligErr, eventKind = GS.ValidateSoftDeleteEventEligibility(record, op, event)
+    if not eligOk then
+        return false, eligErr or "invalid_event"
+    end
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return false, "stale_campaign"
+        end
+    end
+    -- Idempotent: already deleted is accepted as duplicate at apply, not a prepare error.
+    if not opts.skipFloor then
+        local floorOk, floorErr = GS.SoftDeleteFloorOk(record, event)
+        if not floorOk then
+            return false, floorErr or "item_negative"
+        end
+    end
+    return true, nil, {
+        event = event,
+        eventKind = eventKind,
+    }
+end
+
+--- Build the public op value for a local soft-delete prepare.
+function GS.BuildSoftDeleteValue(record, eventId, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil, "invalid_target"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        return nil, "missing_event"
+    end
+    local eventKind = SoftDeleteEventKind(event)
+    if not eventKind then
+        return nil, "invalid_event"
+    end
+    if eventKind ~= "withdrawal" and event.gsProductionCredit ~= true then
+        return nil, "not_credited"
+    end
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return nil, "stale_campaign"
+        end
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.IsEventSoftDeleted(record, event) then
+        return nil, "already_deleted"
+    end
+    local floorOk, floorErr = GS.SoftDeleteFloorOk(record, event)
+    if not floorOk then
+        return nil, floorErr or "item_negative"
+    end
+    local creditName, creditGuid, _, creditStatus = nil, nil, nil, nil
+    if eventKind ~= "withdrawal" and GS.ResolveEffectiveCreditIdentity then
+        creditName, creditGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+        if creditStatus == GS.CREDIT_UNAVAILABLE then
+            return nil, GS.CREDIT_UNAVAILABLE
+        end
+    elseif eventKind == "withdrawal" then
+        creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
+    else
+        creditName, creditGuid = DurableCreditIdentity(event)
+    end
+    return {
+        eventId = event.id,
+        eventKind = eventKind,
+        itemId = tonumber(event.itemId),
+        quantity = tonumber(event.quantity),
+        attributed = creditName,
+        attributedGuid = creditGuid,
+    }
+end
+
+--- Apply an accepted soft-delete mutation (#465). Ledger evidence is untouched.
+function GS.ApplySoftDeleteMutation(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false, "invalid_value"
+    end
+    GS.EnsureEventDeletionProjection(record, nil)
+    local eventId = op.target or (op.value and op.value.eventId)
+    local canonical = GS.CanonicalCreditEventId(record, eventId) or eventId
+    local tKey = GS.SoftDeleteTargetKey and GS.SoftDeleteTargetKey(record, eventId)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId))
+    local ops = record.operations
+    local headId = ops and ops.heads and tKey and ops.heads[tKey]
+    if not headId and type(eventId) == "string" and GS.ComputeTargetKey then
+        local rawKey = GS.ComputeTargetKey(op.kind, eventId)
+        headId = rawKey and ops and ops.heads and ops.heads[rawKey]
+    end
+    local headBody = headId and ops.records and ops.records[headId]
+    if type(headBody) == "table" and headBody.id == op.id then
+        -- Exact retained body: idempotent duplicate (already soft-deleted).
+        return true, "duplicate"
+    end
+    if type(headBody) == "table" and headBody.id ~= op.id then
+        if GS.SoftDeleteRevisionWins
+            and not GS.SoftDeleteRevisionWins(op, headBody) then
+            -- Older concurrent delete: retain as obsolete; credit already removed once.
+            return false, "stale_delete"
+        end
+        -- Newer delete replaces head metadata only; accounting already excluded.
+        if not GS.RebuildEventDeletionProjection(record, op) then
+            return false, "invalid_value"
+        end
+        return true, "accepted"
+    end
+    if GS.IsEventSoftDeleted(record, eventId) or GS.IsEventSoftDeleted(record, canonical) then
+        -- Map says deleted but head missing (adoption edge): treat as duplicate.
+        return true, "duplicate"
+    end
+
+    local isLocal = opts.localProductionAuthority or opts.localWrite or false
+    local ok, err = GS.ValidateSoftDeletePrepare(record, op, {
+        localPrepare = isLocal,
+        -- Remote: still enforce floors; stay pending on failure (unlike corrections).
+        skipFloor = false,
+        remoteAdmit = not isLocal,
+        allowMissingEvent = not isLocal,
+    })
+    if not ok then
+        return false, err or "invalid_value"
+    end
+    -- Preview into projection; floors already checked.
+    if not GS.RebuildEventDeletionProjection(record, op) then
+        return false, "invalid_value"
+    end
+    local count = 0
+    if type(record.eventDeletions) == "table" then
+        for _ in pairs(record.eventDeletions) do
+            count = count + 1
+        end
+    end
+    if count > ((GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)) then
+        GS.RebuildEventDeletionProjection(record, nil)
+        return false, "full"
+    end
+    return true, "accepted"
+end
+
+--- Redrive pending soft-delete ops after ledger/floor changes (#465).
+function GS.RedrivePendingSoftDeletes(record, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return 0
+    end
+    local ops = record.operations
+    local pending = ops.pending
+    if type(pending) ~= "table" then
+        return 0
+    end
+    local promoted = 0
+    local ids = {}
+    for id, entry in pairs(pending) do
+        local body = entry and entry.body
+        if type(body) == "table"
+            and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+            local match = true
+            if type(opts.eventId) == "string" and opts.eventId ~= "" then
+                local target = body.target or (body.value and body.value.eventId)
+                local canonOpts = GS.CanonicalCreditEventId(record, opts.eventId)
+                local canonTarget = GS.CanonicalCreditEventId(record, target)
+                if canonOpts ~= canonTarget and opts.eventId ~= target then
+                    match = false
+                end
+            end
+            if match and type(opts.itemId) == "number" then
+                local itemId = body.value and tonumber(body.value.itemId)
+                if itemId and itemId ~= opts.itemId then
+                    match = false
+                end
+            end
+            if match then
+                ids[#ids + 1] = id
+            end
+        end
+    end
+    for i = 1, #ids do
+        local id = ids[i]
+        local entry = pending[id]
+        local body = entry and entry.body
+        if type(body) == "table" then
+            local sender = entry.sender
+            if GS.AdmitRemoteOperation and type(sender) == "string" and sender ~= "" then
+                pending[id] = nil
+                local st = select(1, GS:AdmitRemoteOperation(body, {
+                    sender = sender,
+                    localWrite = false,
+                    offlineRecord = opts.offlineRecord,
+                    _softDeleteRedrive = true,
+                }))
+                if st == "accepted" or st == "duplicate" then
+                    promoted = promoted + 1
+                elseif st == "pending" and type(pending[id]) ~= "table" then
+                    -- Re-queue if admit returned pending without re-storing.
+                    pending[id] = entry
+                end
+            end
+        end
+    end
+    return promoted
 end
 
 -- Test helper: inject a direct observation without bank scanning (#388 staged only).

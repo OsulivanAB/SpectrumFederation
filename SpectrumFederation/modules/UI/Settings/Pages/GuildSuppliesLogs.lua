@@ -39,6 +39,7 @@ local refreshQueued = false
 local rosterFrame = nil
 local passCache = nil
 local OpenEditContributorDialog
+local OpenDeleteDialog
 
 local function BeginRenderPass()
 	passCache = {}
@@ -412,6 +413,7 @@ local function BuildProjectedRows()
 			end
 		end
 		-- Edit only production-credited current-campaign rows (#459).
+		-- Delete covers donations, adjustments, and withdrawals (#465).
 		local record = CurrentRecord()
 		local productionOk = event.gsProductionCredit == true
 			or (event.uncredited ~= true and event.gsProductionCredit ~= false
@@ -421,11 +423,16 @@ local function BuildProjectedRows()
 		local campaignOk = type(record) == "table"
 			and type(record.currentCampaignId) == "string"
 			and event.campaignId == record.currentCampaignId
-		local canEdit = Caps().canEdit == true
+		local officerOk = Caps().canEdit == true
 			and type(event.id) == "string"
 			and event.id ~= ""
-			and productionOk
 			and campaignOk
+		local canEdit = officerOk
+			and productionOk
+			and kind ~= "withdrawal"
+			and event.creditUnavailable ~= true
+		local canDelete = officerOk
+			and (kind == "withdrawal" or productionOk)
 			and event.creditUnavailable ~= true
 		local effectiveName = event.effectiveAttributed
 		local effectiveGuid = event.effectiveAttributedGuid
@@ -454,9 +461,16 @@ local function BuildProjectedRows()
 			kind = kind,
 			timestamp = event.timestamp,
 			creditUnavailable = event.creditUnavailable == true or nil,
+			-- Backward-compatible aliases for the Edit action column.
 			showAction = canEdit,
 			actionLabel = Loc("GUILD_SUPPLIES_LOGS_EDIT_ACTION", "Edit"),
 			onAction = canEdit and OpenEditContributorDialog or nil,
+			showEdit = canEdit,
+			editLabel = Loc("GUILD_SUPPLIES_LOGS_EDIT_ACTION", "Edit"),
+			onEdit = canEdit and OpenEditContributorDialog or nil,
+			showDelete = canDelete,
+			deleteLabel = Loc("GUILD_SUPPLIES_LOGS_DELETE_ACTION", "Delete"),
+			onDelete = canDelete and OpenDeleteDialog or nil,
 			_eventKind = kind,
 			_contributorName = contributorName,
 			_effectiveName = concreteName,
@@ -829,6 +843,10 @@ local function EditSessionStillFresh(session)
 	if not event then
 		return false, "missing_event"
 	end
+	-- #465: deletion wins over an open contributor editor.
+	if g.IsEventSoftDeleted and g.IsEventSoftDeleted(record, event) then
+		return false, "already_deleted"
+	end
 	local curName, curGuid, _, creditStatus = nil, nil, nil, nil
 	if g.ResolveEffectiveCreditIdentity then
 		curName, curGuid, _, creditStatus = g.ResolveEffectiveCreditIdentity(record, event)
@@ -980,6 +998,222 @@ local function CommitEditSession()
 	CommitCapturedEdit(payload)
 end
 
+---------------------------------------------------------------------------
+-- Officer Delete log entry (#465). Captured confirmation; no chat output.
+---------------------------------------------------------------------------
+
+local deleteSession = nil
+
+local function ClearDeleteSession()
+	InvalidatePendingConfirm()
+	deleteSession = nil
+end
+
+local function DeleteSessionStillFresh(session)
+	if type(session) ~= "table" then
+		return false, "already_deleted"
+	end
+	local g = GS()
+	if not g then
+		return false, "api_unavailable"
+	end
+	local ctx = g.GetCurrentContext and g:GetCurrentContext() or nil
+	if not ctx or ctx.guildKey ~= session.guildKey then
+		return false, "stale_guild"
+	end
+	local record = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if type(record) ~= "table" then
+		return false, "not_configured"
+	end
+	if record.datasetId ~= session.datasetId then
+		return false, "dataset_mismatch"
+	end
+	if record.currentCampaignId ~= session.campaignId then
+		return false, "stale_campaign"
+	end
+	local event = g.FindLedgerEventById and g.FindLedgerEventById(record, session.eventId)
+	if not event then
+		return false, "missing_event"
+	end
+	if g.IsEventSoftDeleted and g.IsEventSoftDeleted(record, event) then
+		return false, "already_deleted"
+	end
+	local tKey = g.SoftDeleteTargetKey and g.SoftDeleteTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.SOFT_DELETE_EVENT, event.id))
+	local headId = tKey and record.operations and record.operations.heads
+		and record.operations.heads[tKey]
+	local expected = session.baseTargetRevision
+	local noPriorHead = expected == nil or expected == record.datasetId
+	if noPriorHead then
+		if headId ~= nil then
+			return false, "stale_delete"
+		end
+	elseif expected ~= headId then
+		return false, "stale_delete"
+	end
+	return true, nil, record, event
+end
+
+local function CommitCapturedDelete(payload)
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		ClearDeleteSession()
+		return
+	end
+	if type(payload) ~= "table" then
+		ReportLogsStatus("rejected", "stale_delete")
+		return
+	end
+	if pendingConfirm ~= payload
+		or payload.confirmGeneration ~= confirmGeneration then
+		ReportLogsStatus("rejected", "stale_delete")
+		return
+	end
+	local fresh, reason = DeleteSessionStillFresh(payload)
+	if not fresh then
+		ClearDeleteSession()
+		ReportLogsStatus("rejected", reason or "stale_delete")
+		return
+	end
+	local session = deleteSession
+	if type(session) ~= "table"
+		or session.eventId ~= payload.eventId
+		or session.datasetId ~= payload.datasetId
+		or session.campaignId ~= payload.campaignId
+		or session.guildKey ~= payload.guildKey
+		or session.baseTargetRevision ~= payload.baseTargetRevision then
+		ClearDeleteSession()
+		ReportLogsStatus("rejected", "stale_delete")
+		return
+	end
+	local g = GS()
+	if not g or not g.NewSoftDeleteOperation then
+		ReportLogsStatus("rejected", "unsupported_kind")
+		return
+	end
+	local op, status, prepReason = g:NewSoftDeleteOperation(payload.eventId)
+	if not op then
+		ClearDeleteSession()
+		ReportLogsStatus(status or "rejected", prepReason or "invalid_value")
+		return
+	end
+	if op.baseTargetRevision ~= payload.baseTargetRevision
+		and payload.baseTargetRevision ~= nil
+		and payload.baseTargetRevision ~= (select(1, g:GetCurrentRecord()) or {}).datasetId then
+		-- Allow datasetId sentinel mismatch only when both mean "no prior head".
+		local record = select(1, g:GetCurrentRecord())
+		local noPrior = (payload.baseTargetRevision == nil
+			or (record and payload.baseTargetRevision == record.datasetId))
+			and (op.baseTargetRevision == nil
+				or (record and op.baseTargetRevision == record.datasetId))
+		if not noPrior then
+			ClearDeleteSession()
+			ReportLogsStatus("rejected", "stale_delete")
+			return
+		end
+	end
+	local applyStatus, applyReason = g:ApplyStagedConfigOperation(op)
+	InvalidatePendingConfirm()
+	deleteSession = nil
+	editSession = nil
+	ReportLogsStatus(applyStatus, applyReason)
+end
+
+OpenDeleteDialog = function(eventId, rowData)
+	if Caps().canEdit ~= true then
+		ReportLogsStatus("rejected", "unauthorized")
+		return
+	end
+	if type(eventId) ~= "string" or eventId == "" then
+		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if not ctx or type(record) ~= "table" then
+		ReportLogsStatus("rejected", "not_ready")
+		return
+	end
+	local event = g.FindLedgerEventById and g.FindLedgerEventById(record, eventId)
+	if not event then
+		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	if g.IsEventSoftDeleted and g.IsEventSoftDeleted(record, event) then
+		ReportLogsStatus("rejected", "already_deleted")
+		return
+	end
+	if event.campaignId ~= record.currentCampaignId then
+		ReportLogsStatus("rejected", "stale_campaign")
+		return
+	end
+	local kind = rowData and rowData._eventKind or rowData and rowData.kind
+	if kind ~= "donation" and kind ~= "adjustment" and kind ~= "withdrawal" then
+		if event.type == (g.LEDGER_EVENT and g.LEDGER_EVENT.WITHDRAWAL) or event.type == "withdrawal" then
+			kind = "withdrawal"
+		elseif event.type == (g.LEDGER_EVENT and g.LEDGER_EVENT.ADJUSTMENT) or event.type == "CONSUMABLE_ADJUSTMENT" then
+			kind = "adjustment"
+		else
+			kind = "donation"
+		end
+	end
+	if kind ~= "withdrawal" and event.gsProductionCredit ~= true then
+		ReportLogsStatus("rejected", "not_credited")
+		return
+	end
+	local tKey = g.SoftDeleteTargetKey and g.SoftDeleteTargetKey(record, event.id)
+		or (g.ComputeTargetKey
+			and g.ComputeTargetKey(g.KIND and g.KIND.SOFT_DELETE_EVENT, event.id))
+	local headRev = tKey and record.operations and record.operations.heads
+		and record.operations.heads[tKey] or nil
+	local baseRev = headRev or record.datasetId
+	local contributor = (rowData and rowData._contributorName)
+		or (rowData and rowData.contributorKey)
+		or Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local quantityText = (rowData and rowData._quantityText) or tostring(event.quantity or "")
+	local itemText = (rowData and rowData._itemText) or tostring(event.itemId or "")
+	ClearEditSession()
+	ClearDeleteSession()
+	deleteSession = {
+		eventId = event.id,
+		kind = kind,
+		guildKey = ctx.guildKey,
+		datasetId = record.datasetId,
+		campaignId = record.currentCampaignId,
+		baseTargetRevision = baseRev,
+		contributor = contributor,
+		quantityText = quantityText,
+		itemText = itemText,
+	}
+	confirmGeneration = confirmGeneration + 1
+	local payload = {
+		confirmGeneration = confirmGeneration,
+		eventId = event.id,
+		kind = kind,
+		guildKey = ctx.guildKey,
+		datasetId = record.datasetId,
+		campaignId = record.currentCampaignId,
+		baseTargetRevision = baseRev,
+		contributor = contributor,
+		quantityText = quantityText,
+		itemText = itemText,
+	}
+	pendingConfirm = payload
+	local Dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local confirm = Loc("GUILD_SUPPLIES_LOGS_DELETE_CONFIRM",
+		"Delete this log entry?\nContributor: %s\nQuantity: %s\nItem: %s\n\nIt will leave goals, Rankings, and contribution totals. Original evidence is kept.")
+		:format(tostring(contributor), tostring(quantityText), tostring(itemText))
+	if not Dialogs or not Dialogs.Confirm then
+		CommitCapturedDelete(payload)
+		return
+	end
+	Dialogs:Confirm(confirm, Loc("GUILD_SUPPLIES_LOGS_DELETE_ACTION", "Delete"), function()
+		CommitCapturedDelete(payload)
+	end)
+end
+
 OpenEditContributorDialog = function(eventId, rowData)
 	if Caps().canEdit ~= true then
 		ReportLogsStatus("rejected", "unauthorized")
@@ -999,6 +1233,10 @@ OpenEditContributorDialog = function(eventId, rowData)
 	local event = g.FindLedgerEventById and g.FindLedgerEventById(record, eventId)
 	if not event then
 		ReportLogsStatus("rejected", "missing_event")
+		return
+	end
+	if g.IsEventSoftDeleted and g.IsEventSoftDeleted(record, event) then
+		ReportLogsStatus("rejected", "already_deleted")
 		return
 	end
 	if event.gsProductionCredit ~= true then
@@ -1438,6 +1676,18 @@ local function Definition()
 								key = "editAction",
 								kind = "action",
 								label = Loc("GUILD_SUPPLIES_LOGS_COL_EDIT", "Edit"),
+								showKey = "showEdit",
+								actionKey = "onEdit",
+								labelKey = "editLabel",
+								width = 70,
+							},
+							{
+								key = "deleteAction",
+								kind = "action",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_DELETE", "Delete"),
+								showKey = "showDelete",
+								actionKey = "onDelete",
+								labelKey = "deleteLabel",
 								width = 70,
 							},
 						},
@@ -1664,17 +1914,23 @@ Page.__sfTest = {
 		return rows, calls
 	end,
 	OpenEditContributorDialog = OpenEditContributorDialog,
+	OpenDeleteDialog = OpenDeleteDialog,
 	ResolveEditAttribution = ResolveEditAttribution,
 	GetEditSession = function()
 		return editSession
+	end,
+	GetDeleteSession = function()
+		return deleteSession
 	end,
 	GetPendingConfirm = function()
 		return pendingConfirm
 	end,
 	ClearEditSession = ClearEditSession,
+	ClearDeleteSession = ClearDeleteSession,
 	InvalidatePendingConfirm = InvalidatePendingConfirm,
 	CommitEditSession = CommitEditSession,
 	CommitCapturedEdit = CommitCapturedEdit,
+	CommitCapturedDelete = CommitCapturedDelete,
 	ConfirmAndSaveEdit = ConfirmAndSaveEdit,
 	EnsureEditRosterCache = EnsureEditRosterCache,
 	SetEditAttributionFromText = SetEditAttributionFromText,

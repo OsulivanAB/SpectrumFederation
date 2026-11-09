@@ -285,6 +285,14 @@ local function ValidateOperationsHeads(ops, record)
                 okKey = true
             end
         end
+        -- #465: soft-delete heads are likewise alias-aware.
+        if not okKey and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT)
+            and GS.SoftDeleteTargetKey and type(record) == "table" then
+            local canonKey = GS.SoftDeleteTargetKey(record, body.target, lookup)
+            if canonKey ~= nil and canonKey == targetKey then
+                okKey = true
+            end
+        end
         if not okKey then
             return false, "invalid_operations"
         end
@@ -757,6 +765,51 @@ local function ValidateGuildRecordStructure(guildKey, record)
             end
             if not IsFiniteNonnegInt(entry.renamedAt) then
                 return false, "invalid_campaign_name"
+            end
+        end
+    end
+    -- Optional #465 soft-deletion heads: absent on older saves.
+    if record.eventDeletions ~= nil then
+        if type(record.eventDeletions) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local delCount = 0
+        local maxDel = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        for eventId, entry in pairs(record.eventDeletions) do
+            delCount = delCount + 1
+            if delCount > maxDel then
+                return false, "full"
+            end
+            if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_record_shape"
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if not IsFiniteNonnegInt(entry.deletedAt) then
+                return false, "invalid_record_shape"
+            end
+            if entry.actorName ~= nil then
+                if type(entry.actorName) ~= "string" or entry.actorName == ""
+                    or #entry.actorName > 64 then
+                    return false, "invalid_record_shape"
+                end
+            end
+            if entry.actorGuid ~= nil then
+                if type(entry.actorGuid) ~= "string" or entry.actorGuid == ""
+                    or #entry.actorGuid > 64 then
+                    return false, "invalid_guid"
+                end
+            end
+            if entry.eventKind ~= nil
+                and entry.eventKind ~= "donation"
+                and entry.eventKind ~= "adjustment"
+                and entry.eventKind ~= "withdrawal" then
+                return false, "invalid_record_shape"
             end
         end
     end
