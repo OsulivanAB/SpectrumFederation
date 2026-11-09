@@ -35919,15 +35919,16 @@ do
             descSchema = row.body.schemaVersion
         end
     end
-    assertEq(descSchema, 6, "val: B1 descriptor schemaVersion 6 (#459)")
+    assertEq(descSchema, 7, "val: B1 descriptor schemaVersion 7 (#465)")
     -- Strict GG equality: older schemas are incompatible with local schema 7.
     local localSchema = tonumber(prov.schema)
     assertEq(localSchema, 7, "val: B1 local schema 7 (#465)")
-    assertTrue(localSchema ~= 5, "val: B1 old schema 5 incompatible with local 6")
-    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 6")
-    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 6")
-    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 6")
-    assertEq(tonumber(6) == localSchema, true, "val: B1 new/new compatible")
+    assertTrue(localSchema ~= 6, "val: B1 schema-6 peer incompatible with local 7")
+    assertTrue(localSchema ~= 5, "val: B1 old schema 5 incompatible with local 7")
+    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 7")
+    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 7")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 7")
+    assertEq(tonumber(7) == localSchema, true, "val: B1 new/new compatible")
     -- Persisted local schema stays 1 across the wire bump.
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
         "val: B1 persisted root schema unchanged")

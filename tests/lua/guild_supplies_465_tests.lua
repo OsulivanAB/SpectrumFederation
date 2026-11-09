@@ -1550,6 +1550,359 @@ do
     assertTrue(GS.IsEventSoftDeleted(record, "confirm-don"), "465: confirm delete applied")
 end
 
+do
+    -- #465 P1: multi-entry pending soft-delete redrive is non-recursive, attempt-
+    -- budgeted, and becomes idle after eligible drain.
+    local record = seedLiveCampaignWithItem(9220, 500)
+    local ctx = select(1, GS:GetCurrentContext())
+    record.operations.pending = record.operations.pending or {}
+    local count = 12
+    for i = 1, count do
+        local donId = string.format("sd-pend-don-%02d", i)
+        injectProductionDonation(record, {
+            id = donId, itemId = 9220, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        local id = string.format("sd-pend-del-%02d", i)
+        record.operations.pending[id] = {
+            id = id,
+            sender = "Alice-Garona",
+            reason = "item_negative",
+            body = {
+                schemaVersion = GS.OP_SCHEMA_VERSION,
+                id = id,
+                guildKey = ctx.guildKey,
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                kind = GS.KIND.SOFT_DELETE_EVENT,
+                target = donId,
+                value = {
+                    eventId = donId,
+                    eventKind = "donation",
+                    itemId = 9220,
+                    quantity = 2,
+                    attributed = "Alice-Garona",
+                    attributedGuid = "Player-1-Alice",
+                },
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                timestamp = world.time + i,
+                baseTargetRevision = record.datasetId,
+                basePolicyRevision = record.permission and record.permission.revisionId,
+                baseCampaignId = record.currentCampaignId,
+            },
+        }
+    end
+    if GS._ClearSoftDeleteRedriveContinuationForTest then
+        GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    end
+    local depth = 0
+    local maxDepth = 0
+    local entries = 0
+    local realRedrive = GS.RedrivePendingSoftDeletes
+    GS.RedrivePendingSoftDeletes = function(rec, o)
+        depth = depth + 1
+        entries = entries + 1
+        if depth > maxDepth then maxDepth = depth end
+        local a, b = realRedrive(rec, o)
+        depth = depth - 1
+        return a, b
+    end
+    local _, attempts1 = GS.RedrivePendingSoftDeletes(record, {
+        itemId = 9220, maxAttempts = 4,
+    })
+    assertEq(attempts1, 4, "465-P1: first slice capped at maxAttempts")
+    assertEq(maxDepth, 1, "465-P1: no recursive redrive depth got " .. tostring(maxDepth))
+    local slices = 0
+    while slices < 16 do
+        if not runOneDueTimer() then
+            break
+        end
+        slices = slices + 1
+    end
+    GS.RedrivePendingSoftDeletes = realRedrive
+    flushTimers()
+    local remaining = 0
+    for id, entry in pairs(record.operations.pending or {}) do
+        local body = entry and entry.body
+        if type(body) == "table" and body.kind == GS.KIND.SOFT_DELETE_EVENT then
+            remaining = remaining + 1
+        end
+    end
+    assertEq(remaining, 0, "465-P1: eligible pending soft-deletes drained")
+    assertTrue(slices >= 1, "465-P1: continuation yielded across slices got " .. tostring(slices))
+    assertTrue(#timers == 0, "465-P1: idle after drain")
+    for i = 1, count do
+        assertTrue(GS.IsEventSoftDeleted(record, string.format("sd-pend-don-%02d", i)),
+            "465-P1: donation soft-deleted " .. i)
+    end
+end
+
+do
+    -- #465 P2: retain accepted losing delete revisions without replacing the head.
+    local function makeDeleteBody(record, id, eventId, ts, actorName, actorGuid)
+        local ctx = select(1, GS:GetCurrentContext())
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.SOFT_DELETE_EVENT,
+            target = eventId,
+            value = {
+                eventId = eventId,
+                eventKind = "donation",
+                itemId = 9221,
+                quantity = 5,
+                attributed = "Alice-Garona",
+                attributedGuid = "Player-1-Alice",
+            },
+            actorGuid = actorGuid,
+            actorName = actorName,
+            timestamp = ts,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+    local function assertBothOrders(label, firstWinner)
+        local record = seedLiveCampaignWithItem(9221, 40)
+        injectProductionDonation(record, {
+            id = "lww-del-don", itemId = 9221, quantity = 5,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local early = makeDeleteBody(record, "del-lose-early", "lww-del-don",
+            world.time + 1, "Bob-Garona", "Player-1-Bob")
+        local late = makeDeleteBody(record, "del-win-late", "lww-del-don",
+            world.time + 10, "Carol-Garona", "Player-1-Carol")
+        local first = firstWinner and late or early
+        local second = firstWinner and early or late
+        assertEq(select(1, GS:AdmitRemoteOperation(first, {
+            sender = first.actorName, offlineRecord = record, preserveAttribution = true,
+        })), "accepted", label .. ": first admit")
+        local st2, r2 = GS:AdmitRemoteOperation(second, {
+            sender = second.actorName, offlineRecord = record, preserveAttribution = true,
+        })
+        assertTrue(st2 == "accepted" or st2 == "duplicate",
+            label .. ": second retained got " .. tostring(st2) .. "/" .. tostring(r2))
+        assertTrue(record.operations.records["del-lose-early"] ~= nil,
+            label .. ": losing op retained")
+        assertTrue(record.operations.records["del-win-late"] ~= nil,
+            label .. ": winning op retained")
+        local tKey = GS.SoftDeleteTargetKey(record, "lww-del-don")
+        assertEq(record.operations.heads[tKey], "del-win-late",
+            label .. ": head is winning revision")
+        local entry = record.eventDeletions and record.eventDeletions["lww-del-don"]
+        assertTrue(type(entry) == "table", label .. ": projection entry")
+        assertEq(entry.revisionId, "del-win-late", label .. ": projection winner")
+        assertEq(entry.actorName, "Carol-Garona", label .. ": winning actor")
+        -- Adoption completeness: replay loser under sourceAcceptedSet.
+        local stAd, rAd = GS:AdmitRemoteOperation(early, {
+            sender = "Bob-Garona", offlineRecord = record, preserveAttribution = true,
+            adoptionReplay = true,
+            sourceAcceptedSet = { ["del-lose-early"] = true },
+        })
+        assertTrue(stAd == "accepted" or stAd == "duplicate",
+            label .. ": adoption loser replay got " .. tostring(stAd) .. "/" .. tostring(rAd))
+        assertTrue(record.operations.records["del-lose-early"] ~= nil,
+            label .. ": loser survives adoption replay")
+        assertEq(record.operations.heads[tKey], "del-win-late",
+            label .. ": head unchanged after adoption loser")
+    end
+    assertBothOrders("465-P2-win-first", true)
+    assertBothOrders("465-P2-lose-first", false)
+end
+
+do
+    -- #465 P2: prior accepted correction retained inactive after delete-first delivery;
+    -- new local edits to deleted rows still rejected.
+    local record = seedLiveCampaignWithItem(9222, 40)
+    injectProductionDonation(record, {
+        id = "corr-del-don", itemId = 9222, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "corr-del-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-corr-del: prepare correction")
+    local corrSnap = select(1, GS._SnapshotPublicOp(corr))
+    local del = select(1, GS:NewSoftDeleteOperation("corr-del-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-corr-del: delete first")
+    assertTrue(GS.IsEventSoftDeleted(record, "corr-del-don"), "465-corr-del: deleted")
+    -- Delete-first: replaying the prior accepted correction must retain history.
+    corrSnap.baseTargetRevision = record.datasetId
+    local stCorr, rCorr = GS:AdmitRemoteOperation(corrSnap, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertTrue(stCorr == "accepted" or stCorr == "duplicate",
+        "465-corr-del: prior correction retained got " .. tostring(stCorr) .. "/" .. tostring(rCorr))
+    assertTrue(record.operations.records[corr.id] ~= nil,
+        "465-corr-del: correction body in accepted history")
+    -- Soft-delete still excludes accounting; correction must not reactivate credit.
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9222), 0,
+        "465-corr-del: Bob credit stays excluded")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9222), 0,
+        "465-corr-del: Alice credit stays excluded")
+    local localCorr, localSt, localReason = GS:NewContributorCorrectionOperation(
+        "corr-del-don", "Carol-Garona", "Player-1-Carol")
+    assertNil(localCorr, "465-corr-del: new local edit rejected")
+    assertEq(localReason, "already_deleted",
+        "465-corr-del: local reason already_deleted got " .. tostring(localReason))
+    -- Adoption replay of the same prior correction remains complete.
+    local stAd, rAd = GS:AdmitRemoteOperation(corrSnap, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        adoptionReplay = true,
+        sourceAcceptedSet = { [corr.id] = true },
+    })
+    assertTrue(stAd == "accepted" or stAd == "duplicate",
+        "465-corr-del: adoption correction replay got " .. tostring(stAd) .. "/" .. tostring(rAd))
+end
+
+do
+    -- Correction-then-delete order: both survive; deletion wins projection.
+    local record = seedLiveCampaignWithItem(9223, 40)
+    injectProductionDonation(record, {
+        id = "corr-then-del", itemId = 9223, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "corr-then-del", "Bob-Garona", "Player-1-Bob"))
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-corr-then: correction")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9223), 4,
+        "465-corr-then: Bob credited before delete")
+    local del = select(1, GS:NewSoftDeleteOperation("corr-then-del"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-corr-then: delete")
+    assertTrue(record.operations.records[corr.id] ~= nil, "465-corr-then: correction retained")
+    assertTrue(record.operations.records[del.id] ~= nil, "465-corr-then: delete retained")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", 9223), 0,
+        "465-corr-then: deletion wins accounting")
+end
+
+do
+    -- Alias + reload reconstruction: soft-delete bound to canonical id survives
+    -- alias lookup and runtime reload projection rebuild.
+    local record = seedLiveCampaignWithItem(9224, 40)
+    injectProductionDonation(record, {
+        id = "alias-canon", itemId = 9224, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local cfg = record.accounting._consumables
+    cfg.creditEventAliases = cfg.creditEventAliases or {}
+    cfg.creditEventAliases["alias-alt"] = "alias-canon"
+    cfg.txnRegistry = cfg.txnRegistry or {}
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = "alias-alt", eventId = "alias-canon", itemId = 9224, quantity = 3,
+    }
+    local del = select(1, GS:NewSoftDeleteOperation("alias-alt"))
+    assertTrue(del ~= nil, "465-alias: prepare via alias")
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-alias: apply")
+    assertTrue(GS.IsEventSoftDeleted(record, "alias-canon"), "465-alias: canonical deleted")
+    assertTrue(GS.IsEventSoftDeleted(record, "alias-alt"), "465-alias: alias deleted")
+    -- Simulate /reload: clear runtime caches and rebuild projections.
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(record, "alias-canon"),
+        "465-alias: canonical deleted after reload rebuild")
+    assertTrue(GS.IsEventSoftDeleted(record, "alias-alt"),
+        "465-alias: alias deleted after reload rebuild")
+    assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", 9224), 0,
+        "465-alias: credit excluded after reload")
+end
+
+do
+    -- Cross-event concurrent deletes (assessment #4): two +10 donations, −10
+    -- adjustment, independent deletions of different donations. Pending-on-floor
+    -- alone leaves peers idle with different effective deleted sets. This test
+    -- demonstrates the divergence; product alternatives are reported in the PR
+    -- rather than silently changing permanent-deletion / balance / authority rules.
+    local function seedConflictPeer(itemId)
+        local record = seedLiveCampaignWithItem(itemId, 100)
+        injectProductionDonation(record, {
+            id = "xevt-d1", itemId = itemId, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        injectProductionDonation(record, {
+            id = "xevt-d2", itemId = itemId, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        injectProductionAdjustment(record, {
+            id = "xevt-adj", itemId = itemId, quantity = -10,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        })
+        return record
+    end
+    local peerA = seedConflictPeer(9225)
+    local delA = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(delA), "accepted", "465-xevt: A deletes D1")
+    local snapA = select(1, GS._SnapshotPublicOp(delA))
+
+    local peerB = seedConflictPeer(9225)
+    local delB = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
+    assertEq(GS:ApplyStagedConfigOperation(delB), "accepted", "465-xevt: B deletes D2")
+    local snapB = select(1, GS._SnapshotPublicOp(delB))
+
+    local function rebind(body, record)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = record.datasetId
+        out.campaignId = record.currentCampaignId
+        out.baseCampaignId = record.currentCampaignId
+        out.basePolicyRevision = record.permission and record.permission.revisionId
+        out.baseTargetRevision = record.datasetId
+        return out
+    end
+
+    local stAB, rAB = GS:AdmitRemoteOperation(rebind(snapB, peerA), {
+        sender = "Alice-Garona", offlineRecord = peerA, preserveAttribution = true,
+    })
+    local stBA, rBA = GS:AdmitRemoteOperation(rebind(snapA, peerB), {
+        sender = "Alice-Garona", offlineRecord = peerB, preserveAttribution = true,
+    })
+    flushTimers()
+    assertEq(stAB, "pending",
+        "465-xevt: A keeps B's D2 delete pending got " .. tostring(stAB) .. "/" .. tostring(rAB))
+    assertEq(stBA, "pending",
+        "465-xevt: B keeps A's D1 delete pending got " .. tostring(stBA) .. "/" .. tostring(rBA))
+    assertTrue(GS.IsEventSoftDeleted(peerA, "xevt-d1"), "465-xevt: A effective {D1}")
+    assertTrue(not GS.IsEventSoftDeleted(peerA, "xevt-d2"), "465-xevt: A D2 not effective")
+    assertTrue(GS.IsEventSoftDeleted(peerB, "xevt-d2"), "465-xevt: B effective {D2}")
+    assertTrue(not GS.IsEventSoftDeleted(peerB, "xevt-d1"), "465-xevt: B D1 not effective")
+    -- Opposite delivery order of the same public bodies yields the same
+    -- asymmetric pending disposition (still divergent across peers).
+    local peerA2 = seedConflictPeer(9226)
+    local delA2 = select(1, GS:NewSoftDeleteOperation("xevt-d1"))
+    assertEq(GS:ApplyStagedConfigOperation(delA2), "accepted", "465-xevt2: A deletes D1")
+    local snapA2 = select(1, GS._SnapshotPublicOp(delA2))
+    local peerB2 = seedConflictPeer(9226)
+    local delB2 = select(1, GS:NewSoftDeleteOperation("xevt-d2"))
+    assertEq(GS:ApplyStagedConfigOperation(delB2), "accepted", "465-xevt2: B deletes D2")
+    local snapB2 = select(1, GS._SnapshotPublicOp(delB2))
+    -- Deliver A→B first this time, then B→A.
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapA2, peerB2), {
+        sender = "Alice-Garona", offlineRecord = peerB2, preserveAttribution = true,
+    })), "pending", "465-xevt2: B receives D1 delete pending")
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(snapB2, peerA2), {
+        sender = "Alice-Garona", offlineRecord = peerA2, preserveAttribution = true,
+    })), "pending", "465-xevt2: A receives D2 delete pending")
+    flushTimers()
+    assertTrue(GS.IsEventSoftDeleted(peerA2, "xevt-d1") and not GS.IsEventSoftDeleted(peerA2, "xevt-d2"),
+        "465-xevt2: A still effective {D1} after opposite order")
+    assertTrue(GS.IsEventSoftDeleted(peerB2, "xevt-d2") and not GS.IsEventSoftDeleted(peerB2, "xevt-d1"),
+        "465-xevt2: B still effective {D2} after opposite order")
+    -- Numeric totals can match (both 0) while deleted sets differ — assert sets.
+    assertEq(
+        GS.PersonalContributorItemTotal(peerA, "Alice-Garona", "Player-1-Alice", 9225),
+        GS.PersonalContributorItemTotal(peerB, "Alice-Garona", "Player-1-Alice", 9225),
+        "465-xevt: numeric totals can agree while sets diverge")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

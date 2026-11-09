@@ -8502,6 +8502,86 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 return "accepted", nil
             end
         end
+        -- #465: retain LWW-losing soft-deletes without replacing the winning head.
+        -- Ordinary authenticated gossip and adoption keep prior accepted evidence
+        -- under capacity/export rules (mirrors stale_credit retention).
+        if stored.kind == GS.KIND.SOFT_DELETE_EVENT
+            and classReason == "stale_delete" then
+            local allowRetain = true
+            if admissionCtx.adoptionReplay then
+                allowRetain = type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+            end
+            if allowRetain then
+                local scopeEvent = nil
+                if GS.ValidateSoftDeleteScope then
+                    local scopeOk, scopeErr, scopedEvent = GS.ValidateSoftDeleteScope(
+                        record, stored, {
+                            allowMissingEvent = true,
+                            remoteAdmit = true,
+                        })
+                    if not scopeOk then
+                        if scopeErr == "pending_event" or scopeErr == "missing_event" then
+                            local stPend, reasonPend = "pending", scopeErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, scopeErr, admissionCtx.sender)
+                            end
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", scopeErr or classReason or "stale_delete"
+                    end
+                    scopeEvent = scopedEvent
+                end
+                if scopeEvent and GS.ValidateSoftDeleteEventEligibility then
+                    local eligOk, eligErr = GS.ValidateSoftDeleteEventEligibility(
+                        record, stored, scopeEvent)
+                    if not eligOk then
+                        if eligErr == "not_credited" then
+                            local stPend, reasonPend = "pending", eligErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, eligErr, admissionCtx.sender)
+                            end
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", eligErr or "invalid_event"
+                    end
+                end
+                local newlyRetained = not (ops.records and ops.records[stored.id])
+                if newlyRetained then
+                    if GS._AcceptedCount
+                        and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                        return "rejected", "full"
+                    end
+                    if GS._StoreAccepted then
+                        -- nil targetKey: keep current winning delete head.
+                        GS._StoreAccepted(ops, stored, nil)
+                    end
+                end
+                if GS.InvalidateEventDeletionProjection then
+                    GS.InvalidateEventDeletionProjection(record)
+                end
+                if GS.EnsureEventDeletionProjection then
+                    GS.EnsureEventDeletionProjection(record, nil)
+                end
+                if newlyRetained and not admissionCtx.adoptionReplay
+                    and GS._NotifyLocalDurableChange then
+                    GS._NotifyLocalDurableChange("remote-delete-history")
+                end
+                return "accepted", nil
+            end
+        end
         return "rejected", classReason or "stale_base"
     end
     if class == "conflict" then
@@ -8724,10 +8804,14 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             if GS.EnsureCreditCorrectionProjection then
                 GS.EnsureCreditCorrectionProjection(record, nil)
             end
-            if not admissionCtx.adoptionReplay then
+            -- Nested soft-delete redrive must not re-enter the full pending scan
+            -- on the same UI callback (#465 P1). Top-level admits coalesce a
+            -- bounded continuation; _softDeleteRedrive skips the wake entirely.
+            if not admissionCtx.adoptionReplay and not admissionCtx._softDeleteRedrive then
                 if GS.RedrivePendingSoftDeletes then
                     GS.RedrivePendingSoftDeletes(record, {
                         itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
                     })
                 end
                 if GS.RedrivePendingContributorCorrections then
@@ -8749,9 +8833,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 elseif GS.EnsureCreditCorrectionProjection then
                     GS.EnsureCreditCorrectionProjection(record, nil)
                 end
-                if GS.RedrivePendingSoftDeletes then
+                if not admissionCtx._softDeleteRedrive
+                    and GS.RedrivePendingSoftDeletes then
                     GS.RedrivePendingSoftDeletes(record, {
                         itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
                     })
                 end
             elseif GS.EnsureCreditCorrectionProjection then

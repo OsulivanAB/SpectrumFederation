@@ -2675,10 +2675,23 @@ end
 local creditRedriveDepth = 0
 local creditRedriveContinuation = setmetatable({}, { __mode = "k" })
 
+-- #465 soft-delete pending redrive: non-reentrant, coalesced After(0) continuation
+-- with attempt budget. Nested admits must not rescan the full pending queue on
+-- the same UI callback (Codex P1 / discussion_r4516516470).
+local softDeleteRedriveDepth = 0
+local softDeleteRedriveContinuation = setmetatable({}, { __mode = "k" })
+
 --- Test seam: drop paced redrive continuation/index for a record (#459 PM).
 function GS._ClearCreditRedriveContinuationForTest(record)
     if type(record) == "table" then
         creditRedriveContinuation[record] = nil
+    end
+end
+
+--- Test seam: drop soft-delete redrive continuation for a record (#465).
+function GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    if type(record) == "table" then
+        softDeleteRedriveContinuation[record] = nil
     end
 end
 
@@ -9538,12 +9551,16 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     if not eligOk then
         return false, eligErr or "invalid_event"
     end
-    -- #465: deletion wins over contributor editing.
-    if GS.EnsureEventDeletionProjection then
-        GS.EnsureEventDeletionProjection(record, nil)
-    end
-    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
-        return false, "already_deleted"
+    -- #465: deletion wins over new local contributor editing. Remote/adoption
+    -- replay of a prior accepted correction must retain inactive history when
+    -- the delete already landed (delete-first delivery); do not reactivate credit.
+    if opts.localPrepare then
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+            return false, "already_deleted"
+        end
     end
     local isDonation = IsDonationLedgerEvent(event)
     local isAdjustment = IsAdjustmentLedgerEvent(event)
@@ -9870,7 +9887,18 @@ local function EventDeletionDependencyStamp(record)
     if type(live) == "table" then
         ledgerN = #live
     end
+    -- Alias map size so late durable bindings force a rebuild that reindexes
+    -- soft-deleted canonical ids under their aliases (#465).
+    local aliasN = 0
+    local aliases = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    if type(aliases) == "table" then
+        for _ in pairs(aliases) do
+            aliasN = aliasN + 1
+        end
+    end
     return tostring(gen) .. ":" .. tostring(orderN) .. ":" .. tostring(ledgerN)
+        .. ":" .. tostring(aliasN)
 end
 
 --- Operation-head key for soft-delete-event, bound to the canonical event id.
@@ -9957,6 +9985,19 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
             end
             if wins then
                 map[eventId] = SoftDeleteHeadEntry(extraOp)
+            end
+        end
+    end
+    -- Index durable creditEventAliases onto deleted canonical ids so alias /
+    -- reobservation lookups stay pure map reads on the hot path (#465).
+    local aliases = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    if type(aliases) == "table" then
+        for alias, canon in pairs(aliases) do
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= ""
+                and type(map[canon]) == "table" then
+                map[alias] = map[canon]
             end
         end
     end
@@ -10309,67 +10350,250 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     return true, "accepted"
 end
 
+local function IsFullSoftDeleteRedriveWake(opts)
+    return type(opts) == "table" and opts.eventId == nil and opts.itemId == nil
+end
+
+local function SoftDeleteRedriveMatch(record, body, waveOpts)
+    if type(body) ~= "table"
+        or body.kind ~= (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+        return false
+    end
+    local eventIdFilter = waveOpts and waveOpts.eventId
+    local itemIdFilter = waveOpts and tonumber(waveOpts.itemId)
+    local matchEvent = true
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        local target = body.target or (body.value and body.value.eventId)
+        local canonOpts = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, eventIdFilter)
+        local canonTarget = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, target)
+        matchEvent = (canonOpts ~= nil and canonTarget ~= nil and canonOpts == canonTarget)
+            or eventIdFilter == target
+    end
+    local matchItem = true
+    if itemIdFilter then
+        local itemId = body.value and tonumber(body.value.itemId)
+        matchItem = itemId == nil or itemId == itemIdFilter
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" and itemIdFilter then
+        return matchEvent or matchItem
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        return matchEvent
+    end
+    if itemIdFilter then
+        return matchItem
+    end
+    return true
+end
+
+local function MergeSoftDeleteRedriveWake(record, opts)
+    local cont = softDeleteRedriveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {
+            opts = opts or {},
+            scheduled = false,
+            followUpWake = false,
+            fullWake = IsFullSoftDeleteRedriveWake(opts),
+        }
+        if cont.fullWake then
+            cont.opts = {
+                maxAttempts = opts and opts.maxAttempts or nil,
+            }
+        end
+        softDeleteRedriveContinuation[record] = cont
+        return cont, cont.fullWake
+    end
+    local prev = cont.opts or {}
+    local merged = {}
+    for k, v in pairs(prev) do
+        merged[k] = v
+    end
+    local broadened = false
+    local externalWake = type(opts) == "table"
+    if externalWake then
+        if IsFullSoftDeleteRedriveWake(opts) then
+            if merged.eventId ~= nil or merged.itemId ~= nil or not cont.fullWake then
+                broadened = true
+            end
+            merged.eventId = nil
+            merged.itemId = nil
+            cont.fullWake = true
+        elseif cont.fullWake then
+            merged.eventId = nil
+            merged.itemId = nil
+        else
+            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+                merged.eventId = nil
+                broadened = true
+            elseif opts.eventId and not prev.eventId then
+                merged.eventId = opts.eventId
+            end
+            if opts.itemId and prev.itemId
+                and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+                merged.itemId = nil
+                merged.eventId = nil
+                broadened = true
+            elseif opts.itemId and not (prev.eventId or prev.itemId) then
+                merged.itemId = opts.itemId
+            elseif opts.itemId then
+                merged.itemId = opts.itemId
+            end
+        end
+        if opts.maxAttempts then
+            merged.maxAttempts = opts.maxAttempts
+        end
+    end
+    cont.opts = merged
+    if broadened then
+        cont.snapshot = nil
+        cont.index = nil
+    end
+    if externalWake and (type(cont.snapshot) == "table" or softDeleteRedriveDepth > 0
+        or cont.scheduled) then
+        cont.followUpWake = true
+    end
+    return cont, broadened
+end
+
+local function ScheduleSoftDeleteRedriveContinuation(record, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = MergeSoftDeleteRedriveWake(record, opts)
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = softDeleteRedriveContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        if GS.RedrivePendingSoftDeletes then
+            GS.RedrivePendingSoftDeletes(record, nil)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+    else
+        run()
+    end
+end
+
 --- Redrive pending soft-delete ops after ledger/floor changes (#465).
+-- Non-reentrant: nested admits coalesce into a bounded After(0) continuation
+-- with attempt budget. Retained senders are reauthenticated through ordinary
+-- AdmitRemoteOperation. Floor-blocked entries stay pending and the wave becomes
+-- idle once the snapshot drains (external wakes resume).
+-- @return promotedCount, attemptCount
 function GS.RedrivePendingSoftDeletes(record, opts)
-    opts = opts or {}
+    if type(opts) == "string" then
+        opts = { eventId = opts }
+    end
     if type(record) ~= "table" or type(record.operations) ~= "table" then
-        return 0
+        return 0, 0
+    end
+    if softDeleteRedriveDepth > 0 then
+        ScheduleSoftDeleteRedriveContinuation(record, opts)
+        return 0, 0
     end
     local ops = record.operations
     local pending = ops.pending
     if type(pending) ~= "table" then
-        return 0
+        return 0, 0
+    end
+    local cont = MergeSoftDeleteRedriveWake(record, opts)
+    local waveOpts = cont.opts or opts or {}
+    local snapshot = cont.snapshot
+    local startIndex = tonumber(cont.index) or 1
+    if type(snapshot) ~= "table" then
+        local ids = {}
+        for id, entry in pairs(pending) do
+            local body = entry and entry.body
+            if SoftDeleteRedriveMatch(record, body, waveOpts) then
+                local reason = entry.reason
+                if reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    ids[#ids + 1] = id
+                end
+            end
+        end
+        table.sort(ids)
+        snapshot = ids
+        startIndex = 1
+        cont.snapshot = snapshot
+        cont.index = 1
+        cont.followUpWake = false
     end
     local promoted = 0
-    local ids = {}
-    for id, entry in pairs(pending) do
-        local body = entry and entry.body
-        if type(body) == "table"
-            and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
-            local match = true
-            if type(opts.eventId) == "string" and opts.eventId ~= "" then
-                local target = body.target or (body.value and body.value.eventId)
-                local canonOpts = GS.CanonicalCreditEventId(record, opts.eventId)
-                local canonTarget = GS.CanonicalCreditEventId(record, target)
-                if canonOpts ~= canonTarget and opts.eventId ~= target then
-                    match = false
-                end
-            end
-            if match and type(opts.itemId) == "number" then
-                local itemId = body.value and tonumber(body.value.itemId)
-                if itemId and itemId ~= opts.itemId then
-                    match = false
-                end
-            end
-            if match then
-                ids[#ids + 1] = id
-            end
+    local attempts = 0
+    local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
+    softDeleteRedriveDepth = softDeleteRedriveDepth + 1
+    GS._softDeleteRedriveAdmitActive = true
+    local i = startIndex
+    while i <= #snapshot do
+        if attempts >= maxAttempts then
+            break
         end
-    end
-    for i = 1, #ids do
-        local id = ids[i]
+        attempts = attempts + 1
+        local id = snapshot[i]
+        i = i + 1
         local entry = pending[id]
         local body = entry and entry.body
-        if type(body) == "table" then
-            local sender = entry.sender
-            if GS.AdmitRemoteOperation and type(sender) == "string" and sender ~= "" then
-                pending[id] = nil
-                local st = select(1, GS:AdmitRemoteOperation(body, {
-                    sender = sender,
-                    localWrite = false,
-                    offlineRecord = opts.offlineRecord,
-                    _softDeleteRedrive = true,
-                }))
-                if st == "accepted" or st == "duplicate" then
+        if type(body) ~= "table" then
+            -- Already removed or malformed; attempt still counts.
+        elseif type(entry.sender) ~= "string" or entry.sender == "" then
+            -- Leave pending until an authenticated sender is known.
+        else
+            local alreadyAccepted = ops.records and ops.records[id]
+            if not alreadyAccepted and GS._AcceptedCount
+                and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
+                -- Capacity full: leave pending.
+            elseif type(GS.AdmitRemoteOperation) == "function" then
+                local okAdmit, status = pcall(function()
+                    return GS:AdmitRemoteOperation(body, {
+                        sender = entry.sender,
+                        offlineRecord = waveOpts.offlineRecord or opts and opts.offlineRecord,
+                        preserveAttribution = true,
+                        _softDeleteRedrive = true,
+                    })
+                end)
+                if not okAdmit then
+                    -- Leave pending; surface via next wake.
+                elseif status == "accepted" or status == "duplicate" then
                     promoted = promoted + 1
-                elseif st == "pending" and type(pending[id]) ~= "table" then
-                    -- Re-queue if admit returned pending without re-storing.
-                    pending[id] = entry
                 end
+                -- Floor-blocked / missing-event pending stays in ops.pending via
+                -- Admit; wave continues and becomes idle after the snapshot.
             end
         end
     end
-    return promoted
+    GS._softDeleteRedriveAdmitActive = false
+    softDeleteRedriveDepth = softDeleteRedriveDepth - 1
+    if i <= #snapshot then
+        cont.snapshot = snapshot
+        cont.index = i
+        cont.opts = waveOpts
+        cont.scheduled = false
+        ScheduleSoftDeleteRedriveContinuation(record, nil)
+    else
+        local followUp = cont.followUpWake == true
+        local wasFull = cont.fullWake == true
+        local retainedOpts = waveOpts
+        if wasFull and not followUp then
+            retainedOpts = { maxAttempts = waveOpts and waveOpts.maxAttempts or nil }
+        end
+        softDeleteRedriveContinuation[record] = {
+            opts = retainedOpts,
+            scheduled = false,
+            followUpWake = false,
+            fullWake = followUp and wasFull or false,
+        }
+        if followUp then
+            ScheduleSoftDeleteRedriveContinuation(record, wasFull and {} or nil)
+        end
+    end
+    return promoted, attempts
 end
 
 -- Test helper: inject a direct observation without bank scanning (#388 staged only).
