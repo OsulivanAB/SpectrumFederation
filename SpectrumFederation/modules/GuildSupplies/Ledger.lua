@@ -5946,6 +5946,11 @@ local function PruneUnusedCreditEventAliases(record, protectKeys)
     return removed
 end
 
+-- Public for alias-page capacity reclaim before install (#459 discussion_r4507532462).
+function GS.PruneUnusedCreditEventAliases(record, protectKeys)
+    return PruneUnusedCreditEventAliases(record, protectKeys)
+end
+
 --- Write alias→canonical into the durable map without touching ops generation.
 -- Reclaims unused bindings at capacity before failing so retained corrections
 -- keep durable alias ownership (#459 G1).
@@ -6092,14 +6097,16 @@ function GS.ReconstructCreditEventAliasesFromOps(record)
         return
     end
     -- Shared exact-id presence set (one live + one archive bounded pass).
+    -- Include withdrawal headroom so mixed-list donations past the donation
+    -- ceiling remain visible (#459 discussion_r4507532464).
     local present = {}
     local ledgerVisits = 0
     local lists = CreditEventLists(record)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
-                or (GS.MAX_ARCHIVED_EVENTS or 4096))
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
             for i = 1, limit do
                 ledgerVisits = ledgerVisits + 1
                 local event = list[i]
@@ -6227,8 +6234,10 @@ function GS.FindLedgerEventById(record, eventId)
     for li = 1, #lists do
         local list = lists[li]
         if type(list) == "table" then
-            local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
-                or (GS.MAX_ARCHIVED_EVENTS or 4096))
+            -- Withdrawal headroom matches mixed-list ownership/reconstruction
+            -- bounds (#459 discussion_r4507532464).
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
             for i = 1, limit do
                 chargeVisit()
                 local event = list[i]
@@ -6252,8 +6261,8 @@ function GS.FindLedgerEventById(record, eventId)
         for li = 1, #lists do
             local list = lists[li]
             if type(list) == "table" then
-                local limit = math.min(#list, (li == 1 and (GS.MAX_LEDGER_EVENTS or 4096))
-                    or (GS.MAX_ARCHIVED_EVENTS or 4096))
+                local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                    or MaxArchivedLedgerScan())
                 for i = 1, limit do
                     chargeVisit()
                     local event = list[i]
@@ -6267,8 +6276,91 @@ function GS.FindLedgerEventById(record, eventId)
     return nil
 end
 
+--- One bounded live+archive (+ registry/durable alias) index for a validation
+-- pass. Replaces per-head FindLedgerEventById rescans during cold ops head
+-- validation (#459 discussion_r4507527088).
+-- @return table lookup { byId, primaryByAlias, visits }
+function GS.BuildCreditCanonicalLookup(record)
+    local byId = {}
+    local visits = 0
+    if type(record) ~= "table" then
+        GS._creditCanonicalLookupVisits = 0
+        return { byId = byId, primaryByAlias = {}, visits = 0 }
+    end
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                visits = visits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and event.id ~= "" then
+                    byId[event.id] = event.id
+                    if type(event.txnId) == "string" and event.txnId ~= "" then
+                        byId[event.txnId] = event.id
+                    end
+                end
+            end
+        end
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    local primaryByAlias = BuildTxnRegistryPrimaryIndex(cfg)
+    local map = cfg and cfg.creditEventAliases
+    if type(map) == "table" then
+        local scanned = 0
+        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        for alias, canon in pairs(map) do
+            scanned = scanned + 1
+            if scanned > scanCap then
+                break
+            end
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                primaryByAlias[alias] = canon
+            end
+        end
+    end
+    GS._creditCanonicalLookupVisits = visits
+    return { byId = byId, primaryByAlias = primaryByAlias, visits = visits }
+end
+
+local function CanonicalFromCreditLookup(lookup, eventId)
+    if type(lookup) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return eventId
+    end
+    local byId = lookup.byId
+    if type(byId) == "table" and type(byId[eventId]) == "string" then
+        return byId[eventId]
+    end
+    local primaryByAlias = lookup.primaryByAlias
+    local cur = eventId
+    local seen = { [eventId] = true }
+    for _ = 1, 8 do
+        local nxt = type(primaryByAlias) == "table" and primaryByAlias[cur] or nil
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            break
+        end
+        if seen[nxt] then
+            break
+        end
+        seen[nxt] = true
+        cur = nxt
+        if type(byId) == "table" and type(byId[cur]) == "string" then
+            return byId[cur]
+        end
+    end
+    return cur
+end
+
 --- Canonical ledger event id for correction targets (alias-aware).
-function GS.CanonicalCreditEventId(record, eventId)
+-- Optional `lookup` from BuildCreditCanonicalLookup avoids ledger rescans.
+function GS.CanonicalCreditEventId(record, eventId, lookup)
+    if type(lookup) == "table" then
+        return CanonicalFromCreditLookup(lookup, eventId) or eventId
+    end
     local event = GS.FindLedgerEventById(record, eventId)
     if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
         return event.id
@@ -6280,11 +6372,12 @@ end
 --- Operation-head key for correct-contributor, bound to the canonical event id.
 -- Admission, apply, and prepare must share this key so alias-targeted ops
 -- LWW against the same head as locally prepared canonical corrections (#459).
-function GS.CorrectionTargetKey(record, target)
+-- Optional `lookup` enables one pass-local index for cold validation.
+function GS.CorrectionTargetKey(record, target, lookup)
     if type(target) ~= "string" or target == "" then
         return nil
     end
-    local canonical = GS.CanonicalCreditEventId(record, target) or target
+    local canonical = GS.CanonicalCreditEventId(record, target, lookup) or target
     if not GS.ComputeTargetKey then
         return "credit:" .. canonical
     end

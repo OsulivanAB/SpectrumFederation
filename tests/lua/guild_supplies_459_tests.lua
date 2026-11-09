@@ -12139,7 +12139,523 @@ do
         "459-FW: recovery find visits bounded")
 end
 
+do
+    -- Cold ops validation: one pass-local canonical lookup instead of per-head
+    -- ledger rescans (#459 discussion_r4507527088).
+    local LEDGER_N = 400
+    local HEAD_N = 48
+    local record = seedLiveCampaignWithItem(9991, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    record.accounting._consumableEvents = {}
+    local list = record.accounting._consumableEvents
+    for i = 1, LEDGER_N do
+        list[#list + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = string.format("ctx:cv-don-%04d", i),
+            txnId = string.format("ctx:cv-don-%04d", i),
+            itemId = 9991, quantity = 1,
+            generation = 1, timestamp = world.time + i,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = record.currentCampaignId, datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    local cfg = record.accounting._consumables
+    cfg.creditEventAliases = {}
+    cfg.txnRegistry = {}
+    record.operations.records = record.operations.records or {}
+    record.operations.order = record.operations.order or {}
+    record.operations.heads = {}
+    for i = 1, HEAD_N do
+        local canon = string.format("ctx:cv-don-%04d", LEDGER_N - HEAD_N + i)
+        local alias = string.format("ctx:cv-alias-%04d", i)
+        cfg.creditEventAliases[alias] = canon
+        local opId = string.format("cv-corr-%04d", i)
+        record.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9991,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + i,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        record.operations.order[#record.operations.order + 1] = opId
+        record.operations.heads["credit:" .. canon] = opId
+    end
+    if GS._ClearOpsValidationCache then
+        GS._ClearOpsValidationCache(record.operations)
+    end
+    GS._ledgerEventIdLookupVisits = 0
+    GS._creditCanonicalLookupVisits = -1
+    local ok, err = GS._ValidateGuildRecordStructure(ctx.guildKey, record)
+    assertTrue(ok, "459-CV: cold validate ok got " .. tostring(err))
+    local findVisits = tonumber(GS._ledgerEventIdLookupVisits) or 0
+    local lookupVisits = tonumber(GS._creditCanonicalLookupVisits) or 0
+    local oldProduct = HEAD_N * LEDGER_N
+    assertTrue(lookupVisits > 0 and lookupVisits <= LEDGER_N + 8,
+        "459-CV: one bounded lookup visits=" .. tostring(lookupVisits)
+            .. " ledger=" .. tostring(LEDGER_N))
+    assertTrue(findVisits * 4 < oldProduct,
+        "459-CV: find visits do not multiply by heads×ledger find="
+            .. tostring(findVisits) .. " product=" .. tostring(oldProduct))
+    assertTrue(findVisits < LEDGER_N,
+        "459-CV: cold heads avoid full per-head rescans find="
+            .. tostring(findVisits))
+end
+
+do
+    -- Alias-page provider admission reclaims unused slots while protecting
+    -- incoming + retained dependencies; rejected pages never mutate
+    -- (#459 discussion_r4507532462).
+    local function withCurrentRecord(target, fn)
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        local saved = GS._root and GS._root.guilds and GS._root.guilds[gk]
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = target
+        end
+        local ok, a, b, c = pcall(fn)
+        if type(GS._root) == "table" and type(GS._root.guilds) == "table" then
+            GS._root.guilds[gk] = saved
+        end
+        if not ok then error(a) end
+        return a, b, c
+    end
+    local function providerAliasPage(target, pageId, pageBody, sender)
+        return withCurrentRecord(target, function()
+            GS:EnsureGossipProvider()
+            local entry = GG.GetProvider(GS.PROVIDER_ID)
+            return entry.api.ValidateAndApply({
+                id = pageId,
+                versionFp = GS.ContentFingerprint(pageBody),
+                body = pageBody,
+            }, { sender = sender })
+        end)
+    end
+    local function aliasCount(map)
+        local n = 0
+        if type(map) ~= "table" then return 0 end
+        for _ in pairs(map) do n = n + 1 end
+        return n
+    end
+    local function snapshotMap(map)
+        local snap = {}
+        if type(map) ~= "table" then return snap end
+        for k, v in pairs(map) do snap[k] = v end
+        return snap
+    end
+    local function mapsEqual(a, b)
+        for k, v in pairs(a) do if b[k] ~= v then return false end end
+        for k, v in pairs(b) do if a[k] ~= v then return false end end
+        return true
+    end
+
+    -- Reclaimable full map + multi-binding incoming page.
+    local record = seedLiveCampaignWithItem(9992, 80)
+    local ctx = select(1, GS:GetCurrentContext())
+    local don = injectProductionDonation(record, {
+        id = "ctx:ar-canon", itemId = 9992, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    don.txnId = "ctx:ar-canon"
+    local cfg = record.accounting._consumables
+    cfg.txnRegistry = {}
+    local maxA = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    cfg.creditEventAliases = {}
+    -- One retained required binding + unused fillers to capacity.
+    cfg.creditEventAliases["ctx:ar-keep"] = "ctx:ar-canon"
+    local keepOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "ar-keep-corr",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:ar-keep",
+        value = {
+            eventId = "ctx:ar-keep", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9992,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    record.operations.records["ar-keep-corr"] = keepOp
+    record.operations.order[#record.operations.order + 1] = "ar-keep-corr"
+    record.operations.heads[GS.CorrectionTargetKey(record, "ctx:ar-canon")] = "ar-keep-corr"
+    local filled = aliasCount(cfg.creditEventAliases)
+    local j = 1
+    while filled < maxA do
+        local junk = string.format("ctx:ar-junk-%04d", j)
+        if cfg.creditEventAliases[junk] == nil then
+            cfg.creditEventAliases[junk] = string.format("ctx:ar-junk-canon-%04d", j)
+            filled = filled + 1
+        end
+        j = j + 1
+    end
+    assertEq(aliasCount(cfg.creditEventAliases), maxA, "459-AR: map saturated")
+    local beforeKeep = cfg.creditEventAliases["ctx:ar-keep"]
+    local pageAliases = {
+        ["ctx:ar-new-a"] = "ctx:ar-canon",
+        ["ctx:ar-new-b"] = "ctx:ar-new-a",
+    }
+    local stOk, rOk = providerAliasPage(record,
+        "gs:cea:" .. record.datasetId .. ":p1", {
+            kind = "gs-credit-aliases-page",
+            datasetId = record.datasetId,
+            page = 1, pageCount = 1,
+            aliases = pageAliases,
+        }, "Alice-Garona")
+    assertTrue(stOk == "accepted" or stOk == "duplicate",
+        "459-AR: reclaim admits page got " .. tostring(stOk) .. "/" .. tostring(rOk))
+    assertEq(cfg.creditEventAliases["ctx:ar-keep"], beforeKeep,
+        "459-AR: retained required binding protected")
+    assertEq(cfg.creditEventAliases["ctx:ar-new-a"], "ctx:ar-canon",
+        "459-AR: incoming a installed")
+    assertEq(cfg.creditEventAliases["ctx:ar-new-b"], "ctx:ar-new-a",
+        "459-AR: incoming multi-binding b installed")
+    assertTrue(aliasCount(cfg.creditEventAliases) <= maxA,
+        "459-AR: capacity honored after reclaim")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, don)), "Bob-Garona",
+        "459-AR: retained credit preserved")
+
+    -- Rejected conflicting page must not mutate (including no opportunistic prune).
+    local record2 = seedLiveCampaignWithItem(9993, 40)
+    injectProductionDonation(record2, {
+        id = "ctx:ar2-canon", itemId = 9993, quantity = 2,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local cfg2 = record2.accounting._consumables
+    cfg2.creditEventAliases = {
+        ["ctx:ar2-exist"] = "ctx:ar2-canon",
+        ["ctx:ar2-junk"] = "ctx:ar2-junk-canon",
+    }
+    local snap2 = snapshotMap(cfg2.creditEventAliases)
+    local stBad, rBad = providerAliasPage(record2,
+        "gs:cea:" .. record2.datasetId .. ":p1", {
+            kind = "gs-credit-aliases-page",
+            datasetId = record2.datasetId,
+            page = 1, pageCount = 1,
+            aliases = { ["ctx:ar2-exist"] = "ctx:ar2-OTHER" },
+        }, "Alice-Garona")
+    assertEq(stBad, "rejected",
+        "459-AR: conflict rejected got " .. tostring(stBad) .. "/" .. tostring(rBad))
+    assertTrue(mapsEqual(snap2, cfg2.creditEventAliases),
+        "459-AR: conflict leaves map untouched")
+
+    -- Genuine required exhaustion: every slot owned by retained corrections.
+    local record3 = seedLiveCampaignWithItem(9994, 40)
+    local cfg3 = record3.accounting._consumables
+    local ctx3 = select(1, GS:GetCurrentContext())
+    cfg3.creditEventAliases = {}
+    record3.operations.records = {}
+    record3.operations.order = {}
+    record3.operations.heads = {}
+    for i = 1, maxA do
+        local alias = string.format("ctx:ar3-req-%04d", i)
+        local canon = string.format("ctx:ar3-req-canon-%04d", i)
+        cfg3.creditEventAliases[alias] = canon
+        local opId = string.format("ar3-corr-%04d", i)
+        record3.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx3.guildKey,
+            datasetId = record3.datasetId,
+            campaignId = record3.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = 9994,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time,
+            baseTargetRevision = record3.datasetId,
+            basePolicyRevision = record3.permission and record3.permission.revisionId,
+            baseCampaignId = record3.currentCampaignId,
+        }
+        record3.operations.order[#record3.operations.order + 1] = opId
+    end
+    local snap3 = snapshotMap(cfg3.creditEventAliases)
+    local stFull, rFull = providerAliasPage(record3,
+        "gs:cea:" .. record3.datasetId .. ":p1", {
+            kind = "gs-credit-aliases-page",
+            datasetId = record3.datasetId,
+            page = 1, pageCount = 1,
+            aliases = { ["ctx:ar3-new"] = "ctx:ar3-new-canon" },
+        }, "Alice-Garona")
+    assertEq(stFull, "rejected",
+        "459-AR: genuine exhaustion rejected got "
+            .. tostring(stFull) .. "/" .. tostring(rFull))
+    assertEq(rFull, "full", "459-AR: genuine exhaustion reason full")
+    assertTrue(mapsEqual(snap3, cfg3.creditEventAliases),
+        "459-AR: exhaustion leaves required map untouched")
+    assertTrue(cfg3.creditEventAliases["ctx:ar3-new"] == nil,
+        "459-AR: exhaustion did not install")
+end
+
+do
+    -- Live/archive reconstruction past position 4096 with missing durable alias
+    -- and evicted registry (#459 discussion_r4507532464).
+    local function buildMixedTail(list, prefix, itemId, campaignId, datasetId)
+        local maxDon = GS.MAX_LEDGER_EVENTS or 4096
+        local maxWd = GS.MAX_WITHDRAWAL_EVENTS or 1024
+        local fillerDon = maxDon - maxWd
+        for i = 1, fillerDon do
+            list[#list + 1] = {
+                type = GS.LEDGER_EVENT.DONATION,
+                id = string.format("%s-fill-%04d", prefix, i),
+                txnId = string.format("%s-fill-%04d", prefix, i),
+                itemId = itemId, quantity = 1,
+                generation = 1, timestamp = world.time + i,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                writer = "Player-1-Alice", verification = "officer",
+                campaignId = campaignId, datasetId = datasetId,
+                gsProductionCredit = true,
+            }
+        end
+        for i = 1, maxWd do
+            list[#list + 1] = {
+                type = GS.LEDGER_EVENT.WITHDRAWAL,
+                id = string.format("%s-wd-%04d", prefix, i),
+                txnId = string.format("%s-wd-%04d", prefix, i),
+                itemId = itemId, quantity = 1,
+                generation = 1, timestamp = world.time + fillerDon + i,
+                actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+                writer = "Player-1-Alice",
+                campaignId = campaignId, datasetId = datasetId,
+                gsProductionCredit = false,
+            }
+        end
+        local ownedId = prefix .. "-owned-tail"
+        list[#list + 1] = {
+            type = GS.LEDGER_EVENT.DONATION,
+            id = ownedId,
+            txnId = ownedId,
+            itemId = itemId, quantity = 5,
+            generation = 1, timestamp = world.time + fillerDon + maxWd + 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            writer = "Player-1-Alice", verification = "officer",
+            campaignId = campaignId, datasetId = datasetId,
+            gsProductionCredit = true,
+        }
+        assertEq(#list, fillerDon + maxWd + 1,
+            "459-RH: mixed list length " .. prefix)
+        assertTrue(#list > (GS.MAX_LEDGER_EVENTS or 4096),
+            "459-RH: owned past donation ceiling " .. prefix)
+        return ownedId
+    end
+    local function seedAliasCorrection(record, ownedId, aliasId, opId, itemId)
+        local ctx = select(1, GS:GetCurrentContext())
+        local cfg = record.accounting._consumables
+        cfg.txnRegistry = {
+            {
+                txnId = ownedId, status = "verified", committed = true,
+                aliases = { aliasId }, itemId = itemId, quantity = 5,
+                donor = "Alice-Garona",
+            },
+            {
+                txnId = aliasId, status = "alias", aliasOf = ownedId,
+                committed = true,
+            },
+        }
+        cfg.creditEventAliases = { [aliasId] = ownedId }
+        local corr = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = aliasId,
+            value = {
+                eventId = aliasId, eventKind = "donation",
+                attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+                itemId = itemId,
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 50,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+        assertEq(select(1, GS:AdmitRemoteOperation(corr, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "459-RH: admit " .. opId)
+        -- Evict registry + durable alias so reconstruct must rediscover presence.
+        cfg.txnRegistry = {}
+        cfg.creditEventAliases = {}
+        if GS._ClearOpsValidationCache then
+            GS._ClearOpsValidationCache(record.operations)
+        end
+        return corr
+    end
+
+    local liveRec = seedLiveCampaignWithItem(9995, 40)
+    liveRec.accounting._consumableEvents = {}
+    local liveOwned = buildMixedTail(
+        liveRec.accounting._consumableEvents, "ctx:rh-live", 9995,
+        liveRec.currentCampaignId, liveRec.datasetId)
+    seedAliasCorrection(liveRec, liveOwned, "ctx:rh-live-alias", "rh-live-corr", 9995)
+    GS._creditEventAliasReconstructLedgerVisits = -1
+    local gkLive = select(1, GS:GetCurrentContext()).guildKey
+    local okLive, errLive = GS._ValidateGuildRecordStructure(gkLive, liveRec)
+    assertTrue(okLive, "459-RH-live: cold validate ok got " .. tostring(errLive))
+    assertEq(liveRec.accounting._consumables.creditEventAliases["ctx:rh-live-alias"],
+        liveOwned, "459-RH-live: durable alias restored")
+    local liveVisits = tonumber(GS._creditEventAliasReconstructLedgerVisits) or 0
+    assertTrue(liveVisits > (GS.MAX_LEDGER_EVENTS or 4096),
+        "459-RH-live: reconstruct scanned past donation ceiling visits="
+            .. tostring(liveVisits))
+    assertTrue(liveVisits <= ((GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_WITHDRAWAL_EVENTS or 1024) + 8),
+        "459-RH-live: reconstruct still bounded visits=" .. tostring(liveVisits))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        liveRec, GS.FindLedgerEventById(liveRec, liveOwned))), "Bob-Garona",
+        "459-RH-live: effective credit Bob")
+
+    local archRec = seedLiveCampaignWithItem(9996, 40)
+    archRec.accounting._consumableEventArchive = {}
+    local archOwned = buildMixedTail(
+        archRec.accounting._consumableEventArchive, "ctx:rh-arch", 9996,
+        archRec.currentCampaignId, archRec.datasetId)
+    seedAliasCorrection(archRec, archOwned, "ctx:rh-arch-alias", "rh-arch-corr", 9996)
+    GS._creditEventAliasReconstructLedgerVisits = -1
+    local gkArch = select(1, GS:GetCurrentContext()).guildKey
+    local okArch, errArch = GS._ValidateGuildRecordStructure(gkArch, archRec)
+    assertTrue(okArch, "459-RH-arch: cold validate ok got " .. tostring(errArch))
+    assertEq(archRec.accounting._consumables.creditEventAliases["ctx:rh-arch-alias"],
+        archOwned, "459-RH-arch: durable alias restored")
+    local archVisits = tonumber(GS._creditEventAliasReconstructLedgerVisits) or 0
+    assertTrue(archVisits > (GS.MAX_ARCHIVED_EVENTS or 4096),
+        "459-RH-arch: reconstruct scanned past archive ceiling visits="
+            .. tostring(archVisits))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        archRec, GS.FindLedgerEventById(archRec, archOwned))), "Bob-Garona",
+        "459-RH-arch: effective credit Bob")
+end
+
+do
+    -- Unchanged Edit selection is a silent no-op before confirmation;
+    -- changed selection still confirms and commits (#459 discussion_r4507532460).
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(logsPage and logsPage.__sfTest, "459-NO: logs hooks")
+    logsPage.panel = logsPage.panel or { IsShown = function() return true end }
+    local record = seedLiveCampaignWithItem(9997, 40)
+    injectProductionDonation(record, {
+        id = "no-don", itemId = 9997, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local adj = injectProductionAdjustment(record, {
+        id = "no-adj", itemId = 9997, quantity = -1,
+        attributed = nil, attributedGuid = nil,
+    })
+    assertTrue(adj ~= nil, "459-NO: unassigned adjustment seeded")
+    local rows = logsPage.__sfTest.BuildProjectedRows()
+    local donRow, adjRow = nil, nil
+    for i = 1, #rows do
+        if rows[i].id == "no-don" then donRow = rows[i] end
+        if rows[i].id == "no-adj" then adjRow = rows[i] end
+    end
+    assertTrue(donRow ~= nil, "459-NO: donation row")
+    assertTrue(adjRow ~= nil, "459-NO: unassigned adj row")
+
+    local function countOps()
+        local n = 0
+        for _ in pairs(record.operations.records or {}) do n = n + 1 end
+        return n
+    end
+    local function captureConfirm()
+        local seen = { opened = false, cb = nil }
+        local prev = SF.SettingsUI.Dialogs.Confirm
+        SF.SettingsUI.Dialogs.Confirm = function(_, _msg, _btn, onConfirm)
+            seen.opened = true
+            seen.cb = onConfirm
+        end
+        return seen, prev
+    end
+
+    -- Prefill unchanged named selection.
+    logsPage.__sfTest.OpenEditContributorDialog("no-don", donRow)
+    local before = countOps()
+    local seen, prevConfirm = captureConfirm()
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(not seen.opened, "459-NO: unchanged named skips confirm")
+    assertNil(logsPage.__sfTest.GetPendingConfirm(),
+        "459-NO: unchanged named no pending confirm")
+    assertNil(logsPage.__sfTest.GetEditSession(),
+        "459-NO: unchanged named closes session")
+    assertEq(countOps(), before, "459-NO: unchanged named allocates no op")
+
+    -- Same concrete identity via normalized text path.
+    logsPage.__sfTest.OpenEditContributorDialog("no-don", donRow)
+    logsPage.__sfTest.SetEditAttributionFromText("  Alice-Garona  ")
+    local sessNorm = logsPage.__sfTest.GetEditSession()
+    assertTrue(sessNorm and sessNorm.attributionResolved,
+        "459-NO: normalized text resolves")
+    before = countOps()
+    seen, prevConfirm = captureConfirm()
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(not seen.opened, "459-NO: normalized same identity skips confirm")
+    assertEq(countOps(), before, "459-NO: normalized same identity no op")
+
+    -- Unassigned unchanged.
+    logsPage.__sfTest.OpenEditContributorDialog("no-adj", adjRow)
+    local sessU = logsPage.__sfTest.GetEditSession()
+    assertTrue(sessU ~= nil, "459-NO: unassigned session")
+    assertNil(sessU.effectiveName, "459-NO: unassigned effective nil")
+    assertNil(sessU.attributed, "459-NO: unassigned attributed nil")
+    before = countOps()
+    seen, prevConfirm = captureConfirm()
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(not seen.opened, "459-NO: unchanged Unassigned skips confirm")
+    assertEq(countOps(), before, "459-NO: unchanged Unassigned no op")
+
+    -- Changed named selection still confirms and commits.
+    logsPage.__sfTest.OpenEditContributorDialog("no-don", donRow)
+    local session = logsPage.__sfTest.GetEditSession()
+    session.attributed = "Bob-Garona"
+    session.attributedGuid = "Player-1-Bob"
+    session.attributionText = "Bob-Garona"
+    session.attributionResolved = true
+    seen, prevConfirm = captureConfirm()
+    logsPage.__sfTest.ConfirmAndSaveEdit()
+    SF.SettingsUI.Dialogs.Confirm = prevConfirm
+    assertTrue(seen.opened and type(seen.cb) == "function",
+        "459-NO: changed selection opens confirm")
+    assertTrue(logsPage.__sfTest.GetPendingConfirm() ~= nil,
+        "459-NO: changed selection pending confirm")
+    seen.cb()
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        record, GS.FindLedgerEventById(record, "no-don"))), "Bob-Garona",
+        "459-NO: changed selection committed Bob")
+    logsPage.__sfTest.ClearEditSession()
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
 end
+

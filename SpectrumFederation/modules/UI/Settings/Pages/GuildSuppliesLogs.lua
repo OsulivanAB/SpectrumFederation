@@ -1085,6 +1085,22 @@ local function ConfirmAndSaveEdit()
 		ReportLogsStatus("rejected", reason or "stale_credit")
 		return
 	end
+	-- Unchanged concrete credit (including allowed Unassigned) is a silent
+	-- no-op before confirmation/preparation (#459 discussion_r4507532460).
+	local g = GS()
+	if g and g.CreditIdentitiesEqual
+		and g.CreditIdentitiesEqual(
+			session.attributed, session.attributedGuid,
+			session.effectiveName, session.effectiveGuid) then
+		InvalidatePendingConfirm()
+		ClearEditSession()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
+		if Page.Refresh and Page.panel then
+			Page:Refresh(Page.panel)
+		end
+		return
+	end
 	-- Freeze the reviewed recipient/entry before the confirm dialog opens.
 	InvalidatePendingConfirm()
 	local payload = {

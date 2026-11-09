@@ -250,6 +250,12 @@ end
 
 local function ValidateOperationsHeads(ops, record)
     local headCount = 0
+    -- One pass-local canonical index for alias-aware correction heads so cold
+    -- validation does not rescan the ledger per head (#459 discussion_r4507527088).
+    local lookup = nil
+    if type(record) == "table" and GS.BuildCreditCanonicalLookup then
+        lookup = GS.BuildCreditCanonicalLookup(record)
+    end
     for targetKey, headId in pairs(ops.heads) do
         headCount = headCount + 1
         if headCount > GS.MAX_ACCEPTED_OPERATIONS then
@@ -274,7 +280,7 @@ local function ValidateOperationsHeads(ops, record)
         -- the immutable body still names an alias target (or vice versa).
         if not okKey and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
             and GS.CorrectionTargetKey and type(record) == "table" then
-            local canonKey = GS.CorrectionTargetKey(record, body.target)
+            local canonKey = GS.CorrectionTargetKey(record, body.target, lookup)
             if canonKey ~= nil and canonKey == targetKey then
                 okKey = true
             end

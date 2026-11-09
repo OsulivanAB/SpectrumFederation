@@ -3904,8 +3904,10 @@ local function ValidateAndApply(record, ctx)
             end
         end
 
-        -- Pass 1a: shape/conflict/capacity against existing map; build proposed
-        -- overlay including every incoming binding (order-independent).
+        -- Pass 1a: shape/conflict against existing map; build proposed overlay
+        -- including every incoming binding (order-independent). Capacity is
+        -- evaluated after validation so reclaimable unused slots can free room
+        -- without mutating the live map on reject (#459 discussion_r4507532462).
         local pendingInstall = {}
         local proposed = {}
         for alias, canon in pairs(map) do
@@ -3917,7 +3919,6 @@ local function ValidateAndApply(record, ctx)
         for _ in pairs(map) do
             existingN = existingN + 1
         end
-        local projectedN = existingN
         local any = false
         for alias, canon in pairs(body.aliases) do
             if type(alias) ~= "string" or alias == ""
@@ -3935,11 +3936,7 @@ local function ValidateAndApply(record, ctx)
             if prior == canon then
                 -- duplicate binding
             else
-                if projectedN >= maxN then
-                    return "rejected", "full"
-                end
                 pendingInstall[#pendingInstall + 1] = { alias = alias, canon = canon }
-                projectedN = projectedN + 1
             end
         end
         if not any then
@@ -3994,6 +3991,40 @@ local function ValidateAndApply(record, ctx)
             if AliasConflictsProposed(alias, canon) then
                 return "rejected", "alias_conflict"
             end
+        end
+
+        -- Pass 1c: capacity against reclaimable unused slots. Protect incoming
+        -- aliases and retained required bindings; never prune before reject.
+        local protect = {}
+        if GS.CollectRequiredCreditEventAliases then
+            local required = GS.CollectRequiredCreditEventAliases(localRecord)
+            if type(required) == "table" then
+                for alias in pairs(required) do
+                    protect[alias] = true
+                end
+            end
+        end
+        local newSlots = 0
+        for i = 1, #pendingInstall do
+            local alias = pendingInstall[i].alias
+            protect[alias] = true
+            if map[alias] == nil then
+                newSlots = newSlots + 1
+            end
+        end
+        local reclaimable = 0
+        for alias in pairs(map) do
+            if not protect[alias] then
+                reclaimable = reclaimable + 1
+            end
+        end
+        local freeSlots = (maxN - existingN) + reclaimable
+        if newSlots > freeSlots then
+            return "rejected", "full"
+        end
+        if newSlots > (maxN - existingN)
+            and GS.PruneUnusedCreditEventAliases then
+            GS.PruneUnusedCreditEventAliases(localRecord, protect)
         end
 
         -- Pass 2: commit all bindings atomically, then one coalesced wake.
