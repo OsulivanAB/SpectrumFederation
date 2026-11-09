@@ -8514,12 +8514,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     and admissionCtx.sourceAcceptedSet[stored.id] == true
             end
             if allowRetain then
+                -- Same narrowly authenticated orphan allowance as the winning
+                -- apply path: source-accepted adoption may retain a losing
+                -- delete after retention trimmed its base evidence (#465).
+                -- Ordinary unknown-target ingress stays pending_event.
+                local orphanedAccepted = admissionCtx.adoptionReplay == true
+                    and type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
                 local scopeEvent = nil
                 if GS.ValidateSoftDeleteScope then
                     local scopeOk, scopeErr, scopedEvent = GS.ValidateSoftDeleteScope(
                         record, stored, {
                             allowMissingEvent = true,
                             remoteAdmit = true,
+                            allowOrphanedAcceptedDelete = orphanedAccepted,
                         })
                     if not scopeOk then
                         if scopeErr == "pending_event" or scopeErr == "missing_event" then
@@ -8539,7 +8547,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     end
                     scopeEvent = scopedEvent
                 end
-                if scopeEvent and GS.ValidateSoftDeleteEventEligibility then
+                -- Eligibility still runs when the base event is absent so orphan
+                -- retention requires a well-shaped eventKind on the op value.
+                if GS.ValidateSoftDeleteEventEligibility then
                     local eligOk, eligErr = GS.ValidateSoftDeleteEventEligibility(
                         record, stored, scopeEvent)
                     if not eligOk then

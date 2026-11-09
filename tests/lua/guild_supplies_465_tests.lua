@@ -2670,6 +2670,205 @@ do
         "465-orphan: credit stays excluded")
 end
 
+do
+    -- Two accepted deletion revisions + retention-evicted evidence: winner-first
+    -- adoption must retain both op IDs without pending the loser (#465
+    -- discussion_r4517511170). Ordinary unknown-target ingress stays pending.
+    local record = seedLiveCampaignWithItem(9245, 40)
+    local ctx = select(1, GS:GetCurrentContext())
+    injectProductionDonation(record, {
+        id = "orphan2-don", itemId = 9245, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local function makeDel(id, ts, actorName, actorGuid)
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.SOFT_DELETE_EVENT,
+            target = "orphan2-don",
+            value = {
+                eventId = "orphan2-don", eventKind = "donation",
+                itemId = 9245, quantity = 6,
+                attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            },
+            actorGuid = actorGuid,
+            actorName = actorName,
+            timestamp = ts,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+    -- Source-authored by Alice so adoption authenticity matches the exporter.
+    local late = makeDel("orphan2-win", world.time + 20, "Alice-Garona", "Player-1-Alice")
+    local early = makeDel("orphan2-lose", world.time + 2, "Alice-Garona", "Player-1-Alice")
+    local function admitSettle(op)
+        local st, r = GS:AdmitRemoteOperation(op, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        local g = 0
+        while st == "pending" and g < 64 do
+            if not runOneDueTimer() then break end
+            st, r = GS:AdmitRemoteOperation(op, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+            g = g + 1
+        end
+        return st, r
+    end
+    local stW, rW = admitSettle(late)
+    assertTrue(stW == "accepted" or stW == "duplicate",
+        "465-orphan2: source winner st=" .. tostring(stW) .. "/" .. tostring(rW))
+    local loseSt, loseReason = admitSettle(early)
+    assertTrue(loseSt == "accepted" or loseSt == "duplicate",
+        "465-orphan2: source loser retained got " .. tostring(loseSt) .. "/" .. tostring(loseReason))
+    assertTrue(record.operations.records["orphan2-win"] ~= nil, "465-orphan2: win in source")
+    assertTrue(record.operations.records["orphan2-lose"] ~= nil, "465-orphan2: lose in source")
+    local tKeySrc = GS.SoftDeleteTargetKey(record, "orphan2-don")
+    assertEq(record.operations.heads[tKeySrc], "orphan2-win", "465-orphan2: source head")
+    -- Evict base evidence while both delete revisions remain accepted.
+    local live = record.accounting._consumableEvents
+    local kept = {}
+    for i = 1, #live do
+        if live[i].id ~= "orphan2-don" then
+            kept[#kept + 1] = live[i]
+        end
+    end
+    record.accounting._consumableEvents = kept
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    assertNil(GS.FindLedgerEventById(record, "orphan2-don"), "465-orphan2: evidence gone")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-orphan2: export bodies")
+    local winBody, loseBody = nil, nil
+    local others = {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local op = row.body and row.body.op
+        if type(op) == "table" and op.id == "orphan2-win" then
+            winBody = row
+        elseif type(op) == "table" and op.id == "orphan2-lose" then
+            loseBody = row
+        else
+            others[#others + 1] = row
+        end
+    end
+    assertTrue(winBody ~= nil, "465-orphan2: winner exported")
+    assertTrue(loseBody ~= nil, "465-orphan2: loser exported")
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-orphan2: begin")
+    -- Winner-first replay: buffer the newer delete before the older loser.
+    local ordered = {}
+    for i = 1, #others do
+        ordered[#ordered + 1] = others[i]
+    end
+    ordered[#ordered + 1] = winBody
+    ordered[#ordered + 1] = loseBody
+    for i = 1, #ordered do
+        GS:BufferAdoptionRecord(ordered[i].id, ordered[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-orphan2: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 128 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(commitSt, "accepted",
+        "465-orphan2: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(adopted ~= nil, "465-orphan2: adopted record")
+    assertTrue(adopted.operations.records["orphan2-win"] ~= nil, "465-orphan2: win survives")
+    assertTrue(adopted.operations.records["orphan2-lose"] ~= nil, "465-orphan2: lose survives")
+    assertTrue(not (adopted.operations.pending and adopted.operations.pending["orphan2-lose"]),
+        "465-orphan2: loser not pending")
+    assertTrue(GS.IsEventSoftDeleted(adopted, "orphan2-don"), "465-orphan2: deleted")
+    local tKey = GS.SoftDeleteTargetKey(adopted, "orphan2-don")
+    assertEq(adopted.operations.heads[tKey], "orphan2-win", "465-orphan2: winning head")
+    local entry = adopted.eventDeletions and adopted.eventDeletions["orphan2-don"]
+    assertTrue(type(entry) == "table", "465-orphan2: projection")
+    assertEq(entry.revisionId, "orphan2-win", "465-orphan2: winning revisionId")
+    assertEq(entry.actorName, "Alice-Garona", "465-orphan2: winning actor")
+    assertEq(entry.deletedAt, late.timestamp, "465-orphan2: winning timestamp")
+    simulateRuntimeReload()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(adopted)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(adopted, nil)
+    end
+    assertTrue(GS.IsEventSoftDeleted(adopted, "orphan2-don"),
+        "465-orphan2: deletion survives reload")
+    assertTrue(adopted.operations.records["orphan2-win"] ~= nil,
+        "465-orphan2: win after reload")
+    assertTrue(adopted.operations.records["orphan2-lose"] ~= nil,
+        "465-orphan2: lose after reload")
+    local tKey2 = GS.SoftDeleteTargetKey(adopted, "orphan2-don")
+    assertEq(adopted.operations.heads[tKey2], "orphan2-win",
+        "465-orphan2: winning head after reload")
+    local entry2 = adopted.eventDeletions and adopted.eventDeletions["orphan2-don"]
+    assertTrue(type(entry2) == "table", "465-orphan2: projection after reload")
+    assertEq(entry2.revisionId, "orphan2-win", "465-orphan2: winner after reload")
+end
+
+do
+    -- Ordinary unknown-target soft-delete ingress remains pending — orphan
+    -- allowance is adoption/source-accepted only.
+    local record = seedLiveCampaignWithItem(9246, 40)
+    local ctx = select(1, GS:GetCurrentContext())
+    local ghost = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "ghost-del-unknown",
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        kind = GS.KIND.SOFT_DELETE_EVENT,
+        target = "ghost-don-missing",
+        value = {
+            eventId = "ghost-don-missing", eventKind = "donation",
+            itemId = 9246, quantity = 1,
+            attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 1,
+        baseTargetRevision = record.datasetId,
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+    }
+    local st, reason = GS:AdmitRemoteOperation(ghost, {
+        sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+    })
+    assertEq(st, "pending", "465-unk: unknown target stays pending")
+    assertEq(reason, "pending_event", "465-unk: pending_event reason")
+    assertTrue(record.operations.pending and record.operations.pending[ghost.id] ~= nil,
+        "465-unk: parked in pending")
+    assertTrue(not GS.IsEventSoftDeleted(record, "ghost-don-missing"),
+        "465-unk: no unrestricted deletion")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

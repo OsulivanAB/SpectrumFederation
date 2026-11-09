@@ -184,6 +184,10 @@ def test_guild_supplies_soft_delete_465():
     assert "465-filt: shared canonical lookup charged" in result.stdout
     assert "465-orphan: deletion projected without base evidence" in result.stdout
     assert "465-orphan: credit stays excluded" in result.stdout
+    assert "465-orphan2: lose survives" in result.stdout
+    assert "465-orphan2: winning actor" in result.stdout
+    assert "465-orphan2: deletion survives reload" in result.stdout
+    assert "465-unk: unknown target stays pending" in result.stdout
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")
