@@ -8834,6 +8834,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 GS._pendingCampaignBoundaries[step.cid] = nil
             end
         end
+        -- Winning correction from conflict resolution is accepted history (#465).
+        if chosen.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and GS.NoteAcceptedCorrectionHistoryMutation then
+            GS.NoteAcceptedCorrectionHistoryMutation(record)
+        end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-resolve")
         end
@@ -9031,6 +9036,12 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 end
                 if GS.EnsureCreditCorrectionProjection then
                     GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+                -- Retained loser history still feeds soft-delete attribution.
+                -- Notify after StoreAccepted (r4529162895); skip only when the
+                -- body was already present and history is unchanged.
+                if newlyRetained and GS.NoteAcceptedCorrectionHistoryMutation then
+                    GS.NoteAcceptedCorrectionHistoryMutation(record)
                 end
                 -- Warm providers must export newly retained older corrections.
                 if newlyRetained and not admissionCtx.adoptionReplay
@@ -9382,6 +9393,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             -- the shared outer allowance when this is a top-level admit.
             if GS.SealCreditCorrectionProjection then
                 GS.SealCreditCorrectionProjection(record, true)
+            end
+            -- Soft-delete hist/facts refresh AFTER accepted history is stored
+            -- (delete-first / prior-correction-second; r4529162895).
+            if GS.NoteAcceptedCorrectionHistoryMutation then
+                GS.NoteAcceptedCorrectionHistoryMutation(record)
             end
             if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
                 and GS.RedrivePendingContributorCorrections then

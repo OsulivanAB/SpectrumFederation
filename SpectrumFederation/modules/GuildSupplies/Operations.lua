@@ -2060,6 +2060,11 @@ function GS:ApplyStagedConfigOperation(op, context)
         elseif GS.RebuildCreditCorrectionProjection then
             GS.RebuildCreditCorrectionProjection(record, nil)
         end
+        -- Soft-delete verified attribution reads accepted correction history.
+        -- Notify AFTER StoreAccepted so hist rebuilds see this body (#465).
+        if GS.NoteAcceptedCorrectionHistoryMutation then
+            GS.NoteAcceptedCorrectionHistoryMutation(record)
+        end
         if GS.RedrivePendingContributorCorrections then
             GS.RedrivePendingContributorCorrections(record, {
                 eventId = stored.target,

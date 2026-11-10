@@ -6860,10 +6860,13 @@ function SoftDeleteRuntime.bumpDep(record, field)
 end
 
 --- O(1) debt-floor dependency stamp — mutation-owned versions only.
+-- Includes histGen so accepted correction-history changes refresh soft-delete
+-- debt aggregates after verified deletion attribution updates.
 function SoftDeleteRuntime.debtFloorStamp(record)
     local d = SoftDeleteRuntime.depsFor(record)
     return tostring(d.delGen or 0) .. ":" .. tostring(d.factGen or 0)
         .. ":" .. tostring(d.scopeGen or 0) .. ":" .. tostring(d.aliasGen or 0)
+        .. ":" .. tostring(d.histGen or 0)
 end
 
 local function SoftDeletePersonalKey(name, guid)
@@ -10475,8 +10478,8 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
         GS.RebuildCreditCorrectionProjection(record, nil)
         return false, aliasErr or "full"
     end
-    -- Soft-delete hist attribution depends on accepted correction history.
-    SoftDeleteRuntime.bumpDep(record, "histGen")
+    -- histGen / deletion-fact refresh runs AFTER StoreAccepted (winning +
+    -- stale_credit retention paths) so Rebuild sees the stored history body.
     return true, "accepted"
 end
 
@@ -10602,12 +10605,14 @@ GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
 local eventDeletionCache = setmetatable({}, { __mode = "k" })
 
 --- O(1) deletion-projection dependency stamp (#465).
--- Mutation-owned soft-delete/alias gens only — not ops.generation, ledger
+-- Mutation-owned soft-delete/alias/hist gens — not ops.generation, ledger
 -- length, or accounting mut — so ordinary adjustment admits do not rebuild
--- the deletion map or invalidate soft-delete debt floors.
+-- the deletion map. Accepted correction-history changes bump histGen and
+-- force Ensure to refresh verified deletion attribution (r4529162895).
 local function EventDeletionDependencyStamp(record)
     local d = SoftDeleteRuntime.depsFor(record)
     return tostring(d.delGen or 0) .. ":" .. tostring(d.aliasGen or 0)
+        .. ":" .. tostring(d.histGen or 0)
 end
 
 --- Ledger/alias stamp for reusable soft-delete event indexes (#465 r4529162895).
@@ -11379,6 +11384,24 @@ function GS.InvalidateEventDeletionProjection(record)
     -- Keep SoftDeleteRuntime.indexes: ledger/alias stamp still gates reuse.
     -- Clearing it here would force a full ledger rescan on every Ensure after
     -- Invalidate.
+end
+
+--- Accepted correction-history mutation notification (#465 r4529162895).
+-- Call AFTER the correction body is stored in ops.records (winning apply,
+-- stale_credit loser retention, or equivalent adoption paths). Bumps O(1)
+-- histGen so deletion/floor stamps observe the change; when deletions are
+-- already projected, Ensure refreshes verified attribution + durable facts
+-- without ops-wide fingerprint scans or unrelated adjustment invalidation.
+function GS.NoteAcceptedCorrectionHistoryMutation(record)
+    if type(record) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime.bumpDep(record, "histGen")
+    if type(record.eventDeletions) == "table" and next(record.eventDeletions) ~= nil then
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+    end
 end
 
 --- Test/repair seam: drop reusable soft-delete ledger indexes (#465).

@@ -3336,10 +3336,11 @@ do
 end
 
 do
-    -- #465 obligation 1: same-event correction then delete must keep verified
-    -- attribution from retained accepted correction history (not active
-    -- creditCorrections, which excludes deleted events). Rebuild/reload,
-    -- reordered receipt, and fresh adoption must not revive the original donor.
+    -- #465 r4529162895: same-event correct Alice→Bob, balance Bob −10, then
+    -- delete. Verified deletion attribution must follow retained accepted
+    -- correction history (not active creditCorrections). Delete-first /
+    -- correction-second public receipt must refresh deletion facts without a
+    -- manual InvalidateEventDeletionProjection crutch.
     local itemId = 9260
     local record = seedLiveCampaignWithItem(itemId, 80)
     injectProductionDonation(record, {
@@ -3350,6 +3351,9 @@ do
         "same-don", "Bob-Garona", "Player-1-Bob"))
     assertTrue(corr ~= nil, "465-same: prepare correction")
     assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-same: correct Alice→Bob")
+    local adj = select(1, GS:NewAdjustmentOperation(itemId, -10, "Bob-Garona"))
+    assertTrue(adj ~= nil, "465-same: prepare Bob balancing adj")
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "465-same: balance Bob −10")
     local del = select(1, GS:NewSoftDeleteOperation("same-don"))
     assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-same: delete corrected event")
     assertTrue(GS.IsEventSoftDeleted(record, "same-don"), "465-same: deleted")
@@ -3359,48 +3363,27 @@ do
     local entry = record.eventDeletions and record.eventDeletions["same-don"]
     assertTrue(type(entry) == "table" and entry.verified == true, "465-same: verified")
     assertEq(entry.attributed, "Bob-Garona", "465-same: verified Bob not Alice")
-    -- Create authorized signed debt under corrected attribution before rebuilds.
-    -- Order: correct → adjust while Bob still has credit → delete leaves Bob −10.
-    -- Snapshot corr/del first so peer reorder admits the historical pair.
-    local delSnap = select(1, GS._SnapshotPublicOp(del))
-    local corrSnap = select(1, GS._SnapshotPublicOp(corr))
-    -- Undo delete locally? No — inject debt via production adjustment under Bob
-    -- after delete for local rebuild/reload; adoption export uses corr+del only.
-    injectProductionAdjustment(record, {
-        id = "same-adj", itemId = itemId, quantity = -10,
-        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
-    })
-    if GS.InvalidateCreditCorrectionProjection then
-        GS.InvalidateCreditCorrectionProjection(record)
-    end
     assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), -10,
         "465-same: Bob debt −10")
     assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), 0,
         "465-same: Alice not charged")
-    -- Repeated rebuild must not fall back to original donor.
+    local delSnap = select(1, GS._SnapshotPublicOp(del))
+    local corrSnap = select(1, GS._SnapshotPublicOp(corr))
+    -- Ordinary Ensure rounds (no forced Invalidate) must keep Bob.
     for round = 1, 3 do
-        if GS.InvalidateEventDeletionProjection then
-            GS.InvalidateEventDeletionProjection(record)
-        end
-        if GS.InvalidateCreditCorrectionProjection then
-            GS.InvalidateCreditCorrectionProjection(record)
-        end
         if GS.EnsureEventDeletionProjection then
             GS.EnsureEventDeletionProjection(record, nil)
         end
         local e = record.eventDeletions and record.eventDeletions["same-don"]
         assertEq(e and e.attributed, "Bob-Garona",
-            "465-same: rebuild " .. tostring(round) .. " keeps Bob")
+            "465-same: ensure " .. tostring(round) .. " keeps Bob")
         assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), -10,
-            "465-same: rebuild " .. tostring(round) .. " Bob debt")
+            "465-same: ensure " .. tostring(round) .. " Bob debt")
         assertEq(GS.PersonalContributorItemTotal(record, "Alice-Garona", "Player-1-Alice", itemId), 0,
-            "465-same: rebuild " .. tostring(round) .. " Alice zero")
+            "465-same: ensure " .. tostring(round) .. " Alice zero")
     end
     simulateRuntimeReload()
     settleRoster()
-    if GS.InvalidateEventDeletionProjection then
-        GS.InvalidateEventDeletionProjection(record)
-    end
     if GS.EnsureEventDeletionProjection then
         GS.EnsureEventDeletionProjection(record, nil)
     end
@@ -3413,22 +3396,12 @@ do
         and type(record.creditCorrections["same-don"]) == "table"),
         "465-same: correction stays inactive after reload")
 
-    -- Fresh adoption keeps Bob attribution. Export corr+del without the injected
-    -- adjustment body (unitCopper-less inject fails adoption completeness).
-    local exportRecord = seedLiveCampaignWithItem(itemId, 80)
-    injectProductionDonation(exportRecord, {
-        id = "same-don", itemId = itemId, quantity = 10,
-        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
-    })
-    assertEq(GS:ApplyStagedConfigOperation(select(1, GS:NewContributorCorrectionOperation(
-        "same-don", "Bob-Garona", "Player-1-Bob"))), "accepted", "465-same: export corr")
-    assertEq(GS:ApplyStagedConfigOperation(select(1, GS:NewSoftDeleteOperation("same-don"))),
-        "accepted", "465-same: export delete")
+    -- Fresh adoption of corr + adj + delete keeps Bob debt immediately.
     GS:EnsureGossipProvider()
     GS.NotifyLocalDurableChange("dataset")
     drainExportMaint(128)
     local exportBodies = collectAllExportBodies()
-    local sourceDataset = exportRecord.datasetId
+    local sourceDataset = record.datasetId
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 2)
     settleRoster()
@@ -3445,7 +3418,7 @@ do
     for i = 1, #exportBodies do
         GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
     end
-        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
         "465-same: transfer ready")
     local commitSt, commitErr = GS:CommitDatasetAdoption()
     local gAdopt = 0
@@ -3460,26 +3433,17 @@ do
     local adopted = GS:GetCurrentRecord()
     local aEntry = adopted.eventDeletions and adopted.eventDeletions["same-don"]
     assertEq(aEntry and aEntry.attributed, "Bob-Garona", "465-same: adopted Bob attribution")
-    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
-        "465-same: adopted Bob excluded")
+    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), -10,
+        "465-same: adopted Bob debt")
     assertEq(GS.PersonalContributorItemTotal(adopted, "Alice-Garona", "Player-1-Alice", itemId), 0,
         "465-same: adopted Alice zero")
     assertTrue(not (type(adopted.creditCorrections) == "table"
         and type(adopted.creditCorrections["same-don"]) == "table"),
         "465-same: adopted correction inactive")
-    injectProductionAdjustment(adopted, {
-        id = "same-adopt-adj", itemId = itemId, quantity = -10,
-        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
-    })
-    if GS.InvalidateCreditCorrectionProjection then
-        GS.InvalidateCreditCorrectionProjection(adopted)
-    end
-    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), -10,
-        "465-same: adopted Bob debt")
-    assertEq(GS.PersonalContributorItemTotal(adopted, "Alice-Garona", "Player-1-Alice", itemId), 0,
-        "465-same: adopted Alice still zero")
 
-    -- Reordered receipt on a fresh peer: delete first, then prior accepted correction.
+    -- Reordered public receipt: warm deletion cache on delete-first (Alice),
+    -- then admit the prior accepted correction. Production histGen wake must
+    -- refresh verified Bob facts — no manual Invalidate.
     switchPlayer("Alice", "Player-1-Alice", 1)
     settleRoster()
     local peer = seedLiveCampaignWithItem(itemId, 80)
@@ -3498,31 +3462,37 @@ do
         out.baseTargetRevision = rec.datasetId
         return out
     end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
     assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
         sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
     })), "accepted", "465-same: peer delete-first")
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    local warmEntry = peer.eventDeletions and peer.eventDeletions["same-don"]
+    assertTrue(type(warmEntry) == "table" and warmEntry.verified == true,
+        "465-same: warm delete facts present")
+    assertEq(warmEntry.attributed, "Alice-Garona",
+        "465-same: warm cache still original donor before correction")
     local stCorr, rCorr = GS:AdmitRemoteOperation(rebind(corrSnap, peer), {
         sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
     })
     assertTrue(stCorr == "accepted" or stCorr == "duplicate",
         "465-same: peer correction after delete got " .. tostring(stCorr) .. "/" .. tostring(rCorr))
-    if GS.InvalidateEventDeletionProjection then
-        GS.InvalidateEventDeletionProjection(peer)
-    end
-    if GS.EnsureEventDeletionProjection then
-        GS.EnsureEventDeletionProjection(peer, nil)
-    end
+    -- Ordinary reads immediately after public correction admission.
     local peerEntry = peer.eventDeletions and peer.eventDeletions["same-don"]
     assertEq(peerEntry and peerEntry.attributed, "Bob-Garona",
-        "465-same: reordered verified Bob")
-    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), 0,
-        "465-same: reordered Bob excluded")
+        "465-same: reordered verified Bob without manual invalidate")
     assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), 0,
-        "465-same: reordered Alice zero")
+        "465-same: reordered Alice zero (no incorrect allowance)")
     assertTrue(not (type(peer.creditCorrections) == "table"
         and type(peer.creditCorrections["same-don"]) == "table"),
         "465-same: reordered correction inactive")
-    -- Authorized signed debt under verified Bob attribution (not original donor).
+    -- Production balancing adj already asserted on source/adoption. Peer inject
+    -- proves signed Bob debt under refreshed deletion facts (remote adj snaps
+    -- after delete-first are not the subject of this histGen repair).
     injectProductionAdjustment(peer, {
         id = "same-peer-adj", itemId = itemId, quantity = -10,
         attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
@@ -3531,9 +3501,50 @@ do
         GS.InvalidateCreditCorrectionProjection(peer)
     end
     assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), -10,
-        "465-same: reordered Bob debt")
+        "465-same: reordered Bob debt −10")
     assertEq(GS.PersonalContributorItemTotal(peer, "Alice-Garona", "Player-1-Alice", itemId), 0,
         "465-same: reordered Alice still zero")
+    -- Real accepted-history mutation after caches are warm: LWW-losing older
+    -- correction retained via stale_credit bumps histGen and must keep Bob.
+    local loseCorr = {}
+    for k, v in pairs(corrSnap) do
+        loseCorr[k] = v
+    end
+    loseCorr.id = "same-corr-lose"
+    loseCorr.timestamp = (tonumber(corrSnap.timestamp) or world.time) - 120
+    if type(corrSnap.value) == "table" then
+        local v = {}
+        for vk, vv in pairs(corrSnap.value) do
+            v[vk] = vv
+        end
+        loseCorr.value = v
+    end
+    local stLose, rLose = GS:AdmitRemoteOperation(rebind(loseCorr, peer), {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertTrue(stLose == "accepted" or stLose == "duplicate",
+        "465-same: loser correction retained got " .. tostring(stLose) .. "/" .. tostring(rLose))
+    assertTrue(peer.operations.records["same-corr-lose"] ~= nil,
+        "465-same: loser body in accepted history")
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    local afterLose = peer.eventDeletions and peer.eventDeletions["same-don"]
+    assertEq(afterLose and afterLose.attributed, "Bob-Garona",
+        "465-same: loser retention keeps Bob attribution")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), -10,
+        "465-same: loser retention keeps Bob debt")
+    simulateRuntimeReload()
+    settleRoster()
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(peer, nil)
+    end
+    assertEq(peer.eventDeletions and peer.eventDeletions["same-don"]
+        and peer.eventDeletions["same-don"].attributed, "Bob-Garona",
+        "465-same: peer reload Bob attribution")
+    assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), -10,
+        "465-same: peer reload Bob debt")
+    assertTrue(GS.IsEventSoftDeleted(peer, "same-don"), "465-same: deletion final after reload")
 end
 
 do
