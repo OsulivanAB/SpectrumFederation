@@ -3537,10 +3537,129 @@ do
 end
 
 do
-    -- #465 obligation 2: verified softDeleteVerifiedFacts survive retention
-    -- eviction, export, fresh Begin/Buffer/CommitDatasetAdoption, reload,
-    -- readable signed debt, officer repair to zero, corrected attribution, and
-    -- invalid-debt controls. Raw delete payload is never verified authority.
+    -- #465 obligation 1: accepted Unassigned correction clears soft-delete
+    -- attribution (nil/nil) and must not fall back to the original contributor.
+    local itemId = 9260
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "ua-base", itemId = itemId, quantity = 12,
+        actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+    })
+    local adjOp = select(1, GS:NewAdjustmentOperation(itemId, 4, "Bob-Garona"))
+    assertTrue(adjOp ~= nil, "465-ua: prepare Bob adjustment")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "465-ua: apply Bob adj")
+    local adjId = adjOp.id
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 4,
+        "465-ua: Bob credited before Unassigned")
+    local corr = select(1, GS:NewContributorCorrectionOperation(adjId, nil, nil))
+    assertTrue(corr ~= nil, "465-ua: prepare Bob→Unassigned")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-ua: apply Unassigned")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-ua: Bob cleared after Unassigned")
+    local del = select(1, GS:NewSoftDeleteOperation(adjId))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-ua: delete Unassigned adj")
+    local entry = record.eventDeletions and record.eventDeletions[adjId]
+    assertTrue(type(entry) == "table" and entry.verified == true, "465-ua: verified delete")
+    assertNil(entry.attributed, "465-ua: Unassigned name nil")
+    assertNil(entry.attributedGuid, "465-ua: Unassigned guid nil")
+    assertEq(entry.eventKind, "adjustment", "465-ua: adjustment kind")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-ua: Bob not charged after delete")
+    assertEq(GS.PersonalContributorItemTotal(record, "Carol-Garona", "Player-1-Carol", itemId), 12,
+        "465-ua: Carol donation untouched")
+    -- Rebuild must preserve Unassigned (not fall back to Bob).
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    entry = record.eventDeletions and record.eventDeletions[adjId]
+    assertNil(entry and entry.attributed, "465-ua: rebuild keeps Unassigned name")
+    assertNil(entry and entry.attributedGuid, "465-ua: rebuild keeps Unassigned guid")
+    local durable = record.accounting._consumables.softDeleteVerifiedFacts
+    assertTrue(type(durable) == "table" and type(durable[adjId]) == "table"
+        and durable[adjId].verified == true, "465-ua: durable Unassigned fact")
+    assertNil(durable[adjId].attributed, "465-ua: durable name nil")
+    assertNil(durable[adjId].attributedGuid, "465-ua: durable guid nil")
+    -- Retention: keep the credited adjustment evidence for transfer (cutover
+    -- provenance). Verified Unassigned facts must still win over durable Bob
+    -- fields after export/adoption/reload — no personal Bob debt.
+    assertTrue(GS.FindLedgerEventById(record, adjId) ~= nil, "465-ua: adj evidence retained")
+    -- Export / fresh adoption must retain Unassigned facts (no Bob debt).
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local corrId, delId = corr.id, del.id
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-ua: begin adoption")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-ua: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 128 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(commitSt, "accepted",
+        "465-ua: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "465-ua: adopted record")
+    assertTrue(adopted.operations.records[corrId] ~= nil, "465-ua: correction history")
+    assertTrue(adopted.operations.records[delId] ~= nil, "465-ua: delete history")
+    local aDurable = adopted.accounting and adopted.accounting._consumables
+        and adopted.accounting._consumables.softDeleteVerifiedFacts
+    assertTrue(type(aDurable) == "table" and type(aDurable[adjId]) == "table"
+        and aDurable[adjId].verified == true, "465-ua: adopted durable fact")
+    assertNil(aDurable[adjId].attributed, "465-ua: adopted Unassigned name")
+    assertNil(aDurable[adjId].attributedGuid, "465-ua: adopted Unassigned guid")
+    local aEntry = adopted.eventDeletions and adopted.eventDeletions[adjId]
+    assertNil(aEntry and aEntry.attributed, "465-ua: adopted projection Unassigned")
+    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-ua: adopted Bob not charged")
+    simulateRuntimeReload()
+    settleRoster()
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(adopted)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(adopted, nil)
+    end
+    assertNil((adopted.eventDeletions and adopted.eventDeletions[adjId] or {}).attributed,
+        "465-ua: Unassigned after reload")
+    assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-ua: Bob zero after reload")
+    -- Ordinary invalid-accounting safeguard still rejects unsafe Bob debt.
+    -- Keep item non-negative so the personal floor is the rejecting control.
+    local badAdj, _, badReason = GS:NewAdjustmentOperation(itemId, -5, "Bob-Garona")
+    assertNil(badAdj, "465-ua: unsafe Bob −5 rejected")
+    assertEq(badReason, "player_negative",
+        "465-ua: player_negative got " .. tostring(badReason))
+end
+
+do
+    -- #465 obligation 2: production donation→correction→balancing adjustment→
+    -- delete, retention eviction with adjustment retained, export/fresh-adopt
+    -- INCLUDING the adjustment, immediate signed-debt assert, reload, then
+    -- public repair to zero. No post-commit debt injection.
     local itemId = 9261
     local record = seedLiveCampaignWithItem(itemId, 80)
     injectProductionDonation(record, {
@@ -3550,65 +3669,56 @@ do
     local corr = select(1, GS:NewContributorCorrectionOperation(
         "xfer-don", "Bob-Garona", "Player-1-Bob"))
     assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-xfer: correct to Bob")
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 10,
+        "465-xfer: Bob credited before balance")
+    -- Balancing adjustment through the public writer while donation still counts.
+    local bal = select(1, GS:NewAdjustmentOperation(itemId, -10, "Bob-Garona"))
+    assertTrue(bal ~= nil, "465-xfer: prepare balancing adjustment")
+    assertEq(GS:ApplyStagedConfigOperation(bal), "accepted", "465-xfer: apply balance")
+    local adjId = bal.id
+    assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-xfer: Bob zero after balance")
     local del = select(1, GS:NewSoftDeleteOperation("xfer-don"))
-    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-xfer: delete")
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-xfer: delete donation")
     local forgedEntry = record.eventDeletions and record.eventDeletions["xfer-don"]
     assertTrue(type(forgedEntry) == "table" and forgedEntry.verified == true,
         "465-xfer: verified before eviction")
     assertEq(forgedEntry.quantity, 10, "465-xfer: qty from evidence")
     assertEq(forgedEntry.attributed, "Bob-Garona", "465-xfer: Bob attribution")
-    -- Keep export as corr+delete only (same as known-good adopt-corr). Debt is
-    -- applied after eviction via inject for local readability, then again after
-    -- adoption so the transfer path is not blocked by adjustment completeness.
-    injectProductionAdjustment(record, {
-        id = "xfer-adj", itemId = itemId, quantity = -10,
-        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", unitCopper = 100,
-    })
-    if GS.InvalidateCreditCorrectionProjection then
-        GS.InvalidateCreditCorrectionProjection(record)
-    end
     assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), -10,
-        "465-xfer: Bob debt before eviction")
-    -- Remove the injected adjustment from the live ledger before export so the
-    -- adoption transfer matches the known-good corr+delete shape while durable
-    -- soft-delete verified facts still transfer.
-    do
-        local live = record.accounting._consumableEvents
-        local kept = {}
-        for i = 1, #live do
-            if live[i].id ~= "xfer-adj" then
-                kept[#kept + 1] = live[i]
-            end
-        end
-        record.accounting._consumableEvents = kept
-        if GS._BumpAccountingMutation then GS._BumpAccountingMutation(record) end
-    end
-    if GS.EnsureEventDeletionProjection then
-        GS.EnsureEventDeletionProjection(record, nil)
-    end
+        "465-xfer: Bob signed debt after delete")
+    assertTrue(GS.FindLedgerEventById(record, adjId) ~= nil, "465-xfer: adj retained pre-evict")
     local durable = record.accounting._consumables.softDeleteVerifiedFacts
     assertTrue(type(durable) == "table" and type(durable["xfer-don"]) == "table"
         and durable["xfer-don"].verified == true, "465-xfer: durable map before eviction")
     assertEq(durable["xfer-don"].attributed, "Bob-Garona", "465-xfer: durable Bob")
-    local live = record.accounting._consumableEvents
-    local kept = {}
-    for i = 1, #live do
-        if live[i].id ~= "xfer-don" then
-            kept[#kept + 1] = live[i]
+    -- Retention/rollover eviction of the donation only; keep the balancing adj.
+    do
+        local live = record.accounting._consumableEvents
+        local kept = {}
+        for i = 1, #live do
+            if live[i].id ~= "xfer-don" then
+                kept[#kept + 1] = live[i]
+            end
         end
-    end
-    record.accounting._consumableEvents = kept
-    if type(record.observations) == "table" and type(record.observations.directExports) == "table" then
-        local de, nextDe = record.observations.directExports, {}
-        for k, row in pairs(de) do
-            local rid = type(row) == "table" and (row.id or row.txnId or row.eventId)
-            if rid ~= "xfer-don" then nextDe[k] = row end
+        record.accounting._consumableEvents = kept
+        if type(record.observations) == "table"
+            and type(record.observations.directExports) == "table" then
+            local de, nextDe = record.observations.directExports, {}
+            for k, row in pairs(de) do
+                local rid = type(row) == "table" and (row.id or row.txnId or row.eventId)
+                if rid ~= "xfer-don" then nextDe[k] = row end
+            end
+            record.observations.directExports = nextDe
         end
-        record.observations.directExports = nextDe
+        if GS._BumpAccountingMutation then GS._BumpAccountingMutation(record) end
     end
-    if GS._BumpAccountingMutation then GS._BumpAccountingMutation(record) end
     assertNil(GS.FindLedgerEventById(record, "xfer-don"), "465-xfer: evidence evicted")
+    assertTrue(GS.FindLedgerEventById(record, adjId) ~= nil, "465-xfer: adj survives eviction")
     if GS.InvalidateEventDeletionProjection then GS.InvalidateEventDeletionProjection(record) end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
     if GS.EnsureEventDeletionProjection then GS.EnsureEventDeletionProjection(record, nil) end
     durable = record.accounting._consumables.softDeleteVerifiedFacts
     assertTrue(type(durable) == "table" and type(durable["xfer-don"]) == "table"
@@ -3617,39 +3727,43 @@ do
     assertTrue(factCount >= 1 and type(facts["xfer-don"]) == "table",
         "465-xfer: collect exports verified fact")
     assertEq(facts["xfer-don"].attributed, "Bob-Garona", "465-xfer: collected Bob")
-    -- Re-inject Bob debt after eviction for readable signed debt on the source.
-    injectProductionAdjustment(record, {
-        id = "xfer-adj", itemId = itemId, quantity = -10,
-        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", unitCopper = 100,
-    })
-    if GS.InvalidateCreditCorrectionProjection then GS.InvalidateCreditCorrectionProjection(record) end
     assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), -10,
-        "465-xfer: debt after eviction")
-    -- Strip adjustment again before export (transfer corr+delete+facts only).
-    do
-        local live2 = record.accounting._consumableEvents
-        local kept2 = {}
-        for i = 1, #live2 do
-            if live2[i].id ~= "xfer-adj" then kept2[#kept2 + 1] = live2[i] end
-        end
-        record.accounting._consumableEvents = kept2
-        if GS._BumpAccountingMutation then GS._BumpAccountingMutation(record) end
-    end
-    -- Export from the eviction source and fresh-adopt.
+        "465-xfer: debt after eviction with adj present")
+    -- Export INCLUDING the retained balancing adjustment + verified facts.
     GS:EnsureGossipProvider()
     GS.NotifyLocalDurableChange("dataset")
     drainExportMaint(128)
     local exportBodies = collectAllExportBodies()
     local descBody = nil
+    local sawAdjOp = false
     for i = 1, #exportBodies do
-        if exportBodies[i].body and exportBodies[i].body.kind == "dataset-desc" then
-            descBody = exportBodies[i].body
+        local body = exportBodies[i].body
+        if body and body.kind == "dataset-desc" then
+            descBody = body
+        elseif body and body.kind == "gs-op" and body.id == adjId then
+            sawAdjOp = true
+        elseif body and body.id == adjId then
+            sawAdjOp = true
+        end
+    end
+    -- Also accept ledger-event export of the adjustment.
+    if not sawAdjOp then
+        for i = 1, #exportBodies do
+            local body = exportBodies[i].body
+            if type(body) == "table" and (body.id == adjId or body.opId == adjId
+                or (body.event and (body.event.id == adjId or body.event.opId == adjId))) then
+                sawAdjOp = true
+                break
+            end
         end
     end
     assertTrue(type(descBody) == "table", "465-xfer: descriptor present")
     assertTrue(tonumber(descBody.softDeleteVerifiedFactCount) or 0 >= 1,
         "465-xfer: descriptor advertises verified facts")
+    assertTrue(sawAdjOp or (GS.FindLedgerEventById(record, adjId) ~= nil),
+        "465-xfer: source still holds balancing adjustment for transfer")
     local sourceDataset = record.datasetId
+    local corrId, delId = corr.id, del.id
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 2)
     settleRoster()
@@ -3682,6 +3796,11 @@ do
     assertTrue(type(adopted) == "table", "465-xfer: adopted record present")
     assertNil(GS.FindLedgerEventById(adopted, "xfer-don"),
         "465-xfer: adopted has no donation evidence")
+    assertTrue(GS.FindLedgerEventById(adopted, adjId) ~= nil,
+        "465-xfer: adopted retained balancing adjustment")
+    assertTrue(adopted.operations.records[corrId] ~= nil, "465-xfer: correction history")
+    assertTrue(adopted.operations.records[delId] ~= nil, "465-xfer: delete history")
+    assertTrue(adopted.operations.records[adjId] ~= nil, "465-xfer: adjustment op history")
     local aDurable = adopted.accounting and adopted.accounting._consumables
         and adopted.accounting._consumables.softDeleteVerifiedFacts
     assertTrue(type(aDurable) == "table" and type(aDurable["xfer-don"]) == "table"
@@ -3693,14 +3812,7 @@ do
         "465-xfer: adopted projection verified")
     assertEq(aEntry and aEntry.attributed, "Bob-Garona", "465-xfer: adopted projection Bob")
     assertEq(aEntry and aEntry.quantity, 10, "465-xfer: adopted qty not forged")
-    -- Re-establish authorized signed debt under verified Bob attribution.
-    injectProductionAdjustment(adopted, {
-        id = "xfer-adj", itemId = itemId, quantity = -10,
-        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", unitCopper = 100,
-    })
-    if GS.InvalidateCreditCorrectionProjection then
-        GS.InvalidateCreditCorrectionProjection(adopted)
-    end
+    -- Immediate signed-debt assert — no post-commit adjustment injection.
     assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), -10,
         "465-xfer: adopted readable debt")
     assertEq(GS.PersonalContributorItemTotal(adopted, "Alice-Garona", "Player-1-Alice", itemId), 0,
@@ -3726,7 +3838,7 @@ do
     assertNil(badCorr, "465-xfer: unsafe correction rejected")
     assertEq(badReason, "player_negative",
         "465-xfer: player_negative got " .. tostring(badReason))
-    -- Officer adjustment repair Bob back to zero; leave Alice keep donation.
+    -- Officer adjustment repair Bob back to zero via public API.
     local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, "Bob-Garona"))
     assertTrue(repair ~= nil, "465-xfer: prepare repair")
     assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465-xfer: apply repair")
@@ -3737,7 +3849,245 @@ do
 end
 
 do
-    -- #465 obligation 3: many retained deletes + orphaned targets share one
+    -- #465 obligation 3: paged soft-delete verified-fact transfer under the real
+    -- wire budget, including incomplete and conflicting transfer controls.
+    local function wireRawBytes(id, body)
+        local fp = (GS.ContentFingerprint and GS.ContentFingerprint(body))
+            or string.rep("f", GS.MAX_OPERATION_ID or 192)
+        local raw = C_EncodingUtil.SerializeCBOR({
+            id = id, versionFp = fp, body = body,
+        })
+        return type(raw) == "string" and #raw or 0
+    end
+    local function filterWireBudget(bodies)
+        local out, dropped = {}, 0
+        local budget = GS.MAX_WIRE_RECORD_BYTES or 2048
+        for i = 1, #bodies do
+            local id, body = bodies[i].id, bodies[i].body
+            if wireRawBytes(id, body) <= budget then
+                out[#out + 1] = bodies[i]
+            else
+                dropped = dropped + 1
+            end
+        end
+        return out, dropped
+    end
+
+    local itemId = 9263
+    local record = seedLiveCampaignWithItem(itemId, 400)
+    local N = 48
+    local donors = { "Alice-Garona", "Bob-Garona", "Carol-Garona" }
+    local guids = {
+        ["Alice-Garona"] = "Player-1-Alice",
+        ["Bob-Garona"] = "Player-1-Bob",
+        ["Carol-Garona"] = "Player-1-Carol",
+    }
+    for i = 1, N do
+        local id = string.format("sdf-wire-don-%04d-xxxxxxxxxxxxxxxx", i)
+        local actor = donors[((i - 1) % #donors) + 1]
+        injectProductionDonation(record, {
+            id = id, itemId = itemId, quantity = 1,
+            actor = actor, actorGuid = guids[actor],
+            timestamp = world.time + i,
+        })
+        local del = select(1, GS:NewSoftDeleteOperation(id))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+            "465-sdf-wire: delete " .. id)
+    end
+    local facts, factCount = GS.CollectSoftDeleteVerifiedFacts(record)
+    assertTrue(factCount >= N, "465-sdf-wire: collected facts n=" .. tostring(factCount))
+
+    local bloatedDesc = {
+        kind = "dataset-desc",
+        schemaVersion = GS.PROVIDER_SCHEMA,
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = record.datasetId,
+        softDeleteVerifiedFacts = facts,
+        softDeleteVerifiedFactCount = factCount,
+        softDeleteVerifiedFactPageCount = 0,
+        acceptedOpCount = 0, transferOpCount = 0, campaignCount = 0, archiveCount = 0,
+        acceptedLedgerCount = 0, donationEvidenceCount = 0, valuationCount = 0,
+        hasBankTab = true,
+    }
+    local bloatedBytes = wireRawBytes("gs:desc:" .. record.datasetId, bloatedDesc)
+    assertTrue(bloatedBytes > (GS.MAX_WIRE_RECORD_BYTES or 2048),
+        "465-sdf-wire: monolithic facts exceed wire budget bytes=" .. tostring(bloatedBytes))
+
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(256)
+    local exportBodies = collectAllExportBodies()
+    local descBody, pages = nil, {}
+    local overBudget = 0
+    for i = 1, #exportBodies do
+        local id, body = exportBodies[i].id, exportBodies[i].body
+        local nbytes = wireRawBytes(id, body)
+        if nbytes > (GS.MAX_WIRE_RECORD_BYTES or 2048) then
+            overBudget = overBudget + 1
+        end
+        if body and body.kind == "dataset-desc" then
+            descBody = body
+        elseif body and body.kind == "gs-soft-delete-facts-page" then
+            pages[#pages + 1] = { id = id, body = body, page = tonumber(body.page) or 0 }
+        end
+    end
+    assertEq(overBudget, 0, "465-sdf-wire: no exported body exceeds wire budget")
+    assertTrue(type(descBody) == "table", "465-sdf-wire: dataset-desc present")
+    assertEq(tonumber(descBody.softDeleteVerifiedFactCount), factCount,
+        "465-sdf-wire: desc advertises fact count")
+    assertTrue((tonumber(descBody.softDeleteVerifiedFactPageCount) or 0) >= 1,
+        "465-sdf-wire: desc uses pages pageCount="
+            .. tostring(descBody.softDeleteVerifiedFactPageCount))
+    local inlineN = 0
+    for _ in pairs(descBody.softDeleteVerifiedFacts or {}) do inlineN = inlineN + 1 end
+    assertEq(inlineN, 0, "465-sdf-wire: paged desc strips inline map")
+    assertEq(#pages, tonumber(descBody.softDeleteVerifiedFactPageCount),
+        "465-sdf-wire: page bodies match pageCount")
+
+    local filtered, dropped = filterWireBudget(exportBodies)
+    assertEq(dropped, 0, "465-sdf-wire: filter drops none got=" .. tostring(dropped))
+    assertEq(#filtered, #exportBodies, "465-sdf-wire: filter preserves all bodies")
+
+    -- Missing page → incomplete_transfer.
+    do
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local sourceDataset = record.datasetId
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "465-sdf-miss: begin")
+        local skipPage = pages[1] and pages[1].page
+        for i = 1, #filtered do
+            local b = filtered[i]
+            if not (b.body.kind == "gs-soft-delete-facts-page"
+                and tonumber(b.body.page) == skipPage) then
+                GS:BufferAdoptionRecord(b.id, b.body)
+            end
+        end
+        local readyMiss = GS:GetPendingAdoption() and GS:GetPendingAdoption().ready
+        assertTrue(not readyMiss, "465-sdf-miss: missing page blocks ready")
+        local okMiss, reasonMiss = GS:IsAdoptionTransferComplete()
+        assertTrue(not okMiss, "465-sdf-miss: incomplete")
+        assertEq(reasonMiss, "incomplete_transfer",
+            "465-sdf-miss: reason got " .. tostring(reasonMiss))
+        GS:CancelDatasetAdoption()
+    end
+
+    -- Conflicting fact page → source_changed.
+    do
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local sourceDataset = record.datasetId
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "465-sdf-confl: begin")
+        for i = 1, #pages do
+            if pages[i].page == 1 then
+                local victim, victimEntry = nil, nil
+                for eventId, entry in pairs(pages[i].body.facts or {}) do
+                    victim, victimEntry = eventId, entry
+                    break
+                end
+                assertTrue(victim ~= nil, "465-sdf-confl: victim fact")
+                local badFacts = {}
+                for eventId, entry in pairs(pages[i].body.facts or {}) do
+                    badFacts[eventId] = entry
+                end
+                badFacts[victim] = {
+                    verified = true,
+                    eventId = victim,
+                    eventKind = victimEntry.eventKind,
+                    itemId = victimEntry.itemId,
+                    quantity = (tonumber(victimEntry.quantity) or 1) + 7,
+                    campaignId = victimEntry.campaignId,
+                    attributed = "Conflict-Garona",
+                    attributedGuid = "Player-1-Conflict",
+                    gsProductionCredit = true,
+                }
+                local badPage = {
+                    kind = "gs-soft-delete-facts-page",
+                    datasetId = sourceDataset,
+                    page = 1,
+                    pageCount = tonumber(descBody.softDeleteVerifiedFactPageCount),
+                    facts = badFacts,
+                }
+                local stGood = select(1, GS:BufferAdoptionRecord(pages[i].id, pages[i].body))
+                assertTrue(stGood == "accepted" or stGood == "duplicate",
+                    "465-sdf-confl: good page accepted")
+                local stBad, rBad = GS:BufferAdoptionRecord(pages[i].id, badPage)
+                assertEq(stBad, "rejected",
+                    "465-sdf-confl: conflicting page rejected got "
+                        .. tostring(stBad) .. "/" .. tostring(rBad))
+                assertEq(rBad, "source_changed",
+                    "465-sdf-confl: source_changed got " .. tostring(rBad))
+                assertTrue(GS:GetPendingAdoption() == nil,
+                    "465-sdf-confl: adoption aborted after changed page")
+                break
+            end
+        end
+        if GS:GetPendingAdoption() then
+            GS:CancelDatasetAdoption()
+        end
+    end
+
+    -- Full fresh adoption through filtered transport.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local sourceDataset = record.datasetId
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-sdf-adopt: begin")
+    for i = 1, #filtered do
+        GS:BufferAdoptionRecord(filtered[i].id, filtered[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-sdf-adopt: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 128 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(commitSt, "accepted",
+        "465-sdf-adopt: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "465-sdf-adopt: adopted record")
+    local aDurable = adopted.accounting and adopted.accounting._consumables
+        and adopted.accounting._consumables.softDeleteVerifiedFacts
+    local installed = 0
+    if type(aDurable) == "table" then
+        for _ in pairs(aDurable) do installed = installed + 1 end
+    end
+    assertTrue(installed >= N,
+        "465-sdf-adopt: installed facts n=" .. tostring(installed))
+end
+
+do
+    -- #465 obligation 3b: many retained deletes + orphaned targets share one
     -- bounded event-object index; FindLedgerEventById must not run per head.
     local itemId = 9262
     local record = seedLiveCampaignWithItem(itemId, 200)

@@ -5380,6 +5380,9 @@ end
 -- @param campaignId optional; defaults to record.currentCampaignId. Callers that
 --   cannot prove historical campaign provenance should reject before calling.
 -- @param opts optional { enforceGoalCeiling = boolean }
+-- Forward-declared: defined after CreditIdentitiesEqual (#465 remote adj floors).
+local VerifiedSoftDeleteAdjustmentDebtFloors
+
 function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
@@ -5413,8 +5416,18 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, 
     opts = opts or {}
     local currentItem = ItemTotal(record, itemId, campaignId)
     local nextItem = currentItem + quantity
+    local itemDebtFloor, personalDebtFloor = 0, 0
+    if opts.respectSoftDeleteDebt then
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        itemDebtFloor, personalDebtFloor = VerifiedSoftDeleteAdjustmentDebtFloors(
+            record, itemId, campaignId, attributed, opts.attributedGuid)
+    end
     if nextItem < 0 then
-        return false, "item_negative"
+        if not (opts.respectSoftDeleteDebt and nextItem >= itemDebtFloor) then
+            return false, "item_negative"
+        end
     end
     -- Attributed negative floors use personal durable identity totals, not the
     -- projected main aggregate. Grouped projection remains for display/logs;
@@ -5434,8 +5447,11 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, 
             return false, GS.CREDIT_UNAVAILABLE
         end
         personal = tonumber(personal) or 0
-        if personal + quantity < 0 then
-            return false, "player_negative"
+        local nextPersonal = personal + quantity
+        if nextPersonal < 0 then
+            if not (opts.respectSoftDeleteDebt and nextPersonal >= personalDebtFloor) then
+                return false, "player_negative"
+            end
         end
     end
     if opts.enforceGoalCeiling and quantity > 0 then
@@ -6799,6 +6815,85 @@ local function CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
         return an == bn
     end
     return an == nil and bn == nil and ag == nil and bg == nil
+end
+
+--- Verified soft-delete debt floors for remote/adoption adjustment floors (#465).
+-- Returns itemFloor (negative or 0) and personalFloor for attributed (negative or 0).
+-- Explicit Unassigned / nil credit soft-deletes do not manufacture personal allowances.
+VerifiedSoftDeleteAdjustmentDebtFloors = function(
+    record, itemId, campaignId, attributed, attributedGuid)
+    local itemFloor, personalFloor = 0, 0
+    if type(record) ~= "table" then
+        return itemFloor, personalFloor
+    end
+    itemId = tonumber(itemId)
+    if not itemId then
+        return itemFloor, personalFloor
+    end
+    local attrName = NormName(attributed)
+    local attrGuid = ValidGuid(attributedGuid)
+    local seen = {}
+    local function absorb(entry)
+        if type(entry) ~= "table" or entry.verified ~= true then
+            return
+        end
+        local canon = entry.eventId
+        if type(canon) ~= "string" or canon == "" or seen[canon] then
+            return
+        end
+        if tonumber(entry.itemId) ~= itemId then
+            return
+        end
+        if type(campaignId) == "string" and campaignId ~= ""
+            and type(entry.campaignId) == "string" and entry.campaignId ~= ""
+            and entry.campaignId ~= campaignId then
+            return
+        end
+        local kind = entry.eventKind
+        local qty = tonumber(entry.quantity) or 0
+        if kind == "donation" then
+            if not (qty > 0) or entry.gsProductionCredit ~= true then
+                return
+            end
+            seen[canon] = true
+            itemFloor = itemFloor - qty
+            local creditName = NormName(entry.attributed)
+            local creditGuid = ValidGuid(entry.attributedGuid)
+            if creditName or creditGuid then
+                if CreditIdentitiesEqual(creditName, creditGuid, attrName, attrGuid) then
+                    personalFloor = personalFloor - qty
+                end
+            end
+        elseif kind == "adjustment" then
+            if qty == 0 or entry.gsProductionCredit ~= true then
+                return
+            end
+            local creditName = NormName(entry.attributed)
+            local creditGuid = ValidGuid(entry.attributedGuid)
+            -- Unassigned adjustment deletions never create personal debt floors.
+            if not (creditName or creditGuid) then
+                return
+            end
+            seen[canon] = true
+            if CreditIdentitiesEqual(creditName, creditGuid, attrName, attrGuid) then
+                personalFloor = personalFloor - math.abs(qty)
+            end
+        end
+    end
+    local delMap = record.eventDeletions
+    if type(delMap) == "table" then
+        for _, entry in pairs(delMap) do
+            absorb(entry)
+        end
+    end
+    local durable = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    if type(durable) == "table" then
+        for _, entry in pairs(durable) do
+            absorb(entry)
+        end
+    end
+    return itemFloor, personalFloor
 end
 
 --- Public identity equality for prepare/UI unchanged checks (#459).
@@ -10257,6 +10352,12 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
     local floorOpts = { attributedGuid = attrGuid }
     if isLocalCommit then
         floorOpts.enforceGoalCeiling = true
+    else
+        -- Remote/adoption catch-up may replay balancing adjustments after the
+        -- matching soft-delete already landed. Honor verified soft-delete debt
+        -- floors so historical signed debt converges without inventing new
+        -- authority (#465 assessment 6771025929).
+        floorOpts.respectSoftDeleteDebt = true
     end
     local floorOk, floorErr = GS.AdjustmentFloorOk(
         record, itemId, quantity, normAttr, record.currentCampaignId, floorOpts)
@@ -10467,32 +10568,28 @@ local function BuildHistoricalCorrectionAttributionIndex(record, lookup)
         if type(canon) ~= "string" or canon == "" then
             return
         end
+        -- Explicit Unassigned clears both fields to nil; still mark present so
+        -- soft-delete derivation does not fall back to the original donor (#465).
         local attr = NormName(body.value and body.value.attributed)
         local attrGuid = ValidGuid(body.value and body.value.attributedGuid)
         local cur = byCanon[canon]
+        local entry = {
+            attributed = attr,
+            attributedGuid = attrGuid,
+            present = true,
+            op = body,
+        }
         if type(cur) ~= "table" then
-            byCanon[canon] = {
-                attributed = attr,
-                attributedGuid = attrGuid,
-                op = body,
-            }
+            byCanon[canon] = entry
             return
         end
         if GS.CreditCorrectionRevisionWins
             and GS.CreditCorrectionRevisionWins(body, cur.op) then
-            byCanon[canon] = {
-                attributed = attr,
-                attributedGuid = attrGuid,
-                op = body,
-            }
+            byCanon[canon] = entry
         elseif not GS.CreditCorrectionRevisionWins
             and (tonumber(body.timestamp) or 0) >= (tonumber(cur.op.timestamp) or 0)
             and tostring(body.id) > tostring(cur.op.id) then
-            byCanon[canon] = {
-                attributed = attr,
-                attributedGuid = attrGuid,
-                op = body,
-            }
+            byCanon[canon] = entry
         end
     end
     for _, body in pairs(ops.records) do
@@ -10573,8 +10670,14 @@ local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry, hist
         else
             -- Retained accepted correction history (not active creditCorrections:
             -- that projection intentionally excludes soft-deleted events).
+            -- hist.present distinguishes "accepted Unassigned clear" (nil/nil)
+            -- from "no correction" (#465 assessment 6771025929).
             local hist = type(histIndex) == "table" and histIndex[event.id] or nil
-            if type(hist) == "table" and (hist.attributed or hist.attributedGuid) then
+            if type(hist) ~= "table" and type(histIndex) == "table"
+                and type(event.txnId) == "string" and event.txnId ~= "" then
+                hist = histIndex[event.txnId]
+            end
+            if type(hist) == "table" and hist.present == true then
                 creditName, creditGuid = hist.attributed, hist.attributedGuid
             else
                 creditName, creditGuid = DurableCreditIdentity(event)

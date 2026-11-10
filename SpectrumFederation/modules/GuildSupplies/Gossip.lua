@@ -5674,6 +5674,8 @@ GS._ApplyCreditAliasExportToDescForTest = ApplyCreditAliasExportToDesc
 GS._SyncCreditAliasExportPagesForTest = SyncCreditAliasExportPages
 GS._ClearCreditAliasExportCacheForTest = ClearCreditAliasExportCache
 GS._CreditAliasExportStampForTest = CreditAliasExportStamp
+GS._ApplySoftDeleteVerifiedFactsExportToDescForTest = ApplySoftDeleteVerifiedFactsExportToDesc
+GS._SyncSoftDeleteVerifiedFactsExportPagesForTest = SyncSoftDeleteVerifiedFactsExportPages
 GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
 GS._ValidateAndApplyForTest = ValidateAndApply
 
