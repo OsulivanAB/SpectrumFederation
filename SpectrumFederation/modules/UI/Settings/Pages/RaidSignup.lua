@@ -582,6 +582,12 @@ local function AcquireEditBox(parent)
 	edit.__sfRaidSignupOwned = true
 	edit.__sfPoolKind = "edit"
 	edit:SetParent(parent)
+	-- Pool reset: prior saved rows may have Disable()'d this widget (archived /
+	-- non-owned). Restore enabled so draft/Add Row and editable rows can type;
+	-- callers that need read-only then Disable() again after acquire.
+	if edit.Enable then
+		edit:Enable()
+	end
 	edit:Show()
 	return edit
 end
@@ -1068,6 +1074,7 @@ function PaintEntries(host, planId, planOpen, caps)
 			nick:SetSize(140, 22)
 			nick:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -4)
 			nick:SetMaxLetters(RS().MAX_NICKNAME or 48)
+			nick:Enable()
 			SafeSetEditText(nick, session.draft.nickname or "")
 			if nick.Instructions then
 				nick.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
@@ -1113,6 +1120,7 @@ function PaintEntries(host, planId, planOpen, caps)
 			notes:SetSize(160, 22)
 			notes:SetPoint("LEFT", anchor, "RIGHT", 12, 0)
 			notes:SetMaxLetters(RS().MAX_NOTES or 160)
+			notes:Enable()
 			SafeSetEditText(notes, session.draft.notes or "")
 			if notes.Instructions then
 				notes.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))

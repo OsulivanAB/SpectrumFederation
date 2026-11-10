@@ -1006,7 +1006,16 @@ local function makeRegion(objectType)
     function r:SetHeight(h) self._h = h end
     function r:GetWidth() return self._w or 100 end
     function r:GetHeight() return self._h or 20 end
-    function r:SetText(t) self._text = t or "" end
+    function r:SetText(t, userInput)
+        -- Programmatic SetText (display) always applies. User typing while
+        -- disabled is refused so interactivity regressions are observable.
+        if userInput and self._enabled == false then
+            self._lastUserEditRejected = true
+            return
+        end
+        self._lastUserEditRejected = false
+        self._text = t or ""
+    end
     function r:GetText() return self._text or "" end
     function r:SetTexture(t) self._texture = t end
     function r:SetDesaturated() end
@@ -1015,6 +1024,12 @@ local function makeRegion(objectType)
     function r:SetAutoFocus() end
     function r:Enable() self._enabled = true end
     function r:Disable() self._enabled = false end
+    function r:IsEnabled()
+        if self._enabled == nil then
+            return true
+        end
+        return self._enabled and true or false
+    end
     function r:EnableMouse() end
     function r:RegisterForClicks() end
     function r:SetScript(name, fn)
@@ -1101,6 +1116,7 @@ function CreateFrame(frameType, name, parent, template)
         f:SetParent(parent)
     end
     if resolved == "EditBox" then
+        f._enabled = true
         -- Template-owned Instructions region (not feature-pooled).
         local instructions = makeRegion("FontString")
         instructions:SetParent(f)
@@ -1246,17 +1262,24 @@ if #boxes < 1 then
 end
 assertTrue(#boxes >= 1, "draft nickname edit box present")
 local nickBox = boxes[1]
+local function SimulateUserType(edit, text)
+    assertTrue(edit ~= nil, "edit box present for SimulateUserType")
+    assertTrue(edit:IsEnabled(), "user typing requires enabled edit box")
+    edit:SetText(text, true)
+    assertTrue(not edit._lastUserEditRejected, "disabled edit rejected user SetText")
+    local onText = edit:GetScript("OnTextChanged")
+    if onText then
+        onText(edit, true)
+    end
+end
+
 nickBox:SetFocus()
 local refreshBefore = UIPage._GetLifecycleCounters().refreshCount
 local entriesBefore = #RS:GetSortedEntries(plan3)
-local onText = nickBox:GetScript("OnTextChanged")
-assertTrue(onText ~= nil, "nickname OnTextChanged bound")
-nickBox:SetText("S")
-onText(nickBox, true)
-nickBox:SetText("Sp")
-onText(nickBox, true)
-nickBox:SetText("SparkUI")
-onText(nickBox, true)
+assertTrue(nickBox:GetScript("OnTextChanged") ~= nil, "nickname OnTextChanged bound")
+SimulateUserType(nickBox, "S")
+SimulateUserType(nickBox, "Sp")
+SimulateUserType(nickBox, "SparkUI")
 assertEq(#RS:GetSortedEntries(plan3), entriesBefore, "typing does not persist entry")
 assertEq(UIPage._GetLifecycleCounters().refreshCount, refreshBefore, "typing does not refresh while focused")
 assertEq(UIPage._GetDraftForTests().nicknameCommitted, false, "nickname remains uncommitted while typing")
@@ -1445,6 +1468,137 @@ assertEq(select(1, provider.ValidateAndApply({
 }, { sender = "Alice-Garona" })), "accepted", "remote archived plan metadata catch-up")
 assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planLive].name, "RemoteName", "archived name caught up remotely")
 assertEq(select(1, RS:SetPlanArchived(planLive, false)), "accepted", "reopen plan")
+
+---------------------------------------------------------------------------
+-- Pooled EditBox enabled-state: read-only reuse must not block Add Row typing
+---------------------------------------------------------------------------
+
+do
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local stRO, _, planRO = RS:CreatePlan("Readonly Then Draft")
+    assertEq(stRO, "accepted", "readonly transition plan")
+    RS:SelectPlan(planRO)
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planRO,
+        nickname = "OfficerOwned",
+        mainClass = "MAGE",
+        mainSpec = 62,
+        notes = "seed",
+    })), "accepted", "seed owned entry for readonly view")
+    assertEq(select(1, RS:SetPlanArchived(planRO, true)), "accepted", "archive plan to force Disable on boxes")
+    UIPage:Refresh(panel, { force = true })
+    local roBoxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    assertTrue(#roBoxes >= 1, "archived nickname box present")
+    assertTrue(not roBoxes[1]:IsEnabled(), "archived nickname is disabled")
+    local beforeText = roBoxes[1]:GetText()
+    roBoxes[1]:SetText("ShouldNotType", true)
+    assertTrue(roBoxes[1]._lastUserEditRejected, "disabled box rejects user typing")
+    assertEq(roBoxes[1]:GetText(), beforeText, "disabled box text unchanged by user SetText")
+
+    -- Reopen + Add Row: pooled edit boxes must be enabled for draft typing.
+    assertEq(select(1, RS:SetPlanArchived(planRO, false)), "accepted", "reopen for Add Row")
+    local draftRO = RS.MakeDraft(planRO)
+    RS.UpdateDraftField(draftRO, "classFile", "WARRIOR")
+    RS.UpdateDraftField(draftRO, "specId", 71)
+    UIPage._SetDraftForTests(draftRO)
+    UIPage:Refresh(panel, { force = true })
+    local draftNick = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    local draftNotes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "notes")
+    assertTrue(#draftNick >= 1, "draft nickname after readonly reuse")
+    assertTrue(#draftNotes >= 1, "draft notes after readonly reuse")
+    assertTrue(draftNick[1]:IsEnabled(), "draft nickname enabled after pooled reuse")
+    assertTrue(draftNotes[1]:IsEnabled(), "draft notes enabled after pooled reuse")
+    SimulateUserType(draftNick[1], "FreshSignup")
+    SimulateUserType(draftNotes[1], "Fresh notes")
+    assertEq(UIPage._GetDraftForTests().nickname, "FreshSignup", "typed nickname reaches draft")
+    assertEq(UIPage._GetDraftForTests().notes, "Fresh notes", "typed notes reach draft")
+    local onEnter = draftNick[1]:GetScript("OnEnterPressed")
+    assertTrue(onEnter ~= nil, "draft nickname commit handler")
+    onEnter(draftNick[1])
+    assertTrue(UIPage._GetDraftForTests() == nil, "draft cleared after commit")
+    local after = RS:GetSortedEntries(planRO)
+    local foundFresh = false
+    for i = 1, #after do
+        if after[i].nickname == "FreshSignup" then
+            foundFresh = true
+            assertEq(after[i].notes, "Fresh notes", "notes persisted from typed draft")
+        end
+    end
+    assertTrue(foundFresh, "completed signup from enabled draft boxes")
+
+    -- Ordinary member: others' rows disabled; own Add Row enabled.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local stMem, _, planMem = RS:CreatePlan("Member Own Entry")
+    assertEq(stMem, "accepted", "member plan created")
+    RS:SelectPlan(planMem)
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planMem,
+        nickname = "AliceRow",
+        mainClass = "MAGE",
+        mainSpec = 62,
+    })), "accepted", "officer seeds other-owned row")
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage:Refresh(panel, { force = true })
+    local others = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    assertTrue(#others >= 1, "other member nickname visible")
+    assertTrue(not others[1]:IsEnabled(), "non-owned nickname disabled for member")
+    local memberDraft = RS.MakeDraft(planMem)
+    RS.UpdateDraftField(memberDraft, "classFile", "PRIEST")
+    RS.UpdateDraftField(memberDraft, "specId", 256)
+    UIPage._SetDraftForTests(memberDraft)
+    UIPage:Refresh(panel, { force = true })
+    local memberNick = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    -- Draft row is first; find an enabled nickname box among them.
+    local enabledDraft = nil
+    for i = 1, #memberNick do
+        if memberNick[i]:IsEnabled() then
+            enabledDraft = memberNick[i]
+            break
+        end
+    end
+    assertTrue(enabledDraft ~= nil, "member draft nickname enabled while others disabled")
+    SimulateUserType(enabledDraft, "CarolOwn")
+    local enterMem = enabledDraft:GetScript("OnEnterPressed")
+    assertTrue(enterMem ~= nil, "member draft commit handler")
+    enterMem(enabledDraft)
+    local memListed = RS:GetSortedEntries(planMem)
+    local carolFound = false
+    for i = 1, #memListed do
+        if memListed[i].nickname == "CarolOwn" then
+            carolFound = true
+        end
+    end
+    assertTrue(carolFound, "member completed own signup via enabled draft")
+
+    -- Reverse: editable → archived read-only again (pooled controls Disable).
+    ActAs("Alice-Garona", "Player-1-Alice")
+    RS:SelectPlan(planRO)
+    UIPage:Refresh(panel, { force = true })
+    local editableAgain = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    assertTrue(#editableAgain >= 1, "editable nicknames before re-archive")
+    local anyEnabled = false
+    for i = 1, #editableAgain do
+        if editableAgain[i]:IsEnabled() then
+            anyEnabled = true
+        end
+    end
+    assertTrue(anyEnabled, "open plan has enabled nickname for owner")
+    assertEq(select(1, RS:SetPlanArchived(planRO, true)), "accepted", "re-archive for reverse transition")
+    UIPage:Refresh(panel, { force = true })
+    local againRO = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    assertTrue(#againRO >= 1, "nickname boxes after re-archive")
+    for i = 1, #againRO do
+        assertTrue(not againRO[i]:IsEnabled(), "re-archived nickname disabled again")
+        local prior = againRO[i]:GetText()
+        againRO[i]:SetText("Nope", true)
+        assertTrue(againRO[i]._lastUserEditRejected, "re-archived rejects user typing")
+        assertEq(againRO[i]:GetText(), prior, "re-archived text unchanged")
+    end
+    assertEq(select(1, RS:SetPlanArchived(planRO, false)), "accepted", "cleanup reopen planRO")
+    UIPage._SetDraftForTests(nil)
+    RS:SelectPlan(plan3)
+    UIPage:Refresh(panel, { force = true })
+end
 
 -- Max-supported roster with alternatives + active picker: allocations still plateau.
 -- 128 mains + 128 alts + class picker exceeds the old 256 hard discard cliff.
