@@ -5384,6 +5384,8 @@ end
 -- @param opts optional { enforceGoalCeiling = boolean }
 -- Forward-declared: defined after CreditIdentitiesEqual (#465 remote adj floors).
 local VerifiedSoftDeleteAdjustmentDebtFloors
+-- Soft-delete runtime table is assigned later; alias/remember paths bump deps.
+local SoftDeleteRuntime
 
 function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
@@ -6099,6 +6101,9 @@ local function WriteCreditEventAlias(record, aliasId, canonicalId)
         end
     end
     map[aliasId] = canonicalId
+    if SoftDeleteRuntime and SoftDeleteRuntime.bumpDep then
+        SoftDeleteRuntime.bumpDep(record, "aliasGen")
+    end
     return true, true
 end
 
@@ -6193,6 +6198,7 @@ function GS.RememberCreditEventAlias(record, aliasId, canonicalId)
     if type(record.operations) == "table" and GS._BumpOpsValidationGen then
         GS._BumpOpsValidationGen(record.operations)
     end
+    -- aliasGen is bumped inside WriteCreditEventAlias on the changed path.
     return true
 end
 
@@ -6821,75 +6827,84 @@ end
 
 --- Soft-delete runtime scratch (#465 r4529162884 / r4529162895).
 -- One module local holds weak caches + helpers to stay under Lua 5.1's
--- 200-local chunk limit.
-local SoftDeleteRuntime = {
+-- 200-local chunk limit. Dependency versions are mutation-owned (O(1) stamps);
+-- never rescan aliases/maps/facts to decide cache freshness.
+SoftDeleteRuntime = {
     debtFloor = setmetatable({}, { __mode = "k" }),
     indexes = setmetatable({}, { __mode = "k" }),
+    deps = setmetatable({}, { __mode = "k" }),
 }
 
-function SoftDeleteRuntime.durableFactStamp(record)
-    local n, fp = 0, 0
-    local durable = record and record.accounting and record.accounting._consumables
-        and record.accounting._consumables.softDeleteVerifiedFacts
-    if type(durable) == "table" then
-        for id, entry in pairs(durable) do
-            n = n + 1
-            if type(id) == "string" then
-                fp = fp + #id + (string.byte(id, 1) or 0)
-            end
-            if type(entry) == "table" then
-                fp = fp + (tonumber(entry.quantity) or 0)
-                    + (tonumber(entry.itemId) or 0)
-            end
-        end
+function SoftDeleteRuntime.depsFor(record)
+    local d = SoftDeleteRuntime.deps[record]
+    if type(d) ~= "table" then
+        d = {
+            delGen = 0,
+            factGen = 0,
+            scopeGen = 0,
+            aliasGen = 0,
+            histGen = 0,
+        }
+        SoftDeleteRuntime.deps[record] = d
     end
-    local scopeN = 0
-    if type(record) == "table" and type(record._gsSoftDeleteFactScope) == "table" then
-        for _ in pairs(record._gsSoftDeleteFactScope) do
-            scopeN = scopeN + 1
-        end
-    end
-    return tostring(n) .. ":" .. tostring(fp) .. ":" .. tostring(scopeN)
+    return d
 end
 
+function SoftDeleteRuntime.bumpDep(record, field)
+    if type(record) ~= "table" or type(field) ~= "string" then
+        return
+    end
+    local d = SoftDeleteRuntime.depsFor(record)
+    d[field] = (tonumber(d[field]) or 0) + 1
+    SoftDeleteRuntime.debtFloor[record] = nil
+end
+
+--- O(1) debt-floor dependency stamp — mutation-owned versions only.
 function SoftDeleteRuntime.debtFloorStamp(record)
-    local ops = record and record.operations
-    local gen = ops and tonumber(ops.generation) or 0
-    local orderN = ops and ops.order and #ops.order or 0
-    local ledgerN = 0
-    local live = record and record.accounting and record.accounting._consumableEvents
-    if type(live) == "table" then
-        ledgerN = #live
-    end
-    local aliasFp, aliasN = 0, 0
-    local aliases = record and record.accounting and record.accounting._consumables
-        and record.accounting._consumables.creditEventAliases
-    if type(aliases) == "table" then
-        for alias, canon in pairs(aliases) do
-            aliasN = aliasN + 1
-            if type(alias) == "string" and type(canon) == "string" then
-                aliasFp = aliasFp + #alias + #canon
-                    + (string.byte(alias, 1) or 0) + (string.byte(canon, 1) or 0)
-            end
-        end
-    end
-    local mut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
-    local delN = 0
-    if type(record.eventDeletions) == "table" then
-        for _ in pairs(record.eventDeletions) do
-            delN = delN + 1
-        end
-    end
-    return tostring(gen) .. ":" .. tostring(orderN) .. ":" .. tostring(ledgerN)
-        .. ":" .. tostring(aliasN) .. ":" .. tostring(aliasFp) .. ":" .. tostring(mut)
-        .. ":" .. tostring(delN) .. ":" .. SoftDeleteRuntime.durableFactStamp(record)
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(d.delGen or 0) .. ":" .. tostring(d.factGen or 0)
+        .. ":" .. tostring(d.scopeGen or 0) .. ":" .. tostring(d.aliasGen or 0)
 end
 
-function SoftDeleteRuntime.buildDebtFloorIndex(record)
+local function SoftDeletePersonalKey(name, guid)
+    if type(guid) == "string" and guid ~= "" then
+        return "g:" .. guid
+    end
+    if type(name) == "string" and name ~= "" then
+        return "n:" .. name
+    end
+    return nil
+end
+
+--- Signed campaign/item/identity aggregates for soft-delete debt floors.
+-- itemFloor(query C) = unscoped + byCampaign[C] (or total when C empty).
+-- Personal keys omit Unassigned (item effect still counted).
+function SoftDeleteRuntime.buildDebtFloorAggregates(record)
     local byItem = {}
     local visits = 0
     local seen = {}
     local scope = record and record._gsSoftDeleteFactScope
+    local function bucketFor(itemId)
+        local b = byItem[itemId]
+        if type(b) ~= "table" then
+            b = {
+                total = 0,
+                unscoped = 0,
+                byCampaign = {},
+                personal = {},
+            }
+            byItem[itemId] = b
+        end
+        return b
+    end
+    local function personalBucket(b, key)
+        local p = b.personal[key]
+        if type(p) ~= "table" then
+            p = { total = 0, unscoped = 0, byCampaign = {} }
+            b.personal[key] = p
+        end
+        return p
+    end
     local function absorb(entry, fromDurable)
         visits = visits + 1
         if type(entry) ~= "table" or entry.verified ~= true then
@@ -6899,9 +6914,6 @@ function SoftDeleteRuntime.buildDebtFloorIndex(record)
         if type(canon) ~= "string" or canon == "" or seen[canon] then
             return
         end
-        -- Provisional adoption scope: durable-only facts grant floors only when
-        -- the authenticated transfer advertises a soft-delete for that target
-        -- (r4529162877). Projected deletions are always in-scope.
         if fromDurable and type(scope) == "table" then
             if not scope[canon]
                 and not (type(entry.eventId) == "string" and scope[entry.eventId]) then
@@ -6926,17 +6938,33 @@ function SoftDeleteRuntime.buildDebtFloorIndex(record)
             return
         end
         seen[canon] = true
-        local bucket = byItem[itemId]
-        if type(bucket) ~= "table" then
-            bucket = {}
-            byItem[itemId] = bucket
+        -- Signed removed effect (same -qty rule as ApplyVerifiedSoftDeleteDebtFloor).
+        local signed = -qty
+        local b = bucketFor(itemId)
+        b.total = b.total + signed
+        local cid = entry.campaignId
+        if type(cid) == "string" and cid ~= "" then
+            b.byCampaign[cid] = (tonumber(b.byCampaign[cid]) or 0) + signed
+        else
+            b.unscoped = b.unscoped + signed
         end
-        bucket[#bucket + 1] = {
-            quantity = qty,
-            campaignId = entry.campaignId,
-            attributed = NormName(entry.attributed),
-            attributedGuid = ValidGuid(entry.attributedGuid),
-        }
+        local creditName = NormName(entry.attributed)
+        local creditGuid = ValidGuid(entry.attributedGuid)
+        local pKey = SoftDeletePersonalKey(creditName, creditGuid)
+        if pKey then
+            local p = personalBucket(b, pKey)
+            -- Also index the alternate identity so guid/name queries hit O(1).
+            if creditGuid and creditName then
+                b.personal["g:" .. creditGuid] = p
+                b.personal["n:" .. creditName] = p
+            end
+            p.total = p.total + signed
+            if type(cid) == "string" and cid ~= "" then
+                p.byCampaign[cid] = (tonumber(p.byCampaign[cid]) or 0) + signed
+            else
+                p.unscoped = p.unscoped + signed
+            end
+        end
     end
     local delMap = record and record.eventDeletions
     if type(delMap) == "table" then
@@ -6954,7 +6982,7 @@ function SoftDeleteRuntime.buildDebtFloorIndex(record)
     return byItem, visits
 end
 
-function SoftDeleteRuntime.ensureDebtFloorIndex(record)
+function SoftDeleteRuntime.ensureDebtFloorAggregates(record)
     if type(record) ~= "table" then
         return nil, 0
     end
@@ -6963,9 +6991,10 @@ function SoftDeleteRuntime.ensureDebtFloorIndex(record)
     if type(scratch) == "table" and scratch.stamp == stamp
         and type(scratch.byItem) == "table" then
         GS._softDeleteDebtFloorIndexReuse = true
+        GS._softDeleteDebtFloorStampVisits = 0
         return scratch.byItem, 0
     end
-    local byItem, visits = SoftDeleteRuntime.buildDebtFloorIndex(record)
+    local byItem, visits = SoftDeleteRuntime.buildDebtFloorAggregates(record)
     SoftDeleteRuntime.debtFloor[record] = {
         stamp = stamp,
         byItem = byItem,
@@ -6973,7 +7002,19 @@ function SoftDeleteRuntime.ensureDebtFloorIndex(record)
     }
     GS._softDeleteDebtFloorIndexReuse = false
     GS._softDeleteDebtFloorIndexVisits = visits
+    GS._softDeleteDebtFloorStampVisits = 0
     return byItem, visits
+end
+
+local function SoftDeleteSignedFloorFromAgg(bucket, campaignId)
+    if type(bucket) ~= "table" then
+        return 0
+    end
+    if type(campaignId) == "string" and campaignId ~= "" then
+        return (tonumber(bucket.unscoped) or 0)
+            + (tonumber(bucket.byCampaign and bucket.byCampaign[campaignId]) or 0)
+    end
+    return tonumber(bucket.total) or 0
 end
 
 --- Verified soft-delete debt floors for remote/adoption adjustment floors (#465).
@@ -6984,8 +7025,8 @@ end
 -- negative adjustment raises the aggregate and must not invent a negative
 -- allowance. Personal floors follow effective attribution only — Unassigned
 -- supplies none.
--- Reuses a stamp-keyed item aggregate across unchanged deletion state
--- (r4529162884) instead of rescanning both maps per adjustment.
+-- Mutation-owned dependency versions + signed campaign/item/identity aggregates
+-- keep stamp+query O(1) across unchanged deletion facts (r4529162884).
 VerifiedSoftDeleteAdjustmentDebtFloors = function(
     record, itemId, campaignId, attributed, attributedGuid)
     local itemFloor, personalFloor = 0, 0
@@ -6998,36 +7039,15 @@ VerifiedSoftDeleteAdjustmentDebtFloors = function(
     end
     local attrName = NormName(attributed)
     local attrGuid = ValidGuid(attributedGuid)
-    local byItem, buildVisits = SoftDeleteRuntime.ensureDebtFloorIndex(record)
-    local rows = type(byItem) == "table" and byItem[itemId] or nil
-    local queryVisits = 0
-    if type(rows) == "table" then
-        for i = 1, #rows do
-            queryVisits = queryVisits + 1
-            local entry = rows[i]
-            if type(campaignId) == "string" and campaignId ~= ""
-                and type(entry.campaignId) == "string" and entry.campaignId ~= ""
-                and entry.campaignId ~= campaignId then
-                -- skip other campaign
-            else
-                local qty = tonumber(entry.quantity) or 0
-                -- Signed removed effect (same -qty rule as ApplyVerifiedSoftDeleteDebtFloor).
-                itemFloor = itemFloor - qty
-                local creditName = entry.attributed
-                local creditGuid = entry.attributedGuid
-                if creditName or creditGuid then
-                    if CreditIdentitiesEqual(creditName, creditGuid, attrName, attrGuid) then
-                        personalFloor = personalFloor - qty
-                    end
-                end
-            end
-        end
+    local byItem, buildVisits = SoftDeleteRuntime.ensureDebtFloorAggregates(record)
+    local bucket = type(byItem) == "table" and byItem[itemId] or nil
+    itemFloor = SoftDeleteSignedFloorFromAgg(bucket, campaignId)
+    local pKey = SoftDeletePersonalKey(attrName, attrGuid)
+    if pKey and type(bucket) == "table" and type(bucket.personal) == "table" then
+        personalFloor = SoftDeleteSignedFloorFromAgg(bucket.personal[pKey], campaignId)
     end
-    GS._softDeleteDebtFloorQueryVisits = queryVisits
+    GS._softDeleteDebtFloorQueryVisits = 1
     GS._softDeleteDebtFloorBuildVisits = tonumber(buildVisits) or 0
-    -- Normalize to permitted negative allowances only (deleting a negative
-    -- adjustment must not leave a positive "floor" that weakens checks, nor
-    -- manufacture a negative allowance via abs).
     if itemFloor > 0 then
         itemFloor = 0
     end
@@ -7035,6 +7055,25 @@ VerifiedSoftDeleteAdjustmentDebtFloors = function(
         personalFloor = 0
     end
     return itemFloor, personalFloor
+end
+
+--- Install provisional soft-delete fact scope for adoption replay floors (#465).
+function GS.NoteSoftDeleteFactScope(record, scope)
+    if type(record) ~= "table" then
+        return
+    end
+    record._gsSoftDeleteFactScope = scope
+    SoftDeleteRuntime.bumpDep(record, "scopeGen")
+end
+
+function GS.ClearSoftDeleteFactScope(record)
+    if type(record) ~= "table" then
+        return
+    end
+    if record._gsSoftDeleteFactScope ~= nil then
+        record._gsSoftDeleteFactScope = nil
+        SoftDeleteRuntime.bumpDep(record, "scopeGen")
+    end
 end
 
 --- Public identity equality for prepare/UI unchanged checks (#459).
@@ -10436,6 +10475,8 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
         GS.RebuildCreditCorrectionProjection(record, nil)
         return false, aliasErr or "full"
     end
+    -- Soft-delete hist attribution depends on accepted correction history.
+    SoftDeleteRuntime.bumpDep(record, "histGen")
     return true, "accepted"
 end
 
@@ -10560,41 +10601,19 @@ GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
 
 local eventDeletionCache = setmetatable({}, { __mode = "k" })
 
-function SoftDeleteRuntime.aliasFingerprint(record)
-    local aliasFp, aliasN = 0, 0
-    local aliases = record and record.accounting and record.accounting._consumables
-        and record.accounting._consumables.creditEventAliases
-    if type(aliases) == "table" then
-        for alias, canon in pairs(aliases) do
-            aliasN = aliasN + 1
-            if type(alias) == "string" and type(canon) == "string" then
-                aliasFp = aliasFp + #alias + #canon
-                    + (string.byte(alias, 1) or 0) + (string.byte(canon, 1) or 0)
-            end
-        end
-    end
-    return aliasN, aliasFp
-end
-
+--- O(1) deletion-projection dependency stamp (#465).
+-- Mutation-owned soft-delete/alias gens only — not ops.generation, ledger
+-- length, or accounting mut — so ordinary adjustment admits do not rebuild
+-- the deletion map or invalidate soft-delete debt floors.
 local function EventDeletionDependencyStamp(record)
-    local ops = record and record.operations
-    local gen = ops and tonumber(ops.generation) or 0
-    local orderN = ops and ops.order and #ops.order or 0
-    local ledgerN = 0
-    local live = record and record.accounting and record.accounting._consumableEvents
-    if type(live) == "table" then
-        ledgerN = #live
-    end
-    -- Alias remaps (not merely map length) must invalidate the projection (#465).
-    local aliasN, aliasFp = SoftDeleteRuntime.aliasFingerprint(record)
-    local mut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
-    return tostring(gen) .. ":" .. tostring(orderN) .. ":" .. tostring(ledgerN)
-        .. ":" .. tostring(aliasN) .. ":" .. tostring(aliasFp) .. ":" .. tostring(mut)
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(d.delGen or 0) .. ":" .. tostring(d.aliasGen or 0)
 end
 
 --- Ledger/alias stamp for reusable soft-delete event indexes (#465 r4529162895).
--- Intentionally omits ops.generation / records size so admitting another
--- soft-delete can reuse lookup + event-object indexes within a slice.
+-- O(1): list lengths + mutation-owned alias gen. Omits ops.generation and
+-- accounting mut so soft-delete admits (and later adjustments) reuse lookup +
+-- event-object indexes while retained evidence cardinality is unchanged.
 function SoftDeleteRuntime.ledgerIndexStamp(record)
     local ledgerN = 0
     local live = record and record.accounting and record.accounting._consumableEvents
@@ -10612,39 +10631,17 @@ function SoftDeleteRuntime.ledgerIndexStamp(record)
     if type(wd) == "table" then
         wdN = #wd
     end
-    local aliasN, aliasFp = SoftDeleteRuntime.aliasFingerprint(record)
-    local mut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    local d = SoftDeleteRuntime.depsFor(record)
     return tostring(ledgerN) .. ":" .. tostring(archiveN) .. ":" .. tostring(wdN)
-        .. ":" .. tostring(aliasN) .. ":" .. tostring(aliasFp) .. ":" .. tostring(mut)
+        .. ":" .. tostring(d.aliasGen or 0)
 end
 
 --- Correction-history stamp for hist attribution index (#465).
--- Soft-delete admits do not change correct-contributor LWW heads, so hist can
--- stay warm across a multi-delete slice. Only correction/alias/accounting
--- changes invalidate this stamp (still cheaper than a ledger rescan).
+-- O(1) mutation-owned histGen — soft-delete admits do not bump it, so hist
+-- stays warm across a multi-delete slice without rescanning ops.records.
 function SoftDeleteRuntime.histIndexStamp(record)
-    local corrN, corrFp = 0, 0
-    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
-    local ops = record and record.operations
-    if type(ops) == "table" and type(ops.records) == "table" and kindCorrect then
-        for id, body in pairs(ops.records) do
-            if type(body) == "table" and body.kind == kindCorrect then
-                corrN = corrN + 1
-                corrFp = corrFp + (tonumber(body.timestamp) or 0)
-                if type(id) == "string" then
-                    corrFp = corrFp + #id + (string.byte(id, 1) or 0)
-                end
-                local tid = body.target or (body.value and body.value.eventId)
-                if type(tid) == "string" then
-                    corrFp = corrFp + #tid
-                end
-            end
-        end
-    end
-    local aliasN, aliasFp = SoftDeleteRuntime.aliasFingerprint(record)
-    local mut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
-    return tostring(corrN) .. ":" .. tostring(corrFp) .. ":" .. tostring(aliasN)
-        .. ":" .. tostring(aliasFp) .. ":" .. tostring(mut)
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(d.histGen or 0) .. ":" .. tostring(d.aliasGen or 0)
 end
 
 --- Operation-head key for soft-delete-event, bound to the canonical event id.
@@ -10719,7 +10716,8 @@ local function RememberSoftDeleteVerifiedFacts(record, facts)
             end
         end
     end
-    map[canon] = {
+    local prior = map[canon]
+    local nextFacts = {
         verified = true,
         eventId = canon,
         eventKind = facts.eventKind,
@@ -10730,7 +10728,19 @@ local function RememberSoftDeleteVerifiedFacts(record, facts)
         attributedGuid = ValidGuid(facts.attributedGuid),
         gsProductionCredit = facts.gsProductionCredit == true,
     }
-    SoftDeleteRuntime.debtFloor[record] = nil
+    map[canon] = nextFacts
+    -- Bump only when content changes so rebuild remember-passes are not O(n)
+    -- factGen storms for unchanged facts.
+    if type(prior) ~= "table"
+        or prior.quantity ~= nextFacts.quantity
+        or prior.itemId ~= nextFacts.itemId
+        or prior.eventKind ~= nextFacts.eventKind
+        or prior.campaignId ~= nextFacts.campaignId
+        or prior.attributed ~= nextFacts.attributed
+        or prior.attributedGuid ~= nextFacts.attributedGuid
+        or (prior.gsProductionCredit == true) ~= (nextFacts.gsProductionCredit == true) then
+        SoftDeleteRuntime.bumpDep(record, "factGen")
+    end
 end
 
 local function LookupSoftDeleteVerifiedFacts(record, eventId, canon)
@@ -10817,9 +10827,22 @@ end
 -- @return table { byObj=, visits= }
 local function BuildSoftDeleteEventObjectIndex(record, lookup)
     local byObj = {}
+    local aliasesByCanon = {}
     local visits = 0
     if type(record) ~= "table" then
-        return { byObj = byObj, visits = 0 }
+        return { byObj = byObj, aliasesByCanon = aliasesByCanon, visits = 0 }
+    end
+    local function noteAlias(terminal, alias)
+        if type(terminal) ~= "string" or terminal == ""
+            or type(alias) ~= "string" or alias == "" then
+            return
+        end
+        local list = aliasesByCanon[terminal]
+        if type(list) ~= "table" then
+            list = {}
+            aliasesByCanon[terminal] = list
+        end
+        list[#list + 1] = alias
     end
     local lists = CreditEventLists(record)
     for li = 1, #lists do
@@ -10835,6 +10858,9 @@ local function BuildSoftDeleteEventObjectIndex(record, lookup)
                     byObj[event.id] = event
                     if type(event.txnId) == "string" and event.txnId ~= "" then
                         byObj[event.txnId] = event
+                        if event.txnId ~= event.id then
+                            noteAlias(event.id, event.txnId)
+                        end
                     end
                 end
             end
@@ -10858,13 +10884,17 @@ local function BuildSoftDeleteEventObjectIndex(record, lookup)
                 local ev = byObj[terminal] or byObj[canon]
                 if type(ev) == "table" then
                     byObj[alias] = ev
+                    noteAlias(terminal, alias)
+                    if terminal ~= canon then
+                        noteAlias(canon, alias)
+                    end
                 elseif byObj[terminal] == false or byObj[canon] == false then
                     byObj[alias] = false
                 end
             end
         end
     end
-    return { byObj = byObj, visits = visits }
+    return { byObj = byObj, aliasesByCanon = aliasesByCanon, visits = visits }
 end
 
 --- Bind soft-delete accounting facts to canonical evidence + accepted correction
@@ -11054,6 +11084,11 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         scratch.lookup = lookup
         scratch.eventIndex = eventIndex
         GS._softDeleteEventIndexVisits = tonumber(eventIndex and eventIndex.visits) or 0
+        GS._softDeleteCumulativeEventVisits =
+            (tonumber(GS._softDeleteCumulativeEventVisits) or 0)
+            + (tonumber(GS._softDeleteEventIndexVisits) or 0)
+        GS._softDeleteColdLedgerBuilds =
+            (tonumber(GS._softDeleteColdLedgerBuilds) or 0) + 1
     end
     if scratch.histStamp == histStamp and type(scratch.histIndex) == "table" then
         histIndex = scratch.histIndex
@@ -11065,6 +11100,9 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         scratch.histIndex = histIndex
         scratch.histVisits = histVisits
         GS._softDeleteHistCorrectionVisits = tonumber(histVisits) or 0
+        GS._softDeleteCumulativeHistVisits =
+            (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
+            + (tonumber(histVisits) or 0)
     end
     GS._softDeleteIndexReuse = reusedLedger
     GS._softDeleteRebuildFindLedgerCalls = 0
@@ -11110,10 +11148,12 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     end
     -- Collect head bodies keyed by terminal canonical id; LWW within each group.
     local winners = {} -- canon -> { body=, entry=, ids={} }
+    local headVisits = 0
     if type(heads) == "table" and type(records) == "table" then
         for targetKey, headId in pairs(heads) do
             if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:"
                 and type(headId) == "string" then
+                headVisits = headVisits + 1
                 local body = records[headId]
                 if type(body) == "table"
                     and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
@@ -11144,6 +11184,9 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
             end
         end
     end
+    GS._softDeleteHeadVisits = headVisits
+    GS._softDeleteCumulativeHeadVisits =
+        (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + headVisits
     -- Speculative local prepare preview: include extraOp before StoreAccepted.
     if type(extraOp) == "table"
         and extraOp.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
@@ -11214,12 +11257,115 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         end
     end
     record.eventDeletions = map
+    SoftDeleteRuntime.bumpDep(record, "delGen")
     eventDeletionCache[record] = {
         stamp = EventDeletionDependencyStamp(record),
         ok = true,
     }
-    -- Deletion map changed: floor aggregates must rebuild on next query.
-    SoftDeleteRuntime.debtFloor[record] = nil
+    return true
+end
+
+--- Incremental soft-delete head apply when ledger/hist indexes are warm (#465).
+-- Avoids folding every retained delete head on each new admission.
+function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false
+    end
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) ~= "table" or type(scratch.eventIndex) ~= "table"
+        or type(scratch.lookup) ~= "table" then
+        return false
+    end
+    if SoftDeleteRuntime.ledgerIndexStamp(record) ~= scratch.ledgerStamp then
+        return false
+    end
+    local lookup = scratch.lookup
+    local eventIndex = scratch.eventIndex
+    local histIndex = scratch.histIndex
+    if SoftDeleteRuntime.histIndexStamp(record) ~= scratch.histStamp
+        or type(histIndex) ~= "table" then
+        local hv
+        histIndex, hv = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
+        scratch.histIndex = histIndex
+        scratch.histVisits = hv
+        GS._softDeleteHistCorrectionVisits = tonumber(hv) or 0
+        GS._softDeleteCumulativeHistVisits =
+            (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
+            + (tonumber(hv) or 0)
+    else
+        GS._softDeleteHistCorrectionVisits = 0
+    end
+    GS._softDeleteEventIndexVisits = 0
+    GS._softDeleteIndexReuse = true
+    GS._softDeleteHeadVisits = 1
+    GS._softDeleteCumulativeHeadVisits =
+        (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + 1
+    GS._softDeleteIncrementalApplies =
+        (tonumber(GS._softDeleteIncrementalApplies) or 0) + 1
+    GS._softDeleteRebuildFindLedgerCalls = 0
+    local eventId = op.target or (op.value and op.value.eventId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return false
+    end
+    local canon = GS.CanonicalCreditEventId
+        and GS.CanonicalCreditEventId(record, eventId, lookup) or eventId
+    local byObj = eventIndex.byObj
+    local resolved = event
+    if type(resolved) ~= "table" and type(byObj) == "table" then
+        resolved = byObj[canon] or byObj[eventId]
+        if resolved == false then
+            resolved = nil
+        end
+    end
+    local priorMap = type(record.eventDeletions) == "table" and record.eventDeletions or nil
+    local prior = nil
+    if type(priorMap) == "table" then
+        prior = priorMap[canon] or priorMap[eventId]
+        if type(prior) ~= "table" or prior.verified ~= true then
+            prior = LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+        end
+    else
+        prior = LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    end
+    local facts = DeriveVerifiedSoftDeleteFacts(
+        record, op, resolved, prior, histIndex)
+    if facts.verified == true then
+        RememberSoftDeleteVerifiedFacts(record, facts)
+    end
+    local entry = SoftDeleteHeadEntry(op, facts)
+    local map = type(record.eventDeletions) == "table" and record.eventDeletions or {}
+    map[canon] = entry
+    map[eventId] = entry
+    if type(resolved) == "table" then
+        if type(resolved.id) == "string" and resolved.id ~= "" then
+            map[resolved.id] = entry
+        end
+        if type(resolved.txnId) == "string" and resolved.txnId ~= "" then
+            map[resolved.txnId] = entry
+        end
+    end
+    -- Local prepare canonicalizes op.target; publish warm alias keys for this
+    -- canon so IsEventSoftDeleted(alias) matches a full Rebuild fold without
+    -- rescanning the whole durable alias map on every incremental delete.
+    local aliasList = eventIndex.aliasesByCanon and (
+        eventIndex.aliasesByCanon[canon]
+        or (type(resolved) == "table" and eventIndex.aliasesByCanon[resolved.id])
+    )
+    if type(aliasList) == "table" then
+        for i = 1, #aliasList do
+            local alias = aliasList[i]
+            if type(alias) == "string" and alias ~= "" then
+                map[alias] = entry
+            end
+        end
+    end
+    record.eventDeletions = map
+    SoftDeleteRuntime.bumpDep(record, "delGen")
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = true,
+    }
     return true
 end
 
@@ -11229,6 +11375,7 @@ function GS.InvalidateEventDeletionProjection(record)
     end
     eventDeletionCache[record] = nil
     SoftDeleteRuntime.debtFloor[record] = nil
+    SoftDeleteRuntime.bumpDep(record, "delGen")
     -- Keep SoftDeleteRuntime.indexes: ledger/alias stamp still gates reuse.
     -- Clearing it here would force a full ledger rescan on every Ensure after
     -- Invalidate.
@@ -11241,6 +11388,8 @@ function GS.InvalidateSoftDeleteLedgerIndexes(record)
     end
     SoftDeleteRuntime.indexes[record] = nil
     SoftDeleteRuntime.debtFloor[record] = nil
+    SoftDeleteRuntime.deps[record] = nil
+    eventDeletionCache[record] = nil
 end
 
 function GS.SealEventDeletionProjection(record, ok)
@@ -11460,15 +11609,23 @@ function GS.BuildSoftDeleteValue(record, eventId, opts)
 end
 
 --- Apply an accepted soft-delete mutation (#465). Ledger evidence is untouched.
+-- Prefer incremental head apply when replay indexes are warm so multi-delete
+-- slices do not re-fold every retained head (r4529162895). Deliberately skips a
+-- leading Ensure→full Rebuild; heads + Rebuild/incremental keep coherence.
 function GS.ApplySoftDeleteMutation(record, op, opts)
     opts = opts or {}
     if type(record) ~= "table" or type(op) ~= "table" then
         return false, "invalid_value"
     end
-    GS.EnsureEventDeletionProjection(record, nil)
     local eventId = op.target or (op.value and op.value.eventId)
-    local canonical = GS.CanonicalCreditEventId(record, eventId) or eventId
-    local tKey = GS.SoftDeleteTargetKey and GS.SoftDeleteTargetKey(record, eventId)
+    local lookup = nil
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) == "table" and type(scratch.lookup) == "table"
+        and SoftDeleteRuntime.ledgerIndexStamp(record) == scratch.ledgerStamp then
+        lookup = scratch.lookup
+    end
+    local canonical = GS.CanonicalCreditEventId(record, eventId, lookup) or eventId
+    local tKey = GS.SoftDeleteTargetKey and GS.SoftDeleteTargetKey(record, eventId, lookup)
         or (GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId))
     local ops = record.operations
     local headId = ops and ops.heads and tKey and ops.heads[tKey]
@@ -11494,6 +11651,9 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
             if not aliasOk then
                 return false, aliasErr or "full"
             end
+        end
+        if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
+            return true, "accepted"
         end
         if not GS.RebuildEventDeletionProjection(record, op) then
             return false, "invalid_value"
@@ -11524,7 +11684,10 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
             return false, aliasErr or "full"
         end
     end
-    if not GS.RebuildEventDeletionProjection(record, op) then
+    -- Warm indexes once via Rebuild when incremental cannot run yet.
+    if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
+        -- ok
+    elseif not GS.RebuildEventDeletionProjection(record, op) then
         return false, "invalid_value"
     end
     local count = 0

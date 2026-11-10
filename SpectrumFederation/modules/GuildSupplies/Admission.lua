@@ -3785,7 +3785,12 @@ local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
     end
     -- Provisional scope for mid-replay floors; final publish still binds facts
     -- to accepted canonical deletions (r4529162877).
-    temp._gsSoftDeleteFactScope = BuildSoftDeleteFactScopeFromAdoption(adop)
+    local scope = BuildSoftDeleteFactScopeFromAdoption(adop)
+    if GS.NoteSoftDeleteFactScope then
+        GS.NoteSoftDeleteFactScope(temp, scope)
+    else
+        temp._gsSoftDeleteFactScope = scope
+    end
     return true
 end
 
@@ -5722,38 +5727,134 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     -- publish. Shape/count alone is insufficient (r4529162877). Orphaned
     -- evidence, aliases, and losing revisions remain valid when the winning
     -- soft-delete head / projected deletion is present.
+    -- Charged/resumable under the existing completeness budget (r4529162895):
+    -- shared canonical lookup — never per-delete FindLedger scans.
     do
         local durable = temp.accounting and temp.accounting._consumables
             and temp.accounting._consumables.softDeleteVerifiedFacts
-        if type(durable) == "table" then
-            if GS.EnsureEventDeletionProjection then
-                GS.EnsureEventDeletionProjection(temp, nil)
+        if type(durable) == "table" and next(durable) ~= nil then
+            local bind = opts.softDeleteBind
+            if type(bind) ~= "table" then
+                bind = { phase = "ensure" }
+                opts.softDeleteBind = bind
             end
-            local delMap = temp.eventDeletions
-            local ops = temp.operations
-            local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
-            -- One pass over accepted soft-delete history (heads + losing
-            -- revisions) → target set; then O(facts) membership checks.
-            local deleteTargets = {}
-            if type(ops) == "table" and kindDel and type(ops.records) == "table" then
-                for _, body in pairs(ops.records) do
-                    if type(body) == "table" and body.kind == kindDel then
-                        local tid = body.target
-                            or (body.value and body.value.eventId)
-                        if type(tid) == "string" and tid ~= "" then
-                            deleteTargets[tid] = true
-                            if GS.CanonicalCreditEventId then
-                                local tCanon = GS.CanonicalCreditEventId(temp, tid)
-                                if type(tCanon) == "string" and tCanon ~= "" then
-                                    deleteTargets[tCanon] = true
-                                end
+            if bind.phase == "ensure" then
+                if visited >= budget then
+                    opts.cursor = #adop.order + 1
+                    opts.budgetExhausted = true
+                    publishCompletenessStats()
+                    return false, "budget"
+                end
+                if GS.EnsureEventDeletionProjection then
+                    GS.EnsureEventDeletionProjection(temp, nil)
+                end
+                visited = visited + 1
+                adop._workStats.completenessVisited =
+                    (adop._workStats.completenessVisited or 0) + 1
+                bind.phase = "lookup"
+            end
+            if bind.phase == "lookup" then
+                if visited >= budget then
+                    opts.cursor = #adop.order + 1
+                    opts.budgetExhausted = true
+                    publishCompletenessStats()
+                    return false, "budget"
+                end
+                if GS.BuildCreditCanonicalLookup then
+                    bind.lookup = GS.BuildCreditCanonicalLookup(temp)
+                    local lv = tonumber(GS._creditCanonicalLookupVisits) or 0
+                    visited = visited + math.max(1, lv)
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + math.max(1, lv)
+                else
+                    bind.lookup = nil
+                    visited = visited + 1
+                end
+                bind.phase = "targets"
+                bind.targetList = nil
+                bind.targetPos = 1
+                bind.deleteTargets = {}
+            end
+            if bind.phase == "targets" then
+                local ops = temp.operations
+                local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+                if type(bind.targetList) ~= "table" then
+                    local list = {}
+                    if type(ops) == "table" and kindDel and type(ops.records) == "table" then
+                        for _, body in pairs(ops.records) do
+                            if type(body) == "table" and body.kind == kindDel then
+                                list[#list + 1] = body
+                            end
+                        end
+                    end
+                    bind.targetList = list
+                    bind.targetPos = 1
+                    bind.deleteTargets = bind.deleteTargets or {}
+                end
+                local list = bind.targetList
+                local pos = tonumber(bind.targetPos) or 1
+                local deleteTargets = bind.deleteTargets
+                local lookup = bind.lookup
+                while pos <= #list do
+                    if visited >= budget then
+                        bind.targetPos = pos
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    visited = visited + 1
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + 1
+                    local body = list[pos]
+                    pos = pos + 1
+                    local tid = body.target or (body.value and body.value.eventId)
+                    if type(tid) == "string" and tid ~= "" then
+                        deleteTargets[tid] = true
+                        if GS.CanonicalCreditEventId then
+                            local tCanon = GS.CanonicalCreditEventId(temp, tid, lookup)
+                            if type(tCanon) == "string" and tCanon ~= "" then
+                                deleteTargets[tCanon] = true
                             end
                         end
                     end
                 end
+                bind.targetPos = pos
+                bind.phase = "facts"
+                bind.factList = nil
+                bind.factPos = 1
             end
-            for eventId, entry in pairs(durable) do
-                if type(entry) == "table" and entry.verified == true then
+            if bind.phase == "facts" then
+                if type(bind.factList) ~= "table" then
+                    local list = {}
+                    for eventId, entry in pairs(durable) do
+                        if type(entry) == "table" and entry.verified == true then
+                            list[#list + 1] = { id = eventId, entry = entry }
+                        end
+                    end
+                    bind.factList = list
+                    bind.factPos = 1
+                end
+                local delMap = temp.eventDeletions
+                local deleteTargets = bind.deleteTargets or {}
+                local lookup = bind.lookup
+                local list = bind.factList
+                local pos = tonumber(bind.factPos) or 1
+                while pos <= #list do
+                    if visited >= budget then
+                        bind.factPos = pos
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    visited = visited + 1
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + 1
+                    local row = list[pos]
+                    pos = pos + 1
+                    local eventId = row.id
+                    local entry = row.entry
                     local canon = entry.eventId
                     if type(canon) ~= "string" or canon == "" then
                         canon = eventId
@@ -5769,7 +5870,7 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                         if deleteTargets[eventId] or deleteTargets[canon] then
                             bound = true
                         elseif GS.CanonicalCreditEventId then
-                            local tCanon = GS.CanonicalCreditEventId(temp, canon)
+                            local tCanon = GS.CanonicalCreditEventId(temp, canon, lookup)
                             if type(tCanon) == "string" and deleteTargets[tCanon] then
                                 bound = true
                             end
@@ -5778,15 +5879,21 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     if not bound then
                         opts.cursor = nil
                         opts.budgetExhausted = false
+                        opts.softDeleteBind = nil
                         publishCompletenessStats()
-                        return false, "incomplete_transfer"
+                        return false, "soft_delete_fact_unbound"
                     end
                 end
+                bind.factPos = pos
+                bind.phase = "done"
             end
+            opts.softDeleteBind = nil
         end
-        -- Drop provisional adoption scope so published datasets use ordinary
-        -- durable+projection floors without a transfer-only filter.
-        temp._gsSoftDeleteFactScope = nil
+        if GS.ClearSoftDeleteFactScope then
+            GS.ClearSoftDeleteFactScope(temp)
+        else
+            temp._gsSoftDeleteFactScope = nil
+        end
     end
     opts.cursor = nil
     opts.budgetExhausted = false
