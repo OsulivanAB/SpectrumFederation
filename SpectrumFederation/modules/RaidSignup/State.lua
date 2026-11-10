@@ -560,14 +560,20 @@ function RS.MergeEntry(record, entry, opts)
     if type(plan) ~= "table" then
         return "rejected", "plan_missing"
     end
-    -- Archived plans are read-only for content mutations. Tombstones still
-    -- apply so stale deletes converge after archive.
-    if plan.archived and not clean.deleted and not opts.allowArchived then
+    -- Local mutations against archived plans are forbidden. Remote gossip may
+    -- still catch up historical roster contents (including first-seen entries)
+    -- that peers already saved while the plan was open. Tombstones always apply.
+    if plan.archived and not clean.deleted and not opts.remote and not opts.allowArchived then
         return "rejected", "plan_archived"
     end
 
     local prev = record.entries[clean.entryId]
     if type(prev) == "table" and ValidVer(prev.ver) then
+        -- Deletion is final: no approved restore. A live record must never
+        -- overwrite a tombstone regardless of version ordering or writer tie-break.
+        if prev.deleted and not clean.deleted then
+            return "rejected", "deleted_final"
+        end
         local cmp = RS.CompareVer(clean.ver, prev.ver)
         if cmp < 0 then
             return "duplicate", "stale"
@@ -580,10 +586,6 @@ function RS.MergeEntry(record, entry, opts)
             return "rejected", "creator_immutable"
         end
         clean.creatorGuid = prev.creatorGuid
-        -- Resist resurrection: a live record must not undo a newer tombstone.
-        -- (Higher ver already required above; if prev was deleted and incoming is
-        -- live with higher ver, allow — that is an intentional recreate/edit path
-        -- only when ver advances from an authorized writer.)
     else
         if not clean.deleted then
             if CountEntries(record, nil, false) >= RS.MAX_ENTRIES then

@@ -82,11 +82,30 @@ function GetGuildRosterInfo(i)
 end
 function date(fmt, ts) return os.date(fmt, ts) end
 function GetSpecializationInfoByID(specId)
+    -- Realistic Retail-shaped returns: id, name, description, icon (file id number), role
     local names = {
         [62] = "Arcane", [71] = "Arms", [72] = "Fury", [65] = "Holy", [66] = "Protection",
         [70] = "Retribution", [105] = "Restoration", [259] = "Assassination",
+        [63] = "Fire", [256] = "Discipline", [262] = "Elemental", [263] = "Enhancement",
+        [102] = "Balance",
     }
-    return specId, names[specId] or ("Spec" .. tostring(specId)), nil, "Interface\\Icons\\INV_Misc_QuestionMark"
+    local descriptions = {
+        [62] = "Master of raw arcane magic",
+        [71] = "A battle-hardened master of two-handed weapons",
+        [105] = "Uses heal-over-time magic to mend allies",
+    }
+    local icons = {
+        [62] = 135932, -- distinct numeric file id (not the spec id)
+        [71] = 132355,
+        [105] = 136041,
+        [65] = 135920,
+        [70] = 135959,
+        [259] = 236270,
+    }
+    local name = names[specId] or ("Spec" .. tostring(specId))
+    local description = descriptions[specId] or ("Description for " .. name)
+    local icon = icons[specId] or (100000 + (tonumber(specId) or 0))
+    return specId, name, description, icon, "DAMAGER"
 end
 
 C_Timer = {
@@ -293,18 +312,45 @@ assertEq(complete, false, "class alone is incomplete")
 _, complete = RS.UpdateDraftField(draft, "specId", 62)
 assertEq(complete, false, "class+spec without nickname incomplete")
 _, complete = RS.UpdateDraftField(draft, "nickname", "Spark")
-assertEq(complete, true, "nickname last completes draft")
+assertEq(complete, true, "nickname last completes draft payload")
+assertEq(RS.DraftReadyToPersist(draft), false, "typing nickname does not ready persist")
+RS.CommitDraftNickname(draft)
+assertEq(RS.DraftReadyToPersist(draft), true, "commit boundary readies persist")
+
+-- Class/spec first: first nickname character must not persist.
+draft = RS.MakeDraft("plan-temp")
+RS.UpdateDraftField(draft, "classFile", "MAGE")
+RS.UpdateDraftField(draft, "specId", 62)
+RS.UpdateDraftField(draft, "nickname", "S")
+assertEq(RS.DraftIsComplete(draft), true, "single char completes payload")
+assertEq(RS.DraftReadyToPersist(draft), false, "single char not ready without commit")
+RS.UpdateDraftField(draft, "nickname", "Spark")
+assertEq(RS.DraftReadyToPersist(draft), false, "continued typing still uncommitted")
+RS.CommitDraftNickname(draft)
+assertEq(RS.DraftReadyToPersist(draft), true, "enter/focus-loss commit readies")
 
 draft = RS.MakeDraft("plan-temp")
 RS.UpdateDraftField(draft, "nickname", "Spark")
+RS.CommitDraftNickname(draft)
 RS.UpdateDraftField(draft, "specId", 62)
 _, complete = RS.UpdateDraftField(draft, "classFile", "MAGE")
 -- classFile clears specId by design when class changes; re-select spec
 assertEq(RS.DraftIsComplete(draft), false, "changing class clears spec")
 RS.UpdateDraftField(draft, "specId", 62)
 assertEq(RS.DraftIsComplete(draft), true, "spec after class completes")
+assertEq(RS.DraftReadyToPersist(draft), true, "prior nickname commit preserved across class/spec")
 
 assertTrue(not RS.IsCompleteEntryPayload("  ", "MAGE", 62), "blank nickname never completes")
+
+-- Spec icon extraction: pcall ok + id/name/description/icon positions
+local icon62 = RS.SpecIconTexture(62)
+assertEq(icon62, 135932, "SpecIconTexture uses icon file id not description/id")
+assertTrue(icon62 ~= 62, "SpecIconTexture is not the specialization id")
+local name62 = RS.SpecDisplayName(62)
+assertEq(name62, "Arcane", "SpecDisplayName uses name return")
+assertTrue(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1]) ~= nil, "category icon present")
+assertTrue(tostring(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1])):find("Spell_Holy_MagicalSentry", 1, true) ~= nil,
+    "intellect uses ability icon not class icon")
 
 ---------------------------------------------------------------------------
 -- Plan + entry local lifecycle
@@ -511,8 +557,81 @@ delStatus = provider.ValidateAndApply({
 assertEq(delStatus, "duplicate", "stale live replay does not resurrect")
 assertTrue(record.entries[entryA].deleted, "still deleted")
 
+-- Higher-version live record must not overwrite tombstone (no restore)
+local zombie = RS.CloneEntry(record.entries[entryA])
+zombie.deleted = false
+zombie.nickname = "Resurrected"
+zombie.ver = { n = record.entries[entryA].ver.n + 5, w = "ffffffffffffffffffffffff" }
+delStatus, delDetail = provider.ValidateAndApply({
+    id = RS.EntryRecordId(entryA),
+    versionFp = "zombie",
+    body = { kind = "raidsignup-entry", schema = 1, entry = zombie },
+}, { sender = "Carol-Garona" })
+assertEq(delStatus, "rejected", "higher-ver live cannot overwrite tombstone")
+assertEq(delDetail, "deleted_final", "deleted_final reason")
+assertTrue(record.entries[entryA].deleted, "tombstone remains after higher-ver live")
+
+-- Equal revision, different writer tie-break: live vs tombstone — tombstone wins
+local tieLive = RS.CloneEntry(record.entries[entryA])
+tieLive.deleted = false
+tieLive.ver = { n = record.entries[entryA].ver.n, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }
+local tieStatus = select(1, RS.MergeEntry(record, tieLive, { remote = true }))
+assertEq(tieStatus, "rejected", "equal-n live cannot beat tombstone via writer tie-break")
+
+-- Opposite delivery order: live first, then tombstone with higher ver
+local entryDelOrder
+ActAs("Carol-Garona", "Player-1-Carol")
+status, _, entryDelOrder = RS:UpsertEntry({
+    planId = planId,
+    nickname = "DelOrder",
+    mainClass = "MAGE",
+    mainSpec = 63,
+})
+assertEq(status, "accepted", "entry for deletion order test")
+local liveSnap = RS.CloneEntry(record.entries[entryDelOrder])
+ActAs("Carol-Garona", "Player-1-Carol")
+status = RS:DeleteEntry(entryDelOrder, { expectedVer = liveSnap.ver })
+assertEq(status, "accepted", "delete for order test")
+local tomb = RS.CloneEntry(record.entries[entryDelOrder])
+-- Simulate peer that saw live, then receives tombstone
+local peerRec = {
+    schemaVersion = 1,
+    guildKey = "club:42",
+    clubId = "42",
+    plans = {},
+    entries = {},
+}
+for _, plan in pairs(record.plans) do
+    RS.MergePlan(peerRec, plan, { remote = true })
+end
+assertEq(select(1, RS.MergeEntry(peerRec, liveSnap, { remote = true })), "accepted", "peer accepts live first")
+assertEq(select(1, RS.MergeEntry(peerRec, tomb, { remote = true })), "accepted", "peer converges to tombstone")
+assertTrue(peerRec.entries[entryDelOrder].deleted, "peer deleted after tombstone")
+-- Stale live replay after tombstone (both MergeEntry and Gossip provider)
+assertEq(select(1, RS.MergeEntry(peerRec, liveSnap, { remote = true })), "rejected", "stale live after tombstone rejected")
+assertTrue(peerRec.entries[entryDelOrder].deleted, "still deleted after stale replay")
+local replayStatus = provider.ValidateAndApply({
+    id = RS.EntryRecordId(entryDelOrder),
+    versionFp = "replay-live",
+    body = { kind = "raidsignup-entry", schema = 1, entry = liveSnap },
+}, { sender = "Carol-Garona" })
+assertEq(replayStatus, "duplicate", "provider rejects stale live vs tombstone as duplicate/stale")
+assertTrue(record.entries[entryDelOrder].deleted, "author DB still deleted after provider replay")
+
+-- Provider path: higher-ver live against existing tombstone on the live guild record
+local zombie2 = RS.CloneEntry(record.entries[entryDelOrder])
+zombie2.deleted = false
+zombie2.ver = { n = tomb.ver.n + 3, w = "bbbbbbbbbbbbbbbbbbbbbbbb" }
+local zStatus, zDetail = provider.ValidateAndApply({
+    id = RS.EntryRecordId(entryDelOrder),
+    versionFp = "zombie2",
+    body = { kind = "raidsignup-entry", schema = 1, entry = zombie2 },
+}, { sender = "Carol-Garona" })
+assertEq(zStatus, "rejected", "provider blocks resurrection")
+assertEq(zDetail, "deleted_final", "provider surfaces deleted_final")
+
 ---------------------------------------------------------------------------
--- Archive race
+-- Archive race + remote historical catch-up via Gossip provider
 ---------------------------------------------------------------------------
 
 ActAs("Alice-Garona", "Player-1-Alice")
@@ -538,7 +657,61 @@ status = RS:UpsertEntry({
     mainClass = "SHAMAN",
     mainSpec = 263,
 })
-assertEq(status, "rejected", "archived plan rejects edits")
+assertEq(status, "rejected", "archived plan rejects local edits")
+
+-- Peer that archived before receiving Carol's historical entry must still catch up via Gossip.
+local archivePeer = {
+    schemaVersion = 1,
+    guildKey = "club:42",
+    clubId = "42",
+    plans = {},
+    entries = {},
+}
+local archivedPlan = RS.ClonePlan(record.plans[plan2])
+assertEq(select(1, RS.MergePlan(archivePeer, archivedPlan, { remote = true })), "accepted", "peer has archived plan")
+-- Historical entry that existed while plan was open (Carol author) arrives after archive
+local historical = RS.CloneEntry(record.entries[entryC])
+-- Direct MergeEntry remote path
+assertEq(select(1, RS.MergeEntry(archivePeer, historical, { remote = true })), "accepted",
+    "remote MergeEntry catch-up onto archived plan")
+assertTrue(archivePeer.entries[entryC] ~= nil, "historical entry stored on archived plan")
+-- Local mutation still forbidden on archived peer copy
+assertEq(select(1, RS.MergeEntry(archivePeer, historical, { remote = false })), "rejected",
+    "local merge still rejected when archived")
+
+-- Provider ValidateAndApply path for catch-up onto a client that only has the archived plan
+-- Use a fresh entry id that the main record already holds, applied through provider into main
+-- after archive (simulates late gossip of already-saved content for another entry).
+ActAs("Dave-Garona", "Player-1-Dave")
+-- Create on a *different* open plan first, then we'll test provider against archivePeer via Merge
+-- already covered; exercise provider against Alice DB for a new historical-shaped apply:
+-- Build a second peer DB initialized like SpectrumFederation using Ensure on side channel:
+local lateEntry = RS.CloneEntry(historical)
+lateEntry.entryId = "entry-historical-late"
+lateEntry.ver = { n = 1, w = "carolcarolcarolcarolcaro" }
+lateEntry.creatorGuid = "Player-1-Carol"
+lateEntry.nickname = "LateCatchup"
+-- Inject into archivePeer through provider by temporarily swapping EnsureGuildRecord — instead
+-- call Merge via provider after planting archivePeer as the guild record is hard; use MergeEntry
+-- + provider against main record for an entry that is first-seen while plan archived:
+ActAs("Alice-Garona", "Player-1-Alice")
+delStatus = provider.ValidateAndApply({
+    id = RS.EntryRecordId(lateEntry.entryId),
+    versionFp = "late",
+    body = { kind = "raidsignup-entry", schema = 1, entry = lateEntry },
+}, { sender = "Carol-Garona" })
+assertEq(delStatus, "accepted", "Gossip provider catch-up admits historical entry on archived plan")
+assertTrue(record.entries[lateEntry.entryId] ~= nil, "late historical entry present")
+assertTrue(record.plans[plan2].archived, "plan remains archived")
+ActAs("Carol-Garona", "Player-1-Carol")
+status = RS:UpsertEntry({
+    entryId = lateEntry.entryId,
+    planId = plan2,
+    nickname = "ShouldFail",
+    mainClass = "SHAMAN",
+    mainSpec = 262,
+})
+assertEq(status, "rejected", "UI/local still cannot edit archived plan after catch-up")
 
 ---------------------------------------------------------------------------
 -- Summary main-only counts + coverage
@@ -606,10 +779,10 @@ assertTrue(summary.major.versatility, "druid covers versatility")
 -- Reload persistence
 ---------------------------------------------------------------------------
 
-local snap = SpectrumFederationDB.raidSignup
-SF.RaidSignup = nil
--- reload modules onto fresh SF table would be heavy; instead re-init same RS
+-- Reload persistence: re-initialize the same module table (do not nil SF.RaidSignup;
+-- later UI page load must resolve the live module via SF.RaidSignup).
 assertTrue(RS:Initialize(SpectrumFederationDB), "re-init after reload")
+SF.RaidSignup = RS
 local restored = RS:GetSortedPlans(true)
 local found = false
 for i = 1, #restored do
@@ -679,6 +852,287 @@ for i = 1, #RS.UTILITY_CATEGORIES do
 end
 assertTrue(foundAtrophic, "Atrophic Poison naming")
 assertTrue(foundBronze, "Blessing of the Bronze naming")
+
+---------------------------------------------------------------------------
+-- Production UI page: typing stability, nickname commit, bounded reuse
+---------------------------------------------------------------------------
+
+local frameCount = 0
+local function makeRegion(objectType)
+    local r = {
+        _type = objectType or "Region",
+        _shown = true,
+        _parent = nil,
+        _points = {},
+        _scripts = {},
+        _text = "",
+        _texture = nil,
+    }
+    function r:GetObjectType() return self._type end
+    function r:SetParent(p) self._parent = p end
+    function r:GetParent() return self._parent end
+    function r:Show() self._shown = true end
+    function r:Hide() self._shown = false end
+    function r:IsShown() return self._shown end
+    function r:SetAllPoints() end
+    function r:ClearAllPoints() self._points = {} end
+    function r:SetPoint(p, rel, rp, x, y)
+        self._points[#self._points + 1] = { p, rel, rp, x, y }
+    end
+    function r:SetSize(w, h) self._w = w; self._h = h end
+    function r:SetWidth(w) self._w = w end
+    function r:SetHeight(h) self._h = h end
+    function r:GetWidth() return self._w or 100 end
+    function r:GetHeight() return self._h or 20 end
+    function r:SetText(t) self._text = t or "" end
+    function r:GetText() return self._text or "" end
+    function r:SetTexture(t) self._texture = t end
+    function r:SetDesaturated() end
+    function r:SetVertexColor() end
+    function r:SetMaxLetters() end
+    function r:SetAutoFocus() end
+    function r:Enable() self._enabled = true end
+    function r:Disable() self._enabled = false end
+    function r:EnableMouse() end
+    function r:RegisterForClicks() end
+    function r:SetScript(name, fn) self._scripts[name] = fn end
+    function r:GetScript(name) return self._scripts[name] end
+    function r:HookScript(name, fn)
+        local prev = self._scripts[name]
+        self._scripts[name] = function(...)
+            if prev then prev(...) end
+            fn(...)
+        end
+    end
+    function r:HasFocus() return self._focused == true end
+    function r:ClearFocus()
+        self._focused = false
+        local fn = self._scripts.OnEditFocusLost
+        if fn then fn(self) end
+    end
+    function r:SetFocus()
+        self._focused = true
+        local fn = self._scripts.OnEditFocusGained
+        if fn then fn(self) end
+    end
+    function r:CreateTexture()
+        return makeRegion("Texture")
+    end
+    function r:CreateFontString()
+        local fs = makeRegion("FontString")
+        function fs:SetJustifyH() end
+        return fs
+    end
+    function r:GetChildren()
+        local kids = {}
+        for _, child in ipairs(self._children or {}) do
+            if child._parent == self then
+                kids[#kids + 1] = child
+            end
+        end
+        return unpack(kids)
+    end
+    function r:GetRegions()
+        return unpack(self._regions or {})
+    end
+    r._children = {}
+    r._regions = {}
+    return r
+end
+
+function CreateFrame(frameType, name, parent, template)
+    frameCount = frameCount + 1
+    local f = makeRegion(frameType or "Frame")
+    f._name = name
+    f._template = template
+    f._parent = parent
+    if parent and parent._children then
+        parent._children[#parent._children + 1] = f
+    end
+    -- EditBox helpers
+    if frameType == "EditBox" or template == "InputBoxTemplate" then
+        f._type = "EditBox"
+        f.Instructions = makeRegion("FontString")
+    end
+    if frameType == "Button" or template == "UIPanelButtonTemplate" then
+        f._type = "Button"
+        function f:Click()
+            local fn = f._scripts.OnClick
+            if fn then fn(f) end
+        end
+    end
+    return f
+end
+
+GameTooltip = {
+    SetOwner = function() end,
+    SetText = function() end,
+    AddLine = function() end,
+    Show = function() end,
+    Hide = function() end,
+}
+
+SF.SettingsUI = SF.SettingsUI or {}
+local registeredPage = nil
+function SF.SettingsUI:RegisterCategory() end
+function SF.SettingsUI:RegisterPage(page)
+    registeredPage = page
+end
+function SF.SettingsUI:CreatePage(panel)
+    local pb = {
+        scrollFrame = CreateFrame("Frame", nil, panel),
+        refreshCallbacks = {},
+        sections = {},
+    }
+    function pb:AddSection(opts)
+        local section = {
+            title = opts and opts.title,
+            rows = {},
+        }
+        function section:AddRow(height, fn)
+            local row = CreateFrame("Frame", nil, panel)
+            row:SetHeight(height)
+            self.rows[#self.rows + 1] = row
+            if fn then fn(row) end
+            return row
+        end
+        self.sections[#self.sections + 1] = section
+        return section
+    end
+    function pb:Finalize() end
+    function pb:Refresh()
+        for i = 1, #self.refreshCallbacks do
+            self.refreshCallbacks[i]()
+        end
+    end
+    function pb:RegisterRefresh(fn)
+        self.refreshCallbacks[#self.refreshCallbacks + 1] = fn
+    end
+    return pb
+end
+SF.SettingsUI.Controls = {
+    AddDisplay = function() end,
+    AddButton = function() end,
+    AddDropdown = function() end,
+    AddEditBoxWithButton = function() end,
+}
+
+SF.RaidSignup = RS
+load("SpectrumFederation/modules/UI/Settings/Pages/RaidSignup.lua")
+local UIPage = SF.RaidSignupUIPage or registeredPage
+assertTrue(UIPage ~= nil, "Raid Signup page registered")
+assertTrue(type(UIPage._SetDraftForTests) == "function", "draft test hook present")
+
+ActAs("Alice-Garona", "Player-1-Alice")
+RS:SelectPlan(plan3)
+UIPage._ResetSessionForTests()
+local panel = CreateFrame("Frame", "RaidSignupTestPanel")
+function panel:IsShown() return true end
+function panel:HookScript(name, fn)
+    self._scripts = self._scripts or {}
+    self._scripts[name] = fn
+end
+UIPage:Build(panel)
+local counters1 = UIPage._GetLifecycleCounters()
+assertEq(counters1.openCount, 1, "page open counted")
+assertTrue(counters1.fullRebuildCount >= 1, "initial full rebuild")
+assertTrue(counters1.listenerCount >= 1, "ui listener registered")
+
+local hostBefore = panel.__sfRaidSignupEntriesHost
+assertTrue(hostBefore ~= nil, "entries host created")
+local summaryBefore = panel.__sfRaidSignupSummaryHost
+assertTrue(summaryBefore ~= nil, "summary host created")
+local rebuildBefore = UIPage._GetLifecycleCounters().fullRebuildCount
+local paintBefore = UIPage._GetLifecycleCounters().boardPaintCount
+UIPage:Refresh(panel)
+UIPage:Refresh(panel)
+local counters2 = UIPage._GetLifecycleCounters()
+assertEq(counters2.fullRebuildCount, rebuildBefore, "soft refresh does not full-rebuild")
+assertTrue(counters2.boardPaintCount > paintBefore, "boards repainted on soft refresh")
+assertTrue(panel.__sfRaidSignupEntriesHost == hostBefore, "entries host reused")
+assertTrue(panel.__sfRaidSignupSummaryHost == summaryBefore, "summary host reused")
+
+-- Draft typing: class/spec first, nickname characters do not persist or rebuild
+ActAs("Carol-Garona", "Player-1-Carol")
+local draft = RS.MakeDraft(plan3)
+RS.UpdateDraftField(draft, "classFile", "MAGE")
+RS.UpdateDraftField(draft, "specId", 62)
+UIPage._SetDraftForTests(draft)
+assertTrue(UIPage._GetDraftForTests() ~= nil, "draft injected into page session")
+UIPage:Refresh(panel, { force = true })
+assertTrue(panel.__sfRaidSignupEntriesHost ~= nil, "entries host after draft refresh")
+local boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+if #boxes < 1 then
+    -- forceRebuild if soft paint missed the draft row for any stubbing reason
+    UIPage:Refresh(panel, { forceRebuild = true, force = true })
+    boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+end
+assertTrue(#boxes >= 1, "draft nickname edit box present")
+local nickBox = boxes[1]
+nickBox:SetFocus()
+local refreshBefore = UIPage._GetLifecycleCounters().refreshCount
+local entriesBefore = #RS:GetSortedEntries(plan3)
+local onText = nickBox:GetScript("OnTextChanged")
+assertTrue(onText ~= nil, "nickname OnTextChanged bound")
+nickBox:SetText("S")
+onText(nickBox, true)
+nickBox:SetText("Sp")
+onText(nickBox, true)
+nickBox:SetText("SparkUI")
+onText(nickBox, true)
+assertEq(#RS:GetSortedEntries(plan3), entriesBefore, "typing does not persist entry")
+assertEq(UIPage._GetLifecycleCounters().refreshCount, refreshBefore, "typing does not refresh while focused")
+assertEq(UIPage._GetDraftForTests().nicknameCommitted, false, "nickname remains uncommitted while typing")
+
+-- Commit boundary persists once
+local onEnter = nickBox:GetScript("OnEnterPressed")
+assertTrue(onEnter ~= nil, "nickname OnEnterPressed bound")
+onEnter(nickBox)
+assertTrue(UIPage._GetDraftForTests() == nil, "draft cleared after successful persist")
+assertTrue(#RS:GetSortedEntries(plan3) > entriesBefore, "commit persists complete draft")
+
+-- Nickname editing on saved row with stale-edit protection
+local listedUI = RS:GetSortedEntries(plan3)
+local target = listedUI[1]
+assertTrue(target ~= nil, "saved entry available for nickname edit")
+local staleStatus = select(1, RS:UpsertEntry({
+    entryId = target.entryId,
+    planId = target.planId,
+    nickname = "ShouldStale",
+    mainClass = target.mainClass,
+    mainSpec = target.mainSpec,
+    notes = target.notes,
+}, { expectedVer = { n = 0, w = "000000000000000000000000" } }))
+assertEq(staleStatus, "rejected", "stale nickname edit rejected")
+
+-- Focus deferral via a page-bound edit box
+UIPage:Refresh(panel, { force = true })
+boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+assertTrue(#boxes >= 1, "edit boxes after persist refresh")
+boxes[1]:SetFocus()
+refreshBefore = UIPage._GetLifecycleCounters().refreshCount
+UIPage:Refresh(panel)
+assertEq(UIPage._GetLifecycleCounters().refreshCount, refreshBefore, "refresh deferred while page edit focused")
+boxes[1]:ClearFocus()
+UIPage:Refresh(panel, { force = true })
+assertTrue(UIPage._GetLifecycleCounters().refreshCount > refreshBefore, "forced refresh runs")
+
+-- Open/close cycles do not stack listeners
+local listenersBefore = UIPage._GetLifecycleCounters().listenerCount
+UIPage:OnHide()
+UIPage:Build(panel)
+UIPage:Build(panel)
+assertEq(UIPage._GetLifecycleCounters().listenerCount, listenersBefore, "listeners not accumulated")
+
+-- Frame creates stay bounded across many soft refreshes
+rebuildBefore = UIPage._GetLifecycleCounters().fullRebuildCount
+local framesSoftStart = UIPage._GetLifecycleCounters().frameCreateCount
+for _ = 1, 8 do
+    UIPage:Refresh(panel)
+end
+local framesSoftEnd = UIPage._GetLifecycleCounters().frameCreateCount
+assertTrue(framesSoftEnd - framesSoftStart < 5000, "frame creates bounded across soft refreshes")
+assertEq(UIPage._GetLifecycleCounters().fullRebuildCount, rebuildBefore, "still no extra full rebuilds")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

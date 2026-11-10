@@ -18,16 +18,28 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 ### Guarantees
 
 - Free-text nicknames; no roster autocomplete or main/alt integration.
-- Drafts are local UI state only; persist/sync only when nickname + class + valid spec are complete.
+- Drafts are local UI state only. Nickname typing uses an Enter / focus-loss commit
+  boundary so class/spec-first flows do not persist on the first nickname character.
+  Persist/sync only when nickname (committed) + class + valid spec are complete;
+  abandoned incomplete drafts are discarded.
+- Creators and officers can edit saved nicknames with `expectedVer` stale-edit protection.
 - At most one alternative; never identical main/alt class+spec.
-- Archived plans are read-only until reopened by an officer.
-- Deletions use versioned tombstones; stale live records cannot resurrect deleted entries.
-- Concurrent edits converge by `(n, w)` version tuples.
-- Idle visible page does not rebuild, poll, or broadcast.
+- Local mutations against archived plans are rejected. Remote Gossip may still catch up
+  already-saved historical roster contents onto archived plans; the UI stays read-only.
+- Deletions use versioned tombstones. There is no restore: a live record never overwrites
+  a tombstone, regardless of version order or writer tie-break. New Add Row uses new IDs.
+- Concurrent edits converge by `(n, w)` version tuples for live records.
+- Coverage summary uses ability/utility category icons (not class-icon stand-ins) with
+  greyed missing state; the selected main-spec icon sits next to the nickname (notes do
+  not separate them).
+- Typing does not rebuild the settings page; durable board hosts are reused. Idle visible
+  page does not poll or broadcast.
 
 ### Gossip multi-hop note
 
 Phase 1 Guild Gossip authenticates the current hop sender. Member-authored entries admit when the transport sender is the creator or an officer. Non-officer relays of someone else's newer entry return `relay_lacks_authority`. Peers still converge when they pull from the author or through an officer hub.
+
+**Repair finding 7 (paused):** ordinary members holding saved data still cannot relay newer third-party entries when authors/officers are offline. Resolving that without weakening creator/officer **edit** rights requires an explicit trust-model choice (Guild Supplies–style membership replica catch-up vs keeping the limitation). See the repair decision note; do not silently weaken admission gates.
 
 ## Saved schema (`schemaVersion = 1`)
 

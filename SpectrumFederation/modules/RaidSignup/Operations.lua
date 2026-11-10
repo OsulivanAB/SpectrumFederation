@@ -35,6 +35,7 @@ function RS.MakeDraft(planId)
     return {
         planId = planId,
         nickname = "",
+        nicknameCommitted = false,
         classFile = nil,
         specId = nil,
         notes = "",
@@ -62,6 +63,30 @@ function RS.DraftIsComplete(draft)
     return RS.IsCompleteEntryPayload(draft.nickname, draft.classFile, draft.specId)
 end
 
+--- True when nickname+class+spec are filled and the nickname input was committed
+-- (Enter / focus-loss). Typing the first character after class/spec must not save.
+function RS.DraftReadyToPersist(draft)
+    if not RS.DraftIsComplete(draft) then
+        return false
+    end
+    return draft.nicknameCommitted == true
+end
+
+function RS.CommitDraftNickname(draft)
+    if type(draft) ~= "table" then
+        return draft, false
+    end
+    local nick = type(draft.nickname) == "string" and draft.nickname or ""
+    if strtrim then
+        nick = strtrim(nick)
+    else
+        nick = (nick:gsub("^%s+", ""):gsub("%s+$", ""))
+    end
+    draft.nickname = nick
+    draft.nicknameCommitted = nick ~= ""
+    return draft, draft.nicknameCommitted
+end
+
 function RS.AltDraftIsComplete(draft)
     if type(draft) ~= "table" then
         return false
@@ -74,12 +99,14 @@ function RS.AltDraftIsComplete(draft)
 end
 
 --- Apply class/spec/nickname to a draft. Completeness is independent of input order.
+-- Nickname text edits clear nicknameCommitted until CommitDraftNickname.
 function RS.UpdateDraftField(draft, field, value)
     if type(draft) ~= "table" then
         return draft, false
     end
     if field == "nickname" then
         draft.nickname = type(value) == "string" and value or ""
+        draft.nicknameCommitted = false
     elseif field == "classFile" then
         draft.classFile = value
         draft.specId = nil
@@ -164,6 +191,8 @@ function RS.FormatMutationFeedback(status, reason)
         plans_overflow = Loc("RAID_SIGNUP_ERR_PLANS_OVERFLOW", "The maximum number of roster plans has been reached."),
         entries_overflow = Loc("RAID_SIGNUP_ERR_ENTRIES_OVERFLOW", "The maximum number of signup entries has been reached."),
         empty_name = Loc("RAID_SIGNUP_ERR_EMPTY_NAME", "A non-blank name is required."),
+        deleted_final = Loc("RAID_SIGNUP_ERR_DELETED_FINAL", "That signup entry was deleted and cannot be restored."),
+        nickname_incomplete = Loc("RAID_SIGNUP_ERR_NICK_INCOMPLETE", "Finish typing the nickname, then press Enter."),
     }
     local msg = map[reason]
     if msg then

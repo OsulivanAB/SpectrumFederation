@@ -53,17 +53,58 @@ local session = {
 	renamePlanName = "",
 	openCount = 0,
 	refreshCount = 0,
+	fullRebuildCount = 0,
 	listenerCount = 0,
+	frameCreateCount = 0,
+	boardPaintCount = 0,
 }
 
 local refreshQueued = false
+local deferredRefresh = false
 local uiHooked = false
 local officerHooked = false
+local typingFocus = nil
 
 local ICON = 22
 local ICON_GAP = 4
 
-local function QueueRefresh()
+local function TrackCreate(frame)
+	session.frameCreateCount = session.frameCreateCount + 1
+	return frame
+end
+
+local function HasTypingFocus()
+	return typingFocus ~= nil
+		and typingFocus.HasFocus
+		and typingFocus:HasFocus()
+end
+
+local function BindTypingFocus(edit, onLost)
+	edit:SetScript("OnEditFocusGained", function(self)
+		typingFocus = self
+	end)
+	edit:SetScript("OnEditFocusLost", function(self)
+		if typingFocus == self then
+			typingFocus = nil
+		end
+		if onLost then
+			onLost(self)
+		end
+		if deferredRefresh then
+			deferredRefresh = false
+			if Page.panel and Page.panel:IsShown() and Page.Refresh then
+				Page:Refresh(Page.panel, { force = true })
+			end
+		end
+	end)
+end
+
+local function QueueRefresh(opts)
+	opts = opts or {}
+	if not opts.force and HasTypingFocus() then
+		deferredRefresh = true
+		return
+	end
 	if refreshQueued then
 		return
 	end
@@ -72,13 +113,13 @@ local function QueueRefresh()
 		C_Timer.After(0, function()
 			refreshQueued = false
 			if Page.panel and Page.panel:IsShown() and Page.Refresh then
-				Page:Refresh(Page.panel)
+				Page:Refresh(Page.panel, opts)
 			end
 		end)
 	else
 		refreshQueued = false
 		if Page.panel and Page.Refresh then
-			Page:Refresh(Page.panel)
+			Page:Refresh(Page.panel, opts)
 		end
 	end
 end
@@ -96,7 +137,7 @@ local function Report(status, reason)
 	else
 		SetStatus(tostring(status) .. ":" .. tostring(reason), "error")
 	end
-	QueueRefresh()
+	QueueRefresh({ force = true })
 end
 
 local function Caps()
@@ -131,7 +172,7 @@ local function EnsureUIListener()
 		if session.altDraft then
 			session.altDraft = nil
 		end
-		QueueRefresh()
+		QueueRefresh({ force = not HasTypingFocus() })
 	end)
 	local GO = SF.GuildOfficer
 	if GO and GO.RegisterUIListener and not officerHooked then
@@ -172,6 +213,14 @@ local function TextureForSpec(specId)
 	return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
 
+local function TextureForCategory(cat)
+	local rs = RS()
+	if rs and rs.CategoryIconTexture then
+		return rs.CategoryIconTexture(cat)
+	end
+	return (cat and cat.icon) or "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
 local function SpecName(specId)
 	local rs = RS()
 	if rs and rs.SpecDisplayName then
@@ -183,7 +232,7 @@ end
 local function TryPersistDraft()
 	local rs = RS()
 	local draft = session.draft
-	if not rs or not draft or not rs.DraftIsComplete or not rs.DraftIsComplete(draft) then
+	if not rs or not draft or not rs.DraftReadyToPersist or not rs.DraftReadyToPersist(draft) then
 		return false
 	end
 	local status, reason, entryId = rs:UpsertEntry({
@@ -262,7 +311,7 @@ local function TryPersistEdit()
 	end
 	local draft = editing.draft
 	if editing.slot == "main" then
-		if not rs.DraftIsComplete(draft) then
+		if not rs.DraftReadyToPersist or not rs.DraftReadyToPersist(draft) then
 			return false
 		end
 		local fields = {
@@ -286,7 +335,6 @@ local function TryPersistEdit()
 		return false
 	end
 
-	-- alt slot replacement
 	draft.mainClass = entry.mainClass
 	draft.mainSpec = entry.mainSpec
 	if not rs.AltDraftIsComplete(draft) then
@@ -311,7 +359,7 @@ local function TryPersistEdit()
 end
 
 local function MakeIconButton(parent, size)
-	local btn = CreateFrame("Button", nil, parent)
+	local btn = TrackCreate(CreateFrame("Button", nil, parent))
 	btn:SetSize(size or ICON, size or ICON)
 	local tex = btn:CreateTexture(nil, "ARTWORK")
 	tex:SetAllPoints()
@@ -350,27 +398,35 @@ local function SetIconVisual(btn, texture, enabled, grey)
 	end
 end
 
-local function ClearChildren(frame)
-	local kids = { frame:GetChildren() }
+local function ClearHost(host)
+	if not host then
+		return
+	end
+	local kids = { host:GetChildren() }
 	for i = 1, #kids do
 		kids[i]:Hide()
 		kids[i]:SetParent(nil)
 	end
-	local regions = { frame:GetRegions() }
+	local regions = { host:GetRegions() }
 	for i = 1, #regions do
-		-- keep; labels are managed explicitly
+		local r = regions[i]
+		if r and r.GetObjectType then
+			local ot = r:GetObjectType()
+			if ot == "FontString" or ot == "Texture" then
+				r:Hide()
+				if r.SetParent then
+					r:SetParent(nil)
+				end
+			end
+		elseif r and r.Hide then
+			r:Hide()
+		end
 	end
 end
 
 local function LayoutPicker(host, draft, opts)
 	opts = opts or {}
-	-- host is a frame; rebuild simple left-to-right icon row for current phase.
-	local children = { host:GetChildren() }
-	for i = 1, #children do
-		children[i]:Hide()
-		children[i]:ClearAllPoints()
-		children[i]:SetParent(nil)
-	end
+	ClearHost(host)
 
 	local x = 0
 	local function place(btn)
@@ -397,7 +453,6 @@ local function LayoutPicker(host, draft, opts)
 			place(btn)
 		end
 	else
-		-- Selected class (or later selected spec) sits first, then remaining specs.
 		local selected = MakeIconButton(host, ICON)
 		if draft.specId then
 			SetIconVisual(selected, TextureForSpec(draft.specId), true, false)
@@ -462,6 +517,9 @@ local function Definition()
 
 	return {
 		id = "raidSignupBoard",
+		selectedId = selectedId,
+		planOpen = planOpen,
+		caps = caps,
 		sections = {
 			{
 				id = "raidSignupStatus",
@@ -505,7 +563,7 @@ local function Definition()
 							end
 							DiscardEphemeral()
 							mod:SelectPlan(value)
-							QueueRefresh()
+							QueueRefresh({ force = true })
 						end,
 						options = function()
 							return planOptions
@@ -599,7 +657,7 @@ local function Definition()
 					{
 						type = "custom",
 						build = function(section)
-							BuildSummary(section, selectedId, planOpen)
+							EnsureSummaryHost(section)
 						end,
 					},
 				},
@@ -623,13 +681,13 @@ local function Definition()
 							session.editing = nil
 							session.altDraft = nil
 							session.draft = mod.MakeDraft(selectedId)
-							QueueRefresh()
+							QueueRefresh({ force = true })
 						end,
 					},
 					{
 						type = "custom",
 						build = function(section)
-							BuildEntries(section, selectedId, planOpen, caps)
+							EnsureEntriesHost(section)
 						end,
 					},
 				},
@@ -638,138 +696,184 @@ local function Definition()
 	}
 end
 
-function BuildSummary(section, planId)
+function PaintSummary(host, planId)
+	ClearHost(host)
+	session.boardPaintCount = session.boardPaintCount + 1
 	local rs = RS()
 	local summary = rs and rs.GetPlanSummary and rs:GetPlanSummary(planId) or {
 		classCounts = {}, major = {}, utility = {},
 	}
 	local height = math.max(13 * (ICON + 2), (#(rs and rs.MAJOR_CATEGORIES or {}) + 1) * 18)
-	section:AddRow(height + 8, function(row)
-		local host = CreateFrame("Frame", nil, row)
-		host:SetAllPoints()
+	host:SetHeight(height + 8)
 
-		local classCol = CreateFrame("Frame", nil, host)
-		classCol:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -2)
-		classCol:SetSize(120, height)
+	local classCol = TrackCreate(CreateFrame("Frame", nil, host))
+	classCol:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -2)
+	classCol:SetSize(120, height)
 
-		local order = ClassOrder()
-		for i = 1, #order do
-			local classFile = order[i]
-			local y = -(i - 1) * (ICON + 2)
-			local icon = classCol:CreateTexture(nil, "ARTWORK")
-			icon:SetSize(ICON, ICON)
-			icon:SetPoint("TOPLEFT", classCol, "TOPLEFT", 0, y)
-			icon:SetTexture(TextureForClass(classFile))
-			local count = classCol:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
-			count:SetText(tostring((summary.classCounts and summary.classCounts[classFile]) or 0))
-		end
+	local order = ClassOrder()
+	for i = 1, #order do
+		local classFile = order[i]
+		local y = -(i - 1) * (ICON + 2)
+		local icon = classCol:CreateTexture(nil, "ARTWORK")
+		icon:SetSize(ICON, ICON)
+		icon:SetPoint("TOPLEFT", classCol, "TOPLEFT", 0, y)
+		icon:SetTexture(TextureForClass(classFile))
+		local count = classCol:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+		count:SetText(tostring((summary.classCounts and summary.classCounts[classFile]) or 0))
+	end
 
-		local function paintGroup(title, categories, coveredMap, anchor)
-			local label = host:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-			label:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 24, 0)
-			label:SetText(title)
-			local wrap = CreateFrame("Frame", nil, host)
-			wrap:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
-			wrap:SetSize(280, height)
-			local x, y, colW = 0, 0, ICON + 2
-			local perCol = 8
-			for i = 1, #categories do
-				local cat = categories[i]
-				local btn = MakeIconButton(wrap, ICON)
-				btn:SetPoint("TOPLEFT", wrap, "TOPLEFT", x, -y)
-				local covered = coveredMap and coveredMap[cat.id]
-				-- Use class icon of first provider as a stable visual stand-in.
-				local tex = "Interface\\Icons\\INV_Misc_QuestionMark"
-				local prov = cat.providers and cat.providers[1]
-				if prov and prov.classFile then
-					tex = TextureForClass(prov.classFile)
-				end
-				SetIconVisual(btn, tex, true, not covered)
-				btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
-				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
-				if (i % perCol) == 0 then
-					x = x + colW + 8
-					y = 0
-				else
-					y = y + ICON + 2
-				end
+	local function paintGroup(title, categories, coveredMap, anchor)
+		local label = host:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+		label:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 24, 0)
+		label:SetText(title)
+		local wrap = TrackCreate(CreateFrame("Frame", nil, host))
+		wrap:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
+		wrap:SetSize(280, height)
+		local x, y, colW = 0, 0, ICON + 2
+		local perCol = 8
+		for i = 1, #categories do
+			local cat = categories[i]
+			local btn = MakeIconButton(wrap, ICON)
+			btn:SetPoint("TOPLEFT", wrap, "TOPLEFT", x, -y)
+			local covered = coveredMap and coveredMap[cat.id]
+			SetIconVisual(btn, TextureForCategory(cat), true, not covered)
+			btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
+			btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
+			if (i % perCol) == 0 then
+				x = x + colW + 8
+				y = 0
+			else
+				y = y + ICON + 2
 			end
-			return label
 		end
+		return label
+	end
 
-		local majorTitle = paintGroup(
-			Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
-			(rs and rs.MAJOR_CATEGORIES) or {},
-			summary.major,
-			classCol
-		)
-		paintGroup(
-			Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
-			(rs and rs.UTILITY_CATEGORIES) or {},
-			summary.utility,
-			majorTitle
-		)
-	end)
+	local majorTitle = paintGroup(
+		Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
+		(rs and rs.MAJOR_CATEGORIES) or {},
+		summary.major,
+		classCol
+	)
+	paintGroup(
+		Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
+		(rs and rs.UTILITY_CATEGORIES) or {},
+		summary.utility,
+		majorTitle
+	)
 end
 
-function BuildEntries(section, planId, planOpen, caps)
+function PaintEntries(host, planId, planOpen, caps)
+	ClearHost(host)
+	session.boardPaintCount = session.boardPaintCount + 1
 	local rs = RS()
 	local entries = rs and rs.GetSortedEntries and rs:GetSortedEntries(planId) or {}
+	local y = -2
 
-	-- Draft row
+	local function placeRow(height, builder)
+		local row = TrackCreate(CreateFrame("Frame", nil, host))
+		row:SetPoint("TOPLEFT", host, "TOPLEFT", 0, y)
+		row:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, y)
+		row:SetHeight(height)
+		builder(row)
+		y = y - height - 4
+	end
+
 	if session.draft and planOpen then
-		section:AddRow(56, function(row)
-			local host = CreateFrame("Frame", nil, row)
-			host:SetAllPoints()
-			local edit = CreateFrame("EditBox", nil, host, "InputBoxTemplate")
-			edit:SetAutoFocus(false)
-			edit:SetSize(140, 22)
-			edit:SetPoint("TOPLEFT", host, "TOPLEFT", 4, -4)
-			edit:SetMaxLetters(RS().MAX_NICKNAME or 48)
-			edit:SetText(session.draft.nickname or "")
-			if edit.Instructions then
-				edit.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
+		placeRow(56, function(row)
+			local nick = TrackCreate(CreateFrame("EditBox", nil, row, "InputBoxTemplate"))
+			nick:SetAutoFocus(false)
+			nick:SetSize(140, 22)
+			nick:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -4)
+			nick:SetMaxLetters(RS().MAX_NICKNAME or 48)
+			nick:SetText(session.draft.nickname or "")
+			if nick.Instructions then
+				nick.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
 			end
-			edit:SetScript("OnTextChanged", function(self)
+			local function commitNick(self)
+				local mod = RS()
+				if not mod or not session.draft then
+					return
+				end
+				mod.UpdateDraftField(session.draft, "nickname", self:GetText() or "")
+				mod.CommitDraftNickname(session.draft)
+				TryPersistDraft()
+			end
+			BindTypingFocus(nick, commitNick)
+			nick:SetScript("OnTextChanged", function(self, userInput)
+				if userInput == false then
+					return
+				end
 				local mod = RS()
 				if not mod then
 					return
 				end
 				mod.UpdateDraftField(session.draft, "nickname", self:GetText() or "")
-				TryPersistDraft()
-				QueueRefresh()
+				-- Do not refresh or persist while typing; commit boundary below.
 			end)
-			local notes = CreateFrame("EditBox", nil, host, "InputBoxTemplate")
+			nick:SetScript("OnEnterPressed", function(self)
+				commitNick(self)
+				self:ClearFocus()
+			end)
+
+			local anchor = nick
+			if session.draft.specId then
+				local mainBtn = MakeIconButton(row, ICON)
+				mainBtn:SetPoint("LEFT", nick, "RIGHT", 8, 0)
+				SetIconVisual(mainBtn, TextureForSpec(session.draft.specId), true, false)
+				mainBtn.tooltipTitle = SpecName(session.draft.specId)
+				anchor = mainBtn
+			end
+
+			local notes = TrackCreate(CreateFrame("EditBox", nil, row, "InputBoxTemplate"))
 			notes:SetAutoFocus(false)
-			notes:SetSize(180, 22)
-			notes:SetPoint("LEFT", edit, "RIGHT", 12, 0)
+			notes:SetSize(160, 22)
+			notes:SetPoint("LEFT", anchor, "RIGHT", 12, 0)
 			notes:SetMaxLetters(RS().MAX_NOTES or 160)
 			notes:SetText(session.draft.notes or "")
 			if notes.Instructions then
 				notes.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
 			end
-			notes:SetScript("OnTextChanged", function(self)
+			BindTypingFocus(notes, function(self)
 				local mod = RS()
-				if not mod then
+				if mod and session.draft then
+					mod.UpdateDraftField(session.draft, "notes", self:GetText() or "")
+					TryPersistDraft()
+				end
+			end)
+			notes:SetScript("OnTextChanged", function(self, userInput)
+				if userInput == false then
+					return
+				end
+				local mod = RS()
+				if not mod or not session.draft then
 					return
 				end
 				mod.UpdateDraftField(session.draft, "notes", self:GetText() or "")
-				TryPersistDraft()
 			end)
-			local picker = CreateFrame("Frame", nil, host)
-			picker:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", 0, -4)
+			notes:SetScript("OnEnterPressed", function(self)
+				local mod = RS()
+				if mod and session.draft then
+					mod.UpdateDraftField(session.draft, "notes", self:GetText() or "")
+					TryPersistDraft()
+				end
+				self:ClearFocus()
+			end)
+
+			local picker = TrackCreate(CreateFrame("Frame", nil, row))
+			picker:SetPoint("TOPLEFT", nick, "BOTTOMLEFT", 0, -4)
 			picker:SetSize(500, ICON + 2)
 			LayoutPicker(picker, session.draft, {
 				onClass = function(classFile)
 					RS().UpdateDraftField(session.draft, "classFile", classFile)
 					TryPersistDraft()
-					QueueRefresh()
+					QueueRefresh({ force = true })
 				end,
 				onSpec = function(specId)
 					RS().UpdateDraftField(session.draft, "specId", specId)
 					TryPersistDraft()
-					QueueRefresh()
+					QueueRefresh({ force = true })
 				end,
 			})
 		end)
@@ -780,33 +884,129 @@ function BuildEntries(section, planId, planOpen, caps)
 		local editingThis = session.editing and session.editing.entryId == entry.entryId
 		local altThis = session.altDraft and session.altDraft.entryId == entry.entryId
 		local rowH = (editingThis or altThis) and 78 or 34
-		section:AddRow(rowH, function(row)
-			local host = CreateFrame("Frame", nil, row)
-			host:SetAllPoints()
+		placeRow(rowH, function(row)
+			local canEdit = planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry)
+			local nickBox = TrackCreate(CreateFrame("EditBox", nil, row, "InputBoxTemplate"))
+			nickBox:SetAutoFocus(false)
+			nickBox:SetSize(120, 20)
+			nickBox:SetPoint("LEFT", row, "LEFT", 4, editingThis and 12 or 0)
+			nickBox:SetMaxLetters(RS().MAX_NICKNAME or 48)
+			nickBox:SetText(entry.nickname or "")
+			if nickBox.Instructions then
+				nickBox.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
+			end
+			if canEdit then
+				nickBox:Enable()
+			else
+				nickBox:Disable()
+			end
+			local function commitSavedNick(self)
+				if not canEdit then
+					return
+				end
+				local text = self:GetText() or ""
+				local status, reason = RS():UpsertEntry({
+					entryId = entry.entryId,
+					planId = entry.planId,
+					nickname = text,
+					mainClass = entry.mainClass,
+					mainSpec = entry.mainSpec,
+					notes = entry.notes,
+					altClass = entry.altClass,
+					altSpec = entry.altSpec,
+				}, { expectedVer = entry.ver })
+				Report(status, reason)
+			end
+			BindTypingFocus(nickBox, function(self)
+				-- Only commit nickname edits explicitly via Enter; Escape reverts.
+			end)
+			nickBox:SetScript("OnEnterPressed", function(self)
+				commitSavedNick(self)
+				self:ClearFocus()
+			end)
+			nickBox:SetScript("OnEscapePressed", function(self)
+				self:SetText(entry.nickname or "")
+				self:ClearFocus()
+			end)
 
-			local name = host:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-			name:SetPoint("LEFT", host, "LEFT", 4, 0)
-			name:SetWidth(120)
-			name:SetJustifyH("LEFT")
-			name:SetText(entry.nickname or "")
+			local mainBtn = MakeIconButton(row, ICON)
+			mainBtn:SetPoint("LEFT", nickBox, "RIGHT", 8, 0)
+			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), planOpen, false)
+			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
+			mainBtn.tooltipText = (entry.mainClass or "") .. " · " .. SpecName(entry.mainSpec)
+			mainBtn:SetScript("OnClick", function()
+				if not planOpen then
+					return
+				end
+				if not RS().CanEditEntry(caps, caps.actorGuid, entry) then
+					return
+				end
+				session.draft = nil
+				session.altDraft = nil
+				session.editing = {
+					entryId = entry.entryId,
+					slot = "main",
+					draft = {
+						nickname = entry.nickname,
+						nicknameCommitted = true,
+						classFile = nil,
+						specId = nil,
+						phase = "class",
+					},
+				}
+				QueueRefresh({ force = true })
+			end)
 
-			local notesBox = CreateFrame("EditBox", nil, host, "InputBoxTemplate")
+			local anchor = mainBtn
+			if entry.altClass and entry.altSpec and not (editingThis and session.editing.slot == "alt") then
+				local altBtn = MakeIconButton(row, ICON)
+				altBtn:SetPoint("LEFT", mainBtn, "RIGHT", 6, 0)
+				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), planOpen, false)
+				altBtn.tooltipTitle = SpecName(entry.altSpec)
+				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
+					.. ": " .. (entry.altClass or "") .. " · " .. SpecName(entry.altSpec)
+				altBtn:SetScript("OnClick", function()
+					if not planOpen then
+						return
+					end
+					if not RS().CanEditEntry(caps, caps.actorGuid, entry) then
+						return
+					end
+					session.draft = nil
+					session.altDraft = nil
+					session.editing = {
+						entryId = entry.entryId,
+						slot = "alt",
+						draft = {
+							classFile = nil,
+							specId = nil,
+							mainClass = entry.mainClass,
+							mainSpec = entry.mainSpec,
+							phase = "class",
+						},
+					}
+					QueueRefresh({ force = true })
+				end)
+				anchor = altBtn
+			end
+
+			local notesBox = TrackCreate(CreateFrame("EditBox", nil, row, "InputBoxTemplate"))
 			notesBox:SetAutoFocus(false)
 			notesBox:SetSize(120, 20)
-			notesBox:SetPoint("LEFT", name, "RIGHT", 6, 0)
+			notesBox:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
 			notesBox:SetMaxLetters(RS().MAX_NOTES or 160)
 			notesBox:SetText(entry.notes or "")
 			if notesBox.Instructions then
 				notesBox.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
 			end
-			local canEditNotes = planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry)
-			if canEditNotes then
+			if canEdit then
 				notesBox:Enable()
 			else
 				notesBox:Disable()
 			end
+			BindTypingFocus(notesBox)
 			notesBox:SetScript("OnEnterPressed", function(self)
-				if not canEditNotes then
+				if not canEdit then
 					return
 				end
 				local status, reason = RS():UpsertEntry({
@@ -826,72 +1026,11 @@ function BuildEntries(section, planId, planOpen, caps)
 				self:SetText(entry.notes or "")
 				self:ClearFocus()
 			end)
+			anchor = notesBox
 
-			local mainBtn = MakeIconButton(host, ICON)
-			mainBtn:SetPoint("LEFT", notesBox, "RIGHT", 8, 0)
-			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), planOpen, false)
-			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
-			mainBtn.tooltipText = (entry.mainClass or "") .. " · " .. SpecName(entry.mainSpec)
-			mainBtn:SetScript("OnClick", function()
-				if not planOpen then
-					return
-				end
-				local can = RS().CanEditEntry(caps, caps.actorGuid, entry)
-				if not can then
-					return
-				end
-				session.draft = nil
-				session.altDraft = nil
-				session.editing = {
-					entryId = entry.entryId,
-					slot = "main",
-					draft = {
-						nickname = entry.nickname,
-						classFile = nil,
-						specId = nil,
-						phase = "class",
-					},
-				}
-				QueueRefresh()
-			end)
-
-			local anchor = mainBtn
-			if entry.altClass and entry.altSpec and not (editingThis and session.editing.slot == "alt") then
-				local altBtn = MakeIconButton(host, ICON)
-				altBtn:SetPoint("LEFT", mainBtn, "RIGHT", 6, 0)
-				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), planOpen, false)
-				altBtn.tooltipTitle = SpecName(entry.altSpec)
-				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
-					.. ": " .. (entry.altClass or "") .. " · " .. SpecName(entry.altSpec)
-				altBtn:SetScript("OnClick", function()
-					if not planOpen then
-						return
-					end
-					local can = RS().CanEditEntry(caps, caps.actorGuid, entry)
-					if not can then
-						return
-					end
-					session.draft = nil
-					session.altDraft = nil
-					session.editing = {
-						entryId = entry.entryId,
-						slot = "alt",
-						draft = {
-							classFile = nil,
-							specId = nil,
-							mainClass = entry.mainClass,
-							mainSpec = entry.mainSpec,
-							phase = "class",
-						},
-					}
-					QueueRefresh()
-				end)
-				anchor = altBtn
-			end
-
-			if planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry) then
+			if planOpen and canEdit then
 				if not entry.altClass and not altThis and not editingThis then
-					local addAlt = CreateFrame("Button", nil, host, "UIPanelButtonTemplate")
+					local addAlt = TrackCreate(CreateFrame("Button", nil, row, "UIPanelButtonTemplate"))
 					addAlt:SetSize(90, 20)
 					addAlt:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
 					addAlt:SetText(Loc("RAID_SIGNUP_ADD_ALT", "Add an Alt?"))
@@ -902,11 +1041,11 @@ function BuildEntries(section, planId, planOpen, caps)
 							entryId = entry.entryId,
 							draft = RS().MakeAltDraft(entry),
 						}
-						QueueRefresh()
+						QueueRefresh({ force = true })
 					end)
 					anchor = addAlt
 				elseif entry.altClass then
-					local remAlt = CreateFrame("Button", nil, host, "UIPanelButtonTemplate")
+					local remAlt = TrackCreate(CreateFrame("Button", nil, row, "UIPanelButtonTemplate"))
 					remAlt:SetSize(90, 20)
 					remAlt:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
 					remAlt:SetText(Loc("RAID_SIGNUP_REMOVE_ALT", "Remove Alt"))
@@ -919,7 +1058,7 @@ function BuildEntries(section, planId, planOpen, caps)
 					anchor = remAlt
 				end
 
-				local del = CreateFrame("Button", nil, host, "UIPanelButtonTemplate")
+				local del = TrackCreate(CreateFrame("Button", nil, row, "UIPanelButtonTemplate"))
 				del:SetSize(70, 20)
 				del:SetPoint("LEFT", anchor, "RIGHT", 8, 0)
 				del:SetText(Loc("RAID_SIGNUP_DELETE", "Delete"))
@@ -942,8 +1081,8 @@ function BuildEntries(section, planId, planOpen, caps)
 			end
 
 			if editingThis then
-				local picker = CreateFrame("Frame", nil, host)
-				picker:SetPoint("TOPLEFT", host, "LEFT", 4, -16)
+				local picker = TrackCreate(CreateFrame("Frame", nil, row))
+				picker:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -28)
 				picker:SetSize(520, ICON + 2)
 				local draft = session.editing.draft
 				LayoutPicker(picker, draft, {
@@ -958,7 +1097,7 @@ function BuildEntries(section, planId, planOpen, caps)
 							RS().UpdateAltDraftField(draft, "classFile", classFile)
 						end
 						TryPersistEdit()
-						QueueRefresh()
+						QueueRefresh({ force = true })
 					end,
 					onSpec = function(specId)
 						if session.editing.slot == "main" then
@@ -967,12 +1106,12 @@ function BuildEntries(section, planId, planOpen, caps)
 							RS().UpdateAltDraftField(draft, "specId", specId)
 						end
 						TryPersistEdit()
-						QueueRefresh()
+						QueueRefresh({ force = true })
 					end,
 				})
 			elseif altThis then
-				local picker = CreateFrame("Frame", nil, host)
-				picker:SetPoint("TOPLEFT", host, "LEFT", 4, -16)
+				local picker = TrackCreate(CreateFrame("Frame", nil, row))
+				picker:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -28)
 				picker:SetSize(520, ICON + 2)
 				local draft = session.altDraft.draft
 				LayoutPicker(picker, draft, {
@@ -982,12 +1121,12 @@ function BuildEntries(section, planId, planOpen, caps)
 					onClass = function(classFile)
 						RS().UpdateAltDraftField(draft, "classFile", classFile)
 						TryPersistAltDraft()
-						QueueRefresh()
+						QueueRefresh({ force = true })
 					end,
 					onSpec = function(specId)
 						RS().UpdateAltDraftField(draft, "specId", specId)
 						TryPersistAltDraft()
-						QueueRefresh()
+						QueueRefresh({ force = true })
 					end,
 				})
 			end
@@ -995,11 +1134,58 @@ function BuildEntries(section, planId, planOpen, caps)
 	end
 
 	if #entries == 0 and not session.draft then
-		section:AddRow(24, function(row)
+		placeRow(24, function(row)
 			local fs = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 			fs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			fs:SetText(Loc("RAID_SIGNUP_EMPTY", "No signups in this plan yet."))
 		end)
+	end
+
+	host:SetHeight(math.max(24, -y + 4))
+end
+
+function EnsureSummaryHost(section)
+	local panel = Page.panel
+	if not panel then
+		return
+	end
+	if panel.__sfRaidSignupSummaryHost then
+		return
+	end
+	local height = 13 * (ICON + 2) + 8
+	section:AddRow(height, function(row)
+		local host = TrackCreate(CreateFrame("Frame", nil, row))
+		host:SetAllPoints()
+		panel.__sfRaidSignupSummaryHost = host
+		local def = Definition()
+		PaintSummary(host, def.selectedId)
+	end)
+end
+
+function EnsureEntriesHost(section)
+	local panel = Page.panel
+	if not panel then
+		return
+	end
+	if panel.__sfRaidSignupEntriesHost then
+		return
+	end
+	section:AddRow(220, function(row)
+		local host = TrackCreate(CreateFrame("Frame", nil, row))
+		host:SetAllPoints()
+		panel.__sfRaidSignupEntriesHost = host
+		local def = Definition()
+		PaintEntries(host, def.selectedId, def.planOpen, def.caps)
+	end)
+end
+
+local function PaintOwnedBoards(panel)
+	local def = Definition()
+	if panel.__sfRaidSignupSummaryHost then
+		PaintSummary(panel.__sfRaidSignupSummaryHost, def.selectedId)
+	end
+	if panel.__sfRaidSignupEntriesHost then
+		PaintEntries(panel.__sfRaidSignupEntriesHost, def.selectedId, def.planOpen, def.caps)
 	end
 end
 
@@ -1011,14 +1197,28 @@ local function WipePageBuilder(panel)
 	end
 	if panel then
 		panel.__sfPageBuilder = nil
+		panel.__sfRaidSignupSummaryHost = nil
+		panel.__sfRaidSignupEntriesHost = nil
 	end
 end
 
-local function BuildWithPageBuilder(panel)
+local function BuildWithPageBuilder(panel, opts)
+	opts = opts or {}
 	if not (SF.SettingsUI and SF.SettingsUI.CreatePage) then
 		return false
 	end
+
+	-- Soft refresh: keep the page builder and durable board hosts; repaint boards.
+	if panel.__sfPageBuilder and not opts.forceRebuild then
+		if panel.__sfPageBuilder.Refresh then
+			panel.__sfPageBuilder:Refresh()
+		end
+		PaintOwnedBoards(panel)
+		return true
+	end
+
 	WipePageBuilder(panel)
+	session.fullRebuildCount = session.fullRebuildCount + 1
 	local pageBuilder = SF.SettingsUI:CreatePage(panel)
 	panel.__sfPageBuilder = pageBuilder
 	local controls = SF.SettingsUI.Controls
@@ -1046,12 +1246,12 @@ end
 function Page:Build(panel)
 	EnsureUIListener()
 	session.openCount = session.openCount + 1
-	BuildWithPageBuilder(panel)
 	self.panel = panel
+	BuildWithPageBuilder(panel, { forceRebuild = true })
 	if panel.HookScript and not panel.__sfRaidSignupHook then
 		panel.__sfRaidSignupHook = true
 		panel:HookScript("OnShow", function()
-			QueueRefresh()
+			QueueRefresh({ force = true })
 		end)
 		panel:HookScript("OnHide", function()
 			Page:OnHide()
@@ -1059,17 +1259,24 @@ function Page:Build(panel)
 	end
 end
 
-function Page:Refresh(panel)
+function Page:Refresh(panel, opts)
+	opts = opts or {}
 	panel = panel or self.panel
 	if not panel or not panel.IsShown or not panel:IsShown() then
 		return
 	end
+	if not opts.force and not opts.forceRebuild and HasTypingFocus() then
+		deferredRefresh = true
+		return
+	end
 	session.refreshCount = session.refreshCount + 1
-	BuildWithPageBuilder(panel)
+	BuildWithPageBuilder(panel, opts)
 end
 
 function Page:OnHide()
 	refreshQueued = false
+	deferredRefresh = false
+	typingFocus = nil
 	DiscardEphemeral()
 end
 
@@ -1078,8 +1285,12 @@ function Page._GetLifecycleCounters()
 	return {
 		openCount = session.openCount,
 		refreshCount = session.refreshCount,
+		fullRebuildCount = session.fullRebuildCount,
 		listenerCount = session.listenerCount,
+		frameCreateCount = session.frameCreateCount,
+		boardPaintCount = session.boardPaintCount,
 		hasDraft = session.draft ~= nil,
+		draftNicknameCommitted = session.draft and session.draft.nicknameCommitted or false,
 	}
 end
 
@@ -1088,7 +1299,39 @@ function Page._ResetSessionForTests()
 	session.status = nil
 	session.newPlanName = ""
 	session.renamePlanName = ""
+	session.frameCreateCount = 0
+	session.boardPaintCount = 0
+	session.refreshCount = 0
+	session.fullRebuildCount = 0
+end
+
+function Page._GetDraftForTests()
+	return session.draft
+end
+
+function Page._SetDraftForTests(draft)
+	session.draft = draft
+end
+
+function Page._FindEditBoxesForTests(root)
+	local found = {}
+	local function walk(frame)
+		if not frame then
+			return
+		end
+		if frame.GetObjectType and frame:GetObjectType() == "EditBox" then
+			found[#found + 1] = frame
+		end
+		local kids = { frame:GetChildren() }
+		for i = 1, #kids do
+			walk(kids[i])
+		end
+	end
+	walk(root)
+	return found
 end
 
 EnsureUIListener()
 SF.SettingsUI:RegisterPage(Page)
+Page._Page = Page
+SF.RaidSignupUIPage = Page

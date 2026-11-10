@@ -80,6 +80,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "Intellect",
         tipKey = "RAID_SIGNUP_COV_INTELLECT_TIP",
         tipDefault = "Arcane Intellect — increases raid Intellect.",
+        icon = "Interface\\Icons\\Spell_Holy_MagicalSentry",
         providers = { ClassAll("MAGE") },
     },
     {
@@ -88,6 +89,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "Attack Power",
         tipKey = "RAID_SIGNUP_COV_ATTACK_POWER_TIP",
         tipDefault = "Battle Shout — increases raid attack power.",
+        icon = "Interface\\Icons\\Ability_Warrior_BattleShout",
         providers = { ClassAll("WARRIOR") },
     },
     {
@@ -96,6 +98,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "Stamina",
         tipKey = "RAID_SIGNUP_COV_STAMINA_TIP",
         tipDefault = "Power Word: Fortitude — increases raid Stamina.",
+        icon = "Interface\\Icons\\Spell_Holy_WordFortitude",
         providers = { ClassAll("PRIEST") },
     },
     {
@@ -104,6 +107,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "3% DR (Devo Aura)",
         tipKey = "RAID_SIGNUP_COV_DEVO_TIP",
         tipDefault = "Devotion Aura — reduces damage taken (Holy and Protection Paladin).",
+        icon = "Interface\\Icons\\Spell_Holy_DevotionAura",
         -- Retribution uses Retribution Aura instead of Devotion Aura.
         providers = { ClassSpecs("PALADIN", 65, 66) },
     },
@@ -113,6 +117,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "5% Physical",
         tipKey = "RAID_SIGNUP_COV_PHYSICAL_TIP",
         tipDefault = "Mystic Touch — increases Physical damage taken by the enemy.",
+        icon = "Interface\\Icons\\Ability_Monk_Provoke",
         providers = { ClassAll("MONK") },
     },
     {
@@ -121,6 +126,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "3% Magic",
         tipKey = "RAID_SIGNUP_COV_MAGIC_TIP",
         tipDefault = "Chaos Brand — increases magic damage taken by the enemy.",
+        icon = "Interface\\Icons\\Ability_DemonHunter_ChaosStrike",
         providers = { ClassAll("DEMONHUNTER") },
     },
     {
@@ -129,6 +135,7 @@ RS.MAJOR_CATEGORIES = {
         nameDefault = "3% Versatility",
         tipKey = "RAID_SIGNUP_COV_VERS_TIP",
         tipDefault = "Mark of the Wild — increases raid Versatility.",
+        icon = "Interface\\Icons\\Spell_Nature_Regeneration",
         providers = { ClassAll("DRUID") },
     },
 }
@@ -140,6 +147,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Bloodlust",
         tipKey = "RAID_SIGNUP_COV_BLOODLUST_TIP",
         tipDefault = "Bloodlust / Heroism / Time Warp / Primal Rage / Fury of the Aspects.",
+        icon = "Interface\\Icons\\Spell_Nature_BloodLust",
         providers = {
             ClassAll("SHAMAN"), ClassAll("MAGE"), ClassAll("HUNTER"), ClassAll("EVOKER"),
         },
@@ -150,6 +158,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Combat Res",
         tipKey = "RAID_SIGNUP_COV_BATTLE_RES_TIP",
         tipDefault = "Combat resurrection (Rebirth, Raise Ally, Soulstone, Intercession).",
+        icon = "Interface\\Icons\\Spell_Nature_Reincarnation",
         providers = {
             ClassAll("DRUID"), ClassAll("DEATHKNIGHT"), ClassAll("WARLOCK"), ClassAll("PALADIN"),
         },
@@ -160,6 +169,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Burst Move Speed",
         tipKey = "RAID_SIGNUP_COV_BURST_MOVE_TIP",
         tipDefault = "Planned burst movement tools (for example Stampeding Roar, Wind Rush Totem, Tiger's Lust).",
+        icon = "Interface\\Icons\\Spell_Druid_StampedingRoar_Cat",
         providers = { ClassAll("DRUID"), ClassAll("SHAMAN"), ClassAll("MONK") },
     },
     {
@@ -168,6 +178,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Lock Stuff (HS, Gate, Curse)",
         tipKey = "RAID_SIGNUP_COV_LOCK_TIP",
         tipDefault = "Warlock Healthstone, Demonic Gateway, and curses.",
+        icon = "Interface\\Icons\\Spell_Shadow_DemonicEmpathy",
         providers = { ClassAll("WARLOCK") },
     },
     {
@@ -176,6 +187,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Mass Dispel",
         tipKey = "RAID_SIGNUP_COV_MD_TIP",
         tipDefault = "Mass Dispel — removes many harmful magic effects at once.",
+        icon = "Interface\\Icons\\Spell_Arcane_MassDispel",
         providers = { ClassAll("PRIEST") },
     },
     {
@@ -184,6 +196,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Innervate",
         tipKey = "RAID_SIGNUP_COV_INNERVATE_TIP",
         tipDefault = "Innervate — Restoration Druid mana acceleration for a healer.",
+        icon = "Interface\\Icons\\Spell_Nature_Lightning",
         providers = { ClassSpecs("DRUID", 105) },
     },
     {
@@ -192,6 +205,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Death Grip/AMZ",
         tipKey = "RAID_SIGNUP_COV_DK_TIP",
         tipDefault = "Death Grip and Anti-Magic Zone from Death Knights.",
+        icon = "Interface\\Icons\\Spell_DeathKnight_Strangulate",
         providers = { ClassAll("DEATHKNIGHT") },
     },
     {
@@ -200,6 +214,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Blessing of Protection",
         tipKey = "RAID_SIGNUP_COV_BOP_TIP",
         tipDefault = "Blessing of Protection — physical immunity blessing.",
+        icon = "Interface\\Icons\\Spell_Holy_SealOfProtection",
         providers = { ClassAll("PALADIN") },
     },
     {
@@ -208,6 +223,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Rallying Cry",
         tipKey = "RAID_SIGNUP_COV_RALLY_TIP",
         tipDefault = "Rallying Cry — temporary raid health increase.",
+        icon = "Interface\\Icons\\Ability_Warrior_RallyingCry",
         providers = { ClassAll("WARRIOR") },
     },
     {
@@ -216,6 +232,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Darkness",
         tipKey = "RAID_SIGNUP_COV_DARKNESS_TIP",
         tipDefault = "Darkness — Demon Hunter area damage reduction.",
+        icon = "Interface\\Icons\\Ability_DemonHunter_Darkness",
         providers = { ClassAll("DEMONHUNTER") },
     },
     {
@@ -224,6 +241,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Immunities",
         tipKey = "RAID_SIGNUP_COV_IMMUNE_TIP",
         tipDefault = "Full damage immunities such as Ice Block, Divine Shield, and Aspect of the Turtle.",
+        icon = "Interface\\Icons\\Spell_Frost_Frost",
         providers = { ClassAll("MAGE"), ClassAll("PALADIN"), ClassAll("HUNTER") },
     },
     {
@@ -232,6 +250,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Skyfury",
         tipKey = "RAID_SIGNUP_COV_SKYFURY_TIP",
         tipDefault = "Skyfury — Mastery and empowered auto-attacks for the raid.",
+        icon = "Interface\\Icons\\Ability_Shaman_FreedomWolf",
         providers = { ClassAll("SHAMAN") },
     },
     {
@@ -240,6 +259,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Atrophic Poison",
         tipKey = "RAID_SIGNUP_COV_ATROPHIC_TIP",
         tipDefault = "Atrophic Poison — reduces damage dealt by the affected enemy.",
+        icon = "Interface\\Icons\\Ability_PoisonSting",
         providers = { ClassAll("ROGUE") },
     },
     {
@@ -248,6 +268,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Blessing of the Bronze",
         tipKey = "RAID_SIGNUP_COV_BRONZE_TIP",
         tipDefault = "Blessing of the Bronze — reduces major movement-ability cooldowns for the raid.",
+        icon = "Interface\\Icons\\Ability_Evoker_BlessingoftheBronze",
         providers = { ClassAll("EVOKER") },
     },
     {
@@ -256,6 +277,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Execute Damage",
         tipKey = "RAID_SIGNUP_COV_EXECUTE_TIP",
         tipDefault = "Execute-range finishing damage such as Execute or Kill Shot.",
+        icon = "Interface\\Icons\\INV_Sword_48",
         providers = { ClassAll("WARRIOR"), ClassAll("HUNTER") },
     },
     {
@@ -264,6 +286,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Attack Speed Reduction",
         tipKey = "RAID_SIGNUP_COV_ATK_SLOW_TIP",
         tipDefault = "Attack-speed reduction such as Numbing Poison.",
+        icon = "Interface\\Icons\\Spell_Nature_Slow",
         providers = { ClassAll("ROGUE") },
     },
     {
@@ -312,7 +335,8 @@ function RS.SpecDisplayName(specId)
         return nil
     end
     if GetSpecializationInfoByID then
-        local ok, _, name = pcall(GetSpecializationInfoByID, specId)
+        -- pcall prepends ok; API returns id, name, description, icon, ...
+        local ok, _id, name = pcall(GetSpecializationInfoByID, specId)
         if ok and type(name) == "string" and name ~= "" then
             return name
         end
@@ -332,13 +356,22 @@ function RS.SpecIconTexture(specId)
         return "Interface\\Icons\\INV_Misc_QuestionMark"
     end
     if GetSpecializationInfoByID then
-        local ok, _, _, icon = pcall(GetSpecializationInfoByID, specId)
+        -- pcall prepends ok before GetSpecializationInfoByID returns:
+        -- id, name, description, icon, role, ...
+        local ok, _id, _name, _description, icon = pcall(GetSpecializationInfoByID, specId)
         if ok and type(icon) == "string" and icon ~= "" then
             return icon
         end
         if ok and type(icon) == "number" then
             return icon
         end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+function RS.CategoryIconTexture(category)
+    if type(category) == "table" and type(category.icon) == "string" and category.icon ~= "" then
+        return category.icon
     end
     return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
