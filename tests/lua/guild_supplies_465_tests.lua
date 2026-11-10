@@ -4087,6 +4087,271 @@ do
 end
 
 do
+    -- #465 assessment 6775258160: +10 adjustment / −10 balancing / delete +10
+    -- must create signed item (and personal, when attributed) debt floors so
+    -- delete-first remote receipt and fresh adoption can replay the survivor.
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        return out
+    end
+
+    -- After delete-first remote admit of the balancing adj succeeds (proves the
+    -- soft-delete debt floor), mark production credit the same way credited
+    -- ledger-export rows do so signed totals are observable. Remote gs-op-only
+    -- admit does not mint localProductionAuthority cutover credit.
+    local function markPeerAdjustmentCredited(rec, eventId)
+        local ev = GS.FindLedgerEventById(rec, eventId)
+        assertTrue(type(ev) == "table", "465-adjfloor: peer adj present " .. tostring(eventId))
+        ev.gsProductionCredit = true
+        if GS._BumpAccountingMutation then
+            GS._BumpAccountingMutation(rec)
+        end
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(rec)
+        end
+        return ev
+    end
+
+    -- Attributed path (full suite with export collected on source first).
+    do
+        local label, itemId = "465-adjfloor", 9264
+        local attributed, attributedGuid = "Bob-Garona", "Player-1-Bob"
+        local record = seedLiveCampaignWithItem(itemId, 120)
+        local pos = select(1, GS:NewAdjustmentOperation(itemId, 10, attributed))
+        assertTrue(pos ~= nil, label .. ": prepare +10")
+        assertEq(GS:ApplyStagedConfigOperation(pos), "accepted", label .. ": apply +10")
+        local posId = pos.id
+        local neg = select(1, GS:NewAdjustmentOperation(itemId, -10, attributed))
+        assertTrue(neg ~= nil, label .. ": prepare −10")
+        assertEq(GS:ApplyStagedConfigOperation(neg), "accepted", label .. ": apply −10")
+        local negId = neg.id
+        assertEq(GS.PersonalContributorItemTotal(record, attributed, attributedGuid, itemId), 0,
+            label .. ": personal zero before delete")
+        local del = select(1, GS:NewSoftDeleteOperation(posId))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted", label .. ": delete +10")
+        assertEq(GS.PersonalContributorItemTotal(record, attributed, attributedGuid, itemId), -10,
+            label .. ": personal debt after delete")
+        local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+        assertEq(tonumber(progress.itemTotals[itemId]) or 0, -10, label .. ": item −10")
+        local delSnap = select(1, GS._SnapshotPublicOp(del))
+        local negSnap = select(1, GS._SnapshotPublicOp(neg))
+
+        GS:EnsureGossipProvider()
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(128)
+        local exportBodies = collectAllExportBodies()
+        local sourceDataset = record.datasetId
+
+        -- Delete-first remote: peer already holds credited +10 evidence (same id),
+        -- receives delete, then must replay −10 against verified soft-delete floors.
+        local peer = seedLiveCampaignWithItem(itemId, 120)
+        injectProductionAdjustment(peer, {
+            id = posId, itemId = itemId, quantity = 10,
+            attributed = attributed, attributedGuid = attributedGuid,
+        })
+        assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })), "accepted", label .. ": peer delete-first")
+        local stNeg, rNeg = GS:AdmitRemoteOperation(rebind(negSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })
+        assertEq(stNeg, "accepted",
+            label .. ": peer −10 after delete-first got " .. tostring(stNeg) .. "/" .. tostring(rNeg))
+        markPeerAdjustmentCredited(peer, negId)
+        assertEq(GS.PersonalContributorItemTotal(peer, attributed, attributedGuid, itemId), -10,
+            label .. ": peer personal debt")
+
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            label .. ": begin adoption")
+        for i = 1, #exportBodies do
+            GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        end
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            label .. ": transfer ready")
+        local commitSt, commitErr = GS:CommitDatasetAdoption()
+        local gAdopt = 0
+        while commitSt == "pending" and gAdopt < 128 do
+            runOneDueTimer()
+            commitSt, commitErr = GS:CommitDatasetAdoption()
+            gAdopt = gAdopt + 1
+        end
+        flushTimers()
+        assertEq(commitSt, "accepted",
+            label .. ": commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+        local adopted = GS:GetCurrentRecord()
+        assertTrue(GS.FindLedgerEventById(adopted, negId) ~= nil, label .. ": survivor retained")
+        assertEq(GS.PersonalContributorItemTotal(adopted, attributed, attributedGuid, itemId), -10,
+            label .. ": adopted immediate debt")
+        simulateRuntimeReload()
+        settleRoster()
+        assertEq(GS.PersonalContributorItemTotal(adopted, attributed, attributedGuid, itemId), -10,
+            label .. ": debt after reload")
+        local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, attributed))
+        assertTrue(repair ~= nil, label .. ": prepare repair")
+        assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", label .. ": apply repair")
+        assertEq(GS.PersonalContributorItemTotal(adopted, attributed, attributedGuid, itemId), 0,
+            label .. ": repaired to zero")
+    end
+
+    -- Unassigned +10 / −10 / delete +10 (item debt only; no personal allowance).
+    do
+        local label, itemId = "465-adjfloor-ua", 9265
+        local record = seedLiveCampaignWithItem(itemId, 120)
+        injectProductionDonation(record, {
+            id = "adjfloor-ua-stock", itemId = itemId, quantity = 20,
+            actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+        })
+        local pos = select(1, GS:NewAdjustmentOperation(itemId, 10, nil))
+        assertTrue(pos ~= nil, label .. ": prepare Unassigned +10")
+        assertEq(GS:ApplyStagedConfigOperation(pos), "accepted", label .. ": apply +10")
+        local posId = pos.id
+        local neg = select(1, GS:NewAdjustmentOperation(itemId, -10, nil))
+        assertTrue(neg ~= nil, label .. ": prepare Unassigned −10")
+        assertEq(GS:ApplyStagedConfigOperation(neg), "accepted", label .. ": apply −10")
+        local negId = neg.id
+        local del = select(1, GS:NewSoftDeleteOperation(posId))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted", label .. ": delete +10")
+        local entry = record.eventDeletions and record.eventDeletions[posId]
+        assertNil(entry and entry.attributed, label .. ": Unassigned fact")
+        assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+            label .. ": Bob not charged")
+        local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+        -- Carol stock 20 + deleted Unassigned +10 + surviving Unassigned −10 → 10.
+        assertEq(tonumber(progress.itemTotals[itemId]) or 0, 10, label .. ": item after delete")
+        local delSnap = select(1, GS._SnapshotPublicOp(del))
+        local negSnap = select(1, GS._SnapshotPublicOp(neg))
+
+        GS:EnsureGossipProvider()
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(128)
+        local exportBodies = collectAllExportBodies()
+        local sourceDataset = record.datasetId
+
+        local peer = seedLiveCampaignWithItem(itemId, 120)
+        injectProductionDonation(peer, {
+            id = "adjfloor-ua-stock", itemId = itemId, quantity = 20,
+            actor = "Carol-Garona", actorGuid = "Player-1-Carol",
+        })
+        injectProductionAdjustment(peer, {
+            id = posId, itemId = itemId, quantity = 10,
+            attributed = nil, attributedGuid = nil,
+        })
+        assertEq(select(1, GS:AdmitRemoteOperation(rebind(delSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })), "accepted", label .. ": peer delete-first")
+        local stNeg, rNeg = GS:AdmitRemoteOperation(rebind(negSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })
+        assertEq(stNeg, "accepted",
+            label .. ": peer −10 after delete-first got " .. tostring(stNeg) .. "/" .. tostring(rNeg))
+        markPeerAdjustmentCredited(peer, negId)
+        local peerProgress = GS.ProjectCampaignProgressOnRecord(peer, peer.currentCampaignId)
+        assertEq(tonumber(peerProgress.itemTotals[itemId]) or 0, 10, label .. ": peer item")
+
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            label .. ": begin adoption")
+        for i = 1, #exportBodies do
+            GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        end
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            label .. ": transfer ready")
+        local commitSt, commitErr = GS:CommitDatasetAdoption()
+        local gAdopt = 0
+        while commitSt == "pending" and gAdopt < 128 do
+            runOneDueTimer()
+            commitSt, commitErr = GS:CommitDatasetAdoption()
+            gAdopt = gAdopt + 1
+        end
+        flushTimers()
+        assertEq(commitSt, "accepted",
+            label .. ": commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+        local adopted = GS:GetCurrentRecord()
+        assertTrue(GS.FindLedgerEventById(adopted, negId) ~= nil, label .. ": survivor retained")
+        local aProgress = GS.ProjectCampaignProgressOnRecord(adopted, adopted.currentCampaignId)
+        assertEq(tonumber(aProgress.itemTotals[itemId]) or 0, 10, label .. ": adopted item")
+        assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
+            label .. ": adopted Bob zero")
+        simulateRuntimeReload()
+        settleRoster()
+        assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(adopted, adopted.currentCampaignId)
+            .itemTotals[itemId]) or 0, 10, label .. ": item after reload")
+        -- Explicit repair of Unassigned item debt from the surviving −10: +10 Unassigned.
+        local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, nil))
+        assertTrue(repair ~= nil, label .. ": prepare Unassigned repair")
+        assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", label .. ": apply repair")
+        assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(adopted, adopted.currentCampaignId)
+            .itemTotals[itemId]) or 0, 20, label .. ": item repaired to stock")
+    end
+
+    -- Deleting a negative adjustment must not manufacture a negative allowance.
+    -- Unrelated same-item credit keeps the item positive so only personal fails.
+    do
+        local label, itemId = "465-negdel", 9266
+        local record = seedLiveCampaignWithItem(itemId, 120)
+        injectProductionDonation(record, {
+            id = "negdel-alice", itemId = itemId, quantity = 20,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local pos = select(1, GS:NewAdjustmentOperation(itemId, 10, "Bob-Garona"))
+        assertEq(GS:ApplyStagedConfigOperation(pos), "accepted", label .. ": Bob +10")
+        local neg = select(1, GS:NewAdjustmentOperation(itemId, -5, "Bob-Garona"))
+        assertEq(GS:ApplyStagedConfigOperation(neg), "accepted", label .. ": Bob −5")
+        local negId = neg.id
+        assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 5,
+            label .. ": Bob 5 before delete")
+        local del = select(1, GS:NewSoftDeleteOperation(negId))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted", label .. ": delete −5")
+        assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), 10,
+            label .. ": Bob restored to 10")
+        local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+        assertTrue((tonumber(progress.itemTotals[itemId]) or 0) > 0, label .. ": item stays positive")
+        -- Soft-delete debt floors must not allow Bob below zero via abs(−5).
+        local okFloor, floorErr = GS.AdjustmentFloorOk(
+            record, itemId, -11, "Bob-Garona", nil, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        assertTrue(okFloor == false, label .. ": Bob −11 rejected")
+        assertEq(floorErr, "player_negative",
+            label .. ": player_negative got " .. tostring(floorErr))
+        -- Local public writer agrees.
+        local bad, _, badReason = GS:NewAdjustmentOperation(itemId, -11, "Bob-Garona")
+        assertNil(bad, label .. ": public −11 rejected")
+        assertEq(badReason, "player_negative",
+            label .. ": public player_negative got " .. tostring(badReason))
+    end
+end
+
+do
     -- #465 obligation 3b: many retained deletes + orphaned targets share one
     -- bounded event-object index; FindLedgerEventById must not run per head.
     local itemId = 9262

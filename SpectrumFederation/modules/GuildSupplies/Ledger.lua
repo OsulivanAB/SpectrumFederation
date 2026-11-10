@@ -6818,8 +6818,13 @@ local function CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
 end
 
 --- Verified soft-delete debt floors for remote/adoption adjustment floors (#465).
--- Returns itemFloor (negative or 0) and personalFloor for attributed (negative or 0).
--- Explicit Unassigned / nil credit soft-deletes do not manufacture personal allowances.
+-- Returns itemFloor and personalFloor as permitted negative allowances (≤ 0).
+-- Aligns with ApplyVerifiedSoftDeleteDebtFloor: each verified deletion contributes
+-- the signed removed effect (-quantity) once per canonical id + campaign.
+-- Positive adjustments (including Unassigned) lower the item floor; deleting a
+-- negative adjustment raises the aggregate and must not invent a negative
+-- allowance. Personal floors follow effective attribution only — Unassigned
+-- supplies none.
 VerifiedSoftDeleteAdjustmentDebtFloors = function(
     record, itemId, campaignId, attributed, attributedGuid)
     local itemFloor, personalFloor = 0, 0
@@ -6856,6 +6861,7 @@ VerifiedSoftDeleteAdjustmentDebtFloors = function(
                 return
             end
             seen[canon] = true
+            -- Signed removed effect (same -qty rule as ApplyVerifiedSoftDeleteDebtFloor).
             itemFloor = itemFloor - qty
             local creditName = NormName(entry.attributed)
             local creditGuid = ValidGuid(entry.attributedGuid)
@@ -6868,15 +6874,15 @@ VerifiedSoftDeleteAdjustmentDebtFloors = function(
             if qty == 0 or entry.gsProductionCredit ~= true then
                 return
             end
+            seen[canon] = true
+            -- Include Unassigned: item effect still applies; personal does not.
+            itemFloor = itemFloor - qty
             local creditName = NormName(entry.attributed)
             local creditGuid = ValidGuid(entry.attributedGuid)
-            -- Unassigned adjustment deletions never create personal debt floors.
-            if not (creditName or creditGuid) then
-                return
-            end
-            seen[canon] = true
-            if CreditIdentitiesEqual(creditName, creditGuid, attrName, attrGuid) then
-                personalFloor = personalFloor - math.abs(qty)
+            if creditName or creditGuid then
+                if CreditIdentitiesEqual(creditName, creditGuid, attrName, attrGuid) then
+                    personalFloor = personalFloor - qty
+                end
             end
         end
     end
@@ -6892,6 +6898,15 @@ VerifiedSoftDeleteAdjustmentDebtFloors = function(
         for _, entry in pairs(durable) do
             absorb(entry)
         end
+    end
+    -- Normalize to permitted negative allowances only (deleting a negative
+    -- adjustment must not leave a positive "floor" that weakens checks, nor
+    -- manufacture a negative allowance via abs).
+    if itemFloor > 0 then
+        itemFloor = 0
+    end
+    if personalFloor > 0 then
+        personalFloor = 0
     end
     return itemFloor, personalFloor
 end
