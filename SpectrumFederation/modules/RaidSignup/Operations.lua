@@ -256,6 +256,9 @@ function RS:RenamePlan(planId, name, opts)
     if type(prev) ~= "table" then
         return "rejected", "plan_missing"
     end
+    if prev.archived then
+        return "rejected", "plan_archived"
+    end
     if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
         return "rejected", "stale_plan"
     end

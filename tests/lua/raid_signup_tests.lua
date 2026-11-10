@@ -243,24 +243,77 @@ end
 
 GG.MAX_RECORD_CBOR = 2048
 GG._providers = {}
+world.indexEpochBumps = 0
 function GG.Init() end
 function GG.RegisterProvider(spec)
     if GG._providers[spec.id] then
         return false, "already_registered"
     end
-    GG._providers[spec.id] = spec
+    GG._providers[spec.id] = {
+        id = spec.id,
+        spec = spec,
+        api = spec,
+        enabled = true,
+        ready = true,
+        index = {
+            buildComplete = false,
+            dirty = true,
+            epoch = 1,
+            byId = {},
+        },
+    }
     return true
 end
 function GG.GetProvider(id)
     return GG._providers[id]
 end
 function GG.SetProviderEnabled() end
-function GG.NotifyProviderChanged()
+function GG.NotifyProviderChanged(id)
     world.providerChanged = world.providerChanged + 1
+    local e = GG._providers[id]
+    if e and e.index then
+        e.index.dirty = true
+        e.index.buildComplete = false
+    end
 end
-function GG.BumpIndexEpoch() end
-function GG.IndexUpsert() end
-function GG.CreateIndex() return {} end
+function GG.IndexUpsert(index, recordId, versionFp, meta)
+    if type(index) ~= "table" or recordId == nil then
+        return false, "bad_args"
+    end
+    recordId = tostring(recordId)
+    versionFp = tostring(versionFp or "")
+    index.byId = index.byId or {}
+    local existing = index.byId[recordId]
+    if existing and existing.versionFp == versionFp then
+        return false, "duplicate"
+    end
+    if existing and existing.versionFp ~= versionFp then
+        return false, "replaced"
+    end
+    index.byId[recordId] = { id = recordId, versionFp = versionFp, meta = meta }
+    if not index.buildComplete then
+        index.dirty = true
+    end
+    return true, index.byId[recordId]
+end
+function GG.BumpIndexEpoch(index)
+    if type(index) ~= "table" then
+        return
+    end
+    index.epoch = (tonumber(index.epoch) or 0) + 1
+    index.byId = {}
+    index.buildComplete = false
+    index.dirty = true
+    world.indexEpochBumps = (world.indexEpochBumps or 0) + 1
+end
+function GG.CreateIndex()
+    return {
+        buildComplete = false,
+        dirty = true,
+        epoch = 1,
+        byId = {},
+    }
+end
 
 SF.NameUtil = {
     NormalizeNameRealm = function(name)
@@ -504,8 +557,9 @@ local live = record.entries[entryA]
 local remoteEntry = RS.CloneEntry(live)
 remoteEntry.nickname = "FromCarol"
 remoteEntry.ver = { n = live.ver.n + 1, w = "cccccccccccccccccccccccc" }
-local provider = GG.GetProvider(RS.PROVIDER_ID)
-assertTrue(provider ~= nil, "provider registered")
+local providerEntry = GG.GetProvider(RS.PROVIDER_ID)
+assertTrue(providerEntry ~= nil and providerEntry.spec ~= nil, "provider registered")
+local provider = providerEntry.spec
 local delStatus, delDetail = provider.ValidateAndApply({
     id = RS.EntryRecordId(entryA),
     versionFp = "x",
@@ -549,12 +603,13 @@ assertTrue(record.entries[entryA].deleted, "tombstone stored")
 local staleLive = RS.CloneEntry(cur)
 staleLive.deleted = false
 staleLive.ver = cur.ver -- older than tombstone
-delStatus = provider.ValidateAndApply({
+local staleReplayStatus, staleReplayDetail = provider.ValidateAndApply({
     id = RS.EntryRecordId(entryA),
     versionFp = "stale",
     body = { kind = "raidsignup-entry", schema = 1, entry = staleLive },
 }, { sender = "Carol-Garona" })
-assertEq(delStatus, "duplicate", "stale live replay does not resurrect")
+assertEq(staleReplayStatus, "rejected", "stale live replay does not resurrect")
+assertEq(staleReplayDetail, "deleted_final", "stale live vs tombstone is deleted_final")
 assertTrue(record.entries[entryA].deleted, "still deleted")
 
 -- Higher-version live record must not overwrite tombstone (no restore)
@@ -562,13 +617,13 @@ local zombie = RS.CloneEntry(record.entries[entryA])
 zombie.deleted = false
 zombie.nickname = "Resurrected"
 zombie.ver = { n = record.entries[entryA].ver.n + 5, w = "ffffffffffffffffffffffff" }
-delStatus, delDetail = provider.ValidateAndApply({
+local zombieStatus, zombieDetail = provider.ValidateAndApply({
     id = RS.EntryRecordId(entryA),
     versionFp = "zombie",
     body = { kind = "raidsignup-entry", schema = 1, entry = zombie },
 }, { sender = "Carol-Garona" })
-assertEq(delStatus, "rejected", "higher-ver live cannot overwrite tombstone")
-assertEq(delDetail, "deleted_final", "deleted_final reason")
+assertEq(zombieStatus, "rejected", "higher-ver live cannot overwrite tombstone")
+assertEq(zombieDetail, "deleted_final", "deleted_final reason")
 assertTrue(record.entries[entryA].deleted, "tombstone remains after higher-ver live")
 
 -- Equal revision, different writer tie-break: live vs tombstone — tombstone wins
@@ -615,7 +670,7 @@ local replayStatus = provider.ValidateAndApply({
     versionFp = "replay-live",
     body = { kind = "raidsignup-entry", schema = 1, entry = liveSnap },
 }, { sender = "Carol-Garona" })
-assertEq(replayStatus, "duplicate", "provider rejects stale live vs tombstone as duplicate/stale")
+assertEq(replayStatus, "rejected", "provider rejects stale live vs tombstone")
 assertTrue(record.entries[entryDelOrder].deleted, "author DB still deleted after provider replay")
 
 -- Provider path: higher-ver live against existing tombstone on the live guild record
@@ -869,7 +924,21 @@ local function makeRegion(objectType)
         _texture = nil,
     }
     function r:GetObjectType() return self._type end
-    function r:SetParent(p) self._parent = p end
+    function r:SetParent(p)
+        if self._parent and self._parent._children then
+            local kids = self._parent._children
+            for i = #kids, 1, -1 do
+                if kids[i] == self then
+                    table.remove(kids, i)
+                end
+            end
+        end
+        self._parent = p
+        if p then
+            p._children = p._children or {}
+            p._children[#p._children + 1] = self
+        end
+    end
     function r:GetParent() return self._parent end
     function r:Show() self._shown = true end
     function r:Hide() self._shown = false end
@@ -945,9 +1014,8 @@ function CreateFrame(frameType, name, parent, template)
     local f = makeRegion(frameType or "Frame")
     f._name = name
     f._template = template
-    f._parent = parent
-    if parent and parent._children then
-        parent._children[#parent._children + 1] = f
+    if parent then
+        f:SetParent(parent)
     end
     -- EditBox helpers
     if frameType == "EditBox" or template == "InputBoxTemplate" then
@@ -1061,11 +1129,11 @@ UIPage._SetDraftForTests(draft)
 assertTrue(UIPage._GetDraftForTests() ~= nil, "draft injected into page session")
 UIPage:Refresh(panel, { force = true })
 assertTrue(panel.__sfRaidSignupEntriesHost ~= nil, "entries host after draft refresh")
-local boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+local boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
 if #boxes < 1 then
     -- forceRebuild if soft paint missed the draft row for any stubbing reason
     UIPage:Refresh(panel, { forceRebuild = true, force = true })
-    boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+    boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
 end
 assertTrue(#boxes >= 1, "draft nickname edit box present")
 local nickBox = boxes[1]
@@ -1107,7 +1175,7 @@ assertEq(staleStatus, "rejected", "stale nickname edit rejected")
 
 -- Focus deferral via a page-bound edit box
 UIPage:Refresh(panel, { force = true })
-boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost)
+boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
 assertTrue(#boxes >= 1, "edit boxes after persist refresh")
 boxes[1]:SetFocus()
 refreshBefore = UIPage._GetLifecycleCounters().refreshCount
@@ -1124,15 +1192,313 @@ UIPage:Build(panel)
 UIPage:Build(panel)
 assertEq(UIPage._GetLifecycleCounters().listenerCount, listenersBefore, "listeners not accumulated")
 
--- Frame creates stay bounded across many soft refreshes
+-- Allocations plateau after warm-up (pooled reuse), not merely "< 5000"
 rebuildBefore = UIPage._GetLifecycleCounters().fullRebuildCount
-local framesSoftStart = UIPage._GetLifecycleCounters().frameCreateCount
+UIPage:Refresh(panel, { force = true })
+UIPage:Refresh(panel, { force = true })
+local createsAfterWarmup = UIPage._GetLifecycleCounters().frameCreateCount
+local reuseAfterWarmup = UIPage._GetLifecycleCounters().frameReuseCount
 for _ = 1, 8 do
-    UIPage:Refresh(panel)
+    UIPage:Refresh(panel, { force = true })
 end
-local framesSoftEnd = UIPage._GetLifecycleCounters().frameCreateCount
-assertTrue(framesSoftEnd - framesSoftStart < 5000, "frame creates bounded across soft refreshes")
+local createsLater = UIPage._GetLifecycleCounters().frameCreateCount
+local reuseLater = UIPage._GetLifecycleCounters().frameReuseCount
+assertEq(createsLater, createsAfterWarmup, "frame creates plateau after warm-up")
+assertTrue(reuseLater > reuseAfterWarmup, "pooled frames are reused after warm-up")
 assertEq(UIPage._GetLifecycleCounters().fullRebuildCount, rebuildBefore, "still no extra full rebuilds")
+
+-- Live control bindings: create plan then Add Row; switch plan; archive disables rename
+ActAs("Alice-Garona", "Player-1-Alice")
+local snap = UIPage._GetDefinitionSnapshotForTests()
+local statusNew, _, planLive = RS:CreatePlan("Live Binding Plan")
+assertEq(statusNew, "accepted", "create plan for live binding")
+RS:SelectPlan(planLive)
+local snap2 = UIPage._GetDefinitionSnapshotForTests()
+assertEq(snap2.selectedId, planLive, "selected plan binding updates")
+assertEq(snap2.planOpen, true, "new plan is open")
+assertEq(snap2.canCreateEntry, true, "officer can create entry on open plan")
+assertEq(snap2.renameEnabled, true, "rename enabled on open plan")
+assertTrue(#snap2.planOptions > #snap.planOptions, "plan options include new plan")
+assertEq(select(1, RS:SetPlanArchived(planLive, true)), "accepted", "archive for rename disable")
+local snap3 = UIPage._GetDefinitionSnapshotForTests()
+assertEq(snap3.renameEnabled, false, "rename disabled while archived")
+assertEq(select(1, RS:RenamePlan(planLive, "Nope")), "rejected", "local rename rejected while archived")
+-- Remote metadata catch-up of archived rename still allowed
+local archivedPlan = RS.ClonePlan(select(1, RS:EnsureGuildRecord("club:42")).plans[planLive])
+archivedPlan.name = "RemoteName"
+archivedPlan.ver = { n = archivedPlan.ver.n + 1, w = "officerofficerofficeroff" }
+assertEq(select(1, provider.ValidateAndApply({
+    id = RS.PlanRecordId(planLive),
+    versionFp = "arch-rename",
+    body = { kind = "raidsignup-plan", schema = 1, plan = archivedPlan },
+}, { sender = "Alice-Garona" })), "accepted", "remote archived plan metadata catch-up")
+assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planLive].name, "RemoteName", "archived name caught up remotely")
+assertEq(select(1, RS:SetPlanArchived(planLive, false)), "accepted", "reopen plan")
+
+---------------------------------------------------------------------------
+-- Equal-n live vs tombstone both delivery orders (production provider)
+---------------------------------------------------------------------------
+
+ActAs("Carol-Garona", "Player-1-Carol")
+local eqId
+status, _, eqId = RS:UpsertEntry({
+    planId = plan3,
+    nickname = "EqNonce",
+    mainClass = "MAGE",
+    mainSpec = 62,
+})
+assertEq(status, "accepted", "equal-n seed entry")
+local base = RS.CloneEntry(select(1, RS:EnsureGuildRecord("club:42")).entries[eqId])
+local liveHigh = RS.CloneEntry(base)
+liveHigh.deleted = false
+liveHigh.nickname = "LiveHigh"
+liveHigh.ver = { n = base.ver.n + 1, w = "zzzzzzzzzzzzzzzzzzzzzzzz" }
+local tombLow = RS.CloneEntry(base)
+tombLow.deleted = true
+tombLow.ver = { n = base.ver.n + 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }
+
+-- Order A: live first, then lower-writer tombstone
+local peerA = { schemaVersion = 1, guildKey = "club:42", clubId = "42", plans = {}, entries = {} }
+for _, plan in pairs(select(1, RS:EnsureGuildRecord("club:42")).plans) do
+    RS.MergePlan(peerA, plan, { remote = true })
+end
+assertEq(select(1, RS.MergeEntry(peerA, liveHigh, { remote = true })), "accepted", "peerA live first")
+assertEq(select(1, RS.MergeEntry(peerA, tombLow, { remote = true })), "accepted", "peerA tombstone wins over higher writer live")
+assertTrue(peerA.entries[eqId].deleted, "peerA deleted after lower-w tombstone")
+
+-- Order B: tombstone first, then higher-writer live
+local peerB = { schemaVersion = 1, guildKey = "club:42", clubId = "42", plans = {}, entries = {} }
+for _, plan in pairs(select(1, RS:EnsureGuildRecord("club:42")).plans) do
+    RS.MergePlan(peerB, plan, { remote = true })
+end
+assertEq(select(1, RS.MergeEntry(peerB, tombLow, { remote = true })), "accepted", "peerB tombstone first")
+assertEq(select(1, RS.MergeEntry(peerB, liveHigh, { remote = true })), "rejected", "peerB live cannot restore")
+assertTrue(peerB.entries[eqId].deleted, "peerB stays deleted")
+
+-- Provider path equal-n tombstone after live on main record
+ActAs("Carol-Garona", "Player-1-Carol")
+local eq2
+status, _, eq2 = RS:UpsertEntry({
+    planId = plan3,
+    nickname = "EqProv",
+    mainClass = "WARRIOR",
+    mainSpec = 71,
+})
+local base2 = RS.CloneEntry(select(1, RS:EnsureGuildRecord("club:42")).entries[eq2])
+local live2 = RS.CloneEntry(base2)
+live2.ver = { n = base2.ver.n + 1, w = "yyyyyyyyyyyyyyyyyyyyyyyy" }
+live2.nickname = "Advanced"
+assertEq(select(1, provider.ValidateAndApply({
+    id = RS.EntryRecordId(eq2),
+    versionFp = "live2",
+    body = { kind = "raidsignup-entry", schema = 1, entry = live2 },
+}, { sender = "Carol-Garona" })), "accepted", "provider admits advanced live")
+local tomb2 = RS.CloneEntry(base2)
+tomb2.deleted = true
+tomb2.ver = { n = base2.ver.n + 1, w = "bbbbbbbbbbbbbbbbbbbbbbbb" }
+assertEq(select(1, provider.ValidateAndApply({
+    id = RS.EntryRecordId(eq2),
+    versionFp = "tomb2",
+    body = { kind = "raidsignup-entry", schema = 1, entry = tomb2 },
+}, { sender = "Carol-Garona" })), "accepted", "provider admits equal-n lower-w tombstone over live")
+assertTrue(select(1, RS:EnsureGuildRecord("club:42")).entries[eq2].deleted, "provider deletion converged")
+-- repeated replay
+assertEq(select(1, provider.ValidateAndApply({
+    id = RS.EntryRecordId(eq2),
+    versionFp = "live2-replay",
+    body = { kind = "raidsignup-entry", schema = 1, entry = live2 },
+}, { sender = "Carol-Garona" })), "rejected", "repeated live replay rejected")
+
+---------------------------------------------------------------------------
+-- Bound first-seen tombstones + terminal revision rejection
+---------------------------------------------------------------------------
+
+local rec = select(1, RS:EnsureGuildRecord("club:42"))
+local tombCount = 0
+for i = 1, RS.MAX_ENTRIES + 5 do
+    local te = {
+        entryId = "tomb-flood-" .. tostring(i),
+        planId = plan3,
+        nickname = "T",
+        mainClass = "MAGE",
+        mainSpec = 62,
+        notes = "",
+        creatorGuid = "Player-1-Carol",
+        deleted = true,
+        ver = { n = 1, w = string.format("%024x", i) },
+        at = 1,
+    }
+    local st = select(1, RS.MergeEntry(rec, te, { remote = true }))
+    if st == "accepted" then
+        tombCount = tombCount + 1
+    end
+end
+assertTrue(tombCount <= RS.MAX_ENTRIES, "first-seen tombstones are bounded")
+assertEq(select(1, RS.MergeEntry(rec, {
+    entryId = "tomb-flood-overflow",
+    planId = plan3,
+    nickname = "T",
+    mainClass = "MAGE",
+    mainSpec = 62,
+    creatorGuid = "Player-1-Carol",
+    deleted = true,
+    ver = { n = 1, w = "ffffffffffffffffffffffff" },
+    at = 1,
+}, { remote = true })), "rejected", "tombstone at capacity rejected")
+
+-- Deleting an existing live entry at capacity still works
+ActAs("Carol-Garona", "Player-1-Carol")
+-- Ensure at least one live entry remains / create if needed
+local liveCapId
+status, _, liveCapId = RS:UpsertEntry({
+    planId = plan3,
+    nickname = "CapDelete",
+    mainClass = "ROGUE",
+    mainSpec = 259,
+})
+if status == "accepted" then
+    assertEq(select(1, RS:DeleteEntry(liveCapId)), "accepted", "delete existing live at/near capacity allowed")
+elseif status == "rejected" then
+    -- capacity already full of retained rows; pick any live and delete
+    local liveList = RS:GetSortedEntries(plan3)
+    assertTrue(#liveList > 0, "have a live entry to delete at capacity")
+    assertEq(select(1, RS:DeleteEntry(liveList[1].entryId)), "accepted", "delete existing live at capacity allowed")
+end
+
+-- Terminal / implausible remote revision
+local bad = RS.CloneEntry(base)
+bad.entryId = "rev-terminal"
+bad.ver = { n = RS.MAX_REV, w = "cccccccccccccccccccccccc" }
+assertEq(select(1, RS.MergeEntry(rec, bad, { remote = true })), "rejected", "terminal MAX_REV rejected")
+bad.ver = { n = RS.MAX_REV - 1, w = "cccccccccccccccccccccccc" }
+bad.ver.n = (rec.entries[eqId] and rec.entries[eqId].ver.n or 0) + RS.MAX_REV_CATCHUP + 1
+assertEq(select(1, RS.MergeEntry(rec, bad, { remote = true })), "rejected", "implausible jump rejected")
+
+-- Admitted member entry remains officer-editable
+ActAs("Carol-Garona", "Player-1-Carol")
+local modId
+status, _, modId = RS:UpsertEntry({
+    planId = plan3,
+    nickname = "ModMe",
+    mainClass = "PRIEST",
+    mainSpec = 256,
+})
+if status ~= "accepted" then
+    -- may fail if overflow; clear by using an existing carol entry if needed
+    local list = RS:GetSortedEntries(plan3)
+    modId = list[1] and list[1].entryId
+end
+assertTrue(modId ~= nil, "have entry for officer moderation")
+ActAs("Bob-Garona", "Player-1-Bob")
+local modEntry = select(1, RS:EnsureGuildRecord("club:42")).entries[modId]
+assertEq(select(1, RS:UpsertEntry({
+    entryId = modId,
+    planId = modEntry.planId,
+    nickname = "OfficerMod",
+    mainClass = modEntry.mainClass,
+    mainSpec = modEntry.mainSpec,
+}, { expectedVer = modEntry.ver })), "accepted", "officer can edit admitted member entry")
+modEntry = select(1, RS:EnsureGuildRecord("club:42")).entries[modId]
+assertEq(select(1, RS:DeleteEntry(modId, { expectedVer = modEntry.ver })), "accepted", "officer can delete admitted member entry")
+
+---------------------------------------------------------------------------
+-- Production GuildGossip index contract (07_Index)
+---------------------------------------------------------------------------
+
+do
+    load("SpectrumFederation/modules/GuildGossip/01_Constants.lua")
+    load("SpectrumFederation/modules/GuildGossip/02_Util.lua")
+    load("SpectrumFederation/modules/GuildGossip/07_Index.lua")
+    local GG = SF.GuildGossip
+    -- Replace mock index helpers with production ones already loaded.
+    local provEntry = GG.GetProvider(RS.PROVIDER_ID)
+    if not provEntry then
+        -- mock GetProvider returns from _providers table
+        GG._providers = GG._providers or {}
+        if not GG._providers[RS.PROVIDER_ID] and GG._providers.byId then
+            provEntry = GG._providers.byId[RS.PROVIDER_ID]
+        else
+            provEntry = GG._providers[RS.PROVIDER_ID]
+        end
+    end
+    assertTrue(provEntry ~= nil, "raid signup provider entry present")
+    local index = GG.CreateIndex()
+    provEntry.index = index
+    local spec = provEntry.spec or (provider)
+    -- Ensure provider ValidateAndApply still available via original provider
+    assertTrue(type(spec.EnsureIndex) == "function", "EnsureIndex present")
+
+    local function drive(budget, rounds)
+        rounds = rounds or 64
+        local steps = 0
+        for _ = 1, rounds do
+            steps = steps + 1
+            local more, examined = spec.EnsureIndex(index, { indexEntries = budget })
+            assertTrue(examined == nil or examined >= 0, "examined is non-negative")
+            if more == false and index.buildComplete and not index.dirty then
+                return steps
+            end
+        end
+        fail("EnsureIndex did not converge budget=" .. tostring(budget))
+        return steps
+    end
+
+    -- Empty-ish rebuild then complete
+    RS.NotifyLocalDurableChange("local")
+    local steps = drive(8)
+    assertTrue(index.buildComplete and not index.dirty, "index completes")
+    assertTrue(steps >= 1, "at least one ensure step")
+
+    -- Idle EnsureIndex does no further work
+    local epoch = index.epoch
+    for _ = 1, 5 do
+        local more = spec.EnsureIndex(index, { indexEntries = 8 })
+        assertEq(more and true or false, false, "idle EnsureIndex returns false")
+    end
+    assertEq(index.epoch, epoch, "idle EnsureIndex does not bump epoch")
+
+    -- Multi-slice with tiny budget
+    ActAs("Alice-Garona", "Player-1-Alice")
+    RS:CreatePlan("IndexSlicePlan")
+    RS.NotifyLocalDurableChange("local")
+    index = GG.CreateIndex()
+    provEntry.index = index
+    steps = drive(1, 256)
+    assertTrue(index.buildComplete and not index.dirty, "multi-slice index completes")
+    assertTrue(steps > 1, "tiny budget requires multiple slices")
+
+    -- create -> complete -> edit -> new fingerprint
+    local beforeFp = nil
+    for id, row in pairs(index.byId or {}) do
+        if tostring(id):find("^rs%-p:", 1) then
+            beforeFp = row.versionFp
+            break
+        end
+    end
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local plansNow = RS:GetSortedPlans(true)
+    local targetPlan = nil
+    for i = 1, #plansNow do
+        if not plansNow[i].archived then
+            targetPlan = plansNow[i]
+            break
+        end
+    end
+    assertTrue(targetPlan ~= nil, "open plan available for rename index test")
+    beforeFp = index.byId[RS.PlanRecordId(targetPlan.planId)]
+        and index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
+    assertEq(select(1, RS:RenamePlan(targetPlan.planId, targetPlan.name .. "X", {
+        expectedVer = targetPlan.ver,
+    })), "accepted", "rename for index fingerprint change")
+    RS.NotifyLocalDurableChange("local")
+    -- Fingerprint replacement restarts EnsureIndex; drive until idle again.
+    index = provEntry.index
+    drive(8, 256)
+    assertTrue(index.buildComplete and not index.dirty, "index idle after rename rebuild")
+    local afterFp = index.byId[RS.PlanRecordId(targetPlan.planId)]
+        and index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
+    assertTrue(afterFp ~= nil and afterFp ~= beforeFp, "physical fingerprint updated after rename")
+end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

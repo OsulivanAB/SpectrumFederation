@@ -19,6 +19,9 @@ RS.MAX_GUID = 64
 RS.MAX_CLASS = 32
 RS.MAX_EVENT_SEQ = 2147483647
 RS.MAX_REV = 9007199254740990
+-- Ordinary remote catch-up may skip missed revisions, but not leap to a
+-- terminal or implausibly forward revision that strands future edits.
+RS.MAX_REV_CATCHUP = 10000
 
 RS._db = nil
 RS._root = nil
@@ -109,6 +112,27 @@ local function ValidVer(ver)
         and type(ver.w) == "string"
         and ver.w ~= ""
         and #ver.w <= 64
+end
+
+--- Remote versions must remain advanceable by AllocateVer and must not leap
+-- an implausible distance past the local revision (Guild Officer convention).
+function RS.RemoteRevisionPlausible(localVer, remoteVer)
+    if not ValidVer(remoteVer) then
+        return false, "invalid_revision"
+    end
+    local remoteN = tonumber(remoteVer.n)
+    if remoteN >= RS.MAX_REV then
+        return false, "implausible_revision"
+    end
+    local localN = 0
+    if type(localVer) == "table" and IsFiniteNonnegInt(localVer.n) then
+        localN = tonumber(localVer.n)
+    end
+    local gap = tonumber(RS.MAX_REV_CATCHUP) or 10000
+    if remoteN > localN + gap then
+        return false, "implausible_revision"
+    end
+    return true
 end
 
 function RS.ParseGuildKey(guildKey)
@@ -530,6 +554,12 @@ function RS.MergePlan(record, plan, opts)
         return "rejected", err or "malformed"
     end
     local prev = record.plans[clean.planId]
+    if opts.remote then
+        local okRev, revReason = RS.RemoteRevisionPlausible(prev and prev.ver, clean.ver)
+        if not okRev then
+            return "rejected", revReason or "implausible_revision"
+        end
+    end
     if type(prev) == "table" and ValidVer(prev.ver) then
         local cmp = RS.CompareVer(clean.ver, prev.ver)
         if cmp < 0 then
@@ -568,11 +598,27 @@ function RS.MergeEntry(record, entry, opts)
     end
 
     local prev = record.entries[clean.entryId]
+    if opts.remote then
+        local okRev, revReason = RS.RemoteRevisionPlausible(prev and prev.ver, clean.ver)
+        if not okRev then
+            return "rejected", revReason or "implausible_revision"
+        end
+    end
     if type(prev) == "table" and ValidVer(prev.ver) then
         -- Deletion is final: no approved restore. A live record must never
         -- overwrite a tombstone regardless of version ordering or writer tie-break.
         if prev.deleted and not clean.deleted then
             return "rejected", "deleted_final"
+        end
+        -- Incoming authorized tombstone wins over any live record of the same
+        -- entry, including equal/lower revisions and opposing writer nonces.
+        if clean.deleted and not prev.deleted then
+            if prev.creatorGuid and clean.creatorGuid and clean.creatorGuid ~= prev.creatorGuid then
+                return "rejected", "creator_immutable"
+            end
+            clean.creatorGuid = prev.creatorGuid or clean.creatorGuid
+            record.entries[clean.entryId] = clean
+            return "accepted", opts.remote and "remote" or "local"
         end
         local cmp = RS.CompareVer(clean.ver, prev.ver)
         if cmp < 0 then
@@ -587,11 +633,17 @@ function RS.MergeEntry(record, entry, opts)
         end
         clean.creatorGuid = prev.creatorGuid
     else
+        -- Bound all retained records, including first-seen tombstones. Deleting
+        -- an already-retained live entry (prev exists above) remains allowed at capacity.
+        if CountEntries(record, nil, false) >= RS.MAX_ENTRIES then
+            return "rejected", "entries_overflow"
+        end
         if not clean.deleted then
-            if CountEntries(record, nil, false) >= RS.MAX_ENTRIES then
-                return "rejected", "entries_overflow"
-            end
             if CountEntries(record, clean.planId, true) >= RS.MAX_ENTRIES_PER_PLAN then
+                return "rejected", "plan_entries_overflow"
+            end
+        else
+            if CountEntries(record, clean.planId, false) >= RS.MAX_ENTRIES_PER_PLAN then
                 return "rejected", "plan_entries_overflow"
             end
         end

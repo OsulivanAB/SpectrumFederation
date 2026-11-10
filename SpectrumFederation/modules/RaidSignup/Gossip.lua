@@ -162,9 +162,10 @@ local function RebuildExportIndex()
     exportRebuildCount = exportRebuildCount + 1
     exportState.order = {}
     exportState.byId = {}
-    exportState.enumPos = 1
+    exportState.enumPos = nil
     local guildKey = CurrentGuildKey()
     exportState.guildKey = guildKey
+    exportDirty = false
     if not guildKey then
         return
     end
@@ -208,74 +209,106 @@ local function RebuildExportIndex()
     end
 end
 
+local function ProviderEntry()
+    local g = Gossip()
+    if not g or type(g.GetProvider) ~= "function" then
+        return nil
+    end
+    return g.GetProvider(RS.PROVIDER_ID)
+end
+
 local function BumpPhysicalIndex(index)
     local g = Gossip()
-    if not g then
+    local idx = index
+    if not idx then
+        local entry = ProviderEntry()
+        idx = entry and entry.index
+    end
+    if not idx or not g or type(g.BumpIndexEpoch) ~= "function" then
         return false
     end
-    if g.BumpIndexEpoch then
-        g.BumpIndexEpoch(RS.PROVIDER_ID)
-        return true
-    end
-    if index and g.CreateIndex then
-        return false
-    end
-    return false
+    g.BumpIndexEpoch(idx)
+    idx.buildComplete = false
+    idx.dirty = true
+    return true
 end
 
 local function EnsureExportFresh()
-    if exportDirty then
-        local needBump = exportDirtyNeedsBump
-        exportDirty = false
-        exportDirtyNeedsBump = false
-        RebuildExportIndex()
-        if needBump then
-            if BumpPhysicalIndex(nil) then
-                exportBumpCount = exportBumpCount + 1
-            end
-        end
-        return true
+    if not exportDirty then
+        return false
     end
-    return false
+    local needBump = exportDirtyNeedsBump
+    RebuildExportIndex()
+    if needBump then
+        exportDirtyNeedsBump = false
+        if BumpPhysicalIndex(nil) then
+            exportBumpCount = exportBumpCount + 1
+        end
+    else
+        exportDirtyNeedsBump = false
+    end
+    return true
 end
 
+local function OnIndexInvalidated()
+    exportState.enumPos = nil
+end
+
+--- Budgeted physical-index build. Returns moreWork[, examined].
+-- moreWork=true while records remain; false when complete (buildComplete, not dirty).
 local function EnsureIndex(index, limits)
+    local g = Gossip()
+    local budget = math.max(1, tonumber(limits and limits.indexEntries) or 8)
     local guildKey = CurrentGuildKey()
     if exportState.guildKey ~= guildKey then
         exportDirty = false
         exportDirtyNeedsBump = false
         RebuildExportIndex()
-        BumpPhysicalIndex(index)
+        if BumpPhysicalIndex(index) then
+            exportBumpCount = exportBumpCount + 1
+        end
+        exportState.enumPos = 1
     else
         EnsureExportFresh()
     end
-    local g = Gossip()
-    if not g or not g.IndexUpsert then
-        return true
+    if type(index) ~= "table" then
+        return false, 0
     end
-    local budget = tonumber(limits and limits.maxEntries) or 64
-    local start = exportState.enumPos or 1
-    local i = start
-    local n = 0
-    while i <= #exportState.order and n < budget do
-        local id = exportState.order[i]
-        local wire = exportState.byId[id]
-        if wire then
-            g.IndexUpsert(index, id, wire.versionFp)
-            n = n + 1
-        end
-        i = i + 1
+    if index.buildComplete and not index.dirty then
+        return false, 0
     end
-    exportState.enumPos = i
-    if i > #exportState.order then
+    if not exportState.enumPos then
         exportState.enumPos = 1
-        return true
     end
-    return false
-end
-
-local function OnIndexInvalidated()
-    exportState.enumPos = 1
+    if not g or type(g.IndexUpsert) ~= "function" then
+        exportState.enumPos = nil
+        index.buildComplete = true
+        index.dirty = false
+        return false, 0
+    end
+    local n = 0
+    while exportState.enumPos <= #exportState.order and n < budget do
+        local rid = exportState.order[exportState.enumPos]
+        exportState.enumPos = exportState.enumPos + 1
+        local r = exportState.byId[rid]
+        if r then
+            local _, detail = g.IndexUpsert(index, rid, r.versionFp, r)
+            if detail == "replaced" then
+                g.BumpIndexEpoch(index)
+                exportBumpCount = exportBumpCount + 1
+                exportState.enumPos = 1
+                return true, n + 1
+            end
+        end
+        n = n + 1
+    end
+    if exportState.enumPos > #exportState.order then
+        exportState.enumPos = nil
+        index.buildComplete = true
+        index.dirty = false
+        return false, n
+    end
+    return true, n
 end
 
 local function ListRecordIds(cursor, limit)
@@ -375,7 +408,12 @@ local function ValidateAndApply(record, ctx)
             return "rejected", "malformed"
         end
         local prev = guildRec.entries[entry.entryId]
+        -- Do not short-circuit live↔tombstone conflicts as stale: deletion finality
+        -- is enforced inside MergeEntry for both delivery orders.
+        local liveTombstoneConflict = type(prev) == "table"
+            and ((prev.deleted and not entry.deleted) or (entry.deleted and not prev.deleted))
         if type(prev) == "table" and ValidVerSafe(prev.ver) and ValidVerSafe(entry.ver)
+            and not liveTombstoneConflict
             and RS.CompareVer(entry.ver, prev.ver) <= 0 then
             return "duplicate", "stale_or_same"
         end

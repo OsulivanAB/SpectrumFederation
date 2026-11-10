@@ -773,6 +773,7 @@ L["RAID_SIGNUP_ERR_ENTRIES_OVERFLOW"] = "The maximum number of signup entries ha
 L["RAID_SIGNUP_ERR_EMPTY_NAME"] = "A non-blank name is required."
 L["RAID_SIGNUP_ERR_DELETED_FINAL"] = "That signup entry was deleted and cannot be restored."
 L["RAID_SIGNUP_ERR_NICK_INCOMPLETE"] = "Finish typing the nickname, then press Enter."
+L["RAID_SIGNUP_TIP_RENAME_ARCHIVED"] = "Archived plans are read-only. Reopen the plan before renaming."
 L["RAID_SIGNUP_PLAN_SELECT"] = "Active plan"
 L["RAID_SIGNUP_PLAN_CREATE"] = "Create plan"
 L["RAID_SIGNUP_PLAN_CREATE_BTN"] = "Create"

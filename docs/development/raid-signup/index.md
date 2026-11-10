@@ -24,16 +24,27 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
   abandoned incomplete drafts are discarded.
 - Creators and officers can edit saved nicknames with `expectedVer` stale-edit protection.
 - At most one alternative; never identical main/alt class+spec.
-- Local mutations against archived plans are rejected. Remote Gossip may still catch up
-  already-saved historical roster contents onto archived plans; the UI stays read-only.
-- Deletions use versioned tombstones. There is no restore: a live record never overwrites
-  a tombstone, regardless of version order or writer tie-break. New Add Row uses new IDs.
-- Concurrent edits converge by `(n, w)` version tuples for live records.
+- Local mutations against archived plans are rejected (including rename). Remote Gossip may
+  still catch up already-saved historical roster contents/metadata onto archived plans;
+  the UI stays read-only.
+- Deletions use versioned tombstones. There is no restore: live never overwrites a
+  tombstone, and an authorized incoming tombstone wins over live for the same entry even
+  when its `(n, w)` tuple is equal or lower. New Add Row uses new IDs.
+- Concurrent live edits converge by `(n, w)` version tuples; deletion finality overrides
+  that ordering for live↔tombstone conflicts.
+- First-seen retention (including tombstones) is bounded by `MAX_ENTRIES` /
+  `MAX_ENTRIES_PER_PLAN`. Deleting an already-retained live entry at capacity remains
+  allowed. Remote revisions must stay advanceable (`n < MAX_REV`) and within
+  `MAX_REV_CATCHUP` of the local revision.
+- `MAX_PLANS = 32` is a lifetime creation cap that includes archived history. There is no
+  automatic plan deletion/compaction; overflow returns `plans_overflow`. Revisit
+  reclamation only when real usage approaches the cap or the owner requests it.
 - Coverage summary uses ability/utility category icons (not class-icon stand-ins) with
   greyed missing state; the selected main-spec icon sits next to the nickname (notes do
   not separate them).
-- Typing does not rebuild the settings page; durable board hosts are reused. Idle visible
-  page does not poll or broadcast.
+- Typing does not rebuild the settings page; durable board hosts and pooled controls are
+  reused so allocations plateau after warm-up. Control callbacks read live selected plan /
+  permissions. Idle visible page does not poll or broadcast.
 
 ### Gossip multi-hop note
 
