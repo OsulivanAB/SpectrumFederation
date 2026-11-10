@@ -57,6 +57,8 @@ local session = {
 	listenerCount = 0,
 	frameCreateCount = 0,
 	frameReuseCount = 0,
+	regionCreateCount = 0,
+	regionReuseCount = 0,
 	boardPaintCount = 0,
 }
 
@@ -72,6 +74,11 @@ local ICON_GAP = 4
 local function TrackCreate(frame)
 	session.frameCreateCount = session.frameCreateCount + 1
 	return frame
+end
+
+local function TrackRegionCreate(region)
+	session.regionCreateCount = (session.regionCreateCount or 0) + 1
+	return region
 end
 
 local function HasTypingFocus()
@@ -363,36 +370,90 @@ local iconButtonPool = {}
 local textButtonPool = {}
 local framePool = {}
 local editPool = {}
+local fontStringPool = {}
 
-local function ReleasePooled(frame, pool)
-	if not frame then
+-- Peak simultaneous demand is finite (MAX_ENTRIES_PER_PLAN rows with main+alt
+-- icons, nick+notes, action buttons, plus an active class/spec picker). Pools
+-- therefore retain every released owned widget instead of discarding at a low
+-- hard cap that would force recurring CreateFrame work.
+
+local function SafeClearScript(widget, script)
+	if not widget or type(script) ~= "string" then
 		return
 	end
-	frame:Hide()
-	frame:ClearAllPoints()
-	frame:SetParent(nil)
-	if frame.SetScript then
-		frame:SetScript("OnClick", nil)
-		frame:SetScript("OnEnterPressed", nil)
-		frame:SetScript("OnEscapePressed", nil)
-		frame:SetScript("OnTextChanged", nil)
-		frame:SetScript("OnEditFocusGained", nil)
-		frame:SetScript("OnEditFocusLost", nil)
+	if type(widget.HasScript) == "function" then
+		if widget:HasScript(script) and widget.SetScript then
+			widget:SetScript(script, nil)
+		end
+		return
 	end
-	if typingFocus == frame then
-		typingFocus = nil
-	end
-	frame.__sfRaidSignupField = nil
-	if #pool < 256 then
-		pool[#pool + 1] = frame
+	-- HasScript unavailable: clear only by object type.
+	local ot = widget.GetObjectType and widget:GetObjectType() or nil
+	if ot == "Button" and script == "OnClick" and widget.SetScript then
+		widget:SetScript(script, nil)
+	elseif ot == "EditBox" and widget.SetScript then
+		if script == "OnEnterPressed" or script == "OnEscapePressed"
+			or script == "OnTextChanged" or script == "OnEditFocusGained"
+			or script == "OnEditFocusLost" then
+			widget:SetScript(script, nil)
+		end
 	end
 end
 
-local function AcquirePooled(pool, factory)
+local function ClearTeardownScripts(widget)
+	if not widget then
+		return
+	end
+	local ot = widget.GetObjectType and widget:GetObjectType() or nil
+	if ot == "EditBox" then
+		-- Clear focus handlers before Hide/reparent can invoke them.
+		SafeClearScript(widget, "OnEditFocusLost")
+		SafeClearScript(widget, "OnEditFocusGained")
+		SafeClearScript(widget, "OnTextChanged")
+		SafeClearScript(widget, "OnEnterPressed")
+		SafeClearScript(widget, "OnEscapePressed")
+	elseif ot == "Button" then
+		-- Keep stable OnEnter/OnLeave tooltip handlers installed at acquire time.
+		SafeClearScript(widget, "OnClick")
+	end
+end
+
+local function ReleasePooled(widget, pool, kind)
+	if not widget then
+		return
+	end
+	if typingFocus == widget then
+		typingFocus = nil
+	end
+	-- Clear teardown-sensitive callbacks before Hide/reparent can fire them.
+	ClearTeardownScripts(widget)
+	local ot = widget.GetObjectType and widget:GetObjectType() or nil
+	if ot == "EditBox" and widget.HasFocus and widget:HasFocus() and widget.ClearFocus then
+		widget:ClearFocus()
+	end
+	widget:Hide()
+	if widget.ClearAllPoints then
+		widget:ClearAllPoints()
+	end
+	if widget.SetParent then
+		widget:SetParent(nil)
+	end
+	widget.__sfRaidSignupField = nil
+	-- Always retain for reuse across supported demand; never discard at a low cap.
+	pool[#pool + 1] = widget
+end
+
+local function AcquirePooled(pool, factory, reuseCounter)
 	local frame = table.remove(pool)
 	if frame then
-		session.frameReuseCount = (session.frameReuseCount or 0) + 1
-		frame:Show()
+		if reuseCounter == "region" then
+			session.regionReuseCount = (session.regionReuseCount or 0) + 1
+		else
+			session.frameReuseCount = (session.frameReuseCount or 0) + 1
+		end
+		if frame.Show then
+			frame:Show()
+		end
 		return frame, true
 	end
 	return factory(), false
@@ -401,9 +462,10 @@ end
 local function MakeIconButton(parent, size)
 	local btn = AcquirePooled(iconButtonPool, function()
 		local b = TrackCreate(CreateFrame("Button", nil, parent))
+		b.__sfRaidSignupOwned = true
 		b.__sfPoolKind = "icon"
 		b:SetSize(size or ICON, size or ICON)
-		local tex = b:CreateTexture(nil, "ARTWORK")
+		local tex = TrackRegionCreate(b:CreateTexture(nil, "ARTWORK"))
 		tex:SetAllPoints()
 		b.icon = tex
 		b:SetScript("OnEnter", function(self)
@@ -423,17 +485,20 @@ local function MakeIconButton(parent, size)
 		end)
 		return b
 	end)
+	btn.__sfRaidSignupOwned = true
+	btn.__sfPoolKind = "icon"
 	btn:SetParent(parent)
 	btn:SetSize(size or ICON, size or ICON)
 	btn.tooltipTitle = nil
 	btn.tooltipText = nil
+	SafeClearScript(btn, "OnClick")
 	btn:Show()
 	return btn
 end
 
 local function SetIconVisual(btn, texture, enabled, grey)
 	if not btn.icon then
-		local tex = btn:CreateTexture(nil, "ARTWORK")
+		local tex = TrackRegionCreate(btn:CreateTexture(nil, "ARTWORK"))
 		tex:SetAllPoints()
 		btn.icon = tex
 	end
@@ -452,6 +517,19 @@ local function SetIconVisual(btn, texture, enabled, grey)
 	end
 end
 
+local function ReleaseOwnedRegions(host)
+	if not host or not host.GetRegions then
+		return
+	end
+	local regions = { host:GetRegions() }
+	for i = 1, #regions do
+		local region = regions[i]
+		if region and region.__sfRaidSignupOwned and region.__sfPoolKind == "font" then
+			ReleasePooled(region, fontStringPool, "font")
+		end
+	end
+end
+
 local function ReleaseHostChildren(host)
 	if not host then
 		return
@@ -459,26 +537,35 @@ local function ReleaseHostChildren(host)
 	local kids = { host:GetChildren() }
 	for i = 1, #kids do
 		local child = kids[i]
-		ReleaseHostChildren(child)
-		local ot = child.GetObjectType and child:GetObjectType() or nil
-		if ot == "Button" then
-			if child.__sfPoolKind == "icon" or child.icon then
-				ReleasePooled(child, iconButtonPool)
-			else
-				ReleasePooled(child, textButtonPool)
+		-- Only pool feature-owned widgets. Template/framework descendants stay
+		-- with their owning control and are never absorbed into generic pools.
+		if child and child.__sfRaidSignupOwned then
+			ReleaseHostChildren(child)
+			ReleaseOwnedRegions(child)
+			local kind = child.__sfPoolKind
+			if kind == "icon" then
+				ReleasePooled(child, iconButtonPool, "icon")
+			elseif kind == "text" then
+				ReleasePooled(child, textButtonPool, "text")
+			elseif kind == "edit" then
+				ReleasePooled(child, editPool, "edit")
+			elseif kind == "frame" then
+				ReleasePooled(child, framePool, "frame")
 			end
-		elseif ot == "EditBox" then
-			ReleasePooled(child, editPool)
-		else
-			ReleasePooled(child, framePool)
 		end
 	end
+	ReleaseOwnedRegions(host)
 end
 
 local function AcquireFrame(parent)
 	local frame = AcquirePooled(framePool, function()
-		return TrackCreate(CreateFrame("Frame", nil, parent))
+		local f = TrackCreate(CreateFrame("Frame", nil, parent))
+		f.__sfRaidSignupOwned = true
+		f.__sfPoolKind = "frame"
+		return f
 	end)
+	frame.__sfRaidSignupOwned = true
+	frame.__sfPoolKind = "frame"
 	frame:SetParent(parent)
 	frame:Show()
 	return frame
@@ -487,12 +574,34 @@ end
 local function AcquireEditBox(parent)
 	local edit = AcquirePooled(editPool, function()
 		local e = TrackCreate(CreateFrame("EditBox", nil, parent, "InputBoxTemplate"))
+		e.__sfRaidSignupOwned = true
+		e.__sfPoolKind = "edit"
 		e:SetAutoFocus(false)
 		return e
 	end)
+	edit.__sfRaidSignupOwned = true
+	edit.__sfPoolKind = "edit"
 	edit:SetParent(parent)
 	edit:Show()
 	return edit
+end
+
+local function AcquireFontString(parent, layer, template)
+	local fs = AcquirePooled(fontStringPool, function()
+		local created = TrackRegionCreate(parent:CreateFontString(nil, layer or "OVERLAY", template or "GameFontHighlight"))
+		created.__sfRaidSignupOwned = true
+		created.__sfPoolKind = "font"
+		return created
+	end, "region")
+	fs.__sfRaidSignupOwned = true
+	fs.__sfPoolKind = "font"
+	if fs.SetParent then
+		fs:SetParent(parent)
+	end
+	if fs.Show then
+		fs:Show()
+	end
+	return fs
 end
 
 local function SafeSetEditText(edit, text)
@@ -832,17 +941,17 @@ function PaintSummary(host, planId)
 		for i = 1, #order do
 			local classFile = order[i]
 			local y = -(i - 1) * (ICON + 2)
-			local icon = classCol:CreateTexture(nil, "ARTWORK")
+			local icon = TrackRegionCreate(classCol:CreateTexture(nil, "ARTWORK"))
 			icon:SetSize(ICON, ICON)
 			icon:SetPoint("TOPLEFT", classCol, "TOPLEFT", 0, y)
 			icon:SetTexture(TextureForClass(classFile))
-			local count = classCol:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+			local count = TrackRegionCreate(classCol:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
 			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
 			host.__sfClassCounts[classFile] = count
 		end
 
 		local function paintGroup(title, categories, coveredMap, anchor)
-			local label = host:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+			local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
 			label:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 24, 0)
 			label:SetText(title)
 			local wrap = AcquireFrame(host)
@@ -1204,10 +1313,14 @@ function PaintEntries(host, planId, planOpen, caps)
 				local function AcquireTextButton()
 					local btn = AcquirePooled(textButtonPool, function()
 						local b = TrackCreate(CreateFrame("Button", nil, row, "UIPanelButtonTemplate"))
+						b.__sfRaidSignupOwned = true
 						b.__sfPoolKind = "text"
 						return b
 					end)
+					btn.__sfRaidSignupOwned = true
+					btn.__sfPoolKind = "text"
 					btn:SetParent(row)
+					SafeClearScript(btn, "OnClick")
 					btn:Show()
 					return btn
 				end
@@ -1317,7 +1430,8 @@ function PaintEntries(host, planId, planOpen, caps)
 
 	if #entries == 0 and not session.draft then
 		placeRow(24, function(row)
-			local fs = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+			local fs = AcquireFontString(row, "OVERLAY", "GameFontHighlight")
+			fs:ClearAllPoints()
 			fs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			fs:SetText(Loc("RAID_SIGNUP_EMPTY", "No signups in this plan yet."))
 		end)
@@ -1478,11 +1592,14 @@ function Page._GetLifecycleCounters()
 		listenerCount = session.listenerCount,
 		frameCreateCount = session.frameCreateCount,
 		frameReuseCount = session.frameReuseCount or 0,
+		regionCreateCount = session.regionCreateCount or 0,
+		regionReuseCount = session.regionReuseCount or 0,
 		boardPaintCount = session.boardPaintCount,
 		iconButtonPool = #iconButtonPool,
 		textButtonPool = #textButtonPool,
 		framePool = #framePool,
 		editPool = #editPool,
+		fontStringPool = #fontStringPool,
 		hasDraft = session.draft ~= nil,
 		draftNicknameCommitted = session.draft and session.draft.nicknameCommitted or false,
 	}
@@ -1495,6 +1612,8 @@ function Page._ResetSessionForTests()
 	session.renamePlanName = ""
 	session.frameCreateCount = 0
 	session.frameReuseCount = 0
+	session.regionCreateCount = 0
+	session.regionReuseCount = 0
 	session.boardPaintCount = 0
 	session.refreshCount = 0
 	session.fullRebuildCount = 0

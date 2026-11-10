@@ -913,6 +913,28 @@ assertTrue(foundBronze, "Blessing of the Bronze naming")
 ---------------------------------------------------------------------------
 
 local frameCount = 0
+local textureCount = 0
+local fontStringCount = 0
+-- Retail-shaped script support: SetScript rejects unsupported handlers.
+local SCRIPT_SUPPORT = {
+    Frame = {
+        OnShow = true, OnHide = true, OnEnter = true, OnLeave = true,
+        OnUpdate = true, OnEvent = true, OnSizeChanged = true,
+    },
+    Button = {
+        OnShow = true, OnHide = true, OnEnter = true, OnLeave = true,
+        OnClick = true, OnEnable = true, OnDisable = true, OnUpdate = true,
+    },
+    EditBox = {
+        OnShow = true, OnHide = true, OnEnter = true, OnLeave = true,
+        OnEnterPressed = true, OnEscapePressed = true, OnTextChanged = true,
+        OnEditFocusGained = true, OnEditFocusLost = true, OnTabPressed = true,
+        OnCursorChanged = true,
+    },
+    Texture = {},
+    FontString = {},
+}
+
 local function makeRegion(objectType)
     local r = {
         _type = objectType or "Region",
@@ -924,24 +946,55 @@ local function makeRegion(objectType)
         _texture = nil,
     }
     function r:GetObjectType() return self._type end
-    function r:SetParent(p)
-        if self._parent and self._parent._children then
-            local kids = self._parent._children
-            for i = #kids, 1, -1 do
-                if kids[i] == self then
-                    table.remove(kids, i)
+    function r:HasScript(name)
+        local map = SCRIPT_SUPPORT[self._type] or SCRIPT_SUPPORT.Frame
+        return map[name] == true
+    end
+    local function detachFromParent(widget)
+        local parent = widget._parent
+        if not parent then
+            return
+        end
+        if parent._children then
+            for i = #parent._children, 1, -1 do
+                if parent._children[i] == widget then
+                    table.remove(parent._children, i)
                 end
             end
         end
+        if parent._regions then
+            for i = #parent._regions, 1, -1 do
+                if parent._regions[i] == widget then
+                    table.remove(parent._regions, i)
+                end
+            end
+        end
+    end
+    function r:SetParent(p)
+        detachFromParent(self)
         self._parent = p
-        if p then
+        if not p then
+            return
+        end
+        local ot = self._type
+        if ot == "Texture" or ot == "FontString" then
+            p._regions = p._regions or {}
+            p._regions[#p._regions + 1] = self
+        else
             p._children = p._children or {}
             p._children[#p._children + 1] = self
         end
     end
     function r:GetParent() return self._parent end
     function r:Show() self._shown = true end
-    function r:Hide() self._shown = false end
+    function r:Hide()
+        local wasShown = self._shown
+        self._shown = false
+        if wasShown then
+            local fn = self._scripts.OnHide
+            if fn then fn(self) end
+        end
+    end
     function r:IsShown() return self._shown end
     function r:SetAllPoints() end
     function r:ClearAllPoints() self._points = {} end
@@ -964,9 +1017,19 @@ local function makeRegion(objectType)
     function r:Disable() self._enabled = false end
     function r:EnableMouse() end
     function r:RegisterForClicks() end
-    function r:SetScript(name, fn) self._scripts[name] = fn end
+    function r:SetScript(name, fn)
+        if not self:HasScript(name) then
+            error(string.format("script '%s' isn't supported by widget of type %s",
+                tostring(name), tostring(self._type)), 2)
+        end
+        self._scripts[name] = fn
+    end
     function r:GetScript(name) return self._scripts[name] end
     function r:HookScript(name, fn)
+        if not self:HasScript(name) then
+            error(string.format("script '%s' isn't supported by widget of type %s",
+                tostring(name), tostring(self._type)), 2)
+        end
         local prev = self._scripts[name]
         self._scripts[name] = function(...)
             if prev then prev(...) end
@@ -975,6 +1038,9 @@ local function makeRegion(objectType)
     end
     function r:HasFocus() return self._focused == true end
     function r:ClearFocus()
+        if not self._focused then
+            return
+        end
         self._focused = false
         local fn = self._scripts.OnEditFocusLost
         if fn then fn(self) end
@@ -985,11 +1051,16 @@ local function makeRegion(objectType)
         if fn then fn(self) end
     end
     function r:CreateTexture()
-        return makeRegion("Texture")
+        textureCount = textureCount + 1
+        local tex = makeRegion("Texture")
+        tex:SetParent(self)
+        return tex
     end
     function r:CreateFontString()
+        fontStringCount = fontStringCount + 1
         local fs = makeRegion("FontString")
         function fs:SetJustifyH() end
+        fs:SetParent(self)
         return fs
     end
     function r:GetChildren()
@@ -1002,7 +1073,13 @@ local function makeRegion(objectType)
         return unpack(kids)
     end
     function r:GetRegions()
-        return unpack(self._regions or {})
+        local regions = {}
+        for _, region in ipairs(self._regions or {}) do
+            if region._parent == self then
+                regions[#regions + 1] = region
+            end
+        end
+        return unpack(regions)
     end
     r._children = {}
     r._regions = {}
@@ -1011,22 +1088,41 @@ end
 
 function CreateFrame(frameType, name, parent, template)
     frameCount = frameCount + 1
-    local f = makeRegion(frameType or "Frame")
+    local resolved = frameType or "Frame"
+    if template == "InputBoxTemplate" then
+        resolved = "EditBox"
+    elseif template == "UIPanelButtonTemplate" then
+        resolved = "Button"
+    end
+    local f = makeRegion(resolved)
     f._name = name
     f._template = template
     if parent then
         f:SetParent(parent)
     end
-    -- EditBox helpers
-    if frameType == "EditBox" or template == "InputBoxTemplate" then
-        f._type = "EditBox"
-        f.Instructions = makeRegion("FontString")
+    if resolved == "EditBox" then
+        -- Template-owned Instructions region (not feature-pooled).
+        local instructions = makeRegion("FontString")
+        instructions:SetParent(f)
+        f.Instructions = instructions
+        fontStringCount = fontStringCount + 1
+        -- Synthetic template chrome that must never enter feature pools.
+        local chrome = makeRegion("Frame")
+        chrome._type = "Frame"
+        chrome.__sfTemplateOwned = true
+        chrome:SetParent(f)
+        frameCount = frameCount + 1
     end
-    if frameType == "Button" or template == "UIPanelButtonTemplate" then
-        f._type = "Button"
+    if resolved == "Button" then
         function f:Click()
             local fn = f._scripts.OnClick
             if fn then fn(f) end
+        end
+        if template == "UIPanelButtonTemplate" then
+            local label = makeRegion("FontString")
+            label:SetParent(f)
+            f.Text = label
+            fontStringCount = fontStringCount + 1
         end
     end
     return f
@@ -1090,6 +1186,19 @@ load("SpectrumFederation/modules/UI/Settings/Pages/RaidSignup.lua")
 local UIPage = SF.RaidSignupUIPage or registeredPage
 assertTrue(UIPage ~= nil, "Raid Signup page registered")
 assertTrue(type(UIPage._SetDraftForTests) == "function", "draft test hook present")
+
+-- Fail-before proof for pooled cleanup: Frame rejects Button-only scripts.
+do
+    local probe = CreateFrame("Frame")
+    local okClick = pcall(function()
+        probe:SetScript("OnClick", nil)
+    end)
+    assertTrue(not okClick, "Frame SetScript(OnClick) fails under Retail script rules")
+    local okEdit = pcall(function()
+        probe:SetScript("OnEnterPressed", nil)
+    end)
+    assertTrue(not okEdit, "Frame SetScript(OnEnterPressed) fails under Retail script rules")
+end
 
 ActAs("Alice-Garona", "Player-1-Alice")
 RS:SelectPlan(plan3)
@@ -1192,20 +1301,80 @@ UIPage:Build(panel)
 UIPage:Build(panel)
 assertEq(UIPage._GetLifecycleCounters().listenerCount, listenersBefore, "listeners not accumulated")
 
--- Allocations plateau after warm-up (pooled reuse), not merely "< 5000"
+-- Allocations plateau after warm-up (pooled reuse), including regions
 rebuildBefore = UIPage._GetLifecycleCounters().fullRebuildCount
 UIPage:Refresh(panel, { force = true })
 UIPage:Refresh(panel, { force = true })
 local createsAfterWarmup = UIPage._GetLifecycleCounters().frameCreateCount
 local reuseAfterWarmup = UIPage._GetLifecycleCounters().frameReuseCount
+local regionsAfterWarmup = UIPage._GetLifecycleCounters().regionCreateCount
+local texturesAfterWarmup = textureCount
+local fontsAfterWarmup = fontStringCount
 for _ = 1, 8 do
     UIPage:Refresh(panel, { force = true })
 end
 local createsLater = UIPage._GetLifecycleCounters().frameCreateCount
 local reuseLater = UIPage._GetLifecycleCounters().frameReuseCount
+local regionsLater = UIPage._GetLifecycleCounters().regionCreateCount
 assertEq(createsLater, createsAfterWarmup, "frame creates plateau after warm-up")
+assertEq(regionsLater, regionsAfterWarmup, "region creates plateau after warm-up")
+assertEq(textureCount, texturesAfterWarmup, "texture creates plateau after warm-up")
+assertEq(fontStringCount, fontsAfterWarmup, "fontstring creates plateau after warm-up")
 assertTrue(reuseLater > reuseAfterWarmup, "pooled frames are reused after warm-up")
 assertEq(UIPage._GetLifecycleCounters().fullRebuildCount, rebuildBefore, "still no extra full rebuilds")
+
+local function countVisibleEmptyLabels(root)
+    local n = 0
+    local function walk(frame)
+        if not frame then
+            return
+        end
+        if frame.GetRegions then
+            local regions = { frame:GetRegions() }
+            for i = 1, #regions do
+                local region = regions[i]
+                if region and region.GetObjectType and region:GetObjectType() == "FontString"
+                    and region.IsShown and region:IsShown()
+                    and (region:GetText() or ""):find("No signups", 1, true) then
+                    n = n + 1
+                end
+            end
+        end
+        local kids = { frame:GetChildren() }
+        for i = 1, #kids do
+            walk(kids[i])
+        end
+    end
+    walk(root)
+    return n
+end
+
+-- Empty → populated must not leave empty-state FontStrings visible on reused rows
+ActAs("Alice-Garona", "Player-1-Alice")
+local statusEmptyPlan, _, planEmpty = RS:CreatePlan("Empty Then Populated")
+assertEq(statusEmptyPlan, "accepted", "empty transition plan created")
+RS:SelectPlan(planEmpty)
+UIPage:Refresh(panel, { force = true })
+assertTrue(countVisibleEmptyLabels(panel.__sfRaidSignupEntriesHost) >= 1, "empty-state label shown")
+assertEq(select(1, RS:UpsertEntry({
+    planId = planEmpty,
+    nickname = "FirstRow",
+    mainClass = "MAGE",
+    mainSpec = 62,
+})), "accepted", "populate empty plan")
+UIPage:Refresh(panel, { force = true })
+assertEq(countVisibleEmptyLabels(panel.__sfRaidSignupEntriesHost), 0,
+    "empty-state label hidden after populate")
+
+-- ReleasePooled must not SetScript unsupported handlers (Retail abort regression)
+do
+    local okRelease, errRelease = pcall(function()
+        for _ = 1, 4 do
+            UIPage:Refresh(panel, { force = true })
+        end
+    end)
+    assertTrue(okRelease, "refresh release does not raise invalid-script: " .. tostring(errRelease))
+end
 
 -- Live control bindings: create plan then Add Row; switch plan; archive disables rename
 ActAs("Alice-Garona", "Player-1-Alice")
@@ -1219,6 +1388,48 @@ assertEq(snap2.planOpen, true, "new plan is open")
 assertEq(snap2.canCreateEntry, true, "officer can create entry on open plan")
 assertEq(snap2.renameEnabled, true, "rename enabled on open plan")
 assertTrue(#snap2.planOptions > #snap.planOptions, "plan options include new plan")
+
+-- Actual Add Row / class / spec / alt / remove flows through page refresh
+local addDraft = RS.MakeDraft(planLive)
+UIPage._SetDraftForTests(addDraft)
+UIPage:Refresh(panel, { force = true })
+assertTrue(#UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname") >= 1,
+    "Add Row draft nickname present")
+RS.UpdateDraftField(addDraft, "classFile", "WARRIOR")
+UIPage:Refresh(panel, { force = true })
+RS.UpdateDraftField(addDraft, "specId", 71)
+RS.UpdateDraftField(addDraft, "nickname", "WarriorMain")
+RS.CommitDraftNickname(addDraft)
+assertEq(select(1, RS:UpsertEntry({
+    planId = planLive,
+    nickname = addDraft.nickname,
+    mainClass = addDraft.classFile,
+    mainSpec = addDraft.specId,
+})), "accepted", "persist Add Row draft")
+UIPage._SetDraftForTests(nil)
+UIPage:Refresh(panel, { force = true })
+local liveEntries = RS:GetSortedEntries(planLive)
+assertTrue(#liveEntries >= 1, "live plan has signup after Add Row")
+local liveEntry = liveEntries[1]
+assertEq(select(1, RS:UpsertEntry({
+    entryId = liveEntry.entryId,
+    planId = liveEntry.planId,
+    nickname = liveEntry.nickname,
+    mainClass = liveEntry.mainClass,
+    mainSpec = liveEntry.mainSpec,
+    altClass = "MAGE",
+    altSpec = 62,
+}, { expectedVer = liveEntry.ver })), "accepted", "add alternative through ops")
+UIPage:Refresh(panel, { force = true })
+liveEntry = RS:GetSortedEntries(planLive)[1]
+assertEq(liveEntry.altClass, "MAGE", "alternative attached")
+assertEq(select(1, RS:DeleteEntry(liveEntry.entryId, { expectedVer = liveEntry.ver })),
+    "accepted", "remove signup through ops")
+UIPage:Refresh(panel, { force = true })
+assertEq(#RS:GetSortedEntries(planLive), 0, "plan empty after removal")
+assertTrue(countVisibleEmptyLabels(panel.__sfRaidSignupEntriesHost) >= 1,
+    "empty-state returns after removal")
+
 assertEq(select(1, RS:SetPlanArchived(planLive, true)), "accepted", "archive for rename disable")
 local snap3 = UIPage._GetDefinitionSnapshotForTests()
 assertEq(snap3.renameEnabled, false, "rename disabled while archived")
@@ -1234,6 +1445,46 @@ assertEq(select(1, provider.ValidateAndApply({
 }, { sender = "Alice-Garona" })), "accepted", "remote archived plan metadata catch-up")
 assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planLive].name, "RemoteName", "archived name caught up remotely")
 assertEq(select(1, RS:SetPlanArchived(planLive, false)), "accepted", "reopen plan")
+
+-- Max-supported roster with alternatives + active picker: allocations still plateau.
+-- 128 mains + 128 alts + class picker exceeds the old 256 hard discard cliff.
+do
+    local statusMax, _, planMax = RS:CreatePlan("Max Roster Plateau")
+    assertEq(statusMax, "accepted", "max roster plan created")
+    RS:SelectPlan(planMax)
+    local maxN = RS.MAX_ENTRIES_PER_PLAN or 128
+    for i = 1, maxN do
+        local st = select(1, RS:UpsertEntry({
+            planId = planMax,
+            nickname = "R" .. tostring(i),
+            mainClass = "MAGE",
+            mainSpec = 62,
+            altClass = "WARRIOR",
+            altSpec = 71,
+        }))
+        assertEq(st, "accepted", "seed max roster row " .. tostring(i))
+    end
+    local pickerDraft = RS.MakeDraft(planMax)
+    UIPage._SetDraftForTests(pickerDraft)
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true })
+    local maxFrameWarm = UIPage._GetLifecycleCounters().frameCreateCount
+    local maxRegionWarm = UIPage._GetLifecycleCounters().regionCreateCount
+    local maxTexWarm = textureCount
+    local maxFontWarm = fontStringCount
+    for _ = 1, 6 do
+        UIPage:Refresh(panel, { force = true })
+    end
+    assertEq(UIPage._GetLifecycleCounters().frameCreateCount, maxFrameWarm,
+        "max-roster frame creates plateau")
+    assertEq(UIPage._GetLifecycleCounters().regionCreateCount, maxRegionWarm,
+        "max-roster region creates plateau")
+    assertEq(textureCount, maxTexWarm, "max-roster texture creates plateau")
+    assertEq(fontStringCount, maxFontWarm, "max-roster fontstring creates plateau")
+    UIPage._SetDraftForTests(nil)
+    RS:SelectPlan(plan3)
+    UIPage:Refresh(panel, { force = true })
+end
 
 ---------------------------------------------------------------------------
 -- Equal-n live vs tombstone both delivery orders (production provider)
@@ -1402,80 +1653,107 @@ modEntry = select(1, RS:EnsureGuildRecord("club:42")).entries[modId]
 assertEq(select(1, RS:DeleteEntry(modId, { expectedVer = modEntry.ver })), "accepted", "officer can delete admitted member entry")
 
 ---------------------------------------------------------------------------
--- Production GuildGossip index contract (07_Index)
+-- Production GuildGossip index contract (07_Index + 08_Providers.EnsureProviderIndex)
 ---------------------------------------------------------------------------
 
 do
+    local providerApi = provider
+    assertTrue(type(providerApi.EnsureIndex) == "function", "raid signup EnsureIndex present")
+
+    SF.GuildGossip._providers = nil
     load("SpectrumFederation/modules/GuildGossip/01_Constants.lua")
     load("SpectrumFederation/modules/GuildGossip/02_Util.lua")
     load("SpectrumFederation/modules/GuildGossip/07_Index.lua")
+    load("SpectrumFederation/modules/GuildGossip/08_Providers.lua")
     local GG = SF.GuildGossip
-    -- Replace mock index helpers with production ones already loaded.
-    local provEntry = GG.GetProvider(RS.PROVIDER_ID)
-    if not provEntry then
-        -- mock GetProvider returns from _providers table
-        GG._providers = GG._providers or {}
-        if not GG._providers[RS.PROVIDER_ID] and GG._providers.byId then
-            provEntry = GG._providers.byId[RS.PROVIDER_ID]
-        else
-            provEntry = GG._providers[RS.PROVIDER_ID]
-        end
-    end
-    assertTrue(provEntry ~= nil, "raid signup provider entry present")
-    local index = GG.CreateIndex()
-    provEntry.index = index
-    local spec = provEntry.spec or (provider)
-    -- Ensure provider ValidateAndApply still available via original provider
-    assertTrue(type(spec.EnsureIndex) == "function", "EnsureIndex present")
+    GG.MarkWorkPending = GG.MarkWorkPending or function() end
+    GG.NotifyMeaningfulChange = GG.NotifyMeaningfulChange or function() end
+    GG.SyncGuildAdapterLifecycle = nil
+    GG.IsGuildReady = function() return false end
+    GG._EnsureScheduler = function() end
+    assertTrue(type(GG.EnsureProviderIndex) == "function", "EnsureProviderIndex present")
+    assertTrue(type(GG.RegisterProvider) == "function", "production RegisterProvider loaded")
 
-    local function drive(budget, rounds)
-        rounds = rounds or 64
+    GG._providers = { byId = {}, order = {}, activeCount = 0, discRotate = 0 }
+    local okReg, provEntry = GG.RegisterProvider({
+        id = RS.PROVIDER_ID,
+        schema = RS.PROVIDER_SCHEMA,
+        enabled = true,
+        ready = true,
+        EnsureIndex = providerApi.EnsureIndex,
+        OnIndexInvalidated = providerApi.OnIndexInvalidated,
+        ListRecordIds = providerApi.ListRecordIds,
+        GetRecordVersionFp = providerApi.GetRecordVersionFp,
+        GetRecordBody = providerApi.GetRecordBody,
+        ValidateAndApply = providerApi.ValidateAndApply,
+        GetScopeId = providerApi.GetScopeId,
+        IsPeerEligible = providerApi.IsPeerEligible,
+        GetCapabilities = providerApi.GetCapabilities,
+    })
+    assertTrue(okReg and provEntry ~= nil, "raid signup provider registered with production Gossip")
+    provEntry = GG.GetProvider(RS.PROVIDER_ID)
+    assertTrue(provEntry ~= nil and provEntry.api ~= nil, "provider entry has api")
+
+    local function examinedNonNeg(entry)
+        local examined = tonumber(entry.lastIndexExamined)
+        return examined == nil or examined >= 0
+    end
+
+    local function driveProvider(budget, rounds)
+        rounds = rounds or 128
         local steps = 0
         for _ = 1, rounds do
             steps = steps + 1
-            local more, examined = spec.EnsureIndex(index, { indexEntries = budget })
-            assertTrue(examined == nil or examined >= 0, "examined is non-negative")
-            if more == false and index.buildComplete and not index.dirty then
+            local more = GG.EnsureProviderIndex(provEntry, { indexEntries = budget })
+            if provEntry.indexFailed then
+                fail("EnsureProviderIndex marked indexFailed (" .. tostring(provEntry.indexFailReason) .. ")")
+                return steps
+            end
+            if not examinedNonNeg(provEntry) then
+                fail("lastIndexExamined is negative")
+                return steps
+            end
+            local index = provEntry.index
+            if more == false and index and index.buildComplete and not index.dirty then
                 return steps
             end
         end
-        fail("EnsureIndex did not converge budget=" .. tostring(budget))
+        fail("EnsureProviderIndex did not converge budget=" .. tostring(budget))
         return steps
     end
 
-    -- Empty-ish rebuild then complete
+    -- Empty-ish rebuild then complete through production driver
     RS.NotifyLocalDurableChange("local")
-    local steps = drive(8)
-    assertTrue(index.buildComplete and not index.dirty, "index completes")
-    assertTrue(steps >= 1, "at least one ensure step")
+    provEntry.index = GG.CreateIndex()
+    provEntry.indexFailed = nil
+    local steps = driveProvider(8)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "provider index completes")
+    assertTrue(steps >= 1, "at least one EnsureProviderIndex step")
+    assertTrue(provEntry._indexUsable == true, "completed index marked usable")
 
-    -- Idle EnsureIndex does no further work
-    local epoch = index.epoch
+    -- Idle EnsureProviderIndex does no further work / no indexFailed
+    local epoch = provEntry.index.epoch
     for _ = 1, 5 do
-        local more = spec.EnsureIndex(index, { indexEntries = 8 })
-        assertEq(more and true or false, false, "idle EnsureIndex returns false")
+        local more = GG.EnsureProviderIndex(provEntry, { indexEntries = 8 })
+        assertEq(more and true or false, false, "idle EnsureProviderIndex returns false")
+        assertTrue(not provEntry.indexFailed, "idle does not fail index")
     end
-    assertEq(index.epoch, epoch, "idle EnsureIndex does not bump epoch")
+    assertEq(provEntry.index.epoch, epoch, "idle EnsureProviderIndex does not bump epoch")
 
     -- Multi-slice with tiny budget
     ActAs("Alice-Garona", "Player-1-Alice")
     RS:CreatePlan("IndexSlicePlan")
     RS.NotifyLocalDurableChange("local")
-    index = GG.CreateIndex()
-    provEntry.index = index
-    steps = drive(1, 256)
-    assertTrue(index.buildComplete and not index.dirty, "multi-slice index completes")
-    assertTrue(steps > 1, "tiny budget requires multiple slices")
+    provEntry.index = GG.CreateIndex()
+    provEntry.indexFailed = nil
+    provEntry._indexUsable = nil
+    -- Max-roster seed above leaves hundreds of export rows; budget=1 needs many slices.
+    steps = driveProvider(1, 4096)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "multi-slice provider index completes")
+    assertTrue(steps > 1, "tiny budget requires multiple EnsureProviderIndex slices")
 
-    -- create -> complete -> edit -> new fingerprint
-    local beforeFp = nil
-    for id, row in pairs(index.byId or {}) do
-        if tostring(id):find("^rs%-p:", 1) then
-            beforeFp = row.versionFp
-            break
-        end
-    end
-    ActAs("Alice-Garona", "Player-1-Alice")
+    -- create -> complete -> edit -> new fingerprint via EnsureProviderIndex
+    local index = provEntry.index
     local plansNow = RS:GetSortedPlans(true)
     local targetPlan = nil
     for i = 1, #plansNow do
@@ -1485,18 +1763,17 @@ do
         end
     end
     assertTrue(targetPlan ~= nil, "open plan available for rename index test")
-    beforeFp = index.byId[RS.PlanRecordId(targetPlan.planId)]
+    local beforeFp = index.byId[RS.PlanRecordId(targetPlan.planId)]
         and index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
     assertEq(select(1, RS:RenamePlan(targetPlan.planId, targetPlan.name .. "X", {
         expectedVer = targetPlan.ver,
     })), "accepted", "rename for index fingerprint change")
     RS.NotifyLocalDurableChange("local")
-    -- Fingerprint replacement restarts EnsureIndex; drive until idle again.
-    index = provEntry.index
-    drive(8, 256)
-    assertTrue(index.buildComplete and not index.dirty, "index idle after rename rebuild")
-    local afterFp = index.byId[RS.PlanRecordId(targetPlan.planId)]
-        and index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
+    driveProvider(8, 512)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "index idle after rename rebuild")
+    assertTrue(not provEntry.indexFailed, "rename rebuild did not fail index")
+    local afterFp = provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)]
+        and provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
     assertTrue(afterFp ~= nil and afterFp ~= beforeFp, "physical fingerprint updated after rename")
 end
 
