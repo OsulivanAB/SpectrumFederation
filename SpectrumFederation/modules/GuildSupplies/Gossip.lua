@@ -529,7 +529,7 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
         return {}, factCount, 0
     end
     descBody.softDeleteVerifiedFacts = {}
-    local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 512
+    local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
     local datasetId = descBody.datasetId or (record and record.datasetId)
     local pairsList = {}
     for eventId, entry in pairs(facts) do

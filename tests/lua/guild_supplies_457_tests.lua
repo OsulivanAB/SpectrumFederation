@@ -5564,12 +5564,16 @@ do
         GS.MAX_ARCHIVE_PAGE_COUNT = 512
         GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 16
         GS.MAX_DIRECT_EVIDENCE_EXPORTS = 256
+        GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT = 4096
         loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
         local maxCampaigns = GS.MAX_CAMPAIGNS or 64
         local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+        local softFactPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
         -- Conservative upper bound: retained archives ≤ MAX_CAMPAIGNS, each with
         -- ≤ MAX_ARCHIVE_PAGE_COUNT item pages and recipe pages. Concurrent
         -- fragment assembly (MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS) is separate.
+        -- Soft-delete verified-fact pages (#465 r4529162866) are part of a legal
+        -- transfer and must fit the pending-record ceiling.
         local expected = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
             + (GS.MAX_LEDGER_EVENTS or 4096)
             + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
@@ -5582,6 +5586,7 @@ do
             + maxCampaigns
             + (maxCampaigns * pagesPerArchive)
             + (maxCampaigns * pagesPerArchive)
+            + softFactPages
             + 512
         assertEq(GS.MAX_ADOPTION_PENDING_RECORDS, expected,
             "E: pending budget matches retained-archive × per-archive page bound")

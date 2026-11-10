@@ -4419,8 +4419,8 @@ do
     assertEq(tonumber(GS._softDeleteRebuildFindLedgerCalls) or 0, 0,
         "465-scan: rebuild FindLedger counter zero")
     assertTrue(visits1 > 0, "465-scan: event-object index visited ledger once")
-    -- Second rebuild must rebuild the shared index again (cold) but still not
-    -- call FindLedger; visit count stays on the same order as one pass.
+    -- Projection Invalidate keeps warm ledger indexes; second Ensure must reuse
+    -- them (0 new ledger visits) while still avoiding FindLedger (#465 r4529162895).
     if GS.InvalidateEventDeletionProjection then
         GS.InvalidateEventDeletionProjection(record)
     end
@@ -4436,7 +4436,20 @@ do
     local findDuring2 = findCalls
     GS.FindLedgerEventById = realFind
     assertEq(findDuring2, 0, "465-scan: second rebuild still no FindLedger")
-    assertEq(visits2, visits1, "465-scan: shared linear visit count stable")
+    assertEq(visits2, 0, "465-scan: warm index reuse after projection invalidate")
+    assertEq(GS._softDeleteIndexReuse, true, "465-scan: reuse flag set")
+    -- Explicit ledger-index invalidation + dependency change forces a cold rebuild.
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    local visits3 = tonumber(GS._softDeleteEventIndexVisits) or 0
+    assertEq(visits3, visits1, "465-scan: cold rebuild after index invalidate")
     local deleted = 0
     for i = 1, deleteN do
         local id = string.format("scan-don-%02d", i)
@@ -4450,6 +4463,400 @@ do
     assertTrue(visits1 < deleteN * archiveLen,
         "465-scan: visits bounded below per-head archive scans ("
             .. tostring(visits1) .. " < " .. tostring(deleteN * archiveLen) .. ")")
+end
+
+do
+    -- #465 r4529162866: valid source with >2048 verified facts must export and
+    -- fresh-adopt without hitting the old 2048 install ceiling. Mix long IDs so
+    -- wrapper-inclusive paging still stays under the wire budget.
+    local itemId = 9270
+    local record = seedLiveCampaignWithItem(itemId, 2500)
+    local N = 2100
+    local longPad = string.rep("x", 96)
+    local maxFact = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 4096
+    assertTrue(maxFact >= N, "465-cap: fact ceiling covers N=" .. tostring(N))
+    assertTrue((GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 0) >= N,
+        "465-cap: page ceiling covers worst-case one-fact pages")
+    for i = 1, N do
+        local id
+        if i % 17 == 0 then
+            id = string.format("cap-long-%04d-%s", i, longPad)
+        else
+            id = string.format("cap-%04d", i)
+        end
+        assertTrue(#id <= (GS.MAX_TXN_ID or 160),
+            "465-cap: supported id length " .. tostring(#id))
+        injectProductionDonation(record, {
+            id = id, itemId = itemId, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        local del = select(1, GS:NewSoftDeleteOperation(id))
+        assertTrue(del ~= nil, "465-cap: prepare delete " .. id)
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+            "465-cap: delete " .. id)
+    end
+    local facts, factCount = GS.CollectSoftDeleteVerifiedFacts(record)
+    assertTrue(factCount >= N,
+        "465-cap: collected facts n=" .. tostring(factCount))
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(512)
+    local exportBodies = collectAllExportBodies()
+    local function wireRawBytes(id, body)
+        local fp = (GS.ContentFingerprint and GS.ContentFingerprint(body))
+            or string.rep("f", GS.MAX_OPERATION_ID or 192)
+        local raw = C_EncodingUtil.SerializeCBOR({
+            id = id, versionFp = fp, body = body,
+        })
+        return type(raw) == "string" and #raw or 0
+    end
+    local descBody, pageN, overBudget = nil, 0, 0
+    for i = 1, #exportBodies do
+        local id, body = exportBodies[i].id, exportBodies[i].body
+        if wireRawBytes(id, body) > (GS.MAX_WIRE_RECORD_BYTES or 2048) then
+            overBudget = overBudget + 1
+        end
+        if body and body.kind == "dataset-desc" then
+            descBody = body
+        elseif body and body.kind == "gs-soft-delete-facts-page" then
+            pageN = pageN + 1
+        end
+    end
+    assertEq(overBudget, 0, "465-cap: no body over wire budget")
+    assertTrue(type(descBody) == "table", "465-cap: descriptor present")
+    assertEq(tonumber(descBody.softDeleteVerifiedFactCount), factCount,
+        "465-cap: desc fact count")
+    assertTrue((tonumber(descBody.softDeleteVerifiedFactPageCount) or 0) >= 1
+        or factCount < 1,
+        "465-cap: paging or inline under budget")
+    if (tonumber(descBody.softDeleteVerifiedFactPageCount) or 0) >= 1 then
+        assertEq(pageN, tonumber(descBody.softDeleteVerifiedFactPageCount),
+            "465-cap: page bodies match pageCount")
+    end
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-cap: begin adoption")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-cap: transfer ready")
+    local commitSt, commitErr = GS:CommitDatasetAdoption()
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 512 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertEq(commitSt, "accepted",
+        "465-cap: commit got " .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    local adopted = GS:GetCurrentRecord()
+    local aDurable = adopted and adopted.accounting and adopted.accounting._consumables
+        and adopted.accounting._consumables.softDeleteVerifiedFacts
+    local installed = 0
+    if type(aDurable) == "table" then
+        for _ in pairs(aDurable) do installed = installed + 1 end
+    end
+    assertTrue(installed >= N,
+        "465-cap: adopted facts n=" .. tostring(installed))
+end
+
+do
+    -- #465 r4529162877: extra well-shaped verified fact + negative adjustment
+    -- without a matching soft-delete must not publish or relax ordinary floors.
+    local itemId = 9271
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "bind-stock", itemId = itemId, quantity = 20,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    -- Legitimate delete+fact control (reordered debt still adopts).
+    injectProductionDonation(record, {
+        id = "bind-ok-don", itemId = itemId, quantity = 5,
+        actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+    })
+    local okDel = select(1, GS:NewSoftDeleteOperation("bind-ok-don"))
+    assertEq(GS:ApplyStagedConfigOperation(okDel), "accepted", "465-bind: ok delete")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    -- Attack path: fabricate an unbound fact for a never-deleted donation and a
+    -- negative adjustment that would only be legal under that fabricated floor.
+    local forgedFact = {
+        verified = true,
+        eventId = "bind-stock",
+        eventKind = "donation",
+        itemId = itemId,
+        quantity = 20,
+        campaignId = record.currentCampaignId,
+        attributed = "Alice-Garona",
+        attributedGuid = "Player-1-Alice",
+        gsProductionCredit = true,
+    }
+    local negAdj = select(1, GS:NewAdjustmentOperation(itemId, -20, "Alice-Garona"))
+    assertTrue(negAdj ~= nil, "465-bind: prepare forged negative adj")
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-bind: begin")
+    local descPatched = false
+    for i = 1, #exportBodies do
+        local id, body = exportBodies[i].id, exportBodies[i].body
+        if body and body.kind == "dataset-desc" then
+            local patched = {}
+            for k, v in pairs(body) do patched[k] = v end
+            local facts = {}
+            for k, v in pairs(body.softDeleteVerifiedFacts or {}) do
+                facts[k] = v
+            end
+            facts["bind-stock"] = forgedFact
+            patched.softDeleteVerifiedFacts = facts
+            patched.softDeleteVerifiedFactCount =
+                (tonumber(body.softDeleteVerifiedFactCount) or 0) + 1
+            -- Force inline facts so the forged entry is assembled (pages would
+            -- otherwise be the authority when pageCount > 0).
+            patched.softDeleteVerifiedFactPageCount = 0
+            GS:BufferAdoptionRecord(id, patched)
+            descPatched = true
+        elseif body and body.kind == "gs-soft-delete-facts-page" then
+            -- Drop pages so inline forged map is authoritative.
+        else
+            GS:BufferAdoptionRecord(id, body)
+        end
+    end
+    assertTrue(descPatched, "465-bind: descriptor patched")
+    -- Inject the negative adjustment into the adoption buffer as a gs-op.
+    do
+        local adjBody = {
+            kind = "gs-op",
+            id = negAdj.id,
+            op = negAdj,
+            datasetId = sourceDataset,
+        }
+        for k, v in pairs(negAdj) do
+            if adjBody[k] == nil then adjBody[k] = v end
+        end
+        adjBody.kind = "gs-op"
+        adjBody.op = negAdj
+        adjBody.datasetId = sourceDataset
+        local stAdj = select(1, GS:BufferAdoptionRecord("gs:op:" .. negAdj.id, {
+            kind = "gs-op",
+            datasetId = sourceDataset,
+            op = negAdj,
+        }))
+        assertTrue(stAdj == "accepted" or stAdj == "duplicate",
+            "465-bind: buffer negative adj st=" .. tostring(stAdj))
+    end
+    local ready = GS:GetPendingAdoption() and GS:GetPendingAdoption().ready
+    -- Transfer may or may not be ready depending on pins; drive commit anyway.
+    local commitSt, commitErr = "pending", nil
+    if ready then
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+    else
+        -- If pages were required, force readiness check path via completeness
+        -- after best-effort commit attempt.
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+    end
+    local gAdopt = 0
+    while commitSt == "pending" and gAdopt < 128 do
+        runOneDueTimer()
+        commitSt, commitErr = GS:CommitDatasetAdoption()
+        gAdopt = gAdopt + 1
+    end
+    flushTimers()
+    assertTrue(commitSt ~= "accepted",
+        "465-bind: forged fact must not publish got "
+            .. tostring(commitSt) .. "/" .. tostring(commitErr))
+    -- Ordinary local floor still rejects overdraft without a real deletion
+    -- (stock 20 → −21 is item_negative / player_negative).
+    SpectrumFederationDB = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    local localRec = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(localRec, {
+        id = "bind-local-stock", itemId = itemId, quantity = 20,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local badAdj, _, badReason = GS:NewAdjustmentOperation(itemId, -21, "Alice-Garona")
+    if badAdj then
+        local st = GS:ApplyStagedConfigOperation(badAdj)
+        assertTrue(st ~= "accepted",
+            "465-bind: local apply rejects unbound debt st=" .. tostring(st))
+    else
+        assertTrue(badReason == "item_negative" or badReason == "player_negative",
+            "465-bind: local prepare rejects got " .. tostring(badReason))
+    end
+end
+
+do
+    -- #465 r4529162884 + r4529162895: multi-delete + mixed adjustment replay
+    -- must reuse ledger indexes / floor aggregates across a callback rather than
+    -- rescanning the full deletion map and ledger per operation.
+    local itemId = 9272
+    local record = seedLiveCampaignWithItem(itemId, 400)
+    local noiseN, deleteN, adjN = 120, 40, 20
+    for i = 1, noiseN do
+        injectProductionDonation(record, {
+            id = string.format("rw-noise-%03d", i), itemId = itemId, quantity = 1,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    local deleteIds = {}
+    for i = 1, deleteN do
+        local id = string.format("rw-del-%02d", i)
+        deleteIds[i] = id
+        injectProductionDonation(record, {
+            id = id, itemId = itemId, quantity = 2,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+            timestamp = world.time + 1000 + i,
+        })
+    end
+    injectProductionDonation(record, {
+        id = "rw-stock", itemId = itemId, quantity = 80,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    -- ApplySoftDeleteMutation calls Ensure then Rebuild(extraOp); measure every
+    -- Rebuild so the Ensure cold-build visits are not overwritten by the reuse
+    -- pass before the test reads counters.
+    local totalEventVisits, totalHistVisits = 0, 0
+    local coldBuilds, reuseHits, rebuildCalls = 0, 0, 0
+    local realRebuild = GS.RebuildEventDeletionProjection
+    GS.RebuildEventDeletionProjection = function(...)
+        rebuildCalls = rebuildCalls + 1
+        local ok = realRebuild(...)
+        local ev = tonumber(GS._softDeleteEventIndexVisits) or 0
+        local hv = tonumber(GS._softDeleteHistCorrectionVisits) or 0
+        totalEventVisits = totalEventVisits + ev
+        totalHistVisits = totalHistVisits + hv
+        if ev > 0 then
+            coldBuilds = coldBuilds + 1
+        end
+        if GS._softDeleteIndexReuse == true then
+            reuseHits = reuseHits + 1
+        end
+        return ok
+    end
+    for i = 1, deleteN do
+        local del = select(1, GS:NewSoftDeleteOperation(deleteIds[i]))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+            "465-rw: delete " .. deleteIds[i])
+        -- Yield between deletes (timer return) so work is not hidden in one drain.
+        world.time = world.time + 0.01
+        runOneDueTimer()
+    end
+    GS.RebuildEventDeletionProjection = realRebuild
+    assertTrue(totalEventVisits > 0, "465-rw: initial ledger index built")
+    assertTrue(coldBuilds <= 2,
+        "465-rw: few cold ledger builds got " .. tostring(coldBuilds))
+    assertTrue(reuseHits >= deleteN,
+        "465-rw: rebuilds reused ledger index hits=" .. tostring(reuseHits)
+            .. " rebuilds=" .. tostring(rebuildCalls))
+    local liveN = #(record.accounting._consumableEvents or {})
+    assertTrue(totalEventVisits < deleteN * liveN,
+        "465-rw: total ledger visits below per-delete full scans ("
+            .. tostring(totalEventVisits) .. " < " .. tostring(deleteN * liveN) .. ")")
+    -- Mixed adjustment replay via AdjustmentFloorOk(respectSoftDeleteDebt): floor
+    -- index builds once then reuses across unchanged deletion state.
+    local totalFloorBuild, totalFloorQuery, floorReuseHits = 0, 0, 0
+    for i = 1, adjN do
+        GS._softDeleteDebtFloorBuildVisits = 0
+        GS._softDeleteDebtFloorQueryVisits = 0
+        GS._softDeleteDebtFloorIndexReuse = false
+        local okFloor, floorErr = GS.AdjustmentFloorOk(
+            record, itemId, -1, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        assertTrue(okFloor,
+            "465-rw: soft-delete debt floor ok i=" .. tostring(i)
+                .. " err=" .. tostring(floorErr))
+        totalFloorBuild = totalFloorBuild
+            + (tonumber(GS._softDeleteDebtFloorBuildVisits) or 0)
+        totalFloorQuery = totalFloorQuery
+            + (tonumber(GS._softDeleteDebtFloorQueryVisits) or 0)
+        if GS._softDeleteDebtFloorIndexReuse == true then
+            floorReuseHits = floorReuseHits + 1
+        end
+        world.time = world.time + 0.01
+        runOneDueTimer()
+    end
+    assertTrue(totalFloorBuild > 0, "465-rw: floor index built at least once")
+    assertTrue(totalFloorQuery > 0, "465-rw: floor queries visited item rows")
+    assertTrue(floorReuseHits >= adjN - 2,
+        "465-rw: floor index reuse hits=" .. tostring(floorReuseHits))
+    -- Item-bucket queries visit one row per canonical delete per adjustment.
+    -- Amortized builds must stay far below rebuilding both maps every time.
+    assertTrue(totalFloorQuery <= deleteN * adjN,
+        "465-rw: floor queries bounded by item rows ("
+            .. tostring(totalFloorQuery) .. " <= " .. tostring(deleteN * adjN) .. ")")
+    assertTrue(totalFloorBuild < adjN * deleteN,
+        "465-rw: floor builds amortized ("
+            .. tostring(totalFloorBuild) .. " < " .. tostring(adjN * deleteN) .. ")")
+    -- Invalidation after a real dependency change forces a fresh floor build.
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    GS._softDeleteDebtFloorIndexReuse = true
+    GS._softDeleteDebtFloorBuildVisits = 0
+    local okProbe, probeErr = GS.AdjustmentFloorOk(
+        record, itemId, -1, "Bob-Garona", record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Bob",
+        })
+    assertTrue(okProbe, "465-rw: post-invalidate floor ok err=" .. tostring(probeErr))
+    assertEq(GS._softDeleteDebtFloorIndexReuse, false,
+        "465-rw: floor index rebuilt after deletion invalidate")
+    -- Cancellation / dataset replacement converges to idle (no soft-delete redrive).
+    assertEq(GS._softDeleteRedriveAdmitActive, false, "465-rw: redrive idle before replace")
+    SpectrumFederationDB = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS:CreateStagedRecord()
+    flushTimers()
+    assertEq(GS._softDeleteRedriveAdmitActive, false, "465-rw: idle after dataset replace")
+    local projected = 0
+    for i = 1, deleteN do
+        if GS.IsEventSoftDeleted(record, deleteIds[i]) then
+            projected = projected + 1
+        end
+    end
+    assertEq(projected, deleteN, "465-rw: all deletes remain projected on source")
 end
 
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))

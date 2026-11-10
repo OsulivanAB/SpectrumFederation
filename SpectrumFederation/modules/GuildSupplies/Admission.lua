@@ -47,8 +47,11 @@ GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
 -- Required credit-event alias pages for adoption (#459 A). Worst case one
 -- binding per page under the 2048-byte wrapper-inclusive wire budget.
 GS.MAX_CREDIT_ALIAS_PAGE_COUNT = 512
-GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT = 512
-GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 2048
+-- Soft-delete verified facts: worst case one fact per page under the same
+-- wrapper-inclusive wire budget; ceiling matches transferable fact capacity
+-- (MAX_ACCEPTED_OPERATIONS / MAX_SOFT_DELETE_VERIFIED_FACTS) (#465 r4529162866).
+GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT = 4096
+GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 4096
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -78,6 +81,7 @@ GS.MAX_MANIFEST_PAGES = math.max(
 do
     local maxCampaigns = GS.MAX_CAMPAIGNS or 64
     local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    local softFactPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
         + (GS.MAX_LEDGER_EVENTS or 4096)
         + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
@@ -90,6 +94,7 @@ do
         + maxCampaigns
         + (maxCampaigns * pagesPerArchive)
         + (maxCampaigns * pagesPerArchive)
+        + softFactPages
         + 512
 end
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
@@ -3478,7 +3483,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
     elseif body.kind == "gs-soft-delete-facts-page" then
-        local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 512
+        local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
         if type(body.datasetId) ~= "string" or body.datasetId ~= adop.sourceDatasetId then
             return "rejected", "invalid_operation"
         end
@@ -3699,6 +3704,42 @@ local function InstallCreditEventAliasesFromDesc(temp, desc, adop)
     return true
 end
 
+--- Provisional soft-delete fact scope from authenticated adoption buffers (#465).
+-- Fact→deletion binding is enforced before publish; mid-replay floors may only
+-- count durable facts whose targets appear on accepted soft-delete ops in the
+-- transfer (fact-before-delete / reordered debt still allowed).
+local function BuildSoftDeleteFactScopeFromAdoption(adop)
+    local scope = {}
+    if type(adop) ~= "table" then
+        return scope
+    end
+    local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+    if not kindDel then
+        return scope
+    end
+    local function noteOp(op)
+        if type(op) ~= "table" or op.kind ~= kindDel then
+            return
+        end
+        local tid = op.target or (op.value and op.value.eventId)
+        if type(tid) == "string" and tid ~= "" then
+            scope[tid] = true
+        end
+        local vid = op.value and op.value.eventId
+        if type(vid) == "string" and vid ~= "" then
+            scope[vid] = true
+        end
+    end
+    if type(adop.records) == "table" then
+        for _, body in pairs(adop.records) do
+            if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
+                noteOp(body.op)
+            end
+        end
+    end
+    return scope
+end
+
 --- Install verified soft-delete accounting facts before op replay (#465).
 -- Survives source evidence eviction: adoptees rebuild debt floors from these
 -- facts rather than raw soft-delete payloads. Older descriptors omit the
@@ -3725,7 +3766,7 @@ local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
         return false, assembleErr or "incomplete_transfer"
     end
     local map = cfg.softDeleteVerifiedFacts
-    local maxN = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 2048
+    local maxN = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 4096
     local n = 0
     for eventId, entry in pairs(incoming) do
         n = n + 1
@@ -3742,6 +3783,9 @@ local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
     if declared ~= nil and declared ~= n then
         return false, "incomplete_transfer"
     end
+    -- Provisional scope for mid-replay floors; final publish still binds facts
+    -- to accepted canonical deletions (r4529162877).
+    temp._gsSoftDeleteFactScope = BuildSoftDeleteFactScopeFromAdoption(adop)
     return true
 end
 
@@ -5673,6 +5717,76 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 return false, "incomplete_transfer"
             end
         end
+    end
+    -- Soft-delete debt facts must bind to accepted canonical deletions before
+    -- publish. Shape/count alone is insufficient (r4529162877). Orphaned
+    -- evidence, aliases, and losing revisions remain valid when the winning
+    -- soft-delete head / projected deletion is present.
+    do
+        local durable = temp.accounting and temp.accounting._consumables
+            and temp.accounting._consumables.softDeleteVerifiedFacts
+        if type(durable) == "table" then
+            if GS.EnsureEventDeletionProjection then
+                GS.EnsureEventDeletionProjection(temp, nil)
+            end
+            local delMap = temp.eventDeletions
+            local ops = temp.operations
+            local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+            -- One pass over accepted soft-delete history (heads + losing
+            -- revisions) → target set; then O(facts) membership checks.
+            local deleteTargets = {}
+            if type(ops) == "table" and kindDel and type(ops.records) == "table" then
+                for _, body in pairs(ops.records) do
+                    if type(body) == "table" and body.kind == kindDel then
+                        local tid = body.target
+                            or (body.value and body.value.eventId)
+                        if type(tid) == "string" and tid ~= "" then
+                            deleteTargets[tid] = true
+                            if GS.CanonicalCreditEventId then
+                                local tCanon = GS.CanonicalCreditEventId(temp, tid)
+                                if type(tCanon) == "string" and tCanon ~= "" then
+                                    deleteTargets[tCanon] = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            for eventId, entry in pairs(durable) do
+                if type(entry) == "table" and entry.verified == true then
+                    local canon = entry.eventId
+                    if type(canon) ~= "string" or canon == "" then
+                        canon = eventId
+                    end
+                    local bound = false
+                    if type(delMap) == "table" then
+                        local projected = delMap[eventId] or delMap[canon]
+                        if type(projected) == "table" and projected.verified == true then
+                            bound = true
+                        end
+                    end
+                    if not bound then
+                        if deleteTargets[eventId] or deleteTargets[canon] then
+                            bound = true
+                        elseif GS.CanonicalCreditEventId then
+                            local tCanon = GS.CanonicalCreditEventId(temp, canon)
+                            if type(tCanon) == "string" and deleteTargets[tCanon] then
+                                bound = true
+                            end
+                        end
+                    end
+                    if not bound then
+                        opts.cursor = nil
+                        opts.budgetExhausted = false
+                        publishCompletenessStats()
+                        return false, "incomplete_transfer"
+                    end
+                end
+            end
+        end
+        -- Drop provisional adoption scope so published datasets use ordinary
+        -- durable+projection floors without a transfer-only filter.
+        temp._gsSoftDeleteFactScope = nil
     end
     opts.cursor = nil
     opts.budgetExhausted = false
