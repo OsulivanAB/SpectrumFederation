@@ -740,6 +740,23 @@ function BuildEntries(section, planId, planOpen, caps)
 				TryPersistDraft()
 				QueueRefresh()
 			end)
+			local notes = CreateFrame("EditBox", nil, host, "InputBoxTemplate")
+			notes:SetAutoFocus(false)
+			notes:SetSize(180, 22)
+			notes:SetPoint("LEFT", edit, "RIGHT", 12, 0)
+			notes:SetMaxLetters(RS().MAX_NOTES or 160)
+			notes:SetText(session.draft.notes or "")
+			if notes.Instructions then
+				notes.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
+			end
+			notes:SetScript("OnTextChanged", function(self)
+				local mod = RS()
+				if not mod then
+					return
+				end
+				mod.UpdateDraftField(session.draft, "notes", self:GetText() or "")
+				TryPersistDraft()
+			end)
 			local picker = CreateFrame("Frame", nil, host)
 			picker:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", 0, -4)
 			picker:SetSize(500, ICON + 2)
@@ -769,12 +786,49 @@ function BuildEntries(section, planId, planOpen, caps)
 
 			local name = host:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 			name:SetPoint("LEFT", host, "LEFT", 4, 0)
-			name:SetWidth(140)
+			name:SetWidth(120)
 			name:SetJustifyH("LEFT")
 			name:SetText(entry.nickname or "")
 
+			local notesBox = CreateFrame("EditBox", nil, host, "InputBoxTemplate")
+			notesBox:SetAutoFocus(false)
+			notesBox:SetSize(120, 20)
+			notesBox:SetPoint("LEFT", name, "RIGHT", 6, 0)
+			notesBox:SetMaxLetters(RS().MAX_NOTES or 160)
+			notesBox:SetText(entry.notes or "")
+			if notesBox.Instructions then
+				notesBox.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
+			end
+			local canEditNotes = planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry)
+			if canEditNotes then
+				notesBox:Enable()
+			else
+				notesBox:Disable()
+			end
+			notesBox:SetScript("OnEnterPressed", function(self)
+				if not canEditNotes then
+					return
+				end
+				local status, reason = RS():UpsertEntry({
+					entryId = entry.entryId,
+					planId = entry.planId,
+					nickname = entry.nickname,
+					mainClass = entry.mainClass,
+					mainSpec = entry.mainSpec,
+					notes = self:GetText() or "",
+					altClass = entry.altClass,
+					altSpec = entry.altSpec,
+				}, { expectedVer = entry.ver })
+				Report(status, reason)
+				self:ClearFocus()
+			end)
+			notesBox:SetScript("OnEscapePressed", function(self)
+				self:SetText(entry.notes or "")
+				self:ClearFocus()
+			end)
+
 			local mainBtn = MakeIconButton(host, ICON)
-			mainBtn:SetPoint("LEFT", name, "RIGHT", 8, 0)
+			mainBtn:SetPoint("LEFT", notesBox, "RIGHT", 8, 0)
 			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), planOpen, false)
 			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
 			mainBtn.tooltipText = (entry.mainClass or "") .. " · " .. SpecName(entry.mainSpec)
