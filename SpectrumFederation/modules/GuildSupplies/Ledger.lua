@@ -31,6 +31,7 @@ GS.MAX_TXN_REGISTRY = 512
 GS.MAX_TXN_ID = 160
 -- Trusted alias→canonical credit bindings that must outlive txn-registry eviction (#459).
 GS.MAX_CREDIT_EVENT_ALIASES = 2048
+GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 2048
 GS.MAX_OBS_QUANTITY = 100000
 GS.MAX_PENDING_ADJUSTMENTS = 32
 GS.MAX_PENDING_DONATION_CANDIDATES = 256
@@ -5946,6 +5947,68 @@ function GS.CollectRequiredCreditEventAliases(record)
     return CollectRequiredCreditEventAliases(record)
 end
 
+--- Collect VERIFIED soft-delete accounting facts for export/adoption (#465).
+-- Only verified entries for currently projected deletions; never raw payloads.
+-- @return table eventId -> facts, number count
+function GS.CollectSoftDeleteVerifiedFacts(record)
+    local out = {}
+    local n = 0
+    if type(record) ~= "table" then
+        return out, 0
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    local delMap = record.eventDeletions
+    local durable = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    local seen = {}
+    local function absorb(id, entry)
+        if type(id) ~= "string" or id == "" or type(entry) ~= "table" then
+            return
+        end
+        if entry.verified ~= true then
+            return
+        end
+        local canon = entry.eventId or id
+        if type(canon) ~= "string" or canon == "" or seen[canon] then
+            return
+        end
+        seen[canon] = true
+        out[canon] = {
+            verified = true,
+            eventId = canon,
+            eventKind = entry.eventKind,
+            itemId = tonumber(entry.itemId),
+            quantity = tonumber(entry.quantity),
+            campaignId = entry.campaignId,
+            attributed = NormName(entry.attributed),
+            attributedGuid = ValidGuid(entry.attributedGuid),
+            gsProductionCredit = entry.gsProductionCredit == true,
+        }
+        n = n + 1
+    end
+    if type(delMap) == "table" then
+        for id, entry in pairs(delMap) do
+            absorb(id, entry)
+        end
+    end
+    -- Durable map may retain facts briefly ahead of projection; export only
+    -- facts that still match a projected deletion (or durable-only orphans
+    -- when the projection entry is verified via priorMap).
+    if type(durable) == "table" then
+        for id, entry in pairs(durable) do
+            if type(delMap) == "table" and type(delMap[id]) == "table" then
+                absorb(id, entry)
+            elseif type(delMap) == "table" and type(entry) == "table"
+                and type(entry.eventId) == "string" and type(delMap[entry.eventId]) == "table" then
+                absorb(entry.eventId, entry)
+            end
+        end
+    end
+    return out, n
+end
+
 --- Drop durable alias bindings not required by retained accepted/pending corrections.
 -- Optional protectKeys keeps in-flight writes. Returns number of reclaimed keys.
 local function PruneUnusedCreditEventAliases(record, protectKeys)
@@ -9803,7 +9866,18 @@ end
 -- authoring (#459 review-5792509439 C).
 -- @return boolean ok, string|nil err
 function GS.ValidateContributorCorrectionEventEligibility(record, op, event)
-    if type(op) ~= "table" or type(op.value) ~= "table" or type(event) ~= "table" then
+    if type(op) ~= "table" or type(op.value) ~= "table" then
+        return false, "invalid_value"
+    end
+    -- Orphaned accepted correction: eligibility from authored eventKind only.
+    if event == nil then
+        local kind = op.value.eventKind
+        if kind == "donation" or kind == "adjustment" then
+            return true
+        end
+        return false, "invalid_event"
+    end
+    if type(event) ~= "table" then
         return false, "invalid_value"
     end
     local eventKind = op.value.eventKind
@@ -9861,6 +9935,12 @@ function GS.ValidateContributorCorrectionScope(record, op, opts)
     end
     local event = GS.FindLedgerEventById(record, eventId)
     if not event then
+        -- #465: source-accepted correction whose target evidence aged out of
+        -- retention can still be retained as inactive history when a verified
+        -- soft-delete accounts for the same event (adoption/orphan transfer).
+        if opts.allowOrphanedAcceptedCorrection then
+            return true, nil, nil
+        end
         if opts.allowMissingEvent or opts.remoteAdmit then
             return false, "pending_event"
         end
@@ -9898,9 +9978,26 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
         if GS.EnsureEventDeletionProjection then
             GS.EnsureEventDeletionProjection(record, nil)
         end
-        if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+        if event and GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
             return false, "already_deleted"
         end
+    end
+    -- Orphaned accepted correction (evidence evicted): retain inactive history
+    -- without floors/identity resolution against a missing ledger row.
+    if event == nil then
+        local kind = op.value.eventKind
+        if kind ~= "donation" and kind ~= "adjustment" then
+            return false, "invalid_event"
+        end
+        return true, nil, {
+            event = nil,
+            eventKind = kind,
+            currentName = nil,
+            currentGuid = nil,
+            newName = NormName(op.value.attributed),
+            newGuid = ValidGuid(op.value.attributedGuid),
+            orphanedAccepted = true,
+        }
     end
     local isDonation = IsDonationLedgerEvent(event)
     local isAdjustment = IsAdjustmentLedgerEvent(event)
@@ -10059,11 +10156,12 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
         skipFloor = not isLocal,
         remoteAdmit = not isLocal,
         allowMissingEvent = not isLocal,
+        allowOrphanedAcceptedCorrection = opts.allowOrphanedAcceptedCorrection == true,
     })
     if not ok then
         return false, err or "invalid_value"
     end
-    local event = details.event
+    local event = details and details.event
     -- Preview rebuild including this op; local prepare must activate.
     local rebuilt, rebuildErr, rebuildDetails = GS.RebuildCreditCorrectionProjection(record, op)
     if not rebuilt then
@@ -10340,10 +10438,130 @@ local function LookupSoftDeleteVerifiedFacts(record, eventId, canon)
     return nil
 end
 
+--- LWW attribution from retained accepted correct-contributor history (#465).
+-- Does NOT read record.creditCorrections (active projection excludes deleted
+-- events). One bounded records pass; heads win via CreditCorrectionRevisionWins.
+-- @return table canonId -> { attributed=, attributedGuid= }, number visits
+local function BuildHistoricalCorrectionAttributionIndex(record, lookup)
+    local byCanon = {}
+    local visits = 0
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return byCanon, 0
+    end
+    local ops = record.operations
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    if type(ops.records) ~= "table" or not kindCorrect then
+        return byCanon, 0
+    end
+    local function noteBody(body)
+        if type(body) ~= "table" or body.kind ~= kindCorrect then
+            return
+        end
+        visits = visits + 1
+        local tid = body.target or (body.value and body.value.eventId)
+        if type(tid) ~= "string" or tid == "" then
+            return
+        end
+        local canon = GS.CanonicalCreditEventId
+            and GS.CanonicalCreditEventId(record, tid, lookup) or tid
+        if type(canon) ~= "string" or canon == "" then
+            return
+        end
+        local attr = NormName(body.value and body.value.attributed)
+        local attrGuid = ValidGuid(body.value and body.value.attributedGuid)
+        local cur = byCanon[canon]
+        if type(cur) ~= "table" then
+            byCanon[canon] = {
+                attributed = attr,
+                attributedGuid = attrGuid,
+                op = body,
+            }
+            return
+        end
+        if GS.CreditCorrectionRevisionWins
+            and GS.CreditCorrectionRevisionWins(body, cur.op) then
+            byCanon[canon] = {
+                attributed = attr,
+                attributedGuid = attrGuid,
+                op = body,
+            }
+        elseif not GS.CreditCorrectionRevisionWins
+            and (tonumber(body.timestamp) or 0) >= (tonumber(cur.op.timestamp) or 0)
+            and tostring(body.id) > tostring(cur.op.id) then
+            byCanon[canon] = {
+                attributed = attr,
+                attributedGuid = attrGuid,
+                op = body,
+            }
+        end
+    end
+    for _, body in pairs(ops.records) do
+        noteBody(body)
+    end
+    return byCanon, visits
+end
+
+--- Bounded event-object index for soft-delete rebuild (#465).
+-- Distinct from BuildCreditCanonicalLookup (which stores canonical-ID strings).
+-- Definitive misses are false; never falls back to FindLedgerEventById per head.
+-- @return table { byObj=, visits= }
+local function BuildSoftDeleteEventObjectIndex(record, lookup)
+    local byObj = {}
+    local visits = 0
+    if type(record) ~= "table" then
+        return { byObj = byObj, visits = 0 }
+    end
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                visits = visits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and event.id ~= "" then
+                    byObj[event.id] = event
+                    if type(event.txnId) == "string" and event.txnId ~= "" then
+                        byObj[event.txnId] = event
+                    end
+                end
+            end
+        end
+    end
+    -- Fold durable aliases onto already-indexed terminals (no new ledger scans).
+    local cfg = record.accounting and record.accounting._consumables
+    local map = cfg and cfg.creditEventAliases
+    if type(map) == "table" then
+        local scanned = 0
+        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        for alias, canon in pairs(map) do
+            scanned = scanned + 1
+            if scanned > scanCap then
+                break
+            end
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                local terminal = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, canon, lookup) or canon
+                local ev = byObj[terminal] or byObj[canon]
+                if type(ev) == "table" then
+                    byObj[alias] = ev
+                elseif byObj[terminal] == false or byObj[canon] == false then
+                    byObj[alias] = false
+                end
+            end
+        end
+    end
+    return { byObj = byObj, visits = visits }
+end
+
 --- Bind soft-delete accounting facts to canonical evidence + accepted correction
 -- history. Raw confirmation payload quantity/attribution is never floor authority
 -- (#465 discussion_r4518378042 / r4518383410).
-local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry)
+-- histIndex: optional BuildHistoricalCorrectionAttributionIndex result.
+local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry, histIndex)
     if type(event) == "table" then
         local eventKind = SoftDeleteEventKind(event)
         if not eventKind then
@@ -10353,14 +10571,11 @@ local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry)
         if eventKind == "withdrawal" then
             creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
         else
-            -- Read accepted correction heads without EnsureCreditCorrectionProjection:
-            -- Ensure rebuilds soft-delete projections (debt floors) and would re-enter
-            -- DeriveVerified here (#465). Prefer an already-built map; else durable.
-            local map = type(record) == "table" and record.creditCorrections or nil
-            local head = CorrectionHeadForKnownEvent
-                and CorrectionHeadForKnownEvent(record, map, event) or nil
-            if type(head) == "table" then
-                creditName, creditGuid = NormName(head.attributed), ValidGuid(head.attributedGuid)
+            -- Retained accepted correction history (not active creditCorrections:
+            -- that projection intentionally excludes soft-deleted events).
+            local hist = type(histIndex) == "table" and histIndex[event.id] or nil
+            if type(hist) == "table" and (hist.attributed or hist.attributedGuid) then
+                creditName, creditGuid = hist.attributed, hist.attributedGuid
             else
                 creditName, creditGuid = DurableCreditIdentity(event)
             end
@@ -10496,18 +10711,34 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     local records = ops and ops.records
     local priorMap = type(record.eventDeletions) == "table" and record.eventDeletions or nil
     local lookup = GS.BuildCreditCanonicalLookup and GS.BuildCreditCanonicalLookup(record) or nil
+    -- Shared event-object index + historical correction attribution (one cold pass
+    -- each). Do not use lookup.byId as event tables — it stores canonical IDs.
+    local eventIndex = BuildSoftDeleteEventObjectIndex(record, lookup)
+    local histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+    GS._softDeleteEventIndexVisits = tonumber(eventIndex.visits) or 0
+    GS._softDeleteHistCorrectionVisits = tonumber(histVisits) or 0
+    GS._softDeleteRebuildFindLedgerCalls = 0
     local function resolveDeleteEvent(eventId, canon)
-        if type(lookup) == "table" and type(lookup.byId) == "table" then
-            local ev = lookup.byId[canon] or lookup.byId[eventId]
+        local byObj = eventIndex and eventIndex.byObj
+        if type(byObj) ~= "table" then
+            return nil
+        end
+        local function probe(id)
+            if type(id) ~= "string" or id == "" then
+                return nil
+            end
+            local ev = byObj[id]
+            if ev == false then
+                return nil
+            end
             if type(ev) == "table" then
                 return ev
             end
+            -- Definitive miss for this rebuild: index already scanned bounded lists.
+            byObj[id] = false
+            return nil
         end
-        if GS.FindLedgerEventById then
-            return GS.FindLedgerEventById(record, canon)
-                or GS.FindLedgerEventById(record, eventId)
-        end
-        return nil
+        return probe(canon) or probe(eventId)
     end
     local function priorFactsFor(canon, eventId)
         if type(priorMap) == "table" then
@@ -10521,7 +10752,7 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     local function entryFor(body, eventId, canon)
         local event = resolveDeleteEvent(eventId, canon)
         local facts = DeriveVerifiedSoftDeleteFacts(
-            record, body, event, priorFactsFor(canon, eventId))
+            record, body, event, priorFactsFor(canon, eventId), histIndex)
         if facts.verified == true then
             RememberSoftDeleteVerifiedFacts(record, facts)
         end

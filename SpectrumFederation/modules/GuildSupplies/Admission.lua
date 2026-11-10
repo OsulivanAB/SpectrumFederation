@@ -47,6 +47,8 @@ GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
 -- Required credit-event alias pages for adoption (#459 A). Worst case one
 -- binding per page under the 2048-byte wrapper-inclusive wire budget.
 GS.MAX_CREDIT_ALIAS_PAGE_COUNT = 512
+GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT = 512
+GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 2048
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -2049,6 +2051,119 @@ local function AssembleCreditAliasesFromAdoption(adop, desc)
     return map, nil
 end
 
+--- Validate one exported verified soft-delete fact entry (#465).
+-- Arbitrary delete-payload fields are never admitted as verified authority.
+local function IsValidSoftDeleteVerifiedFactEntry(eventId, entry)
+    if type(eventId) ~= "string" or eventId == "" or type(entry) ~= "table" then
+        return false
+    end
+    if entry.verified ~= true then
+        return false
+    end
+    local canon = entry.eventId
+    if type(canon) ~= "string" or canon == "" or canon ~= eventId then
+        return false
+    end
+    local kind = entry.eventKind
+    if kind ~= "donation" and kind ~= "adjustment" and kind ~= "withdrawal" then
+        return false
+    end
+    local itemId = tonumber(entry.itemId)
+    local qty = tonumber(entry.quantity)
+    if not itemId or itemId ~= math.floor(itemId) or itemId < 1 then
+        return false
+    end
+    if not qty or qty ~= math.floor(qty) or qty == 0 then
+        return false
+    end
+    if entry.attributed ~= nil and type(entry.attributed) ~= "string" then
+        return false
+    end
+    if entry.attributedGuid ~= nil and type(entry.attributedGuid) ~= "string" then
+        return false
+    end
+    if entry.campaignId ~= nil and type(entry.campaignId) ~= "string" then
+        return false
+    end
+    if entry.gsProductionCredit ~= nil and entry.gsProductionCredit ~= true
+        and entry.gsProductionCredit ~= false then
+        return false
+    end
+    return true
+end
+
+local function SoftDeleteVerifiedFactsEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    return a.verified == true and b.verified == true
+        and a.eventId == b.eventId
+        and a.eventKind == b.eventKind
+        and tonumber(a.itemId) == tonumber(b.itemId)
+        and tonumber(a.quantity) == tonumber(b.quantity)
+        and a.campaignId == b.campaignId
+        and a.attributed == b.attributed
+        and a.attributedGuid == b.attributedGuid
+        and (a.gsProductionCredit == true) == (b.gsProductionCredit == true)
+end
+
+--- Merge inline descriptor verified soft-delete facts with buffered pages (#465).
+-- @return table|nil map, string|nil err
+local function AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+    local map = {}
+    local function absorb(incoming)
+        if incoming == nil then
+            return true
+        end
+        if type(incoming) ~= "table" then
+            return false, "invalid_soft_delete_verified_facts"
+        end
+        for eventId, entry in pairs(incoming) do
+            if not IsValidSoftDeleteVerifiedFactEntry(eventId, entry) then
+                return false, "invalid_soft_delete_verified_facts"
+            end
+            local prior = map[eventId]
+            if type(prior) == "table" and not SoftDeleteVerifiedFactsEqual(prior, entry) then
+                return false, "soft_delete_fact_conflict"
+            end
+            map[eventId] = {
+                verified = true,
+                eventId = eventId,
+                eventKind = entry.eventKind,
+                itemId = tonumber(entry.itemId),
+                quantity = tonumber(entry.quantity),
+                campaignId = entry.campaignId,
+                attributed = entry.attributed,
+                attributedGuid = entry.attributedGuid,
+                gsProductionCredit = entry.gsProductionCredit == true,
+            }
+        end
+        return true
+    end
+    local ok, err = absorb(desc and desc.softDeleteVerifiedFacts)
+    if not ok then
+        return nil, err
+    end
+    local info = adop and adop._softDeleteFactIndex
+    local expectPages = tonumber(desc and desc.softDeleteVerifiedFactPageCount) or 0
+    if expectPages > 0 then
+        if type(info) ~= "table" or type(info.pages) ~= "table" then
+            return nil, "incomplete_transfer"
+        end
+        for page = 1, expectPages do
+            local pageBody = info.pages[page]
+            if type(pageBody) ~= "table" then
+                return nil, "incomplete_transfer"
+            end
+            ok, err = absorb(pageBody.facts)
+            if not ok then
+                return nil, err
+            end
+        end
+    end
+    return map, nil
+end
+
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
     local adop = GS._adoption
@@ -2229,6 +2344,53 @@ function GS:IsAdoptionTransferComplete()
                 return false, "incomplete_transfer"
             end
             for page = 1, expectAliasPages do
+                if type(info.pages[page]) ~= "table" then
+                    return false, "incomplete_transfer"
+                end
+            end
+        end
+    end
+    -- Verified soft-delete fact transfer (#465): when the source advertises a
+    -- count, inline and/or paged facts must assemble to exactly that set.
+    local hasFactManifest = desc.softDeleteVerifiedFactCount ~= nil
+    if hasFactManifest then
+        local expectFactCount = tonumber(desc.softDeleteVerifiedFactCount)
+        local expectFactPages = tonumber(desc.softDeleteVerifiedFactPageCount) or 0
+        if expectFactCount == nil
+            or expectFactCount ~= math.floor(expectFactCount)
+            or expectFactCount < 0
+            or expectFactPages ~= math.floor(expectFactPages)
+            or expectFactPages < 0 then
+            return false, "incomplete_transfer"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactCount ~= expectFactCount then
+            return false, "source_changed"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactPageCount ~= expectFactPages then
+            return false, "source_changed"
+        end
+        local assembled, assembleErr = AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+        if not assembled then
+            return false, assembleErr or "incomplete_transfer"
+        end
+        local n = 0
+        for _ in pairs(assembled) do
+            n = n + 1
+        end
+        if n ~= expectFactCount then
+            return false, "incomplete_transfer"
+        end
+        if expectFactPages > 0 then
+            local info = adop._softDeleteFactIndex
+            if type(info) ~= "table" or type(info.pages) ~= "table" then
+                return false, "incomplete_transfer"
+            end
+            if info.pageCount and info.pageCount ~= expectFactPages then
+                return false, "incomplete_transfer"
+            end
+            for page = 1, expectFactPages do
                 if type(info.pages[page]) ~= "table" then
                     return false, "incomplete_transfer"
                 end
@@ -2426,6 +2588,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _confirmByTarget = {},
         _archiveIndex = {},
         _creditAliasIndex = { pages = {}, pageCount = nil },
+        _softDeleteFactIndex = { pages = {}, pageCount = nil },
         -- Incremental receive-stage completeness (avoids full-history recounts).
         _bufCounts = {
             acceptedOps = 0,
@@ -2460,6 +2623,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedValuationCount = nil,
         pinnedCreditEventAliasCount = nil,
         pinnedCreditEventAliasPageCount = nil,
+        pinnedSoftDeleteVerifiedFactCount = nil,
+        pinnedSoftDeleteVerifiedFactPageCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2951,6 +3116,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local valuations = tonumber(descBody.valuationCount)
         local aliasCount = tonumber(descBody.creditEventAliasCount)
         local aliasPages = tonumber(descBody.creditEventAliasPageCount)
+        local softFactCount = tonumber(descBody.softDeleteVerifiedFactCount)
+        local softFactPages = tonumber(descBody.softDeleteVerifiedFactPageCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -3046,6 +3213,30 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Verified soft-delete fact manifest pins (#465). Omission after pin is
+        -- source_changed; older descriptors that never advertised stay unpinned.
+        if adop.pinnedSoftDeleteVerifiedFactCount == nil then
+            if softFactCount ~= nil then
+                adop.pinnedSoftDeleteVerifiedFactCount = softFactCount
+            end
+        elseif softFactCount == nil
+            or softFactCount ~= adop.pinnedSoftDeleteVerifiedFactCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount == nil then
+            if softFactPages ~= nil then
+                adop.pinnedSoftDeleteVerifiedFactPageCount = softFactPages
+            end
+        elseif softFactPages == nil
+            or softFactPages ~= adop.pinnedSoftDeleteVerifiedFactPageCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return nil
     end
 
@@ -3099,6 +3290,13 @@ function GS:BufferAdoptionRecord(recordId, body)
         -- drift; leave the prior active dataset intact.
         if body.kind == "gs-credit-aliases-page"
             and adop.records[recordId].kind == "gs-credit-aliases-page" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if body.kind == "gs-soft-delete-facts-page"
+            and adop.records[recordId].kind == "gs-soft-delete-facts-page" then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -3279,6 +3477,51 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
+    elseif body.kind == "gs-soft-delete-facts-page" then
+        local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 512
+        if type(body.datasetId) ~= "string" or body.datasetId ~= adop.sourceDatasetId then
+            return "rejected", "invalid_operation"
+        end
+        if type(body.facts) ~= "table" then
+            return "rejected", "invalid_soft_delete_verified_facts"
+        end
+        for eventId, entry in pairs(body.facts) do
+            if not IsValidSoftDeleteVerifiedFactEntry(eventId, entry) then
+                return "rejected", "invalid_soft_delete_verified_facts"
+            end
+        end
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxPages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._softDeleteFactIndex = adop._softDeleteFactIndex or { pages = {}, pageCount = nil }
+        local info = adop._softDeleteFactIndex
+        if info.pageCount and info.pageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactPageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.pages[page]) == "table" then
+            if DeepEqual(info.pages[page], body) then
+                -- Fall through to same-id duplicate handling below.
+            else
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("source_changed")
+                InvalidateAdoptionDeliveryOutcomes("source_changed")
+                return "rejected", "source_changed"
+            end
+        end
+        info.pages[page] = body
+        info.pageCount = info.pageCount or pc
     end
 
     -- Reject malformed / unmintable gs-valuation before buffering/counting.
@@ -3388,6 +3631,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                 },
                 txnRegistry = {},
                 creditEventAliases = {},
+                softDeleteVerifiedFacts = {},
             },
             _consumableEvents = {},
             _consumableEventArchive = {},
@@ -3449,6 +3693,52 @@ local function InstallCreditEventAliasesFromDesc(temp, desc, adop)
         map[alias] = canon
     end
     local declared = tonumber(desc and desc.creditEventAliasCount)
+    if declared ~= nil and declared ~= n then
+        return false, "incomplete_transfer"
+    end
+    return true
+end
+
+--- Install verified soft-delete accounting facts before op replay (#465).
+-- Survives source evidence eviction: adoptees rebuild debt floors from these
+-- facts rather than raw soft-delete payloads. Older descriptors omit the
+-- manifest entirely and remain compatible.
+-- @return boolean ok, string|nil err
+local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
+    if type(temp) ~= "table" or type(temp.accounting) ~= "table" then
+        return false, "invalid_record"
+    end
+    local cfg = temp.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false, "invalid_record"
+    end
+    if type(cfg.softDeleteVerifiedFacts) ~= "table" then
+        cfg.softDeleteVerifiedFacts = {}
+    end
+    if desc and desc.softDeleteVerifiedFactCount == nil
+        and desc.softDeleteVerifiedFacts == nil
+        and (tonumber(desc.softDeleteVerifiedFactPageCount) or 0) < 1 then
+        return true
+    end
+    local incoming, assembleErr = AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+    if not incoming then
+        return false, assembleErr or "incomplete_transfer"
+    end
+    local map = cfg.softDeleteVerifiedFacts
+    local maxN = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 2048
+    local n = 0
+    for eventId, entry in pairs(incoming) do
+        n = n + 1
+        if n > maxN then
+            return false, "full"
+        end
+        local prior = map[eventId]
+        if type(prior) == "table" and not SoftDeleteVerifiedFactsEqual(prior, entry) then
+            return false, "soft_delete_fact_conflict"
+        end
+        map[eventId] = entry
+    end
+    local declared = tonumber(desc and desc.softDeleteVerifiedFactCount)
     if declared ~= nil and declared ~= n then
         return false, "incomplete_transfer"
     end
@@ -6000,6 +6290,14 @@ function GS:CommitDatasetAdoption()
         local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc, adop)
         if not aliasOk then
             return "rejected", aliasErr or "invalid_credit_event_aliases"
+        end
+    end
+    -- Transfer verified soft-delete accounting facts before op replay so
+    -- eviction-orphaned deletes keep signed debt floors (#465).
+    do
+        local factOk, factErr = InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
+        if not factOk then
+            return "rejected", factErr or "invalid_soft_delete_verified_facts"
         end
     end
     -- Active source descriptors install their authenticated liveCutover onto the
@@ -8742,6 +9040,33 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     allowOrphanedAcceptedDelete = admissionCtx.adoptionReplay == true
                         and type(admissionCtx.sourceAcceptedSet) == "table"
                         and admissionCtx.sourceAcceptedSet[stored.id] == true,
+                }
+            elseif stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+                -- Source-accepted corrections may outlive trimmed target evidence
+                -- when a verified soft-delete still accounts for that event (#465).
+                local sourceAccepted = admissionCtx.adoptionReplay == true
+                    and type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+                local tid = stored.target or (stored.value and stored.value.eventId)
+                local verifiedOrDeleted = false
+                if type(tid) == "string" and tid ~= "" then
+                    if GS.EnsureEventDeletionProjection then
+                        GS.EnsureEventDeletionProjection(record, nil)
+                    end
+                    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, tid) then
+                        verifiedOrDeleted = true
+                    else
+                        local facts = record.accounting and record.accounting._consumables
+                            and record.accounting._consumables.softDeleteVerifiedFacts
+                        if type(facts) == "table" and type(facts[tid]) == "table"
+                            and facts[tid].verified == true then
+                            verifiedOrDeleted = true
+                        end
+                    end
+                end
+                applyOpts = {
+                    adoptionReplay = admissionCtx.adoptionReplay == true,
+                    allowOrphanedAcceptedCorrection = sourceAccepted and verifiedOrDeleted,
                 }
             end
             local ok, err = GS._ApplyMutations(record, stored, applyOpts)
