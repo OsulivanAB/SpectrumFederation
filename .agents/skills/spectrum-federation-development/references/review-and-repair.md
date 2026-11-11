@@ -153,6 +153,12 @@ only when later changes do not invalidate it, and explain why.
 - Resolution: only a verified fixed finding, only with resolution
   authorization. Classification alone never authorizes closure. Leave
   unsupported, disputed, decision-dependent, or unresolved findings open.
+- When the owner has authorized review-comment disposition for the operation,
+  post or update each handled thread with an explicit determination —
+  IMPLEMENT, DEFER, DO NOT IMPLEMENT, or OWNER DECISION — plus the reason and
+  current-code evidence. Resolve a thread only after its IMPLEMENT fix is
+  verified in current HEAD; leave DEFER, DO NOT IMPLEMENT, OWNER DECISION,
+  unverified, or disputed threads unresolved for the owner.
 - After delivery, report and stop. No subscriptions, watchers, polling, or
   event-driven continuation; incoming comments/CI/pushes do not renew
   authority.
