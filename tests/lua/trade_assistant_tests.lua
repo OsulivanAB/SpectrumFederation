@@ -63,6 +63,7 @@ local function resetWorld()
         range = { true, true, true },
         bags = {},
         bagSlots = 3,
+        reagentSlots = 0,
         cursor = nil,
         tradeSlots = {},
         placed = {},
@@ -79,6 +80,7 @@ local function resetWorld()
         [1] = { itemId = 123, count = 10, link = LINK1 },
         [2] = { itemId = 456, count = 5, link = LINK2 },
     }
+    world.bags[5] = {}
 end
 resetWorld()
 
@@ -187,6 +189,9 @@ end
 
 C_Container = {
     GetContainerNumSlots = function(bag)
+        if bag == 5 then
+            return world.reagentSlots or 0
+        end
         return bag == 0 and world.bagSlots or 0
     end,
     GetContainerItemInfo = function(bag, slot)
@@ -380,8 +385,48 @@ do
     assertEq(#TA:GetQueueSnapshot(), 1, "manual removal leaves Bob queued")
 end
 
+-- Link color/display formatting is normalized to item data, not link presentation.
+do
+    resetWorld()
+    resetAssistant()
+    local altLink = "|cff123456|Hitem:123:0:0:0:0:0:80:::|h[Renamed Rune]|h|r"
+    assertTrue(TA:HandleCommand(altLink .. " 1") == true, "reformatted item link queues")
+    assertEq(#TA:GetQueueSnapshot(), 2, "reformatted item link queues raid members")
+end
+
+-- ID and link forms of the same item share inventory reservation.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 2
+    world.bags[0][2].count = 10
+    assertTrue(TA:HandleCommand("123 1") == true, "id-form trade command queues")
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == false, "link form cannot overbook same item id")
+    assertEq(#TA:GetQueueSnapshot(), 2, "overbook rejection leaves first queue intact")
+end
+
+-- Items carried only in the reagent bag are visible to queue and prefill.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 0
+    world.bags[0][2].count = 0
+    world.reagentSlots = 1
+    world.bags[5][1] = { itemId = 123, count = 4, link = LINK1 }
+    assertTrue(TA:HandleCommand(LINK1 .. " 2") == true, "reagent bag stock queues")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "reagent bag player can trade")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 1, "reagent bag item is placed")
+    assertEq(world.placed[1].count, 2, "reagent bag placed quantity is two")
+    assertEq(world.bags[5][1].count, 2, "reagent bag stack is split correctly")
+end
+
 -- Insufficient carried inventory fails with only local chat feedback.
 do
+    resetWorld()
     resetAssistant()
     world.bags[0][1].count = 1
     world.errors = {}

@@ -139,10 +139,14 @@ local function NormalizeLinkKey(linkOrId)
     if type(linkOrId) ~= "string" then
         return nil
     end
-    if linkOrId:find("|H", 1, true) or linkOrId:find("|h", 1, true) then
-        return linkOrId:lower()
+    if not (linkOrId:find("|H", 1, true) or linkOrId:find("|h", 1, true)) then
+        return nil
     end
-    return nil
+    local itemData = linkOrId:match("item:([^|]+)")
+    if not itemData then
+        return nil
+    end
+    return ("item:" .. itemData):lower()
 end
 
 function TA:ParseCommand(args)
@@ -217,8 +221,11 @@ local function SlotMatchesItem(bag, slot, item)
     end
     if item.linkKey and C_Container.GetContainerItemLink then
         local link = C_Container.GetContainerItemLink(bag, slot)
-        if link and link:lower() ~= item.linkKey then
-            return false
+        if link then
+            local linkKey = NormalizeLinkKey(link)
+            if linkKey ~= item.linkKey then
+                return false
+            end
         end
     end
     return true
@@ -228,7 +235,8 @@ local function EachBagSlot(callback)
     if not C_Container or not C_Container.GetContainerNumSlots then
         return
     end
-    for bag = 0, 4 do
+    -- Carried containers are bags 0-4 plus the reagent bag at 5.
+    for bag = 0, 5 do
         local numSlots = C_Container.GetContainerNumSlots(bag)
         numSlots = FloorQty(numSlots)
         for slot = 1, numSlots do
@@ -273,13 +281,18 @@ local function CollectStacksForItem(item)
     return stacks
 end
 
-local function QueuedTotalForItem(itemKey)
+local function QueuedTotalForItem(itemId)
     local total = 0
+    local wanted = tonumber(itemId)
     for _, key in ipairs(state.order) do
         local player = state.players[key]
-        local item = player and player.items[itemKey]
-        if item then
-            total = total + FloorQty(item.quantity)
+        if player then
+            for _, itemKey in ipairs(player.itemOrder) do
+                local item = player.items[itemKey]
+                if item and tonumber(item.itemId) == wanted then
+                    total = total + FloorQty(item.quantity)
+                end
+            end
         end
     end
     return total
@@ -547,7 +560,7 @@ function TA:HandleCommand(args)
     end
 
     local available = CountCarriedItem(item)
-    local required = QueuedTotalForItem(item.key) + (FloorQty(item.quantity) * #members)
+    local required = QueuedTotalForItem(item.itemId) + (FloorQty(item.quantity) * #members)
     if available < required then
         SF:PrintError(Loc("TRADE_ASSISTANT_ERR_INSUFFICIENT", "SF Trade failed."))
         Debug("Info", "Rejected /sf trade: available=%d required=%d item=%s", available, required, tostring(item.itemId))

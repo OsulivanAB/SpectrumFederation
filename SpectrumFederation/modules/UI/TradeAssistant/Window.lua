@@ -263,6 +263,8 @@ local function EnsureFrame()
     local frame = CreateFrame("Frame", "SpectrumFederationTradeAssistantWindow", UIParent, "BackdropTemplate")
     frame:SetSize(320, 380)
     frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    frame:SetMovable(true)
+    frame:SetClampedToScreen(true)
     frame:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
