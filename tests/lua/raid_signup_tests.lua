@@ -146,10 +146,20 @@ end
 
 SF.Debug = {
     _on = false,
+    _info = {},
+    _warn = {},
     IsEnabled = function(self) return self._on end,
-    Info = function() end,
-    Warn = function() end,
+    Info = function(self, cat, fmt, ...)
+        self._info[#self._info + 1] = { cat = cat, msg = string.format(fmt, ...) }
+    end,
+    Warn = function(self, cat, fmt, ...)
+        self._warn[#self._warn + 1] = { cat = cat, msg = string.format(fmt, ...) }
+    end,
     Verbose = function() end,
+    Reset = function(self)
+        self._info = {}
+        self._warn = {}
+    end,
 }
 
 SF.WOW_CLASSES = {
@@ -2133,6 +2143,214 @@ assertEq(select(1, RS:UpsertEntry({
 }, { expectedVer = modEntry.ver })), "accepted", "officer can edit admitted member entry")
 modEntry = select(1, RS:EnsureGuildRecord("club:42")).entries[modId]
 assertEq(select(1, RS:DeleteEntry(modId, { expectedVer = modEntry.ver })), "accepted", "officer can delete admitted member entry")
+
+---------------------------------------------------------------------------
+-- Repair batch: rename getSelectionKey, class recovery, locals, debug logs
+---------------------------------------------------------------------------
+
+do
+    -- Accidental globals must stay page-local.
+    assertNil(rawget(_G, "PaintSummary"), "PaintSummary is not global")
+    assertNil(rawget(_G, "PaintEntries"), "PaintEntries is not global")
+    assertNil(rawget(_G, "EnsureSummaryHost"), "EnsureSummaryHost is not global")
+    assertNil(rawget(_G, "EnsureEntriesHost"), "EnsureEntriesHost is not global")
+
+    -- Diagnostic logging at mutation API boundary (no nickname payload).
+    SF.Debug._on = true
+    SF.Debug:Reset()
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local stLog, _, planLog = RS:CreatePlan("Debug Log Plan")
+    assertEq(stLog, "accepted", "create plan for debug logging")
+    local sawCreate = false
+    for i = 1, #SF.Debug._info do
+        local row = SF.Debug._info[i]
+        if row.cat == "RAID_SIGNUP" and tostring(row.msg):find("CreatePlan", 1, true) then
+            sawCreate = true
+            assertTrue(not tostring(row.msg):find("Debug Log Plan", 1, true),
+                "create log omits plan name payload")
+        end
+    end
+    assertTrue(sawCreate, "CreatePlan accepted logs INFO")
+    SF.Debug:Reset()
+    assertEq(select(1, RS:RenamePlan(planLog, "")), "rejected", "empty rename rejected for warn log")
+    local sawWarn = false
+    for i = 1, #SF.Debug._warn do
+        local row = SF.Debug._warn[i]
+        if row.cat == "RAID_SIGNUP" and tostring(row.msg):find("RenamePlan", 1, true) then
+            sawWarn = true
+        end
+    end
+    assertTrue(sawWarn, "RenamePlan rejection logs WARN")
+    SF.Debug._on = false
+    SF.Debug:Reset()
+
+    -- Class-picker recovery: preserve nickname/notes; incomplete stays unsaved.
+    local stPick, _, planPick = RS:CreatePlan("Class Recovery Plan")
+    assertEq(stPick, "accepted", "class recovery plan")
+    RS:SelectPlan(planPick)
+    local recoveryDraft = RS.MakeDraft(planPick)
+    RS.UpdateDraftField(recoveryDraft, "nickname", "KeepNick")
+    RS.CommitDraftNickname(recoveryDraft)
+    RS.UpdateDraftField(recoveryDraft, "notes", "KeepNotes")
+    RS.UpdateDraftField(recoveryDraft, "classFile", "MAGE")
+    assertEq(recoveryDraft.phase, "spec", "draft enters spec phase after class")
+    UIPage._SetDraftForTests(recoveryDraft)
+    UIPage:Refresh(panel, { force = true })
+
+    local function findChangeClassButtons(root)
+        local found = {}
+        local function walk(frame)
+            if not frame then
+                return
+            end
+            if frame.GetObjectType and frame:GetObjectType() == "Button"
+                and type(frame.tooltipText) == "string"
+                and frame.tooltipText:find("different class", 1, true) then
+                found[#found + 1] = frame
+            end
+            local kids = { frame:GetChildren() }
+            for i = 1, #kids do
+                walk(kids[i])
+            end
+        end
+        walk(root)
+        return found
+    end
+
+    local changeBtns = findChangeClassButtons(panel.__sfRaidSignupEntriesHost)
+    assertTrue(#changeBtns >= 1, "spec-phase change-class control present")
+    changeBtns[1]:Click()
+    local afterReset = UIPage._GetDraftForTests()
+    assertTrue(afterReset ~= nil, "draft survives class reset")
+    assertEq(afterReset.nickname, "KeepNick", "nickname preserved on class reset")
+    assertEq(afterReset.notes, "KeepNotes", "notes preserved on class reset")
+    assertNil(afterReset.classFile, "class cleared on reset")
+    assertNil(afterReset.specId, "spec cleared on reset")
+    assertEq(afterReset.phase, "class", "phase returns to class")
+    assertEq(#RS:GetSortedEntries(planPick), 0, "incomplete draft not persisted")
+
+    -- Re-pick class+spec and ensure same-main exclusion still applies on alt draft.
+    RS.UpdateDraftField(afterReset, "classFile", "WARRIOR")
+    RS.UpdateDraftField(afterReset, "specId", 71)
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planPick,
+        nickname = afterReset.nickname,
+        mainClass = afterReset.classFile,
+        mainSpec = afterReset.specId,
+        notes = afterReset.notes,
+    })), "accepted", "persist after recovery re-pick")
+    UIPage._SetDraftForTests(nil)
+    local saved = RS:GetSortedEntries(planPick)[1]
+    assertTrue(saved ~= nil, "saved entry after recovery path")
+    local savedNick, savedClass, savedSpec = saved.nickname, saved.mainClass, saved.mainSpec
+    local savedNotes = saved.notes
+
+    -- Main edit: click main → class → reset → abandon; saved values survive.
+    UIPage:Refresh(panel, { force = true })
+    local mains = UIPage._FindSpecButtonsForTests(panel.__sfRaidSignupEntriesHost, "main")
+    assertTrue(#mains >= 1, "main spec button for edit recovery")
+    mains[1]:Click()
+    local editing = UIPage._GetEditingForTests()
+    assertTrue(editing and editing.draft, "editing draft opened")
+    RS.UpdateDraftField(editing.draft, "classFile", "MAGE")
+    assertEq(editing.draft.phase, "spec", "edit draft in spec phase")
+    UIPage:Refresh(panel, { force = true })
+    changeBtns = findChangeClassButtons(panel.__sfRaidSignupEntriesHost)
+    assertTrue(#changeBtns >= 1, "edit path change-class control present")
+    changeBtns[1]:Click()
+    editing = UIPage._GetEditingForTests()
+    assertTrue(editing and editing.draft and editing.draft.phase == "class",
+        "edit draft returns to class without saving")
+    -- Abandon via plan reselection (DiscardEphemeral).
+    RS:SelectPlan(planPick)
+    UIPage:Refresh(panel, { forceRebuild = true })
+    assertNil(UIPage._GetEditingForTests(), "editing discarded on reselection")
+    saved = RS:GetSortedEntries(planPick)[1]
+    assertEq(saved.nickname, savedNick, "saved nickname survives abandoned edit")
+    assertEq(saved.mainClass, savedClass, "saved class survives abandoned edit")
+    assertEq(saved.mainSpec, savedSpec, "saved spec survives abandoned edit")
+    assertEq(saved.notes, savedNotes, "saved notes survive abandoned edit")
+
+    -- Alt draft: same-main-spec remains disabled after class reset+reselect.
+    local altDraft = RS.MakeAltDraft(saved)
+    RS.UpdateAltDraftField(altDraft, "classFile", "WARRIOR")
+    assertTrue(RS.IsAltSpecDisabled(altDraft, 71), "same-main-spec excluded for alt")
+    RS.UpdateAltDraftField(altDraft, "classFile", nil)
+    assertEq(altDraft.phase, "class", "alt draft class reset")
+    RS.UpdateAltDraftField(altDraft, "classFile", "WARRIOR")
+    assertTrue(RS.IsAltSpecDisabled(altDraft, 71), "same-main-spec exclusion after alt reset")
+
+    -- Wrong-plan rename: dirty text on A must not rename B before deferred refresh.
+    local stA, _, planA = RS:CreatePlan("Rename Plan A")
+    local stB, _, planB = RS:CreatePlan("Rename Plan B")
+    assertEq(stA, "accepted", "rename plan A created")
+    assertEq(stB, "accepted", "rename plan B created")
+    RS:SelectPlan(planA)
+
+    local renameOpts = nil
+    local planSelectSet = nil
+    local editText = ""
+    local lastSelectionKey = nil
+    SF.SettingsUI.Controls.AddEditBoxWithButton = function(_, _, opts)
+        if opts and type(opts.getSelectionKey) == "function" and type(opts.onSubmit) == "function" then
+            renameOpts = opts
+            editText = tostring(opts.get() or "")
+            lastSelectionKey = opts.getSelectionKey()
+        end
+    end
+    SF.SettingsUI.Controls.AddDropdown = function(_, _, opts)
+        if opts and type(opts.set) == "function" and type(opts.get) == "function" then
+            -- Active plan dropdown is the selection-scoped control.
+            if opts.get() == planA or opts.get() == RS:GetSelectedPlanId() then
+                planSelectSet = opts.set
+            end
+        end
+    end
+
+    local function renameDoSubmit()
+        assertTrue(renameOpts ~= nil, "rename control captured")
+        -- Mirror Controls.lua getter-only getSelectionKey abort (#434 / #428).
+        local selectionKey = renameOpts.getSelectionKey()
+        if selectionKey ~= lastSelectionKey then
+            editText = tostring(renameOpts.get() or "")
+            lastSelectionKey = selectionKey
+            return "aborted"
+        end
+        renameOpts.onSubmit(editText)
+        return "submitted"
+    end
+
+    UIPage:Refresh(panel, { forceRebuild = true })
+    assertTrue(renameOpts ~= nil and type(renameOpts.getSelectionKey) == "function",
+        "rename control binds getSelectionKey")
+    assertTrue(type(planSelectSet) == "function", "plan select dropdown captured")
+    assertEq(renameOpts.getSelectionKey(), planA, "selection key is plan A")
+    editText = "Dirty Name For A"
+    -- Select B via production dropdown set (clears rename draft) but do not
+    -- rebuild the rename control — deferred-refresh race.
+    planSelectSet(planB)
+    assertEq(RS:GetSelectedPlanId(), planB, "selected plan is B after dropdown set")
+    assertEq(UIPage._GetRenamePlanNameForTests(), "", "rename draft cleared on plan select")
+    assertEq(renameDoSubmit(), "aborted", "submit aborts when selection key changed")
+    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planB].name, "Rename Plan B",
+        "plan B name unchanged after aborted dirty submit")
+    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planA].name, "Rename Plan A",
+        "plan A name unchanged when submit aborted")
+
+    -- After abort reloads from get(), selection key tracks B and text is B's name.
+    assertEq(lastSelectionKey, planB, "selection key tracks plan B after abort reload")
+    assertEq(editText, "Rename Plan B", "edit reloads plan B name after abort")
+    editText = "Rename Plan B Updated"
+    assertEq(renameDoSubmit(), "submitted", "rename submits for matching selection key")
+    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planB].name, "Rename Plan B Updated",
+        "plan B renamed only with matching selection")
+    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planA].name, "Rename Plan A",
+        "plan A never received B-keyed submit")
+
+    RS:SelectPlan(plan3)
+    UIPage._SetDraftForTests(nil)
+    UIPage:Refresh(panel, { forceRebuild = true })
+end
 
 ---------------------------------------------------------------------------
 -- Production GuildGossip index contract (07_Index + 08_Providers.EnsureProviderIndex)

@@ -11,6 +11,33 @@ local function Loc(key, default)
     return default or key
 end
 
+local function DebugInfo(fmt, ...)
+    if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+        SF.Debug:Info("RAID_SIGNUP", fmt, ...)
+    end
+end
+
+local function DebugWarn(fmt, ...)
+    if SF.Debug and SF.Debug.Warn and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+        SF.Debug:Warn("RAID_SIGNUP", fmt, ...)
+    end
+end
+
+--- One log line per local user mutation API outcome. No nickname/notes payloads.
+local function LogMutation(op, status, reason, idHint)
+    status = tostring(status or "rejected")
+    local idPart = idHint and (" id=" .. tostring(idHint)) or ""
+    if status == "accepted" or status == "duplicate" then
+        if reason ~= nil and reason ~= "" then
+            DebugInfo("%s %s reason=%s%s", op, status, tostring(reason), idPart)
+        else
+            DebugInfo("%s %s%s", op, status, idPart)
+        end
+    else
+        DebugWarn("%s rejected reason=%s%s", op, tostring(reason or "unknown"), idPart)
+    end
+end
+
 local function Notify(reason)
     if RS.NotifyLocalDurableChange then
         RS.NotifyLocalDurableChange(reason or "local")
@@ -108,9 +135,10 @@ function RS.UpdateDraftField(draft, field, value)
         draft.nickname = type(value) == "string" and value or ""
         draft.nicknameCommitted = false
     elseif field == "classFile" then
+        -- nil clears class+spec and returns to class picking (nickname/notes kept).
         draft.classFile = value
         draft.specId = nil
-        draft.phase = "spec"
+        draft.phase = value and "spec" or "class"
     elseif field == "specId" then
         draft.specId = tonumber(value)
         if draft.classFile and draft.specId then
@@ -137,7 +165,7 @@ function RS.UpdateAltDraftField(draft, field, value)
     if field == "classFile" then
         draft.classFile = value
         draft.specId = nil
-        draft.phase = "spec"
+        draft.phase = value and "spec" or "class"
     elseif field == "specId" then
         draft.specId = tonumber(value)
     end
@@ -209,18 +237,22 @@ function RS:CreatePlan(name, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeOfficer(opts)
     if not okAuth then
+        LogMutation("CreatePlan", "rejected", authReason)
         return "rejected", authReason
     end
     local planName = RS.NormalizePlanName(name)
     if not planName then
+        LogMutation("CreatePlan", "rejected", "empty_name")
         return "rejected", "empty_name"
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("CreatePlan", "rejected", err or "not_ready")
         return "rejected", err or "not_ready"
     end
     local ver, verErr = RS.AllocateVer(root, nil)
     if not ver then
+        LogMutation("CreatePlan", "rejected", verErr or "revision_exhausted")
         return "rejected", verErr or "revision_exhausted"
     end
     local plan = {
@@ -236,6 +268,7 @@ function RS:CreatePlan(name, opts)
         record.selectedPlanId = plan.planId
         Notify("local")
     end
+    LogMutation("CreatePlan", status, detail or plan.planId, plan.planId)
     return status, detail or plan.planId, plan.planId
 end
 
@@ -243,28 +276,35 @@ function RS:RenamePlan(planId, name, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeOfficer(opts)
     if not okAuth then
+        LogMutation("RenamePlan", "rejected", authReason, planId)
         return "rejected", authReason
     end
     local planName = RS.NormalizePlanName(name)
     if not planName then
+        LogMutation("RenamePlan", "rejected", "empty_name", planId)
         return "rejected", "empty_name"
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("RenamePlan", "rejected", err or "not_ready", planId)
         return "rejected", err or "not_ready"
     end
     local prev = record.plans[planId]
     if type(prev) ~= "table" then
+        LogMutation("RenamePlan", "rejected", "plan_missing", planId)
         return "rejected", "plan_missing"
     end
     if prev.archived then
+        LogMutation("RenamePlan", "rejected", "plan_archived", planId)
         return "rejected", "plan_archived"
     end
     if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
+        LogMutation("RenamePlan", "rejected", "stale_plan", planId)
         return "rejected", "stale_plan"
     end
     local ver = RS.AllocateVer(root, prev.ver)
     if not ver then
+        LogMutation("RenamePlan", "rejected", "revision_exhausted", planId)
         return "rejected", "revision_exhausted"
     end
     local plan = RS.ClonePlan(prev)
@@ -275,6 +315,7 @@ function RS:RenamePlan(planId, name, opts)
     if status == "accepted" then
         Notify("local")
     end
+    LogMutation("RenamePlan", status, detail, planId)
     return status, detail
 end
 
@@ -282,25 +323,31 @@ function RS:SetPlanArchived(planId, archived, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeOfficer(opts)
     if not okAuth then
+        LogMutation("SetPlanArchived", "rejected", authReason, planId)
         return "rejected", authReason
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("SetPlanArchived", "rejected", err or "not_ready", planId)
         return "rejected", err or "not_ready"
     end
     local prev = record.plans[planId]
     if type(prev) ~= "table" then
+        LogMutation("SetPlanArchived", "rejected", "plan_missing", planId)
         return "rejected", "plan_missing"
     end
     if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
+        LogMutation("SetPlanArchived", "rejected", "stale_plan", planId)
         return "rejected", "stale_plan"
     end
     local want = archived and true or false
     if (prev.archived and true or false) == want then
+        LogMutation("SetPlanArchived", "duplicate", "noop", planId)
         return "duplicate", "noop"
     end
     local ver = RS.AllocateVer(root, prev.ver)
     if not ver then
+        LogMutation("SetPlanArchived", "rejected", "revision_exhausted", planId)
         return "rejected", "revision_exhausted"
     end
     local plan = RS.ClonePlan(prev)
@@ -311,6 +358,7 @@ function RS:SetPlanArchived(planId, archived, opts)
     if status == "accepted" then
         Notify("local")
     end
+    LogMutation("SetPlanArchived", status, detail, planId)
     return status, detail
 end
 
@@ -318,13 +366,16 @@ function RS:SelectPlan(planId, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeMembership(opts)
     if not okAuth then
+        LogMutation("SelectPlan", "rejected", authReason, planId)
         return "rejected", authReason
     end
     local record, _, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("SelectPlan", "rejected", err or "not_ready", planId)
         return "rejected", err or "not_ready"
     end
     if planId ~= nil and type(record.plans[planId]) ~= "table" then
+        LogMutation("SelectPlan", "rejected", "plan_missing", planId)
         return "rejected", "plan_missing"
     end
     record.selectedPlanId = planId
@@ -332,6 +383,7 @@ function RS:SelectPlan(planId, opts)
     if RS.NotifyUI then
         RS.NotifyUI("select")
     end
+    LogMutation("SelectPlan", "accepted", "selected", planId)
     return "accepted", "selected"
 end
 
@@ -351,10 +403,12 @@ function RS:UpsertEntry(fields, opts)
     fields = fields or {}
     local okAuth, authReason, ctx = RS:_AuthorizeMembership(opts)
     if not okAuth then
+        LogMutation("UpsertEntry", "rejected", authReason, fields.entryId)
         return "rejected", authReason
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("UpsertEntry", "rejected", err or "not_ready", fields.entryId)
         return "rejected", err or "not_ready"
     end
 
@@ -363,10 +417,12 @@ function RS:UpsertEntry(fields, opts)
     local planId = fields.planId or record.selectedPlanId
     if prev then
         if prev.deleted then
+            LogMutation("UpsertEntry", "rejected", "missing_entry", entryId)
             return "rejected", "missing_entry"
         end
         -- Existing entryIds cannot change plan membership (no move operation).
         if type(prev.planId) == "string" and planId ~= prev.planId then
+            LogMutation("UpsertEntry", "rejected", "plan_immutable", entryId)
             return "rejected", "plan_immutable"
         end
         planId = prev.planId
@@ -374,17 +430,20 @@ function RS:UpsertEntry(fields, opts)
 
     local plan, planErr = AssertPlanOpen(record, planId)
     if not plan then
+        LogMutation("UpsertEntry", "rejected", planErr, entryId)
         return "rejected", planErr
     end
 
     local nickname = RS.NormalizeNickname(fields.nickname)
     local mainClass, mainSpec, selErr = RS.ValidateMainSelection(fields.mainClass, fields.mainSpec)
     if not nickname or selErr then
+        LogMutation("UpsertEntry", "rejected", selErr or "incomplete", entryId)
         return "rejected", selErr or "incomplete"
     end
 
     local notes = RS.NormalizeNotes(fields.notes)
     if notes == nil then
+        LogMutation("UpsertEntry", "rejected", "invalid_notes", entryId)
         return "rejected", "invalid_notes"
     end
 
@@ -394,6 +453,7 @@ function RS:UpsertEntry(fields, opts)
     elseif fields.altClass ~= nil or fields.altSpec ~= nil then
         local aClass, aSpec, altErr = RS.ValidateAlternative(mainClass, mainSpec, fields.altClass, fields.altSpec)
         if altErr then
+            LogMutation("UpsertEntry", "rejected", altErr, entryId)
             return "rejected", altErr
         end
         altClass, altSpec = aClass, aSpec
@@ -403,15 +463,18 @@ function RS:UpsertEntry(fields, opts)
         local caps = RS:GetCapabilities()
         local mayEdit, mayReason = RS.CanEditEntry(caps, ctx.actorGuid, prev)
         if not mayEdit then
+            LogMutation("UpsertEntry", "rejected", mayReason or "unauthorized", entryId)
             return "rejected", mayReason or "unauthorized"
         end
         if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
+            LogMutation("UpsertEntry", "rejected", "stale_entry", entryId)
             return "rejected", "stale_entry"
         end
         -- Preserve alternative when not explicitly provided/cleared.
         if not fields.clearAlt and fields.altClass == nil and fields.altSpec == nil then
             altClass, altSpec = prev.altClass, prev.altSpec
             if altClass and altSpec and RS.SelectionEqual(mainClass, mainSpec, altClass, altSpec) then
+                LogMutation("UpsertEntry", "rejected", "duplicate_spec", entryId)
                 return "rejected", "duplicate_spec"
             end
         end
@@ -422,6 +485,7 @@ function RS:UpsertEntry(fields, opts)
 
     local ver = RS.AllocateVer(root, prev and prev.ver or nil)
     if not ver then
+        LogMutation("UpsertEntry", "rejected", "revision_exhausted", entryId)
         return "rejected", "revision_exhausted"
     end
 
@@ -446,6 +510,7 @@ function RS:UpsertEntry(fields, opts)
     if status == "accepted" then
         Notify("local")
     end
+    LogMutation("UpsertEntry", status, detail, entryId)
     return status, detail, entryId
 end
 
@@ -453,33 +518,41 @@ function RS:RemoveAlternative(entryId, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeMembership(opts)
     if not okAuth then
+        LogMutation("RemoveAlternative", "rejected", authReason, entryId)
         return "rejected", authReason
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("RemoveAlternative", "rejected", err or "not_ready", entryId)
         return "rejected", err or "not_ready"
     end
     local prev = record.entries[entryId]
     if type(prev) ~= "table" or prev.deleted then
+        LogMutation("RemoveAlternative", "rejected", "missing_entry", entryId)
         return "rejected", "missing_entry"
     end
     local plan = record.plans[prev.planId]
     if type(plan) == "table" and plan.archived then
+        LogMutation("RemoveAlternative", "rejected", "plan_archived", entryId)
         return "rejected", "plan_archived"
     end
     local caps = RS:GetCapabilities()
     local mayEdit, mayReason = RS.CanEditEntry(caps, ctx.actorGuid, prev)
     if not mayEdit then
+        LogMutation("RemoveAlternative", "rejected", mayReason or "unauthorized", entryId)
         return "rejected", mayReason or "unauthorized"
     end
     if not prev.altClass then
+        LogMutation("RemoveAlternative", "duplicate", "noop", entryId)
         return "duplicate", "noop"
     end
     if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
+        LogMutation("RemoveAlternative", "rejected", "stale_entry", entryId)
         return "rejected", "stale_entry"
     end
     local ver = RS.AllocateVer(root, prev.ver)
     if not ver then
+        LogMutation("RemoveAlternative", "rejected", "revision_exhausted", entryId)
         return "rejected", "revision_exhausted"
     end
     local entry = {
@@ -498,6 +571,7 @@ function RS:RemoveAlternative(entryId, opts)
     if status == "accepted" then
         Notify("local")
     end
+    LogMutation("RemoveAlternative", status, detail, entryId)
     return status, detail
 end
 
@@ -505,30 +579,37 @@ function RS:DeleteEntry(entryId, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = RS:_AuthorizeMembership(opts)
     if not okAuth then
+        LogMutation("DeleteEntry", "rejected", authReason, entryId)
         return "rejected", authReason
     end
     local record, root, err = RS:EnsureGuildRecord(ctx.guildKey)
     if not record then
+        LogMutation("DeleteEntry", "rejected", err or "not_ready", entryId)
         return "rejected", err or "not_ready"
     end
     local prev = record.entries[entryId]
     if type(prev) ~= "table" or prev.deleted then
+        LogMutation("DeleteEntry", "rejected", "missing_entry", entryId)
         return "rejected", "missing_entry"
     end
     local plan = record.plans[prev.planId]
     if type(plan) == "table" and plan.archived then
+        LogMutation("DeleteEntry", "rejected", "plan_archived", entryId)
         return "rejected", "plan_archived"
     end
     local caps = RS:GetCapabilities()
     local mayEdit, mayReason = RS.CanEditEntry(caps, ctx.actorGuid, prev)
     if not mayEdit then
+        LogMutation("DeleteEntry", "rejected", mayReason or "unauthorized", entryId)
         return "rejected", mayReason or "unauthorized"
     end
     if opts.expectedVer and RS.CompareVer(prev.ver, opts.expectedVer) ~= 0 then
+        LogMutation("DeleteEntry", "rejected", "stale_entry", entryId)
         return "rejected", "stale_entry"
     end
     local ver = RS.AllocateVer(root, prev.ver)
     if not ver then
+        LogMutation("DeleteEntry", "rejected", "revision_exhausted", entryId)
         return "rejected", "revision_exhausted"
     end
     local tomb = RS.CloneEntry(prev)
@@ -539,6 +620,7 @@ function RS:DeleteEntry(entryId, opts)
     if status == "accepted" then
         Notify("local")
     end
+    LogMutation("DeleteEntry", status, detail, entryId)
     return status, detail
 end
 

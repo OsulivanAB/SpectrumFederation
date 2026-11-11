@@ -160,6 +160,9 @@ local function DiscardEphemeral()
 	session.draft = nil
 	session.altDraft = nil
 	session.editing = nil
+	-- Scope rename drafts to the selected plan; never carry dirty text across
+	-- plan selection (getter-only editbox_button + getSelectionKey).
+	session.renamePlanName = ""
 end
 
 local function EnsureUIListener()
@@ -651,6 +654,7 @@ local function LayoutPicker(host, draft, opts)
 		end
 	else
 		local selected = MakeIconButton(host, ICON)
+		selected:Enable()
 		if draft.specId then
 			SetIconVisual(selected, TextureForSpec(draft.specId), true, false)
 			selected.tooltipTitle = SpecName(draft.specId)
@@ -658,6 +662,14 @@ local function LayoutPicker(host, draft, opts)
 			SetIconVisual(selected, TextureForClass(draft.classFile), true, false)
 			selected.tooltipTitle = draft.classFile
 		end
+		selected.tooltipText = Loc("RAID_SIGNUP_TIP_CHANGE_CLASS",
+			"Click to choose a different class.")
+		-- Spec phase: return to class picking without discarding nickname/notes.
+		selected:SetScript("OnClick", function()
+			if opts.onResetClass then
+				opts.onResetClass()
+			end
+		end)
 		place(selected)
 
 		if not draft.specId then
@@ -727,6 +739,10 @@ local function CurrentPlanOptions()
 	end
 	return planOptions
 end
+
+-- Forward-declare page-local paint/host helpers used by Definition closures
+-- before their bodies (avoids accidental globals).
+local PaintSummary, PaintEntries, EnsureSummaryHost, EnsureEntriesHost
 
 local function Definition()
 	return {
@@ -817,6 +833,11 @@ local function Definition()
 						label = Loc("RAID_SIGNUP_PLAN_RENAME", "Rename plan"),
 						buttonText = Loc("RAID_SIGNUP_PLAN_RENAME_BTN", "Rename"),
 						hint = Loc("RAID_SIGNUP_PLAN_NAME_HINT", "Plan name"),
+						-- Bind dirty draft text to selected plan identity so a
+						-- deferred refresh cannot submit plan A's text against B.
+						getSelectionKey = function()
+							return CurrentSelectedId()
+						end,
 						get = function()
 							local selectedPlan = CurrentSelectedPlan()
 							return session.renamePlanName ~= "" and session.renamePlanName
@@ -927,7 +948,7 @@ local function Definition()
 	}
 end
 
-function PaintSummary(host, planId)
+PaintSummary = function(host, planId)
 	session.boardPaintCount = session.boardPaintCount + 1
 	local rs = RS()
 	local summary = rs and rs.GetPlanSummary and rs:GetPlanSummary(planId) or {
@@ -1045,7 +1066,7 @@ local function SyncEntriesRowHeight(host, height)
 	end
 end
 
-function PaintEntries(host, planId, planOpen, caps)
+PaintEntries = function(host, planId, planOpen, caps)
 	-- Preserve focused edit text across pooled rebuilds.
 	local focusedText, focusedCursor = nil, nil
 	if typingFocus and typingFocus.HasFocus and typingFocus:HasFocus() and typingFocus.GetText then
@@ -1164,6 +1185,10 @@ function PaintEntries(host, planId, planOpen, caps)
 				onSpec = function(specId)
 					RS().UpdateDraftField(session.draft, "specId", specId)
 					TryPersistDraft()
+					QueueRefresh({ force = true })
+				end,
+				onResetClass = function()
+					RS().UpdateDraftField(session.draft, "classFile", nil)
 					QueueRefresh({ force = true })
 				end,
 			})
@@ -1410,6 +1435,14 @@ function PaintEntries(host, planId, planOpen, caps)
 						TryPersistEdit()
 						QueueRefresh({ force = true })
 					end,
+					onResetClass = function()
+						if session.editing.slot == "main" then
+							RS().UpdateDraftField(draft, "classFile", nil)
+						else
+							RS().UpdateAltDraftField(draft, "classFile", nil)
+						end
+						QueueRefresh({ force = true })
+					end,
 				})
 			elseif altThis then
 				local picker = AcquireFrame(row)
@@ -1428,6 +1461,10 @@ function PaintEntries(host, planId, planOpen, caps)
 					onSpec = function(specId)
 						RS().UpdateAltDraftField(draft, "specId", specId)
 						TryPersistAltDraft()
+						QueueRefresh({ force = true })
+					end,
+					onResetClass = function()
+						RS().UpdateAltDraftField(draft, "classFile", nil)
 						QueueRefresh({ force = true })
 					end,
 				})
@@ -1455,7 +1492,7 @@ function PaintEntries(host, planId, planOpen, caps)
 	SyncEntriesRowHeight(host, math.max(24, -y + 4))
 end
 
-function EnsureSummaryHost(section)
+EnsureSummaryHost = function(section)
 	local panel = Page.panel
 	if not panel then
 		return
@@ -1472,7 +1509,7 @@ function EnsureSummaryHost(section)
 	end)
 end
 
-function EnsureEntriesHost(section)
+EnsureEntriesHost = function(section)
 	local panel = Page.panel
 	if not panel then
 		return
@@ -1645,6 +1682,18 @@ end
 
 function Page._SetDraftForTests(draft)
 	session.draft = draft
+end
+
+function Page._GetEditingForTests()
+	return session.editing
+end
+
+function Page._GetAltDraftForTests()
+	return session.altDraft
+end
+
+function Page._GetRenamePlanNameForTests()
+	return session.renamePlanName
 end
 
 function Page._FindEditBoxesForTests(root, field)
