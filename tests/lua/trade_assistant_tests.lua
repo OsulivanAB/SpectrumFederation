@@ -44,6 +44,8 @@ end
 
 local LINK1 = "|cff00ff00|Hitem:123:0:0:0:0:0:80:::|h[Rune One]|h|r"
 local LINK2 = "|cff0000ff|Hitem:456:0:0:0:0:0:80:::|h[Rune Two]|h|r"
+local LINK_VARIANT_A = "|cff00ff00|Hitem:123:0:0:0:0:0:81:::|h[Rune Variant A]|h|r"
+local LINK_VARIANT_B = "|cff00ff00|Hitem:123:0:0:0:0:0:82:::|h[Rune Variant B]|h|r"
 
 local world
 local frames = {}
@@ -213,7 +215,7 @@ C_Container = {
             return
         end
         row.count = row.count - count
-        world.cursor = { itemId = row.itemId, count = count, bag = bag, slot = slot }
+        world.cursor = { itemId = row.itemId, count = count, bag = bag, slot = slot, link = row.link }
     end,
     PickupContainerItem = function(bag, slot)
         world.pickups[#world.pickups + 1] = { bag = bag, slot = slot }
@@ -221,7 +223,7 @@ C_Container = {
         if not row or row.count <= 0 then
             return
         end
-        world.cursor = { itemId = row.itemId, count = row.count, bag = bag, slot = slot }
+        world.cursor = { itemId = row.itemId, count = row.count, bag = bag, slot = slot, link = row.link }
         row.count = 0
     end,
 }
@@ -246,6 +248,9 @@ function GetTradePlayerItemLink(slot)
     local item = world.tradeSlots[slot]
     if not item then
         return nil
+    end
+    if type(item.link) == "string" and item.link:find("|H", 1, true) then
+        return item.link
     end
     local itemId = tonumber(item.itemId) or 0
     if itemId == 123 then
@@ -570,6 +575,66 @@ do
     assertEq(snapshot[1].items[1].itemId, 1001, "Alice retains the replaced item")
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after Alice manual add settlement")
     assertEq(snapshot[2].itemCount, 7, "Bob keeps all seven queued item entries")
+end
+
+-- Same-item variants settle by traded link, not by item ID order.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 10, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 10, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "variant test queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_B .. " 1") == true, "variant test queues variant B")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "variant test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "variant prefill places both variants")
+    assertEq(world.tradeSlots[1].link, LINK_VARIANT_A, "first trade slot holds variant A")
+    assertEq(world.tradeSlots[2].link, LINK_VARIANT_B, "second trade slot holds variant B")
+
+    world.tradeSlots[1] = nil -- remove variant A; variant B remains offered
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "variant settlement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for variant A")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains only variant A")
+    assertEq(snapshot[1].items[1].itemLink, LINK_VARIANT_A, "Alice retains the undelivered variant")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after Alice variant settlement")
+    assertEq(snapshot[2].itemCount, 2, "Bob keeps both queued variants")
+end
+
+-- Missing trade links fall back to the prefill settlement snapshot.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 5
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "missing link test queues item one")
+    assertTrue(TA:HandleCommand(LINK2 .. " 2") == true, "missing link test queues item two")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "missing link test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "missing link prefill places both items")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "missing trade links still settle prefilled offers")
+    assertEq(snapshot[1].name, "Bob", "Alice is removed after fallback settlement")
 end
 
 -- A declined/cancelled trade leaves the player queued.

@@ -515,30 +515,53 @@ function TA:RemovePlayer(playerId)
     return true
 end
 
-local function SettlePlayerItems(playerId, offered)
+local function SettlePlayerItems(playerId, offers)
     local entry, key = FindPlayer(playerId)
-    if not entry or not key or type(offered) ~= "table" then
+    if not entry or not key or type(offers) ~= "table" then
         return false
     end
-    local remaining = {}
-    for itemId, quantity in pairs(offered) do
-        local id = tonumber(itemId)
-        local qty = FloorQty(quantity)
+    local linkRemaining = {}
+    local itemRemaining = {}
+    for _, offer in ipairs(offers) do
+        local id = tonumber(offer and offer.itemId)
+        local qty = FloorQty(offer and offer.quantity)
         if id and qty > 0 then
-            remaining[id] = qty
+            itemRemaining[id] = (itemRemaining[id] or 0) + qty
+            if offer.linkKey then
+                linkRemaining[offer.linkKey] = (linkRemaining[offer.linkKey] or 0) + qty
+            end
         end
     end
     local changed = false
     local removeKeys = {}
     for _, itemKey in ipairs(entry.itemOrder) do
         local item = entry.items[itemKey]
-        if item then
-            local id = tonumber(item.itemId)
-            local qty = id and remaining[id] or 0
-            if qty > 0 then
-                local settled = math.min(qty, FloorQty(item.quantity))
+        if item and item.linkKey then
+            local available = linkRemaining[item.linkKey] or 0
+            local settled = math.min(available, FloorQty(item.quantity))
+            if settled > 0 then
                 item.quantity = FloorQty(item.quantity) - settled
-                remaining[id] = qty - settled
+                linkRemaining[item.linkKey] = available - settled
+                local id = tonumber(item.itemId)
+                if id then
+                    itemRemaining[id] = (itemRemaining[id] or 0) - settled
+                end
+                changed = true
+                if FloorQty(item.quantity) <= 0 then
+                    removeKeys[#removeKeys + 1] = itemKey
+                end
+            end
+        end
+    end
+    for _, itemKey in ipairs(entry.itemOrder) do
+        local item = entry.items[itemKey]
+        if item and not item.linkKey then
+            local id = tonumber(item.itemId)
+            local available = id and itemRemaining[id] or 0
+            local settled = math.min(available, FloorQty(item.quantity))
+            if settled > 0 then
+                item.quantity = FloorQty(item.quantity) - settled
+                itemRemaining[id] = available - settled
                 changed = true
                 if FloorQty(item.quantity) <= 0 then
                     removeKeys[#removeKeys + 1] = itemKey
@@ -777,7 +800,7 @@ function TA:TryPrefillTrade(lifecycle, key)
         return false
     end
 
-    trade.offeredQuantities = {}
+    trade.offeredOffers = {}
     local moves = PlanMoves(entry, freeSlots)
     local placed = 0
     local attempted = 0
@@ -789,7 +812,11 @@ function TA:TryPrefillTrade(lifecycle, key)
             placed = placed + placedQty
             local itemId = move.item and tonumber(move.item.itemId)
             if itemId then
-                trade.offeredQuantities[itemId] = (trade.offeredQuantities[itemId] or 0) + placedQty
+                trade.offeredOffers[#trade.offeredOffers + 1] = {
+                    itemId = itemId,
+                    linkKey = move.item and move.item.linkKey,
+                    quantity = placedQty,
+                }
             end
         else
             Debug("Warn", "Trade prefill move failed for %s: %s", tostring(move.item and move.item.key or "item"), tostring(result))
@@ -856,29 +883,36 @@ local function OnTradeShow()
     Debug("Info", "Trade shown: target=%s autoFill=%s", tostring(name or key or "unknown"), tostring(autoFill))
 end
 
-local function CaptureAcceptedOffer(trade)
+local function CaptureAcceptedOffer()
     if not (GetTradePlayerItemInfo and GetTradePlayerItemLink) then
         return nil
     end
-    local accepted = {}
+    local offers = {}
     for slot = 1, TA.TRADE_SLOTS do
         local name, _, count = GetTradePlayerItemInfo(slot)
         if name then
             local itemId = nil
+            local linkKey = nil
             local link = GetTradePlayerItemLink(slot)
             if type(link) == "string" then
                 itemId = tonumber(link:match("item:(%d+)"))
+                linkKey = NormalizeLinkKey(link)
             end
-            if itemId then
-                local qty = FloorQty(count)
-                if qty < 1 then
-                    qty = 1
-                end
-                accepted[itemId] = (accepted[itemId] or 0) + qty
+            if not itemId or not linkKey then
+                return nil
             end
+            local qty = FloorQty(count)
+            if qty < 1 then
+                qty = 1
+            end
+            offers[#offers + 1] = {
+                itemId = itemId,
+                linkKey = linkKey,
+                quantity = qty,
+            }
         end
     end
-    return accepted
+    return offers
 end
 
 local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
@@ -892,8 +926,8 @@ local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
     if targetAccepted ~= nil then
         trade.targetAccepted = TradeAcceptFlag(targetAccepted)
     end
-    if trade.autoFill and trade.playerAccepted and trade.targetAccepted and trade.acceptedQuantities == nil then
-        trade.acceptedQuantities = CaptureAcceptedOffer(trade)
+    if trade.autoFill and trade.playerAccepted and trade.targetAccepted and trade.acceptedOffers == nil then
+        trade.acceptedOffers = CaptureAcceptedOffer()
     end
 end
 
@@ -905,9 +939,9 @@ local function OnTradeClosed()
     end
     if trade.playerAccepted and trade.targetAccepted then
         if trade.autoFill then
-            local settlement = trade.acceptedQuantities
+            local settlement = trade.acceptedOffers
             if settlement == nil then
-                settlement = trade.offeredQuantities
+                settlement = trade.offeredOffers
             end
             if settlement ~= nil then
                 SettlePlayerItems(trade.key, settlement)
