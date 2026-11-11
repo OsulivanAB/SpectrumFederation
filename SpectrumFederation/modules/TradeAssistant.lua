@@ -1010,38 +1010,63 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
             end
         end
     end
+    local ambiguousNames = {}
+    local identitiesByName = {}
+    for _, offer in ipairs(offered or {}) do
+        local offerName = offer and offer.name
+        if type(offerName) == "string" and offerName ~= "" then
+            local identity = tostring(tonumber(offer.itemId) or "?") .. "|" .. tostring(offer.linkKey)
+            local identities = identitiesByName[offerName]
+            if not identities then
+                identities = {}
+                identitiesByName[offerName] = identities
+            end
+            if not identities[identity] then
+                identities[identity] = true
+                local identityCount = 0
+                for _ in pairs(identities) do
+                    identityCount = identityCount + 1
+                end
+                if identityCount > 1 then
+                    ambiguousNames[offerName] = true
+                end
+            end
+        end
+    end
     local usedOffers = {}
     for _, entry in ipairs(unknown) do
         local slot = tonumber(entry and entry.slot)
         local quantity = FloorQty(entry and entry.quantity)
         local tradeName = entry and entry.name
         local match = nil
-        local slotOffer = slot and offeredBySlot[slot] or nil
-        if slotOffer and not usedOffers[slotOffer] and not ambiguousOffers[slotOffer]
-            and TradeOfferNameCompatible(slotOffer.name, tradeName)
-            and FloorQty(slotOffer.quantity) == quantity then
-            match = slotOffer
-        end
-        if not match then
-            local candidates = {}
-            for _, offer in ipairs(unusedOffers) do
-                if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) and FloorQty(offer.quantity) == quantity then
-                    candidates[#candidates + 1] = offer
+        if not ambiguousNames[tradeName] then
+            local slotOffer = slot and offeredBySlot[slot] or nil
+            if slotOffer and not usedOffers[slotOffer] and not ambiguousOffers[slotOffer]
+                and TradeOfferNameCompatible(slotOffer.name, tradeName)
+                and FloorQty(slotOffer.quantity) == quantity then
+                match = slotOffer
+            end
+            if not match then
+                local candidates = {}
+                for _, offer in ipairs(unusedOffers) do
+                    if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) and FloorQty(offer.quantity) == quantity then
+                        candidates[#candidates + 1] = offer
+                    end
+                end
+                if #candidates > 0 and TradeOffersInterchangeable(candidates[1], candidates) then
+                    match = candidates[1]
                 end
             end
-            if #candidates > 0 and TradeOffersInterchangeable(candidates[1], candidates) then
-                match = candidates[1]
-            end
-        end
-        if not match then
-            local nameCandidates = {}
-            for _, offer in ipairs(unusedOffers) do
-                if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) then
-                    nameCandidates[#nameCandidates + 1] = offer
+            if not match then
+                local nameCandidates = {}
+                for _, offer in ipairs(unusedOffers) do
+                    if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) then
+                        nameCandidates[#nameCandidates + 1] = offer
+                    end
                 end
-            end
-            if #nameCandidates > 0 and TradeOffersInterchangeable(nameCandidates[1], nameCandidates) then
-                match = nameCandidates[1]
+                if #nameCandidates > 0 and TradeOffersInterchangeable(nameCandidates[1], nameCandidates) then
+                    match = nameCandidates[1]
+                end
             end
         end
         if match and quantity > 0 then

@@ -780,6 +780,45 @@ do
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after ambiguous settlement")
 end
 
+-- Edited same-name variants do not settle removed stacks by quantity.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 5
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [2] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [3] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [4] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [5] = { itemId = 123, count = 8, link = LINK_VARIANT_SHARED_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_A .. " 2") == true, "edited variant test queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_B .. " 2") == true, "edited variant test queues variant B")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "edited variant test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 3, "edited variant prefill places split A and B")
+
+    world.tradeSlots = {
+        [3] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_B },
+    }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "edited variant keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice is not settled by removed variant stacks")
+    assertEq(snapshot[1].itemCount, 2, "Alice retains both same-name variants")
+    assertEq(snapshot[1].totalQuantity, 4, "Alice retains both variant quantities")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after edited variant settlement")
+end
+
 -- Identical missing-link stacks still settle by slot.
 do
     resetWorld()
