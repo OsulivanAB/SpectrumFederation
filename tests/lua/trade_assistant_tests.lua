@@ -237,9 +237,23 @@ end
 function GetTradePlayerItemInfo(slot)
     local item = world.tradeSlots[slot]
     if item then
-        return "Trade Item"
+        return "Trade Item", nil, item.count
     end
     return nil
+end
+
+function GetTradePlayerItemLink(slot)
+    local item = world.tradeSlots[slot]
+    if not item then
+        return nil
+    end
+    local itemId = tonumber(item.itemId) or 0
+    if itemId == 123 then
+        return LINK1
+    elseif itemId == 456 then
+        return LINK2
+    end
+    return "|Hitem:" .. tostring(itemId) .. ":0:0:0:0:0:80:::|h[Item]|h|r"
 end
 
 function ClickTradeButton(slot)
@@ -496,6 +510,65 @@ do
     assertEq(snapshot[1].totalQuantity, 1, "Alice retains unoffered quantity")
     assertEq(snapshot[1].items[1].itemId, 1007, "Alice retains the seventh queued item")
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after Alice partial settlement")
+    assertEq(snapshot[2].itemCount, 7, "Bob keeps all seven queued item entries")
+end
+
+-- Edited trade offers settle only the accepted contents.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 5
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "edited offer test queues item one")
+    assertTrue(TA:HandleCommand(LINK2 .. " 2") == true, "edited offer test queues item two")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "edited offer test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "edited offer prefill places both items")
+
+    world.tradeSlots[2] = nil -- simulate removing the second offer before accepting
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "edited offer keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for the removed offer")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains only the unaccepted item")
+    assertEq(snapshot[1].items[1].itemId, 456, "Alice retains item two")
+    assertEq(snapshot[1].totalQuantity, 2, "Alice retains item two quantity")
+    assertEq(snapshot[2].name, "Bob", "Bob remains fully queued after edited offer")
+    assertEq(snapshot[2].itemCount, 2, "Bob keeps both queued item entries")
+end
+
+-- A queued item manually added after prefill settles from the final offer.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 7
+    world.bags[0] = {}
+    for index = 1001, 1007 do
+        world.bags[0][index - 1000] = { itemId = index, count = 5, link = tostring(index) }
+        assertTrue(TA:HandleCommand(tostring(index) .. " 1") == true, "manual add settlement queues item " .. index)
+    end
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "manual add settlement can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 6, "manual add settlement prefill places six items")
+
+    world.tradeSlots[1] = { itemId = 1007, count = 1 } -- manually replace the first offer with the unoffered item
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "manual add settlement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for the replaced offer")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains only the replaced item entry")
+    assertEq(snapshot[1].items[1].itemId, 1001, "Alice retains the replaced item")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after Alice manual add settlement")
     assertEq(snapshot[2].itemCount, 7, "Bob keeps all seven queued item entries")
 end
 

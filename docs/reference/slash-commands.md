@@ -59,7 +59,7 @@ Both modes require an active profile and profile-admin permission. Entering anot
 | `/sf trade` | Open the Trade Assistant window. Closing the window with X hides only the UI; the queue remains until reload/logout or manual removal. |
 | `/sf trade [item link] [quantity]` | Add the item to the runtime trade queue for every other online raid member. Quantity defaults to 1. Repeating the command adds more item entries; each player still appears once and receives the queued items that fit in the trade window. |
 
-Names are green when the player is in trade range and red when they are not. Click a name to open a trade and prefill the queued items, or click the row X to remove that player. A successfully completed trade settles the offered quantities; the player is removed once nothing remains queued. If the trade window cannot hold every queued entry, unoffered entries stay queued. The queue is runtime-only and is lost on reload.
+Names are green when the player is in trade range and red when they are not. Click a name to open a trade and prefill the queued items, or click the row X to remove that player. A successfully completed trade settles the accepted item quantities, including manual edits made before accepting; the player is removed once nothing remains queued. If the trade window cannot hold every queued entry, unoffered entries stay queued unless they are added manually. The queue is runtime-only and is lost on reload.
 
 ## Addon versions
 
