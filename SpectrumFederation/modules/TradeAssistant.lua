@@ -817,6 +817,7 @@ function TA:TryPrefillTrade(lifecycle, key)
                     linkKey = move.item and move.item.linkKey,
                     quantity = placedQty,
                     slot = tradeSlot,
+                    name = ItemDisplayName(move.item),
                 }
             end
         else
@@ -870,7 +871,6 @@ local function OnTradeShow()
         playerAccepted = false,
         targetAccepted = false,
         autoFill = autoFill,
-        acceptedCaptured = false,
     }
     if autoFill then
         local lifecycle = state.tradeLifecycle
@@ -920,6 +920,7 @@ local function CaptureAcceptedOffer()
                 unknown[#unknown + 1] = {
                     slot = slot,
                     quantity = qty,
+                    name = name,
                 }
             end
         end
@@ -938,15 +939,25 @@ local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
     if targetAccepted ~= nil then
         trade.targetAccepted = TradeAcceptFlag(targetAccepted)
     end
-    if trade.autoFill and trade.playerAccepted and trade.targetAccepted and not trade.acceptedCaptured then
-        trade.acceptedCaptured = true
+    if trade.autoFill and trade.playerAccepted and trade.targetAccepted then
         local offers, unknown, complete = CaptureAcceptedOffer()
-        if offers then
-            trade.acceptedOffers = offers
-            trade.acceptedUnknown = unknown
-            trade.acceptedComplete = complete
-        end
+        trade.acceptedOffers = offers
+        trade.acceptedUnknown = unknown
+        trade.acceptedComplete = complete
     end
+end
+
+local function TradeOfferNameCompatible(offerName, tradeName)
+    if type(offerName) ~= "string" or offerName == "" or type(tradeName) ~= "string" or tradeName == "" then
+        return true
+    end
+    return offerName == tradeName
+end
+
+local function TradeOfferNameEqual(offerName, tradeName)
+    return type(offerName) == "string" and offerName ~= ""
+        and type(tradeName) == "string" and tradeName ~= ""
+        and offerName == tradeName
 end
 
 local function MergeAcceptedOffers(accepted, unknown, offered)
@@ -958,22 +969,50 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
         return merged
     end
     local offeredBySlot = {}
+    local unusedOffers = {}
     for _, offer in ipairs(offered or {}) do
         local slot = tonumber(offer and offer.slot)
         if slot then
             offeredBySlot[slot] = offer
         end
+        unusedOffers[#unusedOffers + 1] = offer
     end
+    local usedOffers = {}
     for _, entry in ipairs(unknown) do
         local slot = tonumber(entry and entry.slot)
-        local match = slot and offeredBySlot[slot] or nil
         local quantity = FloorQty(entry and entry.quantity)
+        local tradeName = entry and entry.name
+        local match = nil
+        local slotOffer = slot and offeredBySlot[slot] or nil
+        if slotOffer and not usedOffers[slotOffer] and TradeOfferNameCompatible(slotOffer.name, tradeName) then
+            match = slotOffer
+        end
+        if not match then
+            for _, offer in ipairs(unusedOffers) do
+                if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) and FloorQty(offer.quantity) == quantity then
+                    match = offer
+                    break
+                end
+            end
+        end
+        if not match then
+            local nameCandidates = {}
+            for _, offer in ipairs(unusedOffers) do
+                if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) then
+                    nameCandidates[#nameCandidates + 1] = offer
+                end
+            end
+            if #nameCandidates == 1 then
+                match = nameCandidates[1]
+            end
+        end
         if match and quantity > 0 then
+            usedOffers[match] = true
             merged[#merged + 1] = {
                 itemId = match.itemId,
                 linkKey = match.linkKey,
                 quantity = quantity,
-                slot = slot,
+                slot = slot or tonumber(match.slot),
             }
         else
             Debug("Info", "Trade settlement skipped unidentified offer in slot %s", tostring(slot))

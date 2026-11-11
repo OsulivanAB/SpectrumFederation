@@ -239,7 +239,16 @@ end
 function GetTradePlayerItemInfo(slot)
     local item = world.tradeSlots[slot]
     if item then
-        return "Trade Item", nil, item.count
+        local name = "Trade Item"
+        if type(item.link) == "string" then
+            local bracket = item.link:match("%[([^%]]+)%]")
+            if bracket and bracket ~= "" then
+                name = bracket
+            elseif not item.link:find("|H", 1, true) then
+                name = tostring(item.itemId)
+            end
+        end
+        return name, nil, item.count
     end
     return nil
 end
@@ -667,6 +676,70 @@ do
     assertEq(snapshot[1].itemCount, 1, "Alice retains only the removed offer")
     assertEq(snapshot[1].items[1].itemLink, LINK1, "Alice retains item one")
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after missing link removal")
+end
+
+-- Missing-link captures refresh when offers change before reacceptance.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 5
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "reacceptance test queues item one")
+    assertTrue(TA:HandleCommand(LINK2 .. " 2") == true, "reacceptance test queues item two")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "reacceptance test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "reacceptance prefill places both items")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 0)
+    world.tradeSlots[1] = nil -- remove item one before reaccepting
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "reacceptance keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for the removed offer")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains only the removed offer")
+    assertEq(snapshot[1].items[1].itemLink, LINK1, "Alice retains item one")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after reacceptance")
+end
+
+-- Missing-link fallback matches moved offers by name and quantity.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 5
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "moved offer test queues item one")
+    assertTrue(TA:HandleCommand(LINK2 .. " 2") == true, "moved offer test queues item two")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "moved offer test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "moved offer prefill places both items")
+
+    world.tradeSlots[3] = world.tradeSlots[2]
+    world.tradeSlots[2] = nil -- move item two to another trade slot
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "moved offer still settles both items")
+    assertEq(snapshot[1].name, "Bob", "Alice is removed after moved offer settlement")
 end
 
 -- A declined/cancelled trade leaves the player queued.
