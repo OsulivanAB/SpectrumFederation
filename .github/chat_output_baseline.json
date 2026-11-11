@@ -1435,6 +1435,60 @@
       "note": ""
     },
     {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 530,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(Loc(\"TRADE_ASSISTANT_ERR_QUANTITY\", \"SF Trade: Quantity must be a positive whole number.\"))",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 532,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(Loc(\"TRADE_ASSISTANT_ERR_ITEM\", \"SF Trade: Enter a valid item link.\"))",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 540,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(Loc(\"TRADE_ASSISTANT_ERR_NOT_IN_RAID\", \"SF Trade: You must be in a raid.\"))",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 545,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(Loc(\"TRADE_ASSISTANT_ERR_NO_MEMBERS\", \"SF Trade: No other raid members are in the raid.\"))",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 552,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(Loc(\"TRADE_ASSISTANT_ERR_INSUFFICIENT\", \"SF Trade failed.\"))",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
+      "path": "SpectrumFederation/modules/TradeAssistant.lua",
+      "line": 565,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(string.format(",
+      "enclosing": "TA:HandleCommand",
+      "hotpath_ok": false,
+      "note": "Owner-authorized /sf trade feedback (#269)"
+    },
+    {
       "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
       "line": 505,
       "kind": "print",

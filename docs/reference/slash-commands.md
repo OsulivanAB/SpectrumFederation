@@ -1,6 +1,6 @@
 # Slash Command Reference
 
-The dispatcher lowercases the entire command line. Commands are therefore case-insensitive, but profile-name arguments are also lowercased before lookup. Use a profile ID when a profile's displayed name contains capital letters.
+Most commands lowercase the entire command line. Commands are therefore case-insensitive, but profile-name arguments are also lowercased before lookup. Use a profile ID when a profile's displayed name contains capital letters. `/sf trade` is the exception for item arguments: it preserves item-link casing so bag matching stays exact.
 
 ## Settings and help
 
@@ -51,6 +51,15 @@ Unsupported arguments such as `admin` or `as-admin` are rejected. This command n
 | `/sf raidcheck raid` | `start`, no argument | Run the awarding Raid Check. |
 
 Both modes require an active profile and profile-admin permission. Entering another argument prints the supported syntax.
+
+## Trade Assistant
+
+| Command | Result |
+| --- | --- |
+| `/sf trade` | Open the Trade Assistant window. Closing the window with X hides only the UI; the queue remains until reload/logout or manual removal. |
+| `/sf trade [item link] [quantity]` | Add the item to the runtime trade queue for every other online raid member. Quantity defaults to 1. Repeating the command adds more item entries; each player still appears once and receives all queued items when traded. |
+
+Names are green when the player is in trade range and red when they are not. Click a name to open a trade and prefill the queued items, or click the row X to remove that player. Any successfully completed trade with a queued player removes them from the list. The queue is runtime-only and is lost on reload.
 
 ## Addon versions
 

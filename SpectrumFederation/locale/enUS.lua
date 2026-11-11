@@ -732,6 +732,23 @@ L["RAID_CHECK_UI_SESSION_START_FAILED"] = "Could not start a Loot Helper session
 L["RAID_CHECK_UI_PREFLIGHT_UNAVAILABLE"] = "Session preflight dialog is unavailable."
 L["RAID_CHECK_UI_PREFLIGHT_SHOW_FAILED"] = "Could not show the session prompt. The check was not started."
 
+-- Trade Assistant raid trade queue (#269)
+L["TRADE_ASSISTANT_TITLE"] = "Trade Assistant"
+L["TRADE_ASSISTANT_HINT"] = "Click a player to trade. Use the X to remove them."
+L["TRADE_ASSISTANT_EMPTY"] = "No pending trades."
+L["TRADE_ASSISTANT_ONE_ITEM"] = "1 item"
+L["TRADE_ASSISTANT_ITEMS"] = "%d items"
+L["TRADE_ASSISTANT_RANGE_IN"] = "In trade range"
+L["TRADE_ASSISTANT_RANGE_OUT"] = "Out of trade range"
+L["TRADE_ASSISTANT_RANGE_UNKNOWN"] = "Range unavailable"
+L["TRADE_ASSISTANT_ERR_ITEM"] = "SF Trade: Enter a valid item link."
+L["TRADE_ASSISTANT_ERR_QUANTITY"] = "SF Trade: Quantity must be a positive whole number."
+L["TRADE_ASSISTANT_ERR_NOT_IN_RAID"] = "SF Trade: You must be in a raid."
+L["TRADE_ASSISTANT_ERR_NO_MEMBERS"] = "SF Trade: No other raid members are in the raid."
+L["TRADE_ASSISTANT_ERR_INSUFFICIENT"] = "SF Trade failed."
+L["TRADE_ASSISTANT_QUEUED"] = "SF Trade: Added %dx %s to the trade list."
+L["TRADE_ASSISTANT_SLASH_DESC"] = "Queue items to trade to raid members"
+
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
 	local value = L[key]
