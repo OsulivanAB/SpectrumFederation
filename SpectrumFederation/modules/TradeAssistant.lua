@@ -201,7 +201,8 @@ local function ItemDisplayName(item)
         if ok and type(itemName) == "string" and itemName ~= "" then
             return itemName
         end
-    elseif C_Item and C_Item.GetItemNameByID then
+    end
+    if C_Item and C_Item.GetItemNameByID then
         local ok, itemName = pcall(C_Item.GetItemNameByID, item.itemId)
         if ok and type(itemName) == "string" and itemName ~= "" then
             return itemName
@@ -960,6 +961,11 @@ local function TradeOfferNameEqual(offerName, tradeName)
         and offerName == tradeName
 end
 
+local function TradeOfferSameNameAndQuantity(a, b)
+    return TradeOfferNameEqual(a and a.name, b and b.name)
+        and FloorQty(a and a.quantity) == FloorQty(b and b.quantity)
+end
+
 local function MergeAcceptedOffers(accepted, unknown, offered)
     local merged = {}
     for _, offer in ipairs(accepted or {}) do
@@ -977,6 +983,15 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
         end
         unusedOffers[#unusedOffers + 1] = offer
     end
+    local ambiguousOffers = {}
+    for _, offer in ipairs(offered or {}) do
+        for _, other in ipairs(offered or {}) do
+            if offer ~= other and TradeOfferSameNameAndQuantity(offer, other) then
+                ambiguousOffers[offer] = true
+                break
+            end
+        end
+    end
     local usedOffers = {}
     for _, entry in ipairs(unknown) do
         local slot = tonumber(entry and entry.slot)
@@ -984,15 +999,20 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
         local tradeName = entry and entry.name
         local match = nil
         local slotOffer = slot and offeredBySlot[slot] or nil
-        if slotOffer and not usedOffers[slotOffer] and TradeOfferNameCompatible(slotOffer.name, tradeName) then
+        if slotOffer and not usedOffers[slotOffer] and not ambiguousOffers[slotOffer]
+            and TradeOfferNameCompatible(slotOffer.name, tradeName)
+            and FloorQty(slotOffer.quantity) == quantity then
             match = slotOffer
         end
         if not match then
+            local candidates = {}
             for _, offer in ipairs(unusedOffers) do
                 if not usedOffers[offer] and TradeOfferNameEqual(offer.name, tradeName) and FloorQty(offer.quantity) == quantity then
-                    match = offer
-                    break
+                    candidates[#candidates + 1] = offer
                 end
+            end
+            if #candidates == 1 then
+                match = candidates[1]
             end
         end
         if not match then

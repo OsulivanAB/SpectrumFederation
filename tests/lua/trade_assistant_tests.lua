@@ -46,6 +46,8 @@ local LINK1 = "|cff00ff00|Hitem:123:0:0:0:0:0:80:::|h[Rune One]|h|r"
 local LINK2 = "|cff0000ff|Hitem:456:0:0:0:0:0:80:::|h[Rune Two]|h|r"
 local LINK_VARIANT_A = "|cff00ff00|Hitem:123:0:0:0:0:0:81:::|h[Rune Variant A]|h|r"
 local LINK_VARIANT_B = "|cff00ff00|Hitem:123:0:0:0:0:0:82:::|h[Rune Variant B]|h|r"
+local LINK_VARIANT_SHARED_A = "|cff00ff00|Hitem:123:0:0:0:0:0:83:::|h[Shared Rune]|h|r"
+local LINK_VARIANT_SHARED_B = "|cff00ff00|Hitem:123:0:0:0:0:0:84:::|h[Shared Rune]|h|r"
 
 local world
 local frames = {}
@@ -740,6 +742,84 @@ do
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "moved offer still settles both items")
     assertEq(snapshot[1].name, "Bob", "Alice is removed after moved offer settlement")
+end
+
+-- Ambiguous same-name variants are not settled by missing-link fallbacks.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 10, link = LINK_VARIANT_SHARED_A },
+        [2] = { itemId = 123, count = 10, link = LINK_VARIANT_SHARED_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_A .. " 1") == true, "ambiguous variant test queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_B .. " 1") == true, "ambiguous variant test queues variant B")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "ambiguous variant test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "ambiguous variant prefill places both items")
+    assertEq(world.tradeSlots[1].link, LINK_VARIANT_SHARED_A, "ambiguous first slot holds variant A")
+    assertEq(world.tradeSlots[2].link, LINK_VARIANT_SHARED_B, "ambiguous second slot holds variant B")
+
+    world.tradeSlots[1] = world.tradeSlots[2] -- move variant B into variant A's slot
+    world.tradeSlots[2] = nil
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "ambiguous variants keep both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice is not settled by an ambiguous variant")
+    assertEq(snapshot[1].itemCount, 2, "Alice retains both ambiguous variants")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after ambiguous settlement")
+end
+
+-- Bare IDs resolve through C_Item when GetItemInfo is uncached.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 0
+    local originalGetItemInfo = GetItemInfo
+    local originalCItem = C_Item
+    GetItemInfo = function()
+        return nil
+    end
+    C_Item = {
+        GetItemNameByID = function(itemId)
+            if tonumber(itemId) == 123 then
+                return "Rune One"
+            end
+            return nil
+        end,
+    }
+
+    assertTrue(TA:HandleCommand("123 1") == true, "bare id test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "bare id test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 1, "bare id prefill places item")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+    GetItemInfo = originalGetItemInfo
+    C_Item = originalCItem
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "bare id settles when name resolves through C_Item")
+    assertEq(snapshot[1].name, "Bob", "Alice is removed after bare id settlement")
 end
 
 -- A declined/cancelled trade leaves the player queued.
