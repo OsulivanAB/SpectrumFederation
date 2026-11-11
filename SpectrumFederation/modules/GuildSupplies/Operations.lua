@@ -2063,7 +2063,7 @@ function GS:ApplyStagedConfigOperation(op, context)
         -- Soft-delete verified attribution reads accepted correction history.
         -- Notify AFTER StoreAccepted so hist rebuilds see this body (#465).
         if GS.NoteAcceptedCorrectionHistoryMutation then
-            GS.NoteAcceptedCorrectionHistoryMutation(record)
+            GS.NoteAcceptedCorrectionHistoryMutation(record, stored)
         end
         if GS.RedrivePendingContributorCorrections then
             GS.RedrivePendingContributorCorrections(record, {

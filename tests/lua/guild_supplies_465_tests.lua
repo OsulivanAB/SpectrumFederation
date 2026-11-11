@@ -4940,6 +4940,620 @@ do
     assertEq(GS._softDeleteRedriveAdmitActive, false, "465-rw: idle after dataset replace")
 end
 
+do
+    -- #465 r4538978963: correction-heavy replay after warm deletions must not
+    -- rebuild history/heads per accepted correction. Measure total callback
+    -- hist/head work, not merely admission counts.
+    local itemId = 9280
+    local record = seedLiveCampaignWithItem(itemId, 400)
+    local deleteN, corrN = 24, 40
+    local deleteIds = {}
+    for i = 1, deleteN do
+        local id = string.format("cr-del-%02d", i)
+        deleteIds[i] = id
+        injectProductionDonation(record, {
+            id = id, itemId = itemId, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+    end
+    -- Snapshot a correction body while the target is still live.
+    local template = select(1, GS:NewContributorCorrectionOperation(
+        deleteIds[1], "Bob-Garona", "Player-1-Bob"))
+    assertTrue(template ~= nil, "465-cr: correction template")
+    local corrSnap = select(1, GS._SnapshotPublicOp(template))
+    assertTrue(type(corrSnap) == "table", "465-cr: correction snapshot")
+    for i = 1, deleteN do
+        local del = select(1, GS:NewSoftDeleteOperation(deleteIds[i]))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+            "465-cr: source delete " .. deleteIds[i])
+    end
+    -- Warm deletion projection before correction-heavy work.
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil), "465-cr: warm ensure")
+    GS._softDeleteCumulativeHistVisits = 0
+    GS._softDeleteCumulativeHeadVisits = 0
+    GS._softDeleteAffectedAttributionRefreshes = 0
+    local function rebindCorr(body, rec, target, attr, attrGuid, id, ts)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.id = id
+        out.timestamp = ts
+        out.target = target
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        if type(out.value) == "table" then
+            local v = {}
+            for vk, vv in pairs(out.value) do v[vk] = vv end
+            v.eventId = target
+            v.attributed = attr
+            v.attributedGuid = attrGuid
+            out.value = v
+        end
+        return out
+    end
+    for i = 1, corrN do
+        local target = deleteIds[((i - 1) % deleteN) + 1]
+        local attr = (i % 2 == 0) and "Bob-Garona" or "Carol-Garona"
+        local attrGuid = (i % 2 == 0) and "Player-1-Bob" or "Player-1-Carol"
+        local body = rebindCorr(corrSnap, record, target, attr, attrGuid,
+            string.format("cr-corr-%02d", i), world.time + i)
+        local st, r = GS:AdmitRemoteOperation(body, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertTrue(st == "accepted" or st == "duplicate",
+            "465-cr: admit correction " .. tostring(i)
+                .. " got " .. tostring(st) .. "/" .. tostring(r))
+    end
+    local histVisits = tonumber(GS._softDeleteCumulativeHistVisits) or 0
+    local headVisits = tonumber(GS._softDeleteCumulativeHeadVisits) or 0
+    local affected = tonumber(GS._softDeleteAffectedAttributionRefreshes) or 0
+    assertTrue(affected >= corrN - 2,
+        "465-cr: affected-target refreshes got " .. tostring(affected))
+    -- Full rebuild per correction would charge ≈ corrN × (corrN + deleteN) hist
+    -- visits and ≈ corrN × deleteN head visits. Affected refresh stays near-linear.
+    assertTrue(histVisits < corrN * (corrN + deleteN) / 2,
+        "465-cr: hist visits bounded got " .. tostring(histVisits))
+    assertTrue(headVisits <= corrN + deleteN + 8,
+        "465-cr: head visits near-linear got " .. tostring(headVisits))
+    -- Immediate ordinary-read correctness after last correction (corrN even → Bob).
+    local lastTarget = deleteIds[((corrN - 1) % deleteN) + 1]
+    local entry = record.eventDeletions and record.eventDeletions[lastTarget]
+    assertEq(entry and entry.attributed, "Bob-Garona",
+        "465-cr: immediate attribution after correction-heavy batch")
+    -- Intervening debt-floor consumer must see refreshed allowances (not stale).
+    local okFloor, floorErr = GS.AdjustmentFloorOk(
+        record, itemId, -1, "Bob-Garona", record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Bob",
+        })
+    assertTrue(okFloor,
+        "465-cr: debt floor coherent after corrections err=" .. tostring(floorErr))
+end
+
+do
+    -- #465 r4538978983: merge compatible name-only / GUID debt buckets in both
+    -- pairs traversal orders; real delete-first negative-adjustment replay.
+    local itemId = 9281
+    local function installMixedFacts(orderNameFirst)
+        local record = seedLiveCampaignWithItem(itemId, 80)
+        local durable = record.accounting._consumables.softDeleteVerifiedFacts
+        if type(durable) ~= "table" then
+            durable = {}
+            record.accounting._consumables.softDeleteVerifiedFacts = durable
+        end
+        local nameOnly = {
+            verified = true, eventId = "mix-name", eventKind = "donation",
+            itemId = itemId, quantity = 10, campaignId = record.currentCampaignId,
+            attributed = "Bob-Garona", attributedGuid = nil,
+            gsProductionCredit = true,
+        }
+        local withGuid = {
+            verified = true, eventId = "mix-guid", eventKind = "donation",
+            itemId = itemId, quantity = 10, campaignId = record.currentCampaignId,
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            gsProductionCredit = true,
+        }
+        if orderNameFirst then
+            durable["mix-name"] = nameOnly
+            durable["mix-guid"] = withGuid
+        else
+            durable["mix-guid"] = withGuid
+            durable["mix-name"] = nameOnly
+        end
+        -- Projected deletions sharing the durable fact tables (canonical count 2).
+        record.eventDeletions = {
+            ["mix-name"] = nameOnly,
+            ["mix-guid"] = withGuid,
+        }
+        if GS.InvalidateEventDeletionProjection then
+            GS.InvalidateEventDeletionProjection(record)
+        end
+        if GS.InvalidateSoftDeleteLedgerIndexes then
+            GS.InvalidateSoftDeleteLedgerIndexes(record)
+        end
+        return record
+    end
+    for _, nameFirst in ipairs({ true, false }) do
+        local label = nameFirst and "name-first" or "guid-first"
+        local record = installMixedFacts(nameFirst)
+        local okName = GS.AdjustmentFloorOk(
+            record, itemId, -15, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+            })
+        local okGuid = GS.AdjustmentFloorOk(
+            record, itemId, -15, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        assertTrue(okName,
+            "465-mix: " .. label .. " name query accepts full −15 debt")
+        assertTrue(okGuid,
+            "465-mix: " .. label .. " GUID query accepts full −15 debt")
+        local okOver = GS.AdjustmentFloorOk(
+            record, itemId, -25, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        assertTrue(not okOver,
+            "465-mix: " .. label .. " rejects beyond merged −20 floor")
+    end
+    -- Different GUIDs with same name must not merge.
+    do
+        local record = seedLiveCampaignWithItem(itemId, 80)
+        local durable = {}
+        record.accounting._consumables.softDeleteVerifiedFacts = durable
+        durable["mix-g1"] = {
+            verified = true, eventId = "mix-g1", eventKind = "donation",
+            itemId = itemId, quantity = 10, campaignId = record.currentCampaignId,
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            gsProductionCredit = true,
+        }
+        durable["mix-g2"] = {
+            verified = true, eventId = "mix-g2", eventKind = "donation",
+            itemId = itemId, quantity = 10, campaignId = record.currentCampaignId,
+            attributed = "Bob-Garona", attributedGuid = "Player-1-BobAlt",
+            gsProductionCredit = true,
+        }
+        record.eventDeletions = {
+            ["mix-g1"] = durable["mix-g1"],
+            ["mix-g2"] = durable["mix-g2"],
+        }
+        if GS.InvalidateSoftDeleteLedgerIndexes then
+            GS.InvalidateSoftDeleteLedgerIndexes(record)
+        end
+        local okBob = GS.AdjustmentFloorOk(
+            record, itemId, -10, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        local okAlt = GS.AdjustmentFloorOk(
+            record, itemId, -10, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-BobAlt",
+            })
+        assertTrue(okBob, "465-mix: Bob GUID keeps own −10")
+        assertTrue(okAlt, "465-mix: other GUID keeps own −10")
+        local okBobOver = GS.AdjustmentFloorOk(
+            record, itemId, -15, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            })
+        assertTrue(not okBobOver,
+            "465-mix: different GUIDs do not pool debt")
+    end
+    -- Real delete-first then negative adjustment uses the complete merged allowance.
+    do
+        local record = seedLiveCampaignWithItem(itemId, 80)
+        injectProductionDonation(record, {
+            id = "mix-live-a", itemId = itemId, quantity = 10,
+            actor = "Bob-Garona", actorGuid = nil,
+        })
+        -- Name-only durable credit identity on A.
+        local evA = GS.FindLedgerEventById(record, "mix-live-a")
+        evA.actorGuid = nil
+        evA.donorGuid = nil
+        injectProductionDonation(record, {
+            id = "mix-live-b", itemId = itemId, quantity = 10,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+        })
+        injectProductionDonation(record, {
+            id = "mix-live-stock", itemId = itemId, quantity = 30,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local delA = select(1, GS:NewSoftDeleteOperation("mix-live-a"))
+        assertEq(GS:ApplyStagedConfigOperation(delA), "accepted", "465-mix: delete A")
+        local delB = select(1, GS:NewSoftDeleteOperation("mix-live-b"))
+        assertEq(GS:ApplyStagedConfigOperation(delB), "accepted", "465-mix: delete B")
+        local factA = record.accounting._consumables.softDeleteVerifiedFacts["mix-live-a"]
+        local factB = record.accounting._consumables.softDeleteVerifiedFacts["mix-live-b"]
+        assertTrue(type(factA) == "table" and factA.verified == true, "465-mix: fact A")
+        assertTrue(type(factB) == "table" and factB.verified == true, "465-mix: fact B")
+        -- Force name-only on A fact (mixed completeness).
+        factA.attributedGuid = nil
+        if record.eventDeletions and record.eventDeletions["mix-live-a"] then
+            record.eventDeletions["mix-live-a"].attributedGuid = nil
+        end
+        if GS.InvalidateSoftDeleteLedgerIndexes then
+            GS.InvalidateSoftDeleteLedgerIndexes(record)
+        end
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        -- Local prepare does not honor soft-delete debt floors; remote/adoption
+        -- catch-up does (ApplyAdjustmentMutation). Prove merged allowance there.
+        assertTrue(GS.AdjustmentFloorOk(
+            record, itemId, -15, "Bob-Garona", record.currentCampaignId, {
+                respectSoftDeleteDebt = true,
+                attributedGuid = "Player-1-Bob",
+            }), "465-mix: live merged floor allows −15")
+        local adjTemplate = select(1, GS:NewAdjustmentOperation(itemId, -1, "Bob-Garona"))
+        -- Stock still covers a tiny local −1; snapshot then rewrite quantity.
+        if adjTemplate == nil then
+            injectProductionDonation(record, {
+                id = "mix-live-bob-temp", itemId = itemId, quantity = 5,
+                actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+            })
+            adjTemplate = select(1, GS:NewAdjustmentOperation(itemId, -1, "Bob-Garona"))
+        end
+        assertTrue(adjTemplate ~= nil, "465-mix: prepare adj template")
+        local adjSnap = select(1, GS._SnapshotPublicOp(adjTemplate))
+        adjSnap.id = "mix-live-adj-15"
+        adjSnap.timestamp = world.time + 5
+        if type(adjSnap.value) == "table" then
+            adjSnap.value.quantity = -15
+        end
+        local function rebind(body, rec)
+            local out = {}
+            for k, v in pairs(body) do out[k] = v end
+            out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+            out.datasetId = rec.datasetId
+            out.campaignId = rec.currentCampaignId
+            out.baseCampaignId = rec.currentCampaignId
+            out.basePolicyRevision = rec.permission and rec.permission.revisionId
+            out.baseTargetRevision = rec.datasetId
+            return out
+        end
+        -- Drop the temporary Bob credit used only to mint the adj template.
+        if GS.FindLedgerEventById(record, "mix-live-bob-temp") then
+            local delTemp = select(1, GS:NewSoftDeleteOperation("mix-live-bob-temp"))
+            if delTemp then
+                GS:ApplyStagedConfigOperation(delTemp)
+            end
+        end
+        local function markAdjCredited(rec, eventId)
+            local ev = GS.FindLedgerEventById(rec, eventId)
+            if type(ev) == "table" then
+                ev.gsProductionCredit = true
+                if GS._BumpAccountingMutation then GS._BumpAccountingMutation(rec) end
+                if GS.InvalidateCreditCorrectionProjection then
+                    GS.InvalidateCreditCorrectionProjection(rec)
+                end
+            end
+        end
+        local stLive, rLive = GS:AdmitRemoteOperation(rebind(adjSnap, record), {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertTrue(stLive == "accepted" or stLive == "duplicate",
+            "465-mix: live −15 uses merged debt got "
+                .. tostring(stLive) .. "/" .. tostring(rLive))
+        markAdjCredited(record, "mix-live-adj-15")
+        assertEq(GS.PersonalContributorItemTotal(record, "Bob-Garona", "Player-1-Bob", itemId), -15,
+            "465-mix: Bob personal −15 after merged floor")
+        -- Delete-first remote receipt of the same adjustment.
+        local peer = seedLiveCampaignWithItem(itemId, 80)
+        injectProductionDonation(peer, {
+            id = "mix-live-a", itemId = itemId, quantity = 10,
+            actor = "Bob-Garona", actorGuid = nil,
+        })
+        local peerA = GS.FindLedgerEventById(peer, "mix-live-a")
+        peerA.actorGuid = nil
+        peerA.donorGuid = nil
+        injectProductionDonation(peer, {
+            id = "mix-live-b", itemId = itemId, quantity = 10,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+        })
+        injectProductionDonation(peer, {
+            id = "mix-live-stock", itemId = itemId, quantity = 30,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local delASnap = select(1, GS._SnapshotPublicOp(delA))
+        local delBSnap = select(1, GS._SnapshotPublicOp(delB))
+        assertEq(select(1, GS:AdmitRemoteOperation(rebind(delASnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })), "accepted", "465-mix: peer delete A first")
+        assertEq(select(1, GS:AdmitRemoteOperation(rebind(delBSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })), "accepted", "465-mix: peer delete B")
+        local peerFactA = peer.accounting._consumables.softDeleteVerifiedFacts["mix-live-a"]
+        if type(peerFactA) == "table" then
+            peerFactA.attributedGuid = nil
+        end
+        if peer.eventDeletions and peer.eventDeletions["mix-live-a"] then
+            peer.eventDeletions["mix-live-a"].attributedGuid = nil
+        end
+        if GS.InvalidateSoftDeleteLedgerIndexes then
+            GS.InvalidateSoftDeleteLedgerIndexes(peer)
+        end
+        local stAdj, rAdj = GS:AdmitRemoteOperation(rebind(adjSnap, peer), {
+            sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+        })
+        assertTrue(stAdj == "accepted" or stAdj == "duplicate",
+            "465-mix: peer delete-first adj got " .. tostring(stAdj) .. "/" .. tostring(rAdj))
+        markAdjCredited(peer, "mix-live-adj-15")
+        assertEq(GS.PersonalContributorItemTotal(peer, "Bob-Garona", "Player-1-Bob", itemId), -15,
+            "465-mix: peer Bob −15 with full merged allowance")
+    end
+end
+
+do
+    -- #465 r4538978993: alias-heavy admission uses canonical deletion capacity;
+    -- forced failure after preview leaves no leaked durable fact/allowance.
+    local itemId = 9282
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "cap-alias-don", itemId = itemId, quantity = 8,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local cfg = record.accounting._consumables
+    if type(cfg.creditEventAliases) ~= "table" then
+        cfg.creditEventAliases = {}
+    end
+    -- Many aliases for one canonical donation → eventDeletions key count ≫ 1.
+    for i = 1, 64 do
+        cfg.creditEventAliases[string.format("cap-alias-%03d", i)] = "cap-alias-don"
+    end
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(record)
+    end
+    local del = select(1, GS:NewSoftDeleteOperation("cap-alias-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+        "465-fact: alias-heavy delete accepted")
+    local keyCount = 0
+    for _ in pairs(record.eventDeletions or {}) do
+        keyCount = keyCount + 1
+    end
+    local canonCount = GS.CountCanonicalSoftDeletions
+        and GS.CountCanonicalSoftDeletions(record.eventDeletions) or 0
+    assertTrue(keyCount >= 16, "465-fact: alias keys present n=" .. tostring(keyCount))
+    assertEq(canonCount, 1, "465-fact: canonical deletion count is 1")
+    assertTrue(type(record.accounting._consumables.softDeleteVerifiedFacts["cap-alias-don"]) == "table",
+        "465-fact: durable fact retained for accepted delete")
+
+    -- Forced reject/full after preview Remember: no leaked fact or allowance.
+    injectProductionDonation(record, {
+        id = "cap-force-don", itemId = itemId, quantity = 5,
+        actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+    })
+    local beforeForce = record.accounting._consumables.softDeleteVerifiedFacts["cap-force-don"]
+    assertNil(beforeForce, "465-fact: no fact before forced delete")
+    GS._softDeleteForceCapacityReject = true
+    local delForce = select(1, GS:NewSoftDeleteOperation("cap-force-don"))
+    local stForce = GS:ApplyStagedConfigOperation(delForce)
+    assertTrue(stForce == "rejected" or stForce == "failed",
+        "465-fact: forced capacity reject got " .. tostring(stForce))
+    assertNil(record.accounting._consumables.softDeleteVerifiedFacts["cap-force-don"],
+        "465-fact: no leaked durable fact after reject")
+    assertTrue(not GS.IsEventSoftDeleted(record, "cap-force-don"),
+        "465-fact: projection dropped rejected delete")
+    -- Bob still holds the undeleted +5 donation; −10 would require leaked debt.
+    local okBobNeg = GS.AdjustmentFloorOk(
+        record, itemId, -10, "Bob-Garona", record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Bob",
+        })
+    assertTrue(not okBobNeg,
+        "465-fact: rejected delete grants no Bob debt allowance")
+    -- Legitimate accepted delete still allows Alice soft-delete debt.
+    local okAlice = GS.AdjustmentFloorOk(
+        record, itemId, -3, "Alice-Garona", record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Alice",
+        })
+    assertTrue(okAlice, "465-fact: prior accepted fact still usable")
+end
+
+do
+    -- #465 r4539041882: forged orphan fact + delete/adj before late canonical
+    -- row must not publish; legitimate late-row control still adopts.
+    local itemId = 9283
+    local function buildSourceWithEvidence()
+        local record = seedLiveCampaignWithItem(itemId, 80)
+        injectProductionDonation(record, {
+            id = "late-don", itemId = itemId, quantity = 10,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+        })
+        injectProductionDonation(record, {
+            id = "late-stock", itemId = itemId, quantity = 40,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        local corr = select(1, GS:NewContributorCorrectionOperation(
+            "late-don", "Bob-Garona", "Player-1-Bob"))
+        -- Identity-noop correction still creates accepted history for attribution.
+        if corr then
+            corr.id = "late-corr"
+            corr.timestamp = world.time + 1
+            GS:ApplyStagedConfigOperation(corr)
+        end
+        -- Author balancing adj while Bob still has credit; delete afterward so
+        -- local prepare floors stay ordinary (remote catch-up honors debt floors).
+        local adj = select(1, GS:NewAdjustmentOperation(itemId, -6, "Bob-Garona"))
+        assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "465-late: source adj")
+        local del = select(1, GS:NewSoftDeleteOperation("late-don"))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-late: source delete")
+        return record, del, adj
+    end
+
+    -- Malicious transfer: forged fact qty, delete+adj before real row.
+    do
+        local record = buildSourceWithEvidence()
+        GS:EnsureGossipProvider()
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(128)
+        local exportBodies = collectAllExportBodies()
+        local sourceDataset = record.datasetId
+        -- Strip ledger donation from transfer; keep forged soft-delete fact.
+        local filtered = {}
+        for i = 1, #exportBodies do
+            local body = exportBodies[i].body
+            local skip = false
+            if body and body.kind == "gs-ledger-event" and body.event
+                and body.event.id == "late-don" then
+                skip = true
+            end
+            if not skip then
+                filtered[#filtered + 1] = exportBodies[i]
+            end
+        end
+        -- Alter verified fact quantity in descriptor / pages.
+        for i = 1, #filtered do
+            local body = filtered[i].body
+            if body and body.kind == "dataset-desc"
+                and type(body.softDeleteVerifiedFacts) == "table"
+                and type(body.softDeleteVerifiedFacts["late-don"]) == "table" then
+                body.softDeleteVerifiedFacts["late-don"].quantity = 99
+                body.softDeleteVerifiedFacts["late-don"].itemId = itemId
+            elseif body and body.kind == "gs-soft-delete-facts-page"
+                and type(body.facts) == "table"
+                and type(body.facts["late-don"]) == "table" then
+                body.facts["late-don"].quantity = 99
+            end
+        end
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "465-late: begin forged adoption")
+        -- Buffer forged transfer first (facts/ops) without late-don row.
+        for i = 1, #filtered do
+            GS:BufferAdoptionRecord(filtered[i].id, filtered[i].body)
+        end
+        -- Append the real canonical row after ops are buffered (late evidence).
+        local lateRow = {
+            kind = "gs-ledger-event",
+            event = {
+                type = GS.LEDGER_EVENT.DONATION,
+                id = "late-don",
+                txnId = "late-don",
+                generation = 1,
+                timestamp = world.time,
+                actor = "Bob-Garona",
+                actorGuid = "Player-1-Bob",
+                donorGuid = "Player-1-Bob",
+                itemId = itemId,
+                quantity = 10,
+                campaignId = nil,
+                verification = "officer",
+                writer = "Player-1-Alice",
+                gsProductionCredit = true,
+            },
+        }
+        -- Fill campaign/dataset from desc when possible.
+        for i = 1, #filtered do
+            local b = filtered[i].body
+            if b and b.kind == "dataset-desc" then
+                lateRow.event.campaignId = b.currentCampaignId
+                lateRow.event.datasetId = b.datasetId
+                lateRow.event.generation = tonumber(b.generation) or 1
+            end
+        end
+        GS:BufferAdoptionRecord("gs:ledger:late-don", lateRow)
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            "465-late: forged transfer ready")
+        local commitSt, commitErr = GS:CommitDatasetAdoption()
+        local gAdopt = 0
+        while commitSt == "pending" and gAdopt < 256 do
+            runOneDueTimer()
+            commitSt, commitErr = GS:CommitDatasetAdoption()
+            gAdopt = gAdopt + 1
+        end
+        flushTimers()
+        assertTrue(commitSt ~= "accepted",
+            "465-late: forged late-row transfer must not publish got "
+                .. tostring(commitSt) .. "/" .. tostring(commitErr))
+        assertTrue(commitErr == "soft_delete_fact_conflict"
+            or commitSt == "rejected" or commitSt == "failed",
+            "465-late: conflict-class failure err=" .. tostring(commitErr))
+    end
+
+    -- Legitimate late-row control: orphan fact matches real evidence.
+    do
+        local record = buildSourceWithEvidence()
+        GS:EnsureGossipProvider()
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(128)
+        local exportBodies = collectAllExportBodies()
+        local sourceDataset = record.datasetId
+        local filtered = {}
+        local lateBody = nil
+        for i = 1, #exportBodies do
+            local body = exportBodies[i].body
+            if body and body.kind == "gs-ledger-event" and body.event
+                and body.event.id == "late-don" then
+                lateBody = exportBodies[i]
+            else
+                filtered[#filtered + 1] = exportBodies[i]
+            end
+        end
+        assertTrue(lateBody ~= nil, "465-late: captured real late-don body")
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "465-late: begin legitimate adoption")
+        for i = 1, #filtered do
+            GS:BufferAdoptionRecord(filtered[i].id, filtered[i].body)
+        end
+        GS:BufferAdoptionRecord(lateBody.id, lateBody.body)
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            "465-late: legitimate transfer ready")
+        local commitSt, commitErr = GS:CommitDatasetAdoption()
+        local gAdopt = 0
+        while commitSt == "pending" and gAdopt < 256 do
+            runOneDueTimer()
+            commitSt, commitErr = GS:CommitDatasetAdoption()
+            gAdopt = gAdopt + 1
+        end
+        flushTimers()
+        assertEq(commitSt, "accepted",
+            "465-late: legitimate late-row publish got "
+                .. tostring(commitSt) .. "/" .. tostring(commitErr))
+        local adopted = GS:GetCurrentRecord()
+        assertTrue(GS.IsEventSoftDeleted(adopted, "late-don"),
+            "465-late: deletion final after legitimate late row")
+        assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), -6,
+            "465-late: Bob signed debt after legitimate adopt")
+        simulateRuntimeReload()
+        settleRoster()
+        assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), -6,
+            "465-late: reload keeps Bob debt")
+        local repair = select(1, GS:NewAdjustmentOperation(itemId, 6, "Bob-Garona"))
+        assertEq(GS:ApplyStagedConfigOperation(repair), "accepted",
+            "465-late: officer repair to zero")
+        assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
+            "465-late: repaired to zero")
+    end
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

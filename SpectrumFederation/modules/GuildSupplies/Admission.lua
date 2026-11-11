@@ -5751,6 +5751,15 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 visited = visited + 1
                 adop._workStats.completenessVisited =
                     (adop._workStats.completenessVisited or 0) + 1
+                -- Late evidence that conflicted with transferred/orphan facts
+                -- must fail closed before publish (#465 r4539041882).
+                if temp._gsSoftDeleteFactEvidenceConflict == true then
+                    opts.cursor = nil
+                    opts.budgetExhausted = false
+                    opts.softDeleteBind = nil
+                    publishCompletenessStats()
+                    return false, "soft_delete_fact_conflict"
+                end
                 bind.phase = "lookup"
             end
             if bind.phase == "lookup" then
@@ -5882,6 +5891,27 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                         opts.softDeleteBind = nil
                         publishCompletenessStats()
                         return false, "soft_delete_fact_unbound"
+                    end
+                    -- Available canonical evidence must agree with durable /
+                    -- projected item/quantity before atomic publish
+                    -- (#465 r4539041882). Truly missing evidence stays orphan-OK.
+                    if GS.FindLedgerEventById then
+                        local evidence = GS.FindLedgerEventById(temp, canon)
+                            or GS.FindLedgerEventById(temp, eventId)
+                        if type(evidence) == "table" then
+                            local projected = type(delMap) == "table"
+                                and (delMap[eventId] or delMap[canon]) or nil
+                            local check = (type(projected) == "table"
+                                and projected.verified == true) and projected or entry
+                            if tonumber(evidence.itemId) ~= tonumber(check.itemId)
+                                or tonumber(evidence.quantity) ~= tonumber(check.quantity) then
+                                opts.cursor = nil
+                                opts.budgetExhausted = false
+                                opts.softDeleteBind = nil
+                                publishCompletenessStats()
+                                return false, "soft_delete_fact_conflict"
+                            end
+                        end
                     end
                 end
                 bind.factPos = pos
@@ -8837,7 +8867,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         -- Winning correction from conflict resolution is accepted history (#465).
         if chosen.kind == GS.KIND.CORRECT_CONTRIBUTOR
             and GS.NoteAcceptedCorrectionHistoryMutation then
-            GS.NoteAcceptedCorrectionHistoryMutation(record)
+            GS.NoteAcceptedCorrectionHistoryMutation(record, chosen)
         end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-resolve")
@@ -9041,7 +9071,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 -- Notify after StoreAccepted (r4529162895); skip only when the
                 -- body was already present and history is unchanged.
                 if newlyRetained and GS.NoteAcceptedCorrectionHistoryMutation then
-                    GS.NoteAcceptedCorrectionHistoryMutation(record)
+                    GS.NoteAcceptedCorrectionHistoryMutation(record, stored)
                 end
                 -- Warm providers must export newly retained older corrections.
                 if newlyRetained and not admissionCtx.adoptionReplay
@@ -9397,7 +9427,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             -- Soft-delete hist/facts refresh AFTER accepted history is stored
             -- (delete-first / prior-correction-second; r4529162895).
             if GS.NoteAcceptedCorrectionHistoryMutation then
-                GS.NoteAcceptedCorrectionHistoryMutation(record)
+                GS.NoteAcceptedCorrectionHistoryMutation(record, stored)
             end
             if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
                 and GS.RedrivePendingContributorCorrections then
