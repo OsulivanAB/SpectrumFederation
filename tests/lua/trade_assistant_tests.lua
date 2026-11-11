@@ -780,6 +780,41 @@ do
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after ambiguous settlement")
 end
 
+-- Unchanged same-name variants settle by their original slots.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 3
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [2] = { itemId = 123, count = 1, link = LINK_VARIANT_SHARED_A },
+        [3] = { itemId = 123, count = 6, link = LINK_VARIANT_SHARED_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_A .. " 1") == true, "unchanged variant test queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_B .. " 2") == true, "unchanged variant test queues variant B")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "unchanged variant test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "unchanged variant prefill places both items")
+    assertEq(world.tradeSlots[1].link, LINK_VARIANT_SHARED_A, "first unchanged variant stays in slot one")
+    assertEq(world.tradeSlots[2].link, LINK_VARIANT_SHARED_B, "second unchanged variant stays in slot two")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "Alice is removed after unchanged variant settlement")
+    assertEq(snapshot[1].name, "Bob", "Bob remains queued after unchanged variant settlement")
+    assertEq(snapshot[1].itemCount, 2, "Bob retains both variant entries")
+    assertEq(snapshot[1].totalQuantity, 3, "Bob retains both variant quantities")
+end
+
 -- Edited same-name variants do not settle removed stacks by quantity.
 do
     resetWorld()

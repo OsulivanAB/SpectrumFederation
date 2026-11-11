@@ -1033,13 +1033,63 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
             end
         end
     end
+    local safeAmbiguousNames = {}
+    local safeAmbiguousSlotOffers = {}
+    for offerName in pairs(ambiguousNames) do
+        local offeredKeys = {}
+        local unknownKeys = {}
+        for _, offer in ipairs(offered or {}) do
+            if offer and offer.name == offerName then
+                local key = tostring(tonumber(offer.slot) or "?") .. ":" .. tostring(FloorQty(offer.quantity))
+                offeredKeys[key] = (offeredKeys[key] or 0) + 1
+            end
+        end
+        for _, entry in ipairs(unknown or {}) do
+            if entry and entry.name == offerName then
+                local key = tostring(tonumber(entry.slot) or "?") .. ":" .. tostring(FloorQty(entry.quantity))
+                unknownKeys[key] = (unknownKeys[key] or 0) + 1
+            end
+        end
+        local unchanged = true
+        for key, count in pairs(offeredKeys) do
+            if unknownKeys[key] ~= count then
+                unchanged = false
+                break
+            end
+        end
+        if unchanged then
+            for key, count in pairs(unknownKeys) do
+                if offeredKeys[key] ~= count then
+                    unchanged = false
+                    break
+                end
+            end
+        end
+        if unchanged then
+            safeAmbiguousNames[offerName] = true
+            safeAmbiguousSlotOffers[offerName] = {}
+            for _, offer in ipairs(offered or {}) do
+                local slot = tonumber(offer and offer.slot)
+                if offer and offer.name == offerName and slot then
+                    safeAmbiguousSlotOffers[offerName][slot] = offer
+                end
+            end
+        end
+    end
     local usedOffers = {}
     for _, entry in ipairs(unknown) do
         local slot = tonumber(entry and entry.slot)
         local quantity = FloorQty(entry and entry.quantity)
         local tradeName = entry and entry.name
         local match = nil
-        if not ambiguousNames[tradeName] then
+        if ambiguousNames[tradeName] then
+            if safeAmbiguousNames[tradeName] then
+                local slotOffer = safeAmbiguousSlotOffers[tradeName] and safeAmbiguousSlotOffers[tradeName][slot] or nil
+                if slotOffer and not usedOffers[slotOffer] and FloorQty(slotOffer.quantity) == quantity then
+                    match = slotOffer
+                end
+            end
+        else
             local slotOffer = slot and offeredBySlot[slot] or nil
             if slotOffer and not usedOffers[slotOffer] and not ambiguousOffers[slotOffer]
                 and TradeOfferNameCompatible(slotOffer.name, tradeName)
