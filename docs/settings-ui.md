@@ -2,7 +2,7 @@
 
 Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
-The left sidebar lists **categories** grouped as Core, Raid Tools, Advanced, and Optional. **Core** is General, Guild Settings, then Gameplay. **Raid Tools** is Loot Helper, Loot Logs, Raid Equipment, then Raid Supplies. Categories with more than one page show **tabs** in the content area. Categories with a single page have no tab bar. The first `/sf` open in a session starts on **General**. Later `/sf` toggles restore the category and tab from this session; that restoration is not saved across a reload.
+The left sidebar lists **categories** grouped as Core, Raid Tools, Advanced, and Optional. **Core** is General, Guild Settings, then Gameplay. **Raid Tools** is Loot Helper, Loot Logs, Raid Equipment, Raid Signup, then Raid Supplies. Categories with more than one page show **tabs** in the content area. Categories with a single page have no tab bar. The first `/sf` open in a session starts on **General**. Later `/sf` toggles restore the category and tab from this session; that restoration is not saved across a reload.
 
 **Quick Find** matches category and page names, descriptions, and group labels. With a search query, choosing a category opens the best matching page in that category.
 
@@ -102,6 +102,10 @@ The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It do
 **Raid Equipment** is a top-level Raid Tools category. It does not require a Loot Helper profile or session. Auto refresh is off by default and remains stored as `lootHelper.raidCheckAuditAutoRefresh`; enable it or select **Refresh Snapshot** when you need current data.
 
 See [Raid Check](features/raid-check.md) for interpretation and inspection limitations.
+
+## Raid Signup
+
+**Raid Signup** is a top-level Raid Tools category for season/tier roster plans. It does not require a Loot Helper profile or session. Officers manage named plans; members add free-text nickname entries with class/spec choices. A summary above the list shows main-only class counts and planned buff/utility coverage. See [Raid Signup](development/raid-signup/index.md).
 
 ## Loot Helper: Admin
 

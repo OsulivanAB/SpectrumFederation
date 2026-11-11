@@ -132,6 +132,16 @@ local function productionFixture()
             layout = { windowWidth = 1280, disablePageScroll = true },
         }),
         page({
+            id = "raidSignupBoard",
+            categoryId = "raidSignup",
+            name = "Raid Signup",
+            navLabel = "Raid Signup",
+            contentHeading = "Raid Signup",
+            group = "Raid Tools",
+            description = "Plan season and tier roster signups.",
+            order = 19,
+        }),
+        page({
             id = "lootHelperAdmin",
             parentId = "lootHelper",
             name = "Admin Settings",
@@ -271,6 +281,18 @@ local function productionFixture()
         enablementResolved = true,
     })
     categoriesById.raidEquipment = categories[#categories]
+
+    table.insert(categories, {
+        id = "raidSignup",
+        name = "Raid Signup",
+        navLabel = "Raid Signup",
+        group = "Raid Tools",
+        description = "Plan season and tier roster signups. Independent of Loot Helper profiles.",
+        order = 30,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.raidSignup = categories[#categories]
 
     table.insert(categories, {
         id = "nicheFeatures",
@@ -571,6 +593,7 @@ assertDeepEq(
         "lootHelper",
         "lootLogs",
         "raidEquipment",
+        "raidSignup",
         "guildSupplies",
         "debugging",
         "widgets",
@@ -603,6 +626,7 @@ assertDeepEq(sidebarLabels, {
     "lootHelper:Loot Helper",
     "lootLogs:Loot Logs",
     "raidEquipment:Raid Equipment",
+    "raidSignup:Raid Signup",
     "guildSupplies:Raid Supplies",
     "group:Advanced",
     "debugging:Debugging",

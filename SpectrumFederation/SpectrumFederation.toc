@@ -1,7 +1,7 @@
 ## Interface: 120105
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 1.5.19-beta.5
+## Version: 1.5.19-beta.6
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIconV2
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
@@ -98,6 +98,11 @@ modules/GuildInfo/Authority.lua
 modules/GuildInfo/Operations.lua
 modules/GuildInfo/Roster.lua
 modules/GuildInfo/Gossip.lua
+modules/RaidSignup/Coverage.lua
+modules/RaidSignup/State.lua
+modules/RaidSignup/Authority.lua
+modules/RaidSignup/Operations.lua
+modules/RaidSignup/Gossip.lua
 modules/RaidEquipment/Policy.lua
 modules/RaidEquipment/CheckRun.lua
 modules/RaidCheck.lua
@@ -138,6 +143,7 @@ modules/UI/Settings/Pages/GuildSuppliesRankings.lua
 modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua
 modules/UI/Settings/Pages/MainAltAssignments.lua
 modules/UI/Settings/Pages/RaidEquipment.lua
+modules/UI/Settings/Pages/RaidSignup.lua
 modules/UI/Settings/Pages/LootLogs.lua
 modules/UI/Settings/Pages/Debugging.lua
 modules/UI/Settings/StandaloneWindow.lua
