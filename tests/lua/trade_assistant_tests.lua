@@ -780,6 +780,37 @@ do
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after ambiguous settlement")
 end
 
+-- Identical missing-link stacks still settle by slot.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 4
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 1, link = LINK1 },
+        [2] = { itemId = 123, count = 1, link = LINK1 },
+        [3] = { itemId = 123, count = 1, link = LINK1 },
+        [4] = { itemId = 123, count = 1, link = LINK1 },
+    }
+    assertTrue(TA:HandleCommand(LINK1 .. " 2") == true, "identical stacks test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "identical stacks test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "identical stacks prefill places both stacks")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "identical stacks settle after delivery")
+    assertEq(snapshot[1].name, "Bob", "Alice is removed after identical stack settlement")
+end
+
 -- Bare IDs resolve through C_Item when GetItemInfo is uncached.
 do
     resetWorld()

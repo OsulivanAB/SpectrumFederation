@@ -966,6 +966,23 @@ local function TradeOfferSameNameAndQuantity(a, b)
         and FloorQty(a and a.quantity) == FloorQty(b and b.quantity)
 end
 
+local function TradeOfferSameIdentity(a, b)
+    if not a or not b then
+        return false
+    end
+    return tonumber(a.itemId) == tonumber(b.itemId)
+        and (a.linkKey == b.linkKey)
+end
+
+local function TradeOffersInterchangeable(first, candidates)
+    for index = 2, #candidates do
+        if not TradeOfferSameIdentity(first, candidates[index]) then
+            return false
+        end
+    end
+    return true
+end
+
 local function MergeAcceptedOffers(accepted, unknown, offered)
     local merged = {}
     for _, offer in ipairs(accepted or {}) do
@@ -986,7 +1003,8 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
     local ambiguousOffers = {}
     for _, offer in ipairs(offered or {}) do
         for _, other in ipairs(offered or {}) do
-            if offer ~= other and TradeOfferSameNameAndQuantity(offer, other) then
+            if offer ~= other and TradeOfferSameNameAndQuantity(offer, other)
+                and not TradeOfferSameIdentity(offer, other) then
                 ambiguousOffers[offer] = true
                 break
             end
@@ -1011,7 +1029,7 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
                     candidates[#candidates + 1] = offer
                 end
             end
-            if #candidates == 1 then
+            if #candidates > 0 and TradeOffersInterchangeable(candidates[1], candidates) then
                 match = candidates[1]
             end
         end
@@ -1022,7 +1040,7 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
                     nameCandidates[#nameCandidates + 1] = offer
                 end
             end
-            if #nameCandidates == 1 then
+            if #nameCandidates > 0 and TradeOffersInterchangeable(nameCandidates[1], nameCandidates) then
                 match = nameCandidates[1]
             end
         end
