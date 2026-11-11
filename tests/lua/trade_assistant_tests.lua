@@ -637,6 +637,38 @@ do
     assertEq(snapshot[1].name, "Bob", "Alice is removed after fallback settlement")
 end
 
+-- Missing links still respect offers removed before acceptance.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0][1].count = 10
+    world.bags[0][2].count = 5
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "missing link removal test queues item one")
+    assertTrue(TA:HandleCommand(LINK2 .. " 2") == true, "missing link removal test queues item two")
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "missing link removal test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "missing link removal prefill places both items")
+
+    world.tradeSlots[1] = nil -- remove item one; item two remains offered
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "missing link removal keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for the removed offer")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains only the removed offer")
+    assertEq(snapshot[1].items[1].itemLink, LINK1, "Alice retains item one")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after missing link removal")
+end
+
 -- A declined/cancelled trade leaves the player queued.
 do
     resetWorld()

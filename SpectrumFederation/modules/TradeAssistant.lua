@@ -767,7 +767,7 @@ local function PlaceOfferFromStack(bag, slot, quantity)
                 end
                 return false, "place_failed"
             end
-            return true, take
+            return true, take, tradeSlot
         end
     end
     if ClearCursor then
@@ -806,7 +806,7 @@ function TA:TryPrefillTrade(lifecycle, key)
     local attempted = 0
     for _, move in ipairs(moves) do
         attempted = attempted + 1
-        local ok, result = PlaceOfferFromStack(move.bag, move.slot, move.quantity)
+        local ok, result, tradeSlot = PlaceOfferFromStack(move.bag, move.slot, move.quantity)
         if ok then
             local placedQty = FloorQty(result)
             placed = placed + placedQty
@@ -816,6 +816,7 @@ function TA:TryPrefillTrade(lifecycle, key)
                     itemId = itemId,
                     linkKey = move.item and move.item.linkKey,
                     quantity = placedQty,
+                    slot = tradeSlot,
                 }
             end
         else
@@ -869,6 +870,7 @@ local function OnTradeShow()
         playerAccepted = false,
         targetAccepted = false,
         autoFill = autoFill,
+        acceptedCaptured = false,
     }
     if autoFill then
         local lifecycle = state.tradeLifecycle
@@ -884,35 +886,45 @@ local function OnTradeShow()
 end
 
 local function CaptureAcceptedOffer()
-    if not (GetTradePlayerItemInfo and GetTradePlayerItemLink) then
+    if not GetTradePlayerItemInfo then
         return nil
     end
     local offers = {}
+    local unknown = {}
+    local complete = true
     for slot = 1, TA.TRADE_SLOTS do
         local name, _, count = GetTradePlayerItemInfo(slot)
         if name then
             local itemId = nil
             local linkKey = nil
-            local link = GetTradePlayerItemLink(slot)
-            if type(link) == "string" then
-                itemId = tonumber(link:match("item:(%d+)"))
-                linkKey = NormalizeLinkKey(link)
-            end
-            if not itemId or not linkKey then
-                return nil
+            if GetTradePlayerItemLink then
+                local link = GetTradePlayerItemLink(slot)
+                if type(link) == "string" then
+                    itemId = tonumber(link:match("item:(%d+)"))
+                    linkKey = NormalizeLinkKey(link)
+                end
             end
             local qty = FloorQty(count)
             if qty < 1 then
                 qty = 1
             end
-            offers[#offers + 1] = {
-                itemId = itemId,
-                linkKey = linkKey,
-                quantity = qty,
-            }
+            if itemId and linkKey then
+                offers[#offers + 1] = {
+                    itemId = itemId,
+                    linkKey = linkKey,
+                    quantity = qty,
+                    slot = slot,
+                }
+            else
+                complete = false
+                unknown[#unknown + 1] = {
+                    slot = slot,
+                    quantity = qty,
+                }
+            end
         end
     end
-    return offers
+    return offers, unknown, complete
 end
 
 local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
@@ -926,9 +938,48 @@ local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
     if targetAccepted ~= nil then
         trade.targetAccepted = TradeAcceptFlag(targetAccepted)
     end
-    if trade.autoFill and trade.playerAccepted and trade.targetAccepted and trade.acceptedOffers == nil then
-        trade.acceptedOffers = CaptureAcceptedOffer()
+    if trade.autoFill and trade.playerAccepted and trade.targetAccepted and not trade.acceptedCaptured then
+        trade.acceptedCaptured = true
+        local offers, unknown, complete = CaptureAcceptedOffer()
+        if offers then
+            trade.acceptedOffers = offers
+            trade.acceptedUnknown = unknown
+            trade.acceptedComplete = complete
+        end
     end
+end
+
+local function MergeAcceptedOffers(accepted, unknown, offered)
+    local merged = {}
+    for _, offer in ipairs(accepted or {}) do
+        merged[#merged + 1] = offer
+    end
+    if type(unknown) ~= "table" or #unknown == 0 then
+        return merged
+    end
+    local offeredBySlot = {}
+    for _, offer in ipairs(offered or {}) do
+        local slot = tonumber(offer and offer.slot)
+        if slot then
+            offeredBySlot[slot] = offer
+        end
+    end
+    for _, entry in ipairs(unknown) do
+        local slot = tonumber(entry and entry.slot)
+        local match = slot and offeredBySlot[slot] or nil
+        local quantity = FloorQty(entry and entry.quantity)
+        if match and quantity > 0 then
+            merged[#merged + 1] = {
+                itemId = match.itemId,
+                linkKey = match.linkKey,
+                quantity = quantity,
+                slot = slot,
+            }
+        else
+            Debug("Info", "Trade settlement skipped unidentified offer in slot %s", tostring(slot))
+        end
+    end
+    return merged
 end
 
 local function OnTradeClosed()
@@ -940,7 +991,9 @@ local function OnTradeClosed()
     if trade.playerAccepted and trade.targetAccepted then
         if trade.autoFill then
             local settlement = trade.acceptedOffers
-            if settlement == nil then
+            if settlement ~= nil and trade.acceptedComplete == false then
+                settlement = MergeAcceptedOffers(settlement, trade.acceptedUnknown, trade.offeredOffers)
+            elseif settlement == nil then
                 settlement = trade.offeredOffers
             end
             if settlement ~= nil then
