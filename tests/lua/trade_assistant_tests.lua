@@ -467,8 +467,30 @@ do
     assertTrue(contains(world.errors[1], "SF Trade failed."), "insufficient inventory message is the failure message")
 end
 
+-- Exact link variants reserve inventory independently.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 4
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 1, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 1, link = LINK_VARIANT_A },
+        [3] = { itemId = 123, count = 1, link = LINK_VARIANT_B },
+        [4] = { itemId = 123, count = 1, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "variant reservation queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_B .. " 1") == true, "variant reservation queues variant B")
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "variant reservation keeps both raid members queued")
+    assertEq(snapshot[1].itemCount, 2, "variant reservation keeps both entries for Alice")
+    assertEq(snapshot[1].totalQuantity, 2, "variant reservation totals two for Alice")
+    assertEq(snapshot[2].itemCount, 2, "variant reservation keeps both entries for Bob")
+    assertEq(snapshot[2].totalQuantity, 2, "variant reservation totals two for Bob")
+end
+
 -- Clicking a queued player prefills every queued item; accepted trade removes only that player.
 do
+    resetWorld()
     resetAssistant()
     world.bags[0][1].count = 10
     world.bags[0][2].count = 5
@@ -497,6 +519,25 @@ do
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "completed trade removes only that player")
     assertEq(snapshot[1].name, "Bob", "Bob remains queued")
+end
+
+-- Player-first acceptance still settles when the trade closes without a cancel.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "player-first test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "player-first test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 1, "player-first prefill places item")
+
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 0)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "player-first completed trade removes Alice")
+    assertEq(snapshot[1].name, "Bob", "Bob remains queued after player-first settlement")
 end
 
 -- Partial prefill settles only offered quantities and retains the rest.
@@ -938,6 +979,7 @@ do
     frame.scripts.OnEvent(frame, "TRADE_SHOW")
     runAfter()
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 0)
+    frame.scripts.OnEvent(frame, "TRADE_REQUEST_CANCEL")
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
 
     local snapshot = TA:GetQueueSnapshot()

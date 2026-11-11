@@ -282,16 +282,26 @@ local function CollectStacksForItem(item)
     return stacks
 end
 
-local function QueuedTotalForItem(itemId)
+local function QueuedTotalForItem(item)
     local total = 0
-    local wanted = tonumber(itemId)
+    local wantedId = tonumber(item and item.itemId)
+    local wantedLinkKey = item and item.linkKey
+    if not wantedId then
+        return 0
+    end
     for _, key in ipairs(state.order) do
         local player = state.players[key]
         if player then
             for _, itemKey in ipairs(player.itemOrder) do
-                local item = player.items[itemKey]
-                if item and tonumber(item.itemId) == wanted then
-                    total = total + FloorQty(item.quantity)
+                local queued = player.items[itemKey]
+                if queued and tonumber(queued.itemId) == wantedId then
+                    local include = true
+                    if wantedLinkKey then
+                        include = queued.linkKey == wantedLinkKey or queued.linkKey == nil
+                    end
+                    if include then
+                        total = total + FloorQty(queued.quantity)
+                    end
                 end
             end
         end
@@ -642,7 +652,7 @@ function TA:HandleCommand(args)
     end
 
     local available = CountCarriedItem(item)
-    local required = QueuedTotalForItem(item.itemId) + (FloorQty(item.quantity) * #members)
+    local required = QueuedTotalForItem(item) + (FloorQty(item.quantity) * #members)
     if available < required then
         SF:PrintError(Loc("TRADE_ASSISTANT_ERR_INSUFFICIENT", "SF Trade failed."))
         Debug("Info", "Rejected /sf trade: available=%d required=%d item=%s", available, required, tostring(item.itemId))
@@ -872,6 +882,7 @@ local function OnTradeShow()
         playerAccepted = false,
         targetAccepted = false,
         autoFill = autoFill,
+        cancelled = false,
     }
     if autoFill then
         local lifecycle = state.tradeLifecycle
@@ -940,7 +951,7 @@ local function OnTradeAcceptUpdate(playerAccepted, targetAccepted)
     if targetAccepted ~= nil then
         trade.targetAccepted = TradeAcceptFlag(targetAccepted)
     end
-    if trade.autoFill and trade.playerAccepted and trade.targetAccepted then
+    if trade.autoFill and trade.playerAccepted then
         local offers, unknown, complete = CaptureAcceptedOffer()
         trade.acceptedOffers = offers
         trade.acceptedUnknown = unknown
@@ -1134,13 +1145,22 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
     return merged
 end
 
+local function OnTradeRequestCancel()
+    local trade = state.activeTrade
+    if not trade then
+        return
+    end
+    trade.cancelled = true
+    Debug("Info", "Trade cancelled for %s", tostring(trade.name or trade.key))
+end
+
 local function OnTradeClosed()
     local trade = state.activeTrade
     state.activeTrade = nil
     if not trade or not trade.key then
         return
     end
-    if trade.playerAccepted and trade.targetAccepted then
+    if trade.playerAccepted and not trade.cancelled then
         if trade.autoFill then
             local settlement = trade.acceptedOffers
             if settlement ~= nil and trade.acceptedComplete == false then
@@ -1207,6 +1227,7 @@ function TA:EnsureListeners()
     state.frame = frame
     frame:RegisterEvent("TRADE_SHOW")
     frame:RegisterEvent("TRADE_ACCEPT_UPDATE")
+    frame:RegisterEvent("TRADE_REQUEST_CANCEL")
     frame:RegisterEvent("TRADE_CLOSED")
     frame:RegisterEvent("PLAYER_LOGOUT")
     frame:SetScript("OnEvent", function(_, event, ...)
@@ -1214,6 +1235,8 @@ function TA:EnsureListeners()
             OnTradeShow()
         elseif event == "TRADE_ACCEPT_UPDATE" then
             OnTradeAcceptUpdate(...)
+        elseif event == "TRADE_REQUEST_CANCEL" then
+            OnTradeRequestCancel()
         elseif event == "TRADE_CLOSED" then
             OnTradeClosed()
         elseif event == "PLAYER_LOGOUT" then

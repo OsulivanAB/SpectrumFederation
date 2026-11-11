@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,14 @@ CHILD_TOCS = (
     REPO_ROOT / "SpectrumFederation_CursedSurgeTracker" / "SpectrumFederation_CursedSurgeTracker.toc",
     REPO_ROOT / "SpectrumFederation_RCLootCouncilIntegration" / "SpectrumFederation_RCLootCouncilIntegration.toc",
 )
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?$")
+
+
+def _toc_version(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## Version:"):
+            return line.split(":", 1)[1].strip()
+    return ""
 
 EXPECTED_LOCALE_KEYS = {
     "TRADE_ASSISTANT_TITLE",
@@ -50,9 +59,10 @@ def _lua51() -> str:
 
 def test_trade_assistant_packaging_and_localization_contract():
     toc = TOC.read_text(encoding="utf-8")
-    assert "## Version: 1.5.19-beta.6" in toc
+    parent_version = _toc_version(TOC)
+    assert VERSION_RE.fullmatch(parent_version)
     for child_toc in CHILD_TOCS:
-        assert "## Version: 1.5.19-beta.6" in child_toc.read_text(encoding="utf-8")
+        assert _toc_version(child_toc) == parent_version
     assert CORE.exists()
     assert WINDOW.exists()
 
