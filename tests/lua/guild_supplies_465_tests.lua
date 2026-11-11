@@ -4973,6 +4973,8 @@ do
     GS._softDeleteCumulativeHistVisits = 0
     GS._softDeleteCumulativeHeadVisits = 0
     GS._softDeleteAffectedAttributionRefreshes = 0
+    GS._softDeleteDeletionMapVisits = 0
+    local mapVisitPeak = 0
     local function rebindCorr(body, rec, target, attr, attrGuid, id, ts)
         local out = {}
         for k, v in pairs(body) do out[k] = v end
@@ -5007,6 +5009,10 @@ do
         assertTrue(st == "accepted" or st == "duplicate",
             "465-cr: admit correction " .. tostring(i)
                 .. " got " .. tostring(st) .. "/" .. tostring(r))
+        local mv = tonumber(GS._softDeleteDeletionMapVisits) or 0
+        if mv > mapVisitPeak then
+            mapVisitPeak = mv
+        end
     end
     local histVisits = tonumber(GS._softDeleteCumulativeHistVisits) or 0
     local headVisits = tonumber(GS._softDeleteCumulativeHeadVisits) or 0
@@ -5019,6 +5025,16 @@ do
         "465-cr: hist visits bounded got " .. tostring(histVisits))
     assertTrue(headVisits <= corrN + deleteN + 8,
         "465-cr: head visits near-linear got " .. tostring(headVisits))
+    -- Per-correction eventDeletions pairs() scans charge ≥ |map| keys each
+    -- refresh. Shared-entry field copies stay near the entry width (≪ |map|
+    -- once aliases inflate the map beyond a single head).
+    local delMapSize = 0
+    for _ in pairs(record.eventDeletions or {}) do
+        delMapSize = delMapSize + 1
+    end
+    assertTrue(mapVisitPeak <= 64,
+        "465-cr: deletion-map visits bounded per refresh peak="
+            .. tostring(mapVisitPeak) .. " mapSize=" .. tostring(delMapSize))
     -- Immediate ordinary-read correctness after last correction (corrN even → Bob).
     local lastTarget = deleteIds[((corrN - 1) % deleteN) + 1]
     local entry = record.eventDeletions and record.eventDeletions[lastTarget]
@@ -5551,6 +5567,446 @@ do
             "465-late: officer repair to zero")
         assertEq(GS.PersonalContributorItemTotal(adopted, "Bob-Garona", "Player-1-Bob", itemId), 0,
             "465-late: repaired to zero")
+    end
+end
+
+do
+    -- #465 r4539832738: completeness evidence uses one budgeted event-object
+    -- index across yields — never FindLedgerEventById per fact.
+    local Validate = GS._ValidateAdoptionCompletenessForTest
+    assertTrue(type(Validate) == "function", "465-evidx: completeness seam")
+    assertTrue(type(GS.BuildSoftDeleteEventObjectIndex) == "function",
+        "465-evidx: shared index export")
+    local itemId = 9290
+    local record = seedLiveCampaignWithItem(itemId, 400)
+    local factN, padN = 48, 120
+    local durable = {}
+    record.accounting._consumables.softDeleteVerifiedFacts = durable
+    record.eventDeletions = {}
+    for i = 1, factN do
+        local id = string.format("evidx-del-%03d", i)
+        injectProductionDonation(record, {
+            id = id, itemId = itemId, quantity = 2,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+            timestamp = world.time + i,
+        })
+        local del = select(1, GS:NewSoftDeleteOperation(id))
+        assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+            "465-evidx: delete " .. id)
+        local entry = record.eventDeletions and record.eventDeletions[id]
+        assertTrue(type(entry) == "table" and entry.verified == true,
+            "465-evidx: verified " .. id)
+        durable[id] = {
+            verified = true,
+            eventId = id,
+            eventKind = "donation",
+            itemId = itemId,
+            quantity = 2,
+            campaignId = record.currentCampaignId,
+            attributed = "Alice-Garona",
+            attributedGuid = "Player-1-Alice",
+            gsProductionCredit = true,
+        }
+    end
+    for i = 1, padN do
+        injectProductionDonation(record, {
+            id = string.format("evidx-pad-%03d", i), itemId = itemId, quantity = 1,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob",
+            timestamp = world.time + 1000 + i,
+        })
+    end
+    local findCalls = 0
+    local realFind = GS.FindLedgerEventById
+    GS.FindLedgerEventById = function(...)
+        findCalls = findCalls + 1
+        return realFind(...)
+    end
+    local adop = {
+        order = {},
+        records = {},
+        _workStats = {},
+    }
+    local opts = { budget = 40, cursor = 1 }
+    local ok, err = Validate(record, adop, opts)
+    local slices = 0
+    local totalVisited = 0
+    while ok == false and err == "budget" and slices < 64 do
+        slices = slices + 1
+        totalVisited = totalVisited
+            + (tonumber(adop._workStats and adop._workStats.completenessVisited) or 0)
+        opts.budget = 40
+        ok, err = Validate(record, adop, opts)
+    end
+    GS.FindLedgerEventById = realFind
+    assertEq(ok, true,
+        "465-evidx: completeness ok got " .. tostring(ok) .. "/" .. tostring(err))
+    -- Per-fact FindLedgerEventById would be ≥ factN (often 2×). Shared index
+    -- keeps incidental FindLedger use far below that floor.
+    assertTrue(findCalls < factN,
+        "465-evidx: no per-fact ledger scans got " .. tostring(findCalls))
+    local indexVisits = tonumber(adop._workStats and adop._workStats.softDeleteEventIndexVisits) or 0
+    assertTrue(indexVisits >= factN,
+        "465-evidx: event-index visits charged got " .. tostring(indexVisits))
+    -- Naive per-fact full-list scans would visit ≫ factN × (factN+padN).
+    local naive = factN * (factN + padN)
+    totalVisited = totalVisited
+        + (tonumber(adop._workStats and adop._workStats.completenessVisited) or 0)
+    assertTrue(totalVisited < naive / 4,
+        "465-evidx: nested completeness work bounded got "
+            .. tostring(totalVisited) .. " naive=" .. tostring(naive))
+    assertTrue(slices >= 1
+        or (tonumber(adop._workStats and adop._workStats.completenessVisited) or 0) > 40,
+        "465-evidx: budgeted completeness work observed slices="
+            .. tostring(slices))
+end
+
+do
+    -- #465 r4539343147: soft-delete known-older-policy catch-up (policy-first /
+    -- delete-first, missing predecessor, demotion).
+    local itemId = 9291
+    local function seedDeletePolicyFixture()
+        local record = seedLiveCampaignWithItem(itemId, 80)
+        injectProductionDonation(record, {
+            id = "pol-don", itemId = itemId, quantity = 5,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+        })
+        return record
+    end
+    local function makeDeleteBody(record, policyRev, id, ts)
+        local ctx = select(1, GS:GetCurrentContext())
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.SOFT_DELETE_EVENT,
+            target = "pol-don",
+            value = {
+                eventId = "pol-don", eventKind = "donation",
+                itemId = itemId, quantity = 5,
+                attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = ts or (world.time + 1),
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = policyRev,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+    local function makeRankBody(record, policy0, id, ts)
+        local ctx = select(1, GS:GetCurrentContext())
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = ctx.guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.SET_EDITOR_RANK,
+            target = "editorRankPosition",
+            value = 2,
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = ts or (world.time + 2),
+            baseTargetRevision = policy0,
+            basePolicyRevision = policy0,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+
+    -- Policy-first then older-policy delete.
+    do
+        local record = seedDeletePolicyFixture()
+        local policy0 = record.permission and record.permission.revisionId
+        local rank = makeRankBody(record, policy0, "pol-rank-a", world.time + 2)
+        local del = makeDeleteBody(record, policy0, "pol-del-a", world.time + 1)
+        assertEq(select(1, GS:AdmitRemoteOperation(rank, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "465-pol: policy-first rank accepted")
+        local st, r = GS:AdmitRemoteOperation(del, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        local g = 0
+        while st == "pending" and g < 64 do
+            if not runOneDueTimer() then break end
+            st, r = GS:AdmitRemoteOperation(del, {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+            g = g + 1
+        end
+        flushTimers()
+        assertTrue(st == "accepted" or st == "duplicate",
+            "465-pol: policy-first delete catch-up st="
+                .. tostring(st) .. "/" .. tostring(r))
+        assertTrue(GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol: policy-first deletion final")
+    end
+
+    -- Delete-first then policy still keeps deletion.
+    do
+        local record = seedDeletePolicyFixture()
+        local policy0 = record.permission and record.permission.revisionId
+        local del = makeDeleteBody(record, policy0, "pol-del-b", world.time + 1)
+        local rank = makeRankBody(record, policy0, "pol-rank-b", world.time + 2)
+        assertEq(select(1, GS:AdmitRemoteOperation(del, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "465-pol: delete-first accepted")
+        assertTrue(GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol: delete-first deleted")
+        assertEq(select(1, GS:AdmitRemoteOperation(rank, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "465-pol: delete-first later policy")
+        assertTrue(GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol: deletion survives later policy")
+    end
+
+    -- Missing policy predecessor remains pending.
+    do
+        local record = seedDeletePolicyFixture()
+        local del = makeDeleteBody(record, "never-seen-policy", "pol-del-miss", world.time + 1)
+        local st, r = GS:AdmitRemoteOperation(del, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending", "465-pol: missing predecessor pending")
+        assertEq(r, "missing_policy_predecessor",
+            "465-pol: missing reason got " .. tostring(r))
+        assertTrue(not GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol: missing pred does not delete")
+    end
+
+    -- Unauthorized member cannot prepare a soft-delete (auth control).
+    do
+        local record = seedDeletePolicyFixture()
+        switchPlayer("Dave", "Player-1-Dave", 4)
+        settleRoster()
+        local op, _, reason = GS:NewSoftDeleteOperation("pol-don")
+        assertNil(op, "465-pol: member prepare rejected")
+        assertEq(reason, "unauthorized",
+            "465-pol: unauthorized reason got " .. tostring(reason))
+        assertTrue(not GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol: unauthorized delete absent")
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        settleRoster()
+    end
+end
+
+do
+    -- #465 Devin 5860609021: two concurrent locally-valid corrections merge with
+    -- one floor-inactive; deleting the inactive target removes Alice's effective
+    -- credit (not the inactive recipient). Follows #459 Bob−10 dependency so
+    -- Bob stays active and Carol stays inactive. Both receipt orders + adopt/reload.
+    local itemId = 9292
+    local function seedBase()
+        local record = seedLiveCampaignWithItem(itemId, 100)
+        injectProductionDonation(record, {
+            id = "inact-d1", itemId = itemId, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 8000,
+        })
+        injectProductionDonation(record, {
+            id = "inact-d2", itemId = itemId, quantity = 10,
+            actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 8001,
+        })
+        world.time = math.max(world.time, 8002)
+        local aliceAdj = select(1, GS:NewAdjustmentOperation(
+            itemId, -10, "Alice-Garona"))
+        assertTrue(aliceAdj ~= nil, "465-inact: prepare Alice−10")
+        assertEq(GS:ApplyStagedConfigOperation(aliceAdj), "accepted",
+            "465-inact: Alice−10")
+        return record
+    end
+    local function rebind(body, rec)
+        local out = {}
+        for k, v in pairs(body) do out[k] = v end
+        out.guildKey = select(1, GS:GetCurrentContext()).guildKey
+        out.datasetId = rec.datasetId
+        out.campaignId = rec.currentCampaignId
+        out.baseCampaignId = rec.currentCampaignId
+        out.basePolicyRevision = rec.permission and rec.permission.revisionId
+        out.baseTargetRevision = rec.datasetId
+        return out
+    end
+    local function assertInactiveDeleteOutcome(record, label, carolId)
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        if GS.EnsureCreditCorrectionProjection then
+            GS.EnsureCreditCorrectionProjection(record, nil)
+        end
+        assertTrue(GS.IsEventSoftDeleted(record, "inact-d2"),
+            label .. ": D2 deleted")
+        local entry = record.eventDeletions and record.eventDeletions["inact-d2"]
+        assertTrue(type(entry) == "table" and entry.verified == true,
+            label .. ": verified facts")
+        if type(entry) ~= "table" then
+            return
+        end
+        assertEq(entry.attributed, "Alice-Garona",
+            label .. ": effective Alice attribution not inactive Carol")
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Alice-Garona", "Player-1-Alice", itemId), -10,
+            label .. ": Alice signed debt −10")
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Carol-Garona", "Player-1-Carol", itemId), 0,
+            label .. ": Carol not granted debt allowance")
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+            label .. ": Bob spent credit remains 0")
+        local retainedCarol = false
+        if type(carolId) == "string"
+            and type(record.operations.records) == "table"
+            and type(record.operations.records[carolId]) == "table" then
+            retainedCarol = true
+        elseif type(record.operations.records) == "table" then
+            for _, body in pairs(record.operations.records) do
+                if type(body) == "table"
+                    and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                    and (body.target == "inact-d2"
+                        or (body.value and body.value.eventId == "inact-d2"))
+                    and body.value and body.value.attributed == "Carol-Garona" then
+                    retainedCarol = true
+                    break
+                end
+            end
+        end
+        assertTrue(retainedCarol, label .. ": inactive Carol correction retained")
+        assertTrue(not (type(record.creditCorrections) == "table"
+            and type(record.creditCorrections["inact-d2"]) == "table"),
+            label .. ": D2 correction inactive in projection")
+        assertTrue(type(record.creditCorrections) == "table"
+            and type(record.creditCorrections["inact-d1"]) == "table",
+            label .. ": Bob correction remains active")
+    end
+
+    local function admitUntilSettled(body, record, label)
+        local st, r = GS:AdmitRemoteOperation(rebind(body, record), {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        local g = 0
+        while st == "pending" and g < 64 do
+            if not runOneDueTimer() then break end
+            st, r = GS:AdmitRemoteOperation(rebind(body, record), {
+                sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+            })
+            g = g + 1
+        end
+        flushTimers()
+        assertTrue(st == "accepted" or st == "duplicate",
+            label .. " st=" .. tostring(st) .. "/" .. tostring(r))
+        return st, r
+    end
+
+    -- Peer1 pattern: D1→Bob + Bob−10, then admit newer D2→Carol (inactive).
+    -- Keep source as the current record through delete so ApplyStaged targets it.
+    local source = seedBase()
+    -- Snapshot a locally-valid Carol correction before Bob consumes Alice's floor.
+    world.time = 8900
+    local corrCarolPrep = select(1, GS:NewContributorCorrectionOperation(
+        "inact-d2", "Carol-Garona", "Player-1-Carol"))
+    assertTrue(corrCarolPrep ~= nil, "465-inact: prepare Carol snap")
+    local carolSnap = select(1, GS._SnapshotPublicOp(corrCarolPrep))
+    assertTrue(type(carolSnap) == "table", "465-inact: Carol snapshot")
+    carolSnap.timestamp = 9500
+    local carolId = carolSnap.id
+
+    world.time = 9000
+    local corrBob = select(1, GS:NewContributorCorrectionOperation(
+        "inact-d1", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corrBob ~= nil, "465-inact: prepare Bob corr")
+    assertEq(GS:ApplyStagedConfigOperation(corrBob), "accepted", "465-inact: Bob corr")
+    local cut1 = source.liveCutover
+    local boundary1 = tonumber(cut1 and cut1.eligibilityBoundary
+            and cut1.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(cut1 and cut1.contextObservedAt) or world.time
+    world.time = math.max(world.time, boundary1) + 50
+    local bobAdj = select(1, GS:NewAdjustmentOperation(itemId, -10, "Bob-Garona"))
+    assertTrue(bobAdj ~= nil, "465-inact: prepare Bob−10")
+    assertEq(GS:ApplyStagedConfigOperation(bobAdj), "accepted", "465-inact: Bob−10")
+    local bobSnap = select(1, GS._SnapshotPublicOp(corrBob))
+    local bobAdjSnap = select(1, GS._SnapshotPublicOp(bobAdj))
+
+    assertEq(select(1, GS:AdmitRemoteOperation(rebind(carolSnap, source), {
+        sender = "Alice-Garona", offlineRecord = source, preserveAttribution = true,
+    })), "accepted", "465-inact: source admits Carol")
+    GS.EnsureCreditCorrectionProjection(source, nil)
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        source, GS.FindLedgerEventById(source, "inact-d1"))), "Bob-Garona",
+        "465-inact: Bob correction active")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+        source, GS.FindLedgerEventById(source, "inact-d2"))), "Alice-Garona",
+        "465-inact: Carol correction inactive after merge")
+    assertTrue(type(source.operations.records[carolId]) == "table",
+        "465-inact: Carol body in accepted history")
+
+    local delD2 = select(1, GS:NewSoftDeleteOperation("inact-d2"))
+    assertTrue(delD2 ~= nil, "465-inact: prepare delete D2")
+    assertEq(GS:ApplyStagedConfigOperation(delD2), "accepted", "465-inact: delete D2")
+    assertTrue(GS.IsEventSoftDeleted(source, "inact-d2"),
+        "465-inact: source map deleted before outcome asserts")
+    assertInactiveDeleteOutcome(source, "465-inact-src", carolId)
+    local delSnap = select(1, GS._SnapshotPublicOp(delD2))
+
+    -- Reload persistence on the authoritative merged source.
+    simulateRuntimeReload()
+    settleRoster()
+    assertInactiveDeleteOutcome(source, "465-inact-reload", carolId)
+    local repair = select(1, GS:NewAdjustmentOperation(itemId, 10, "Alice-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted",
+        "465-inact-reload: repair Alice debt")
+    assertEq(GS.PersonalContributorItemTotal(
+        source, "Alice-Garona", "Player-1-Alice", itemId), 0,
+        "465-inact-reload: repaired")
+
+    -- Fresh peer datasets cover both receipt orders (adoption-equivalent delivery).
+    -- Peer receipt order A: local Bob + Bob−10 (459 peer1), then remote Carol/delete.
+    do
+        local peer = seedBase()
+        world.time = 9000
+        local moveD1 = select(1, GS:NewContributorCorrectionOperation(
+            "inact-d1", "Bob-Garona", "Player-1-Bob"))
+        assertEq(GS:ApplyStagedConfigOperation(moveD1), "accepted", "465-inact-A: local Bob")
+        local cut = peer.liveCutover
+        local boundary = tonumber(cut and cut.eligibilityBoundary
+                and cut.eligibilityBoundary.tabEligibleFrom)
+            or tonumber(cut and cut.contextObservedAt) or world.time
+        world.time = math.max(world.time, boundary) + 50
+        local adj = select(1, GS:NewAdjustmentOperation(itemId, -10, "Bob-Garona"))
+        assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "465-inact-A: local Bob−10")
+        admitUntilSettled(carolSnap, peer, "465-inact-A: Carol")
+        assertTrue(GS.EnsureCreditCorrectionProjection(peer, nil),
+            "465-inact-A: projection ready")
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            peer, GS.FindLedgerEventById(peer, "inact-d1"))), "Bob-Garona",
+            "465-inact-A: Bob active before delete")
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            peer, GS.FindLedgerEventById(peer, "inact-d2"))), "Alice-Garona",
+            "465-inact-A: Carol inactive before delete")
+        admitUntilSettled(delSnap, peer, "465-inact-A: delete")
+        assertInactiveDeleteOutcome(peer, "465-inact-A", carolId)
+    end
+
+    -- Peer receipt order B: Carol first (alone valid), then Bob history + delete.
+    do
+        local peer = seedBase()
+        world.time = 8500
+        local moveCarol = select(1, GS:NewContributorCorrectionOperation(
+            "inact-d2", "Carol-Garona", "Player-1-Carol"))
+        assertEq(GS:ApplyStagedConfigOperation(moveCarol), "accepted",
+            "465-inact-B: local Carol first")
+        admitUntilSettled(bobSnap, peer, "465-inact-B: Bob")
+        local cut = peer.liveCutover
+        local boundary = tonumber(cut and cut.eligibilityBoundary
+                and cut.eligibilityBoundary.tabEligibleFrom)
+            or tonumber(cut and cut.contextObservedAt) or world.time
+        world.time = math.max(world.time, boundary) + 50
+        local adj = select(1, GS:NewAdjustmentOperation(itemId, -10, "Bob-Garona"))
+        assertTrue(adj ~= nil, "465-inact-B: prepare Bob−10")
+        assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "465-inact-B: local Bob−10")
+        assertTrue(GS.EnsureCreditCorrectionProjection(peer, nil),
+            "465-inact-B: projection ready")
+        assertEq(select(1, GS.ResolveEffectiveCreditIdentity(
+            peer, GS.FindLedgerEventById(peer, "inact-d2"))), "Alice-Garona",
+            "465-inact-B: Carol inactive after Bob dependency")
+        admitUntilSettled(delSnap, peer, "465-inact-B: delete")
+        assertInactiveDeleteOutcome(peer, "465-inact-B", nil)
     end
 end
 

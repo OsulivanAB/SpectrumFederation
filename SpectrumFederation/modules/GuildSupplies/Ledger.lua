@@ -10882,7 +10882,7 @@ end
 --- Bounded event-object index for soft-delete rebuild (#465).
 -- Distinct from BuildCreditCanonicalLookup (which stores canonical-ID strings).
 -- Definitive misses are false; never falls back to FindLedgerEventById per head.
--- @return table { byObj=, visits= }
+-- @return table { byObj=, aliasesByCanon=, visits= }
 local function BuildSoftDeleteEventObjectIndex(record, lookup)
     local byObj = {}
     local aliasesByCanon = {}
@@ -10955,6 +10955,234 @@ local function BuildSoftDeleteEventObjectIndex(record, lookup)
     return { byObj = byObj, aliasesByCanon = aliasesByCanon, visits = visits }
 end
 
+-- Adoption completeness / tests: shared event-object index builder (#465 r4539832738).
+GS.BuildSoftDeleteEventObjectIndex = BuildSoftDeleteEventObjectIndex
+
+--- Personal total for hist-effectiveness floors: soft-deleted rows still count
+-- so deleted-event attribution matches pre-delete floor reconstruction (#465).
+-- Hosted on SoftDeleteRuntime to stay under Lua 5.1's 200-local chunk limit.
+function SoftDeleteRuntime.personalTotalIncludingSoftDeleted(
+    record, actorName, actorGuid, itemId, campaignId, activeMap)
+    itemId = tonumber(itemId)
+    if type(record) ~= "table" or not IsItemId(itemId) then
+        return 0
+    end
+    campaignId = campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return 0
+    end
+    local identityName = NormName(actorName)
+    local identityGuid = ValidGuid(actorGuid)
+    if not identityName and not identityGuid then
+        return 0
+    end
+    local generation = nil
+    if record.currentCampaignId == campaignId then
+        local cfg = record.accounting and record.accounting._consumables
+        generation = cfg and tonumber(cfg.generation)
+    end
+    if not generation then
+        local archive = record.campaignArchives and record.campaignArchives[campaignId]
+        generation = archive and tonumber(archive.generation)
+    end
+    if not generation or generation < 1 then
+        return 0
+    end
+    local function sideMatches(sideName, sideGuid)
+        local g = ValidGuid(sideGuid)
+        if identityGuid and g then
+            return g == identityGuid
+        end
+        local side = NormName(sideName)
+        if identityGuid and not g then
+            if side and identityName and side == identityName then
+                return true
+            end
+            if side then
+                local resolved = GS.ResolveUniqueCharacterGuid(record, side, nil)
+                if resolved and resolved == identityGuid then
+                    return true
+                end
+            end
+            return false
+        end
+        return side ~= nil and identityName ~= nil and side == identityName
+    end
+    local total = 0
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if tonumber(event.generation) ~= generation then
+            return
+        end
+        -- Soft-deleted production rows still count for hist effectiveness.
+        if event.type == "withdrawal"
+            or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL) then
+            return
+        end
+        if GS.IsLiveActive and GS.IsLiveActive(record)
+            and event.gsProductionCredit ~= true then
+            return
+        end
+        if tonumber(event.itemId) ~= itemId then
+            return
+        end
+        local qty = tonumber(event.quantity) or 0
+        if qty == 0 then
+            return
+        end
+        local typ = event.type
+        local isDonation = typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION"
+        local isAdjustment = typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT"
+        if not isDonation and not isAdjustment then
+            return
+        end
+        local creditName, creditGuid
+        local override = type(activeMap) == "table" and type(event.id) == "string"
+            and activeMap[event.id] or nil
+        if type(override) == "table" then
+            creditName, creditGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
+        else
+            creditName, creditGuid = DurableCreditIdentity(event)
+        end
+        if isDonation then
+            if qty > 0 and sideMatches(creditName, creditGuid) then
+                total = total + qty
+            end
+        elseif creditName or creditGuid then
+            if sideMatches(creditName, creditGuid) then
+                total = total + qty
+            end
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        for i = 1, #live do
+            consider(live[i])
+        end
+    end
+    if type(archived) == "table" then
+        for i = 1, #archived do
+            consider(archived[i])
+        end
+    end
+    return total
+end
+
+function SoftDeleteRuntime.floorOkIncludingSoftDeleted(
+    record, event, newName, newGuid, activeMap)
+    if type(record) ~= "table" or type(event) ~= "table" then
+        return false, "invalid_event"
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity)
+    if not IsItemId(itemId) or not qty or qty ~= qty or qty ~= math.floor(qty) or qty == 0 then
+        return false, "invalid_event"
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return false, "no_campaign"
+    end
+    local curName, curGuid
+    local override = type(activeMap) == "table" and activeMap[event.id]
+    if type(override) == "table" then
+        curName, curGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
+    else
+        curName, curGuid = DurableCreditIdentity(event)
+    end
+    newName = NormName(newName)
+    newGuid = ValidGuid(newGuid)
+    if CreditIdentitiesEqual(curName, curGuid, newName, newGuid) then
+        return true
+    end
+    if curName or curGuid then
+        local personal = SoftDeleteRuntime.personalTotalIncludingSoftDeleted(
+            record, curName, curGuid, itemId, campaignId, activeMap)
+        if personal - qty < 0 then
+            return false, "player_negative"
+        end
+    end
+    if newName or newGuid then
+        local personal = SoftDeleteRuntime.personalTotalIncludingSoftDeleted(
+            record, newName, newGuid, itemId, campaignId, activeMap)
+        if personal + qty < 0 then
+            return false, "player_negative"
+        end
+    end
+    return true
+end
+
+--- Mark hist LWW winners that survive ordinary floor activation when soft-deleted
+-- rows still contribute. Floor-suppressed corrections keep present=true for audit
+-- but effective=false so soft-delete facts do not grant their recipients debt
+-- allowance (#465 assessment 6804075343 / Devin 5860609021).
+function SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+    if type(histIndex) ~= "table" then
+        return 0
+    end
+    local ordered = {}
+    local visits = 0
+    for canon, hist in pairs(histIndex) do
+        visits = visits + 1
+        if type(hist) == "table" then
+            hist.effective = false
+            if hist.present == true and type(hist.op) == "table"
+                and type(canon) == "string" and canon ~= "" then
+                local event = nil
+                local scratch = SoftDeleteRuntime.indexes[record]
+                local byObj = scratch and scratch.eventIndex and scratch.eventIndex.byObj
+                if type(byObj) == "table" then
+                    event = byObj[canon]
+                    if event == false then
+                        event = nil
+                    end
+                end
+                if type(event) ~= "table" and GS.FindLedgerEventById then
+                    event = GS.FindLedgerEventById(record, canon)
+                end
+                if type(event) == "table" and event.gsProductionCredit == true then
+                    ordered[#ordered + 1] = {
+                        canon = canon,
+                        hist = hist,
+                        event = event,
+                        op = hist.op,
+                    }
+                end
+            end
+        end
+    end
+    table.sort(ordered, function(a, b)
+        local ta = tonumber(a.op.timestamp) or 0
+        local tb = tonumber(b.op.timestamp) or 0
+        if ta ~= tb then
+            return ta < tb
+        end
+        return tostring(a.op.id) < tostring(b.op.id)
+    end)
+    local activeMap = {}
+    for i = 1, #ordered do
+        visits = visits + 1
+        local entry = ordered[i]
+        local newName = entry.hist.attributed
+        local newGuid = entry.hist.attributedGuid
+        local ok = SoftDeleteRuntime.floorOkIncludingSoftDeleted(
+            record, entry.event, newName, newGuid, activeMap)
+        if ok then
+            activeMap[entry.event.id] = {
+                attributed = newName,
+                attributedGuid = newGuid,
+            }
+            entry.hist.effective = true
+        else
+            entry.hist.effective = false
+        end
+    end
+    GS._softDeleteHistEffectivenessVisits = visits
+    return visits
+end
+
 --- Pure verified soft-delete facts from evidence + hist (no durable write).
 -- Kept on SoftDeleteRuntime to stay under Lua 5.1's 200-local chunk limit.
 function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex)
@@ -10967,19 +11195,33 @@ function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex
         if eventKind == "withdrawal" then
             creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
         else
-            -- Retained accepted correction history (not active creditCorrections:
-            -- that projection intentionally excludes soft-deleted events).
-            -- hist.present distinguishes "accepted Unassigned clear" (nil/nil)
-            -- from "no correction" (#465 assessment 6771025929).
-            local hist = type(histIndex) == "table" and histIndex[event.id] or nil
-            if type(hist) ~= "table" and type(histIndex) == "table"
-                and type(event.txnId) == "string" and event.txnId ~= "" then
-                hist = histIndex[event.txnId]
+            -- Prefer live effective identity while the row is not yet soft-deleted
+            -- (first apply): floor-suppressed corrections must not receive debt
+            -- allowance (#465 / Devin 5860609021). Soft-deleted rebuild/refresh
+            -- keeps accepted-history catch-up via hist.present, but only when
+            -- hist.effective ~= false (annotated with include-deleted floors).
+            local softDeleted = GS.IsEventSoftDeleted
+                and GS.IsEventSoftDeleted(record, event)
+            local usedEffective = false
+            if not softDeleted and GS.ResolveEffectiveCreditIdentity then
+                local n, g, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+                if status ~= GS.CREDIT_UNAVAILABLE then
+                    creditName, creditGuid = n, g
+                    usedEffective = true
+                end
             end
-            if type(hist) == "table" and hist.present == true then
-                creditName, creditGuid = hist.attributed, hist.attributedGuid
-            else
-                creditName, creditGuid = DurableCreditIdentity(event)
+            if not usedEffective then
+                local hist = type(histIndex) == "table" and histIndex[event.id] or nil
+                if type(hist) ~= "table" and type(histIndex) == "table"
+                    and type(event.txnId) == "string" and event.txnId ~= "" then
+                    hist = histIndex[event.txnId]
+                end
+                if type(hist) == "table" and hist.present == true
+                    and hist.effective ~= false then
+                    creditName, creditGuid = hist.attributed, hist.attributedGuid
+                else
+                    creditName, creditGuid = DurableCreditIdentity(event)
+                end
             end
         end
         return {
@@ -11198,6 +11440,7 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
         or scratch.histAliasGen ~= (d.aliasGen or 0)
     if needFullHist then
         local histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
         scratch.histIndex = histIndex
         scratch.histVisits = histVisits
         scratch.histAliasGen = d.aliasGen or 0
@@ -11213,6 +11456,7 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
                 scratch.histIndex, record, correctionBody, lookup)
             histTouch = 1
         end
+        SoftDeleteRuntime.annotateHistEffectiveness(record, scratch.histIndex, lookup)
         scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
         scratch.histAliasGen = d.aliasGen or 0
         GS._softDeleteHistCorrectionVisits = histTouch
@@ -11256,18 +11500,39 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
     local facts = DeriveVerifiedSoftDeleteFacts(
         record, headBody, resolved, priorEntry, scratch.histIndex)
     local newEntry = SoftDeleteRuntime.headEntry(headBody, facts)
-    for k, v in pairs(map) do
-        if v == priorEntry then
-            map[k] = newEntry
+    -- Preserve shared entry table identity across alias keys — never scan all
+    -- eventDeletions to repoint one target (#465 r4538978963 / r4539832738).
+    local mapVisits = 0
+    for k in pairs(priorEntry) do
+        priorEntry[k] = nil
+        mapVisits = mapVisits + 1
+    end
+    for k, v in pairs(newEntry) do
+        priorEntry[k] = v
+        mapVisits = mapVisits + 1
+    end
+    map[canon] = priorEntry
+    map[eventId] = priorEntry
+    mapVisits = mapVisits + 2
+    local aliasList = scratch.eventIndex and scratch.eventIndex.aliasesByCanon
+        and (scratch.eventIndex.aliasesByCanon[canon]
+            or (type(resolved) == "table"
+                and scratch.eventIndex.aliasesByCanon[resolved.id]))
+    if type(aliasList) == "table" then
+        for i = 1, #aliasList do
+            local alias = aliasList[i]
+            if type(alias) == "string" and alias ~= "" then
+                map[alias] = priorEntry
+                mapVisits = mapVisits + 1
+            end
         end
     end
-    map[canon] = newEntry
-    map[eventId] = newEntry
     SoftDeleteRuntime.bumpDep(record, "delGen")
     eventDeletionCache[record] = {
         stamp = EventDeletionDependencyStamp(record),
         ok = true,
     }
+    GS._softDeleteDeletionMapVisits = mapVisits
     GS._softDeleteHeadVisits = 1
     GS._softDeleteCumulativeHeadVisits =
         (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + 1
@@ -11445,8 +11710,11 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         histIndex = scratch.histIndex
         histVisits = tonumber(scratch.histVisits) or 0
         GS._softDeleteHistCorrectionVisits = 0
+        -- Re-annotate: floor context may have changed since the cached hist build.
+        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
     else
         histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
         scratch.histStamp = histStamp
         scratch.histIndex = histIndex
         scratch.histVisits = histVisits
@@ -11641,6 +11909,7 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
         or type(histIndex) ~= "table" then
         local hv
         histIndex, hv = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
         scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
         scratch.histIndex = histIndex
         scratch.histVisits = hv
@@ -11649,6 +11918,7 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
             (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
             + (tonumber(hv) or 0)
     else
+        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
         GS._softDeleteHistCorrectionVisits = 0
     end
     do

@@ -1337,18 +1337,20 @@ local function ClassifyStaleBase(record, op, targetKey)
             and headBody.id == policyNow then
             return "conflict", "divergent_edit"
         end
-        -- #459 C: contributor corrections authored under an older accepted policy
-        -- must still converge when the transport sender is currently authorized.
-        -- Do not treat known superseded policy bases as permanent stale_policy
-        -- rejection (mirrors campaign-head exemption). Missing predecessors stay
-        -- pending. Other kinds keep obsolete/stale_policy.
-        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+        -- #459 C / #465: contributor corrections and soft-deletes authored under
+        -- an older accepted policy must still converge when the transport sender
+        -- is currently authorized. Do not treat known superseded policy bases as
+        -- permanent stale_policy rejection (mirrors campaign-head exemption).
+        -- Missing predecessors stay pending. Other kinds keep obsolete/stale_policy.
+        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            or op.kind == GS.KIND.SOFT_DELETE_EVENT then
             if not HasAcceptedId(ops, op.basePolicyRevision)
                 and op.basePolicyRevision ~= record.datasetId then
                 return "pending", "missing_policy_predecessor"
             end
             -- Known older/current-dataset policy base: fall through to target
-            -- causality (apply / stale_credit / conflict) under current authority.
+            -- causality (apply / stale_credit / stale_delete / conflict) under
+            -- current authority.
         else
             -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
             if HasAcceptedId(ops, op.basePolicyRevision) then
@@ -5829,6 +5831,33 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     end
                 end
                 bind.targetPos = pos
+                bind.phase = "eventIndex"
+            end
+            if bind.phase == "eventIndex" then
+                -- One reusable event-object index for evidence checks; charge
+                -- construction under the completeness budget (#465 r4539832738).
+                if type(bind.eventIndex) ~= "table" then
+                    if visited >= budget then
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    if GS.BuildSoftDeleteEventObjectIndex then
+                        bind.eventIndex = GS.BuildSoftDeleteEventObjectIndex(
+                            temp, bind.lookup)
+                        local ev = tonumber(bind.eventIndex and bind.eventIndex.visits) or 0
+                        visited = visited + math.max(1, ev)
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + math.max(1, ev)
+                        adop._workStats.softDeleteEventIndexVisits = ev
+                    else
+                        bind.eventIndex = { byObj = {}, visits = 0 }
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                    end
+                end
                 bind.phase = "facts"
                 bind.factList = nil
                 bind.factPos = 1
@@ -5847,6 +5876,7 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 local delMap = temp.eventDeletions
                 local deleteTargets = bind.deleteTargets or {}
                 local lookup = bind.lookup
+                local byObj = bind.eventIndex and bind.eventIndex.byObj
                 local list = bind.factList
                 local pos = tonumber(bind.factPos) or 1
                 while pos <= #list do
@@ -5895,22 +5925,27 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     -- Available canonical evidence must agree with durable /
                     -- projected item/quantity before atomic publish
                     -- (#465 r4539041882). Truly missing evidence stays orphan-OK.
-                    if GS.FindLedgerEventById then
-                        local evidence = GS.FindLedgerEventById(temp, canon)
-                            or GS.FindLedgerEventById(temp, eventId)
-                        if type(evidence) == "table" then
-                            local projected = type(delMap) == "table"
-                                and (delMap[eventId] or delMap[canon]) or nil
-                            local check = (type(projected) == "table"
-                                and projected.verified == true) and projected or entry
-                            if tonumber(evidence.itemId) ~= tonumber(check.itemId)
-                                or tonumber(evidence.quantity) ~= tonumber(check.quantity) then
-                                opts.cursor = nil
-                                opts.budgetExhausted = false
-                                opts.softDeleteBind = nil
-                                publishCompletenessStats()
-                                return false, "soft_delete_fact_conflict"
-                            end
+                    -- Resolve via the budgeted event-object index — never
+                    -- FindLedgerEventById per fact (#465 r4539832738).
+                    local evidence = nil
+                    if type(byObj) == "table" then
+                        evidence = byObj[canon] or byObj[eventId]
+                        if evidence == false then
+                            evidence = nil
+                        end
+                    end
+                    if type(evidence) == "table" then
+                        local projected = type(delMap) == "table"
+                            and (delMap[eventId] or delMap[canon]) or nil
+                        local check = (type(projected) == "table"
+                            and projected.verified == true) and projected or entry
+                        if tonumber(evidence.itemId) ~= tonumber(check.itemId)
+                            or tonumber(evidence.quantity) ~= tonumber(check.quantity) then
+                            opts.cursor = nil
+                            opts.budgetExhausted = false
+                            opts.softDeleteBind = nil
+                            publishCompletenessStats()
+                            return false, "soft_delete_fact_conflict"
                         end
                     end
                 end
