@@ -1040,6 +1040,26 @@ local function makeRegion(objectType)
         end
         return self._enabled and true or false
     end
+    function r:SetEnabled(v)
+        if v then
+            self:Enable()
+        else
+            self:Disable()
+        end
+    end
+    function r:SetShown(v)
+        if v then
+            self:Show()
+        else
+            self:Hide()
+        end
+    end
+    function r:SetAlpha(a) self._alpha = a end
+    function r:SetTextColor() end
+    function r:SetCursorPosition(p) self._cursor = p end
+    function r:GetCursorPosition() return self._cursor or 0 end
+    function r:SetFrameLevel(l) self._frameLevel = l end
+    function r:GetFrameLevel() return self._frameLevel or 0 end
     function r:EnableMouse() end
     function r:RegisterForClicks() end
     function r:SetScript(name, fn)
@@ -2280,72 +2300,247 @@ do
     RS.UpdateAltDraftField(altDraft, "classFile", "WARRIOR")
     assertTrue(RS.IsAltSpecDisabled(altDraft, 71), "same-main-spec exclusion after alt reset")
 
-    -- Wrong-plan rename: dirty text on A must not rename B before deferred refresh.
+    -- Wrong-plan rename: exercise production AddEditBoxWithButton DoSubmit with
+    -- the Raid Signup rename definition (not a copied selection-key guard).
     local stA, _, planA = RS:CreatePlan("Rename Plan A")
     local stB, _, planB = RS:CreatePlan("Rename Plan B")
     assertEq(stA, "accepted", "rename plan A created")
     assertEq(stB, "accepted", "rename plan B created")
     RS:SelectPlan(planA)
 
+    local stubControls = SF.SettingsUI.Controls
+    local savedAddEdit = stubControls.AddEditBoxWithButton
+    local savedAddDropdown = stubControls.AddDropdown
+    local savedAddDisplay = stubControls.AddDisplay
+    local savedAddButton = stubControls.AddButton
+
     local renameOpts = nil
     local planSelectSet = nil
-    local editText = ""
-    local lastSelectionKey = nil
-    SF.SettingsUI.Controls.AddEditBoxWithButton = function(_, _, opts)
-        if opts and type(opts.getSelectionKey) == "function" and type(opts.onSubmit) == "function" then
-            renameOpts = opts
-            editText = tostring(opts.get() or "")
-            lastSelectionKey = opts.getSelectionKey()
+    stubControls.AddEditBoxWithButton = function(_, _, opts)
+        if opts and type(opts.onSubmit) == "function"
+            and type(opts.get) == "function"
+            and opts.buttonText then
+            -- Capture the rename control (has getSelectionKey when fixed).
+            if opts.getSelectionKey ~= nil or (opts.label and tostring(opts.label):find("Rename", 1, true)) then
+                renameOpts = opts
+            end
         end
     end
-    SF.SettingsUI.Controls.AddDropdown = function(_, _, opts)
+    stubControls.AddDropdown = function(_, _, opts)
         if opts and type(opts.set) == "function" and type(opts.get) == "function" then
-            -- Active plan dropdown is the selection-scoped control.
             if opts.get() == planA or opts.get() == RS:GetSelectedPlanId() then
                 planSelectSet = opts.set
             end
         end
     end
-
-    local function renameDoSubmit()
-        assertTrue(renameOpts ~= nil, "rename control captured")
-        -- Mirror Controls.lua getter-only getSelectionKey abort (#434 / #428).
-        local selectionKey = renameOpts.getSelectionKey()
-        if selectionKey ~= lastSelectionKey then
-            editText = tostring(renameOpts.get() or "")
-            lastSelectionKey = selectionKey
-            return "aborted"
-        end
-        renameOpts.onSubmit(editText)
-        return "submitted"
-    end
-
     UIPage:Refresh(panel, { forceRebuild = true })
-    assertTrue(renameOpts ~= nil and type(renameOpts.getSelectionKey) == "function",
+    assertTrue(renameOpts ~= nil, "Raid Signup rename definition captured")
+    assertTrue(type(renameOpts.getSelectionKey) == "function",
         "rename control binds getSelectionKey")
     assertTrue(type(planSelectSet) == "function", "plan select dropdown captured")
     assertEq(renameOpts.getSelectionKey(), planA, "selection key is plan A")
-    editText = "Dirty Name For A"
-    -- Select B via production dropdown set (clears rename draft) but do not
-    -- rebuild the rename control — deferred-refresh race.
-    planSelectSet(planB)
-    assertEq(RS:GetSelectedPlanId(), planB, "selected plan is B after dropdown set")
-    assertEq(UIPage._GetRenamePlanNameForTests(), "", "rename draft cleared on plan select")
-    assertEq(renameDoSubmit(), "aborted", "submit aborts when selection key changed")
-    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planB].name, "Rename Plan B",
-        "plan B name unchanged after aborted dirty submit")
-    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planA].name, "Rename Plan A",
-        "plan A name unchanged when submit aborted")
 
-    -- After abort reloads from get(), selection key tracks B and text is B's name.
-    assertEq(lastSelectionKey, planB, "selection key tracks plan B after abort reload")
-    assertEq(editText, "Rename Plan B", "edit reloads plan B name after abort")
-    editText = "Rename Plan B Updated"
-    assertEq(renameDoSubmit(), "submitted", "rename submits for matching selection key")
-    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planB].name, "Rename Plan B Updated",
-        "plan B renamed only with matching selection")
-    assertEq(select(1, RS:EnsureGuildRecord("club:42")).plans[planA].name, "Rename Plan A",
-        "plan A never received B-keyed submit")
+    -- Load production Controls; keep page-builder stubs restored afterward.
+    load("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    local productionAddEdit = SF.SettingsUI.Controls.AddEditBoxWithButton
+    assertTrue(type(productionAddEdit) == "function", "production AddEditBoxWithButton loaded")
+    stubControls.AddEditBoxWithButton = savedAddEdit
+    stubControls.AddDropdown = savedAddDropdown
+    stubControls.AddDisplay = savedAddDisplay
+    stubControls.AddButton = savedAddButton
+
+    local function makeRenameSection()
+        return {
+            __sfPageBuilder = {
+                _refresh = {},
+                RegisterRefresh = function(self, fn)
+                    self._refresh[#self._refresh + 1] = fn
+                end,
+                FireRefresh = function(self)
+                    for i = 1, #self._refresh do
+                        self._refresh[i]()
+                    end
+                end,
+            },
+            AddRow = function(self, _, builder)
+                local row = CreateFrame("Frame", nil, panel)
+                row:SetSize(400, 26)
+                builder(row)
+                return row
+            end,
+        }
+    end
+
+    local function findRenameWidgets(section)
+        local edit, btn
+        local function walk(frame)
+            if not frame then
+                return
+            end
+            if frame.GetObjectType then
+                local kind = frame:GetObjectType()
+                if kind == "EditBox" and not edit then
+                    edit = frame
+                elseif kind == "Button" and frame.GetText and frame:GetText() == renameOpts.buttonText and not btn then
+                    btn = frame
+                end
+            end
+            local kids = { frame:GetChildren() }
+            for i = 1, #kids do
+                walk(kids[i])
+            end
+        end
+        for i = 1, #(section._rows or {}) do
+            walk(section._rows[i])
+        end
+        -- Rows may not be tracked; walk from AddRow parent via recent creates is
+        -- brittle — instead search panel children created during AddEditBoxWithButton.
+        walk(panel)
+        return edit, btn
+    end
+
+    local function mountRenameControl(opts)
+        local section = makeRenameSection()
+        local rows = {}
+        local origAddRow = section.AddRow
+        function section:AddRow(height, builder)
+            local row = origAddRow(self, height, builder)
+            rows[#rows + 1] = row
+            self._rows = rows
+            return row
+        end
+        productionAddEdit(SF.SettingsUI.Controls, section, opts)
+        local edit, btn = findRenameWidgets(section)
+        -- Prefer widgets under the section rows we just created.
+        if not edit or not btn then
+            for i = 1, #rows do
+                local function walk(frame)
+                    if not frame then return end
+                    if frame.GetObjectType then
+                        local kind = frame:GetObjectType()
+                        if kind == "EditBox" and not edit then edit = frame end
+                        if kind == "Button" and frame.GetText and frame:GetText() == opts.buttonText and not btn then
+                            btn = frame
+                        end
+                    end
+                    local kids = { frame:GetChildren() }
+                    for j = 1, #kids do walk(kids[j]) end
+                end
+                walk(rows[i])
+            end
+        end
+        return section, edit, btn
+    end
+
+    local function planName(planId)
+        local rec = select(1, RS:EnsureGuildRecord("club:42"))
+        return rec.plans[planId] and rec.plans[planId].name
+    end
+
+    -- Fail-before: same Raid Signup onSubmit/get, but without getSelectionKey
+    -- (pre-fix page binding). Dirty A → select B → real DoSubmit renames B.
+    do
+        RS:SelectPlan(planA)
+        local broken = {}
+        for k, v in pairs(renameOpts) do
+            broken[k] = v
+        end
+        broken.getSelectionKey = nil
+        local _, edit, btn = mountRenameControl(broken)
+        assertTrue(edit ~= nil and btn ~= nil, "pre-fix rename widgets created")
+        assertEq(edit:GetText(), "Rename Plan A", "pre-fix loaded plan A name")
+        edit:SetText("Dirty Name For A")
+        planSelectSet(planB)
+        assertEq(RS:GetSelectedPlanId(), planB, "pre-fix selected B before refresh")
+        -- No FireRefresh: deferred-refresh race.
+        btn:Click()
+        assertEq(planName(planB), "Dirty Name For A",
+            "pre-fix: durable B incorrectly receives A's dirty text")
+        assertEq(planName(planA), "Rename Plan A", "pre-fix: A name unchanged")
+        -- Restore durable B for the fixed-path assertions.
+        assertEq(select(1, RS:RenamePlan(planB, "Rename Plan B")), "accepted",
+            "restore plan B after fail-before proof")
+    end
+
+    -- Fixed binding: production DoSubmit aborts dirty A→B before refresh.
+    RS:SelectPlan(planA)
+    UIPage:Refresh(panel, { forceRebuild = true }) -- refresh captured closures for A
+    -- Re-capture opts after rebuild (closures bind CurrentSelectedId).
+    renameOpts = nil
+    planSelectSet = nil
+    stubControls.AddEditBoxWithButton = function(_, _, opts)
+        if opts and type(opts.getSelectionKey) == "function" and type(opts.onSubmit) == "function" then
+            renameOpts = opts
+        end
+    end
+    stubControls.AddDropdown = function(_, _, opts)
+        if opts and type(opts.set) == "function" and type(opts.get) == "function" then
+            if opts.get() == planA or opts.get() == RS:GetSelectedPlanId() then
+                planSelectSet = opts.set
+            end
+        end
+    end
+    UIPage:Refresh(panel, { forceRebuild = true })
+    stubControls.AddEditBoxWithButton = savedAddEdit
+    stubControls.AddDropdown = savedAddDropdown
+    assertTrue(renameOpts ~= nil and type(renameOpts.getSelectionKey) == "function",
+        "fixed rename opts re-captured")
+    assertTrue(type(planSelectSet) == "function", "plan select re-captured")
+
+    local section, edit, btn = mountRenameControl(renameOpts)
+    assertTrue(edit ~= nil and btn ~= nil, "fixed rename widgets created")
+    assertEq(edit:GetText(), "Rename Plan A", "fixed control loaded plan A name")
+    edit:SetText("Dirty Name For A")
+    planSelectSet(planB)
+    assertEq(RS:GetSelectedPlanId(), planB, "selected B before deferred refresh")
+    assertEq(UIPage._GetRenamePlanNameForTests(), "", "rename draft cleared on plan select")
+    btn:Click()
+    assertEq(planName(planB), "Rename Plan B",
+        "fixed: durable B unchanged after aborted dirty submit")
+    assertEq(planName(planA), "Rename Plan A",
+        "fixed: durable A unchanged after aborted dirty submit")
+    assertEq(edit:GetText(), "Rename Plan B",
+        "fixed: aborted submit reloads plan B getter text")
+
+    -- Switching plans with normal refresh reloads B; valid rename of B succeeds.
+    section.__sfPageBuilder:FireRefresh()
+    assertEq(edit:GetText(), "Rename Plan B", "refresh keeps plan B name")
+    edit:SetText("Rename Plan B Updated")
+    btn:Click()
+    assertEq(planName(planB), "Rename Plan B Updated",
+        "fixed: durable B renamed through production DoSubmit")
+    assertEq(planName(planA), "Rename Plan A",
+        "fixed: durable A never receives B-keyed submit")
+
+    -- Also cover dirty A → select B → refresh (no submit) → names untouched.
+    RS:SelectPlan(planA)
+    stubControls.AddEditBoxWithButton = function(_, _, opts)
+        if opts and type(opts.getSelectionKey) == "function" then
+            renameOpts = opts
+        end
+    end
+    stubControls.AddDropdown = function(_, _, opts)
+        if opts and type(opts.set) == "function" then
+            planSelectSet = opts.set
+        end
+    end
+    UIPage:Refresh(panel, { forceRebuild = true })
+    stubControls.AddEditBoxWithButton = savedAddEdit
+    stubControls.AddDropdown = savedAddDropdown
+    section, edit, btn = mountRenameControl(renameOpts)
+    edit:SetText("Another Dirty A")
+    planSelectSet(planB)
+    section.__sfPageBuilder:FireRefresh()
+    assertEq(edit:GetText(), "Rename Plan B Updated",
+        "normal refresh after select reloads B without submitting dirty A")
+    assertEq(planName(planA), "Rename Plan A", "normal refresh leaves durable A")
+    assertEq(planName(planB), "Rename Plan B Updated", "normal refresh leaves durable B")
+
+    -- Restore page-builder control stubs for later tests.
+    stubControls.AddEditBoxWithButton = savedAddEdit
+    stubControls.AddDropdown = savedAddDropdown
+    stubControls.AddDisplay = savedAddDisplay
+    stubControls.AddButton = savedAddButton
 
     RS:SelectPlan(plan3)
     UIPage._SetDraftForTests(nil)
