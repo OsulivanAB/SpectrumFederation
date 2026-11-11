@@ -769,17 +769,20 @@ local function ValidateGuildRecordStructure(guildKey, record)
         end
     end
     -- Optional #465 soft-deletion heads: absent on older saves.
+    -- Capacity is distinct verified canons; alias keys must not inflate it
+    -- (#465 r4538978993). Shape-check every map entry.
     if record.eventDeletions ~= nil then
         if type(record.eventDeletions) ~= "table" then
             return false, "invalid_record_shape"
         end
-        local delCount = 0
+        local canonCount = 0
+        local seenCanon = {}
         local maxDel = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local override = tonumber(GS._softDeleteCanonicalCapacityMaxOverride)
+        if override and override >= 0 then
+            maxDel = override
+        end
         for eventId, entry in pairs(record.eventDeletions) do
-            delCount = delCount + 1
-            if delCount > maxDel then
-                return false, "full"
-            end
             if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
                 return false, "invalid_record_shape"
             end
@@ -852,6 +855,17 @@ local function ValidateGuildRecordStructure(guildKey, record)
                     and entry.gsProductionCredit ~= true
                     and entry.gsProductionCredit ~= false then
                     return false, "invalid_record_shape"
+                end
+                local canon = entry.eventId
+                if type(canon) ~= "string" or canon == "" then
+                    canon = eventId
+                end
+                if type(canon) == "string" and canon ~= "" and not seenCanon[canon] then
+                    seenCanon[canon] = true
+                    canonCount = canonCount + 1
+                    if canonCount > maxDel then
+                        return false, "full"
+                    end
                 end
             end
         end
