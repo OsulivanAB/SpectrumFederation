@@ -1783,6 +1783,151 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- Spec-button enabled state follows canEdit across pooled reuse
+---------------------------------------------------------------------------
+
+do
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local stSpec, _, planSpec = RS:CreatePlan("Spec Eligibility")
+    assertEq(stSpec, "accepted", "spec eligibility plan")
+    RS:SelectPlan(planSpec)
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planSpec,
+        nickname = "AliceSpec",
+        mainClass = "MAGE",
+        mainSpec = 62,
+        altClass = "WARRIOR",
+        altSpec = 71,
+    })), "accepted", "officer owned row with alt")
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planSpec,
+        nickname = "CarolSpec",
+        mainClass = "PRIEST",
+        mainSpec = 256,
+        altClass = "ROGUE",
+        altSpec = 259,
+    })), "accepted", "second row before member create")
+    -- Replace second row ownership: delete and let Carol create her own.
+    local carolSeed = nil
+    for _, e in ipairs(RS:GetSortedEntries(planSpec)) do
+        if e.nickname == "CarolSpec" then
+            carolSeed = e.entryId
+        end
+    end
+    assertTrue(carolSeed ~= nil, "carol seed id")
+    assertEq(select(1, RS:DeleteEntry(carolSeed)), "accepted", "remove officer-authored carol seed")
+    ActAs("Carol-Garona", "Player-1-Carol")
+    assertEq(select(1, RS:UpsertEntry({
+        planId = planSpec,
+        nickname = "CarolSpec",
+        mainClass = "PRIEST",
+        mainSpec = 256,
+        altClass = "ROGUE",
+        altSpec = 259,
+    })), "accepted", "member owned row with alt")
+
+    local function bySlot(slot)
+        return UIPage._FindSpecButtonsForTests(panel.__sfRaidSignupEntriesHost, slot)
+    end
+
+    -- Member: own specs enabled; Alice's specs disabled; tooltips preserved.
+    UIPage:Refresh(panel, { force = true })
+    local mains = bySlot("main")
+    local alts = bySlot("alt")
+    assertEq(#mains, 2, "two main spec buttons")
+    assertEq(#alts, 2, "two alt spec buttons")
+    local enabledMain, disabledMain = 0, 0
+    for i = 1, #mains do
+        assertTrue(mains[i].tooltipTitle ~= nil and mains[i].tooltipTitle ~= "",
+            "main tooltip title present for member view")
+        assertTrue(mains[i].tooltipText ~= nil and mains[i].tooltipText ~= "",
+            "main tooltip text present for member view")
+        if mains[i]:IsEnabled() then
+            enabledMain = enabledMain + 1
+        else
+            disabledMain = disabledMain + 1
+        end
+    end
+    assertEq(enabledMain, 1, "member: exactly one main spec enabled (own)")
+    assertEq(disabledMain, 1, "member: other creator main spec disabled")
+    local enabledAlt, disabledAlt = 0, 0
+    for i = 1, #alts do
+        assertTrue(alts[i].tooltipTitle ~= nil and alts[i].tooltipTitle ~= "",
+            "alt tooltip title present for member view")
+        if alts[i]:IsEnabled() then
+            enabledAlt = enabledAlt + 1
+        else
+            disabledAlt = disabledAlt + 1
+        end
+    end
+    assertEq(enabledAlt, 1, "member: exactly one alt spec enabled (own)")
+    assertEq(disabledAlt, 1, "member: other creator alt spec disabled")
+
+    -- Creator/officer: both rows editable.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    UIPage:Refresh(panel, { force = true })
+    mains = bySlot("main")
+    alts = bySlot("alt")
+    for i = 1, #mains do
+        assertTrue(mains[i]:IsEnabled(), "creator/officer main spec enabled")
+        assertTrue(mains[i].tooltipTitle ~= nil and mains[i].tooltipTitle ~= "",
+            "creator main tooltip preserved")
+    end
+    for i = 1, #alts do
+        assertTrue(alts[i]:IsEnabled(), "creator/officer alt spec enabled")
+    end
+
+    ActAs("Bob-Garona", "Player-1-Bob")
+    UIPage:Refresh(panel, { force = true })
+    mains = bySlot("main")
+    for i = 1, #mains do
+        assertTrue(mains[i]:IsEnabled(), "officer main spec enabled")
+    end
+
+    -- Archive: all disabled after pooled reuse; tooltips remain.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    assertEq(select(1, RS:SetPlanArchived(planSpec, true)), "accepted", "archive for spec disable")
+    UIPage:Refresh(panel, { force = true })
+    mains = bySlot("main")
+    alts = bySlot("alt")
+    assertTrue(#mains >= 1 and #alts >= 1, "archived spec buttons present")
+    for i = 1, #mains do
+        assertTrue(not mains[i]:IsEnabled(), "archived main spec disabled")
+        assertTrue(mains[i].tooltipTitle ~= nil and mains[i].tooltipTitle ~= "",
+            "archived main tooltip preserved")
+    end
+    for i = 1, #alts do
+        assertTrue(not alts[i]:IsEnabled(), "archived alt spec disabled")
+        assertTrue(alts[i].tooltipTitle ~= nil and alts[i].tooltipTitle ~= "",
+            "archived alt tooltip preserved")
+    end
+
+    -- Reopen: creator specs enabled again after archive→open pooled reuse.
+    assertEq(select(1, RS:SetPlanArchived(planSpec, false)), "accepted", "reopen spec plan")
+    UIPage:Refresh(panel, { force = true })
+    mains = bySlot("main")
+    for i = 1, #mains do
+        assertTrue(mains[i]:IsEnabled(), "reopened creator main spec enabled after pool reuse")
+    end
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage:Refresh(panel, { force = true })
+    mains = bySlot("main")
+    enabledMain, disabledMain = 0, 0
+    for i = 1, #mains do
+        if mains[i]:IsEnabled() then
+            enabledMain = enabledMain + 1
+        else
+            disabledMain = disabledMain + 1
+        end
+    end
+    assertEq(enabledMain, 1, "member after reopen: own main enabled")
+    assertEq(disabledMain, 1, "member after reopen: other main disabled")
+    UIPage._SetDraftForTests(nil)
+    ActAs("Alice-Garona", "Player-1-Alice")
+    RS:SelectPlan(plan3)
+    UIPage:Refresh(panel, { force = true })
+end
+
 -- Max-supported roster with alternatives + active picker: allocations still plateau.
 -- 128 mains + 128 alts + class picker exceeds the old 256 hard discard cliff.
 do

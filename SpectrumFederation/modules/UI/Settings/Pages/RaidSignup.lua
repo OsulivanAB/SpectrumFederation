@@ -491,6 +491,7 @@ local function MakeIconButton(parent, size)
 	btn:SetSize(size or ICON, size or ICON)
 	btn.tooltipTitle = nil
 	btn.tooltipText = nil
+	btn.__sfRaidSignupSpecSlot = nil
 	SafeClearScript(btn, "OnClick")
 	btn:Show()
 	return btn
@@ -1220,15 +1221,15 @@ function PaintEntries(host, planId, planOpen, caps)
 			end)
 
 			local mainBtn = MakeIconButton(row, ICON)
+			mainBtn.__sfRaidSignupSpecSlot = "main"
 			mainBtn:SetPoint("LEFT", nickBox, "RIGHT", 8, 0)
-			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), planOpen, false)
+			-- Enabled presentation follows canEdit (plan open + edit eligibility).
+			-- Informative hover tooltips stay assigned even when the button is disabled.
+			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), canEdit, false)
 			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
 			mainBtn.tooltipText = (entry.mainClass or "") .. " · " .. SpecName(entry.mainSpec)
 			mainBtn:SetScript("OnClick", function()
-				if not planOpen then
-					return
-				end
-				if not RS().CanEditEntry(caps, caps.actorGuid, entry) then
+				if not canEdit then
 					return
 				end
 				session.draft = nil
@@ -1250,16 +1251,14 @@ function PaintEntries(host, planId, planOpen, caps)
 			local anchor = mainBtn
 			if entry.altClass and entry.altSpec and not (editingThis and session.editing.slot == "alt") then
 				local altBtn = MakeIconButton(row, ICON)
+				altBtn.__sfRaidSignupSpecSlot = "alt"
 				altBtn:SetPoint("LEFT", mainBtn, "RIGHT", 6, 0)
-				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), planOpen, false)
+				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), canEdit, false)
 				altBtn.tooltipTitle = SpecName(entry.altSpec)
 				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
 					.. ": " .. (entry.altClass or "") .. " · " .. SpecName(entry.altSpec)
 				altBtn:SetScript("OnClick", function()
-					if not planOpen then
-						return
-					end
-					if not RS().CanEditEntry(caps, caps.actorGuid, entry) then
+					if not canEdit then
 						return
 					end
 					session.draft = nil
@@ -1656,6 +1655,27 @@ function Page._FindEditBoxesForTests(root, field)
 		end
 		if frame.GetObjectType and frame:GetObjectType() == "EditBox" then
 			if not field or frame.__sfRaidSignupField == field then
+				found[#found + 1] = frame
+			end
+		end
+		local kids = { frame:GetChildren() }
+		for i = 1, #kids do
+			walk(kids[i])
+		end
+	end
+	walk(root)
+	return found
+end
+
+function Page._FindSpecButtonsForTests(root, slot)
+	local found = {}
+	local function walk(frame)
+		if not frame then
+			return
+		end
+		if frame.GetObjectType and frame:GetObjectType() == "Button"
+			and frame.__sfRaidSignupSpecSlot then
+			if not slot or frame.__sfRaidSignupSpecSlot == slot then
 				found[#found + 1] = frame
 			end
 		end
