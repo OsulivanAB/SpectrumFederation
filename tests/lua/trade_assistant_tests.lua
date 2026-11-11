@@ -172,8 +172,9 @@ end
 
 function GetItemInfoInstant(linkOrId)
     local id = tostring(linkOrId):match("item:(%d+)") or tostring(linkOrId):match("^(%d+)$")
-    if id == "123" or id == "456" then
-        return tonumber(id)
+    local itemId = id and tonumber(id) or nil
+    if itemId == 123 or itemId == 456 or (itemId and itemId >= 1001 and itemId <= 1007) then
+        return itemId
     end
     return nil
 end
@@ -468,8 +469,39 @@ do
     assertEq(snapshot[1].name, "Bob", "Bob remains queued")
 end
 
+-- Partial prefill settles only offered quantities and retains the rest.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 7
+    world.bags[0] = {}
+    for index = 1001, 1007 do
+        world.bags[0][index - 1000] = { itemId = index, count = 5, link = tostring(index) }
+        assertTrue(TA:HandleCommand(tostring(index) .. " 1") == true, "partial settlement queues item " .. index)
+    end
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "partial settlement can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 6, "partial prefill places only six trade slots")
+
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "partial settlement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains for unoffered items")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains one unoffered item entry")
+    assertEq(snapshot[1].totalQuantity, 1, "Alice retains unoffered quantity")
+    assertEq(snapshot[1].items[1].itemId, 1007, "Alice retains the seventh queued item")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after Alice partial settlement")
+    assertEq(snapshot[2].itemCount, 7, "Bob keeps all seven queued item entries")
+end
+
 -- A declined/cancelled trade leaves the player queued.
 do
+    resetWorld()
     resetAssistant()
     assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "cancel test queues item")
     assertTrue(TA:TradeWithPlayer("Bob-TestRealm") == true, "Bob can be traded")

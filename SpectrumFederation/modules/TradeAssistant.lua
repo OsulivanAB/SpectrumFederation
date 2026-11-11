@@ -515,6 +515,49 @@ function TA:RemovePlayer(playerId)
     return true
 end
 
+local function SettlePlayerItems(playerId, offered)
+    local entry, key = FindPlayer(playerId)
+    if not entry or not key or type(offered) ~= "table" then
+        return false
+    end
+    local changed = false
+    for itemKey, quantity in pairs(offered) do
+        local item = entry.items[itemKey]
+        if item then
+            local settled = math.min(FloorQty(quantity), FloorQty(item.quantity))
+            if settled > 0 then
+                item.quantity = FloorQty(item.quantity) - settled
+                changed = true
+            end
+            if FloorQty(item.quantity) <= 0 then
+                entry.items[itemKey] = nil
+                for index = #entry.itemOrder, 1, -1 do
+                    if entry.itemOrder[index] == itemKey then
+                        table.remove(entry.itemOrder, index)
+                    end
+                end
+            end
+        end
+    end
+    if not changed then
+        return false
+    end
+    if #entry.itemOrder == 0 then
+        state.players[key] = nil
+        for index = #state.order, 1, -1 do
+            if state.order[index] == key then
+                table.remove(state.order, index)
+            end
+        end
+        Debug("Info", "Completed trade removed %s from queue", tostring(entry.name or key))
+        RefreshQueueUI()
+        return true
+    end
+    Debug("Info", "Completed trade settled offered items for %s; %d item entries remain", tostring(entry.name or key), #entry.itemOrder)
+    RefreshQueueUI()
+    return false
+end
+
 function TA:ClearQueue()
     state.players = {}
     state.order = {}
@@ -719,6 +762,7 @@ function TA:TryPrefillTrade(lifecycle, key)
         return false
     end
 
+    trade.offeredQuantities = {}
     local moves = PlanMoves(entry, freeSlots)
     local placed = 0
     local attempted = 0
@@ -726,7 +770,12 @@ function TA:TryPrefillTrade(lifecycle, key)
         attempted = attempted + 1
         local ok, result = PlaceOfferFromStack(move.bag, move.slot, move.quantity)
         if ok then
-            placed = placed + FloorQty(result)
+            local placedQty = FloorQty(result)
+            placed = placed + placedQty
+            local itemKey = move.item and move.item.key
+            if itemKey then
+                trade.offeredQuantities[itemKey] = (trade.offeredQuantities[itemKey] or 0) + placedQty
+            end
         else
             Debug("Warn", "Trade prefill move failed for %s: %s", tostring(move.item and move.item.key or "item"), tostring(result))
             break
@@ -812,9 +861,11 @@ local function OnTradeClosed()
         return
     end
     if trade.playerAccepted and trade.targetAccepted then
-        local removed = TA:RemovePlayer(trade.key)
-        if removed then
-            Debug("Info", "Completed trade removed %s from queue", tostring(trade.name or trade.key))
+        local offered = trade.offeredQuantities
+        if trade.autoFill and offered and next(offered) ~= nil then
+            SettlePlayerItems(trade.key, offered)
+        else
+            TA:RemovePlayer(trade.key)
         end
     else
         Debug("Info", "Trade closed without completion for %s", tostring(trade.name or trade.key))
