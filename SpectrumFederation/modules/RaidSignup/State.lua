@@ -586,6 +586,17 @@ function RS.MergeEntry(record, entry, opts)
     if not clean then
         return "rejected", err or "malformed"
     end
+
+    -- Plan membership is immutable once an entryId is retained. Enforce before
+    -- plan lookup, tombstone fast paths, or any durable mutation so attempted
+    -- moves cannot bypass archive/capacity checks on a different plan.
+    local prev = record.entries[clean.entryId]
+    if type(prev) == "table"
+        and type(prev.planId) == "string"
+        and clean.planId ~= prev.planId then
+        return "rejected", "plan_immutable"
+    end
+
     local plan = record.plans[clean.planId]
     if type(plan) ~= "table" then
         return "rejected", "plan_missing"
@@ -597,7 +608,6 @@ function RS.MergeEntry(record, entry, opts)
         return "rejected", "plan_archived"
     end
 
-    local prev = record.entries[clean.entryId]
     if opts.remote then
         local okRev, revReason = RS.RemoteRevisionPlausible(prev and prev.ver, clean.ver)
         if not okRev then
@@ -617,6 +627,7 @@ function RS.MergeEntry(record, entry, opts)
                 return "rejected", "creator_immutable"
             end
             clean.creatorGuid = prev.creatorGuid or clean.creatorGuid
+            clean.planId = prev.planId
             record.entries[clean.entryId] = clean
             return "accepted", opts.remote and "remote" or "local"
         end
@@ -632,6 +643,7 @@ function RS.MergeEntry(record, entry, opts)
             return "rejected", "creator_immutable"
         end
         clean.creatorGuid = prev.creatorGuid
+        clean.planId = prev.planId
     else
         -- Bound all retained records, including first-seen tombstones. Deleting
         -- an already-retained live entry (prev exists above) remains allowed at capacity.

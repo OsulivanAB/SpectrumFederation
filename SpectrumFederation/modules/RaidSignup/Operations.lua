@@ -193,6 +193,7 @@ function RS.FormatMutationFeedback(status, reason)
         empty_name = Loc("RAID_SIGNUP_ERR_EMPTY_NAME", "A non-blank name is required."),
         deleted_final = Loc("RAID_SIGNUP_ERR_DELETED_FINAL", "That signup entry was deleted and cannot be restored."),
         nickname_incomplete = Loc("RAID_SIGNUP_ERR_NICK_INCOMPLETE", "Finish typing the nickname, then press Enter."),
+        plan_immutable = Loc("RAID_SIGNUP_ERR_PLAN_IMMUTABLE", "Signup entries cannot move between roster plans."),
     }
     local msg = map[reason]
     if msg then
@@ -357,7 +358,20 @@ function RS:UpsertEntry(fields, opts)
         return "rejected", err or "not_ready"
     end
 
+    local entryId = fields.entryId
+    local prev = entryId and record.entries[entryId] or nil
     local planId = fields.planId or record.selectedPlanId
+    if prev then
+        if prev.deleted then
+            return "rejected", "missing_entry"
+        end
+        -- Existing entryIds cannot change plan membership (no move operation).
+        if type(prev.planId) == "string" and planId ~= prev.planId then
+            return "rejected", "plan_immutable"
+        end
+        planId = prev.planId
+    end
+
     local plan, planErr = AssertPlanOpen(record, planId)
     if not plan then
         return "rejected", planErr
@@ -385,12 +399,7 @@ function RS:UpsertEntry(fields, opts)
         altClass, altSpec = aClass, aSpec
     end
 
-    local entryId = fields.entryId
-    local prev = entryId and record.entries[entryId] or nil
     if prev then
-        if prev.deleted then
-            return "rejected", "missing_entry"
-        end
         local caps = RS:GetCapabilities()
         local mayEdit, mayReason = RS.CanEditEntry(caps, ctx.actorGuid, prev)
         if not mayEdit then

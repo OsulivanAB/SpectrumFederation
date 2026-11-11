@@ -30,6 +30,9 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 - Deletions use versioned tombstones. There is no restore: live never overwrites a
   tombstone, and an authorized incoming tombstone wins over live for the same entry even
   when its `(n, w)` tuple is equal or lower. New Add Row uses new IDs.
+- `planId` is immutable for an existing `entryId` (no move). `MergeEntry` rejects
+  plan-ID changes before tombstone/mutation paths; local `UpsertEntry` returns
+  `plan_immutable` for clear failure feedback.
 - Concurrent live edits converge by `(n, w)` version tuples; deletion finality overrides
   that ordering for live↔tombstone conflicts.
 - First-seen retention (including tombstones) is bounded by `MAX_ENTRIES` /

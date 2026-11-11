@@ -1600,6 +1600,189 @@ do
     UIPage:Refresh(panel, { force = true })
 end
 
+---------------------------------------------------------------------------
+-- planId immutability for existing entryIds (no move)
+---------------------------------------------------------------------------
+
+do
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local stSrc, _, planSrc = RS:CreatePlan("Immutable Src")
+    local stDst, _, planDst = RS:CreatePlan("Immutable Dst")
+    local stArch, _, planArch = RS:CreatePlan("Immutable Arch")
+    assertEq(stSrc, "accepted", "immutable src plan")
+    assertEq(stDst, "accepted", "immutable dst plan")
+    assertEq(stArch, "accepted", "immutable arch plan")
+    assertEq(select(1, RS:SetPlanArchived(planArch, true)), "accepted", "archive move target")
+
+    ActAs("Carol-Garona", "Player-1-Carol")
+    RS:SelectPlan(planSrc)
+    local stEnt, _, moveId = RS:UpsertEntry({
+        planId = planSrc,
+        nickname = "StayPut",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+        notes = "anchor",
+        altClass = "MAGE",
+        altSpec = 62,
+    })
+    assertEq(stEnt, "accepted", "creator seeds immutable entry")
+    assertTrue(moveId ~= nil, "immutable entry id")
+    local rec = select(1, RS:EnsureGuildRecord("club:42"))
+    local before = RS.CloneEntry(rec.entries[moveId])
+    local beforeCount = 0
+    for _ in pairs(rec.entries) do
+        beforeCount = beforeCount + 1
+    end
+
+    local function assertUnchanged(label)
+        local now = select(1, RS:EnsureGuildRecord("club:42")).entries[moveId]
+        assertTrue(now ~= nil, label .. " entry still present")
+        assertEq(now.planId, before.planId, label .. " planId unchanged")
+        assertEq(now.nickname, before.nickname, label .. " nickname unchanged")
+        assertEq(now.ver.n, before.ver.n, label .. " ver.n unchanged")
+        assertEq(now.ver.w, before.ver.w, label .. " ver.w unchanged")
+        assertEq(now.deleted == true, before.deleted == true, label .. " deleted unchanged")
+        local count = 0
+        for _ in pairs(select(1, RS:EnsureGuildRecord("club:42")).entries) do
+            count = count + 1
+        end
+        assertEq(count, beforeCount, label .. " entry table size unchanged")
+    end
+
+    local function rejectMove(actorLabel, planTarget, targetLabel)
+        local st, reason = RS:UpsertEntry({
+            entryId = moveId,
+            planId = planTarget,
+            nickname = before.nickname,
+            mainClass = before.mainClass,
+            mainSpec = before.mainSpec,
+            notes = before.notes,
+            altClass = before.altClass,
+            altSpec = before.altSpec,
+        }, { expectedVer = before.ver })
+        assertEq(st, "rejected", actorLabel .. " UpsertEntry rejects " .. targetLabel .. " move")
+        assertEq(reason, "plan_immutable", actorLabel .. " UpsertEntry " .. targetLabel .. " reason")
+        assertUnchanged("after " .. actorLabel .. " " .. targetLabel .. " move")
+    end
+
+    -- Creator UpsertEntry attempting move to open / archived targets.
+    rejectMove("creator", planDst, "open-target")
+    rejectMove("creator", planArch, "archived-target")
+
+    -- Officer UpsertEntry also rejected.
+    ActAs("Bob-Garona", "Player-1-Bob")
+    rejectMove("officer", planDst, "open-target")
+    rejectMove("officer", planArch, "archived-target")
+
+    -- MergeEntry live path: changed planId rejected before mutation.
+    local liveMove = RS.CloneEntry(before)
+    liveMove.planId = planDst
+    liveMove.nickname = "Moved"
+    liveMove.ver = { n = before.ver.n + 1, w = "cccccccccccccccccccccccc" }
+    local stLive, reasonLive = RS.MergeEntry(rec, liveMove, { remote = true })
+    assertEq(stLive, "rejected", "MergeEntry live rejects planId change")
+    assertEq(reasonLive, "plan_immutable", "MergeEntry live reason plan_immutable")
+    assertUnchanged("after MergeEntry live move")
+
+    liveMove.planId = planArch
+    assertEq(select(1, RS.MergeEntry(rec, liveMove, { remote = true })), "rejected",
+        "MergeEntry live rejects archived-target planId change")
+    assertUnchanged("after MergeEntry archived-target move")
+
+    -- Isolated full-target MergeEntry: existing row must not bypass per-plan capacity.
+    local fullRec = {
+        schemaVersion = 1,
+        guildKey = "club:42",
+        clubId = "42",
+        plans = {},
+        entries = {},
+    }
+    assertEq(select(1, RS.MergePlan(fullRec, {
+        planId = "iso-src",
+        name = "Iso Src",
+        archived = false,
+        createdBy = "Player-1-Alice",
+        ver = { n = 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
+        at = 1,
+    }, { remote = true })), "accepted", "iso src plan")
+    assertEq(select(1, RS.MergePlan(fullRec, {
+        planId = "iso-full",
+        name = "Iso Full",
+        archived = false,
+        createdBy = "Player-1-Alice",
+        ver = { n = 1, w = "bbbbbbbbbbbbbbbbbbbbbbbb" },
+        at = 1,
+    }, { remote = true })), "accepted", "iso full plan")
+    for i = 1, RS.MAX_ENTRIES_PER_PLAN do
+        local st = select(1, RS.MergeEntry(fullRec, {
+            entryId = "iso-full-" .. tostring(i),
+            planId = "iso-full",
+            nickname = "F" .. tostring(i),
+            mainClass = "MAGE",
+            mainSpec = 62,
+            notes = "",
+            creatorGuid = "Player-1-Carol",
+            deleted = false,
+            ver = { n = 1, w = string.format("%024x", i) },
+            at = 1,
+        }, { remote = true }))
+        assertEq(st, "accepted", "iso full seed " .. tostring(i))
+    end
+    assertEq(select(1, RS.MergeEntry(fullRec, {
+        entryId = "iso-move",
+        planId = "iso-src",
+        nickname = "Stay",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+        notes = "",
+        creatorGuid = "Player-1-Carol",
+        deleted = false,
+        ver = { n = 1, w = "ffffffffffffffffffffffff" },
+        at = 1,
+    }, { remote = true })), "accepted", "iso source entry")
+    local isoBefore = RS.CloneEntry(fullRec.entries["iso-move"])
+    local stFull, reasonFull = RS.MergeEntry(fullRec, {
+        entryId = "iso-move",
+        planId = "iso-full",
+        nickname = "MovedIntoFull",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+        notes = "",
+        creatorGuid = "Player-1-Carol",
+        deleted = false,
+        ver = { n = 2, w = "ffffffffffffffffffffffff" },
+        at = 2,
+    }, { remote = true })
+    assertEq(stFull, "rejected", "MergeEntry rejects move into full plan")
+    assertEq(reasonFull, "plan_immutable", "full-target move reason plan_immutable")
+    assertEq(fullRec.entries["iso-move"].planId, isoBefore.planId, "iso entry planId unchanged")
+    assertEq(fullRec.entries["iso-move"].nickname, isoBefore.nickname, "iso entry nickname unchanged")
+    assertEq(fullRec.entries["iso-move"].ver.n, isoBefore.ver.n, "iso entry ver unchanged")
+
+    -- MergeEntry tombstone path: planId change rejected before tombstone fast path.
+    local tombMove = RS.CloneEntry(before)
+    tombMove.deleted = true
+    tombMove.planId = planDst
+    tombMove.ver = { n = before.ver.n + 1, w = "dddddddddddddddddddddddd" }
+    local stTomb, reasonTomb = RS.MergeEntry(rec, tombMove, { remote = true })
+    assertEq(stTomb, "rejected", "MergeEntry tombstone rejects planId change")
+    assertEq(reasonTomb, "plan_immutable", "MergeEntry tombstone reason plan_immutable")
+    assertUnchanged("after MergeEntry tombstone move")
+    assertTrue(not rec.entries[moveId].deleted, "tombstone move did not delete")
+
+    -- Same-planId tombstone still applies (control).
+    local tombOk = RS.CloneEntry(before)
+    tombOk.deleted = true
+    tombOk.planId = before.planId
+    tombOk.ver = { n = before.ver.n + 1, w = "eeeeeeeeeeeeeeeeeeeeeeee" }
+    assertEq(select(1, RS.MergeEntry(rec, tombOk, { remote = true })), "accepted",
+        "same-planId tombstone still accepted")
+    assertTrue(rec.entries[moveId].deleted, "same-planId tombstone applied")
+    assertEq(rec.entries[moveId].planId, before.planId, "tombstone keeps original planId")
+    ActAs("Alice-Garona", "Player-1-Alice")
+end
+
+---------------------------------------------------------------------------
 -- Max-supported roster with alternatives + active picker: allocations still plateau.
 -- 128 mains + 128 alts + class picker exceeds the old 256 hard discard cliff.
 do
