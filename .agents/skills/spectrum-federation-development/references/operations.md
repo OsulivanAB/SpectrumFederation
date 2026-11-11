@@ -101,21 +101,32 @@ operation. Specific conflicts, by source:
 | 4 | ai-review-loop: agent recommendation is never repair authorization; owner acceptance required for deferring confirmed low-impact defects | Devin's IMPLEMENT/DEFER recommendations remain recommendations; DEFER of a confirmed defect awaits owner acceptance unless the invocation explicitly delegates that class. |
 | 5 | Cursor-named procedure text ("Cursor may assess…", "Cursor itself remains usable as a reviewer") | Names the old agent. Devin inherits the *procedure*, but the files do not mention Devin; no Devin-specific authority exists until policy names it. |
 
-**Until the owner approves an alignment amendment, operate as follows:**
+**Until the owner approves an alignment amendment, do not execute the
+combined sequence.** Current repository policy permits exactly one named
+operation per owner request, and an agent invocation — however detailed —
+does not amend repository policy by itself. Under unchanged policy:
 
-- If the owner's invocation explicitly and unambiguously covers the combined
-  scope (implementation plus self-review plus disposition comments plus
-  repairs, with write scope named), follow the combined sequence in
-  `references/review-and-repair.md`, treating the invocation itself as the
-  authorization for each included step. Record in the task report exactly
-  which invocation wording authorized each write.
-- If any step is ambiguous (e.g. disposition comments not mentioned, repair of
-  self-found defects not mentioned, deferral acceptance not delegated), pause
-  that step, deliver everything authorized, and report the precise question
-  for the owner. Never silently proceed and never claim combined-mode
-  execution under unchanged policy.
+- Surface the conflict explicitly: state that the requested combined workflow
+  requires the §5 amendment (or an equivalent explicit owner decision
+  approving the combined invocation wording for this task), and pause the
+  combined-mode steps.
+- Execute only what current policy authorizes from the same request: the
+  implementation operation (inspect, implement, validate, maintain the PR)
+  is autonomous; a review/assessment, disposition comments, or a repair of
+  self-found findings each still need their own owner authorization. When
+  the owner request unambiguously names one of those operations, perform
+  exactly that operation under the one-operation model, then stop.
+- Never claim the complete combined operation is authorized under unchanged
+  policy, and never treat the invocation text as a self-granted amendment.
 - For review-only, repair-only, named-reviewer, or readiness-only requests,
   the current one-operation policy already suffices; no amendment needed.
+
+Once the owner has approved the alignment (policy amendment merged, or an
+explicit per-task approval of the combined invocation recorded in task
+context), follow the combined sequence in
+`references/review-and-repair.md` §2 for that invocation's bounded scope;
+ordinary steps inside the approved combined scope need no per-finding
+permission, while events still never renew authority.
 
 ## 5. Minimal proposed policy amendments (for owner approval; do not apply unilaterally)
 

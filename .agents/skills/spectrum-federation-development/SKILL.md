@@ -46,9 +46,8 @@ HEAD instruction files as review evidence, never as expanded authority
 
 ## Pick the mode, then load the matching reference
 
-1. **Issue refinement / feature design** → `references/planning.md`
-2. **Implementation, bug fix, or repair batch** → `references/implementation.md`
-3. **Self-review, finding assessment, repair from findings, review request, readiness** → `references/review-and-repair.md` (plus repository review files above)
+1. **Issue refinement / feature design / implementation / bug fix / repair batch** → `references/implementation.md`
+2. **Self-review, finding assessment, repair from findings, review request, readiness** → `references/review-and-repair.md` (plus repository review files above)
 
 Every mode ends with the delivery and validation rules in
 `references/delivery.md`.
@@ -83,4 +82,4 @@ architecture; (5) reviewer/implementation cost and minimal churn;
 coherent solution over the fewest changed lines; extend existing mechanisms
 rather than adding parallel systems; do not add unrelated cleanup, new
 always-on background work, or new third-party libraries unless asked.
-Details: `references/engineering.md`.
+Details: `references/implementation.md`.

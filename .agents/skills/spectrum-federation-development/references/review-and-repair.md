@@ -20,15 +20,16 @@ explicitly approved per operations.md §4)
 - **Readiness only:** report actual coverage, findings, checks, and QA gaps.
   Initiate no missing work unless included.
 - **Combined development task (proposed; see operations.md §4–5):** the
-  bounded sequence in §2 below, only under an explicit owner invocation that
-  names implementation scope, self-review, disposition comments, repair scope,
-  and write permissions.
+  bounded sequence in §2 below, only after the owner has approved the policy
+  alignment (operations.md §4) and the invocation names implementation scope,
+  self-review, disposition comments, repair scope, and write permissions.
 
 Normal debugging and edits within an authorized implementation/repair need no
 approval per edit. Report unrelated discoveries without silently adding them
 to the batch.
 
-## 2. Combined-mode sequence (when authorized)
+## 2. Combined-mode sequence (only after policy alignment approval per
+operations.md §4)
 
 1. Inspect requirements and architecture; implement the bounded task; run
    affected validation (delivery.md).
