@@ -658,7 +658,7 @@ do
     assertEq(#world.placed, 0, "unknown-link matching offer defers exact variant")
 end
 
--- Partial unknown-link offers cover only their quantity for exact variants.
+-- Partial unknown-link offers still defer exact variants to avoid misidentifying them.
 do
     resetWorld()
     resetAssistant()
@@ -679,8 +679,7 @@ do
     runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
-    assertEq(#world.placed, 1, "partial unknown-link offer places only the shortage")
-    assertEq(world.placed[1].count, 1, "partial unknown-link offer shortage is one")
+    assertEq(#world.placed, 0, "partial unknown-link offer defers exact variant")
 end
 
 -- Player-first acceptance still settles when the trade closes without a cancel.
