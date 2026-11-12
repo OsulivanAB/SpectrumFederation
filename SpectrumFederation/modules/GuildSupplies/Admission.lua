@@ -6413,6 +6413,11 @@ local function ContinueAdoptionReplay(adop)
         end
     end
 
+    -- Coalesced soft-delete hist/fact refresh after correction-heavy replay
+    -- (#465 r4538978963 / 6829598989). Deferred NoteAccepted only invalidated.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(temp, nil)
+    end
     -- Final completeness is indexed/resumable; source-authored ops skip searches.
     -- Optional test override keeps replay slice size unchanged while forcing
     -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
@@ -8902,7 +8907,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         -- Winning correction from conflict resolution is accepted history (#465).
         if chosen.kind == GS.KIND.CORRECT_CONTRIBUTOR
             and GS.NoteAcceptedCorrectionHistoryMutation then
-            GS.NoteAcceptedCorrectionHistoryMutation(record, chosen)
+            GS.NoteAcceptedCorrectionHistoryMutation(record, chosen, {
+                deferRefresh = admissionCtx.adoptionReplay == true,
+            })
         end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-resolve")
@@ -9106,7 +9113,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 -- Notify after StoreAccepted (r4529162895); skip only when the
                 -- body was already present and history is unchanged.
                 if newlyRetained and GS.NoteAcceptedCorrectionHistoryMutation then
-                    GS.NoteAcceptedCorrectionHistoryMutation(record, stored)
+                    GS.NoteAcceptedCorrectionHistoryMutation(record, stored, {
+                        deferRefresh = admissionCtx.adoptionReplay == true,
+                    })
                 end
                 -- Warm providers must export newly retained older corrections.
                 if newlyRetained and not admissionCtx.adoptionReplay
@@ -9461,8 +9470,12 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
             -- Soft-delete hist/facts refresh AFTER accepted history is stored
             -- (delete-first / prior-correction-second; r4529162895).
+            -- Adoption replay defers fact refresh until one coherent Ensure after
+            -- the full transfer (assessment 6829598989).
             if GS.NoteAcceptedCorrectionHistoryMutation then
-                GS.NoteAcceptedCorrectionHistoryMutation(record, stored)
+                GS.NoteAcceptedCorrectionHistoryMutation(record, stored, {
+                    deferRefresh = admissionCtx.adoptionReplay == true,
+                })
             end
             if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
                 and GS.RedrivePendingContributorCorrections then

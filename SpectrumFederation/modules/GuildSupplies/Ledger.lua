@@ -5228,9 +5228,17 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "rejected", "stale_generation"
             end
             -- Floor and stored GUID share one authenticated attributed identity.
+            -- Adoption replay may receive balancing adjustments after the matching
+            -- soft-delete already landed (same as gs-op catch-up). Honor verified
+            -- soft-delete debt floors so signed historical debt converges
+            -- (#465 assessment 6829598989 / 6771025929).
+            local floorOpts = { attributedGuid = attrGuid }
+            if admissionCtx.adoptionReplay then
+                floorOpts.respectSoftDeleteDebt = true
+            end
             local floorOk, floorErr = GS.AdjustmentFloorOk(
                 record, tonumber(event.itemId), qty, attributed, eventCampaign,
-                { attributedGuid = attrGuid })
+                floorOpts)
             if not floorOk then
                 return "pending", floorErr or "adjustment_floor"
             end
@@ -8565,12 +8573,45 @@ function SoftDeleteRuntime.leaveIncludeDeletedProjection(record)
     end
 end
 
---- Resume paced include-deleted historical rebuild without touching live credit.
-function SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
-    if type(record) ~= "table" then
+--- Drain sync-drain hist-effective continuations after rebuild releases busy.
+-- Adoption tests set GS._adoptionReplaySyncDrain and never flush C_Timer; paced
+-- hist-effective must still make progress without disabling C_Timer.After.
+function SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    local q = SoftDeleteRuntime._histEffectiveSyncDrain
+    SoftDeleteRuntime._histEffectiveSyncDrain = nil
+    if type(q) ~= "table" or #q == 0 then
         return
     end
-    if not (C_Timer and C_Timer.After) then
+    local depth = tonumber(SoftDeleteRuntime._histEffectiveSyncDrainDepth) or 0
+    if depth >= 8 then
+        -- Bound nested sync slices. Clear scheduled so a later Ensure can resume.
+        -- Do not re-queue After(0) — test flushTimers would loop forever.
+        for i = 1, #q do
+            local item = q[i]
+            local rec = item and item.record
+            local cont = type(rec) == "table"
+                and SoftDeleteRuntime.histEffectiveContinuation[rec]
+            if type(cont) == "table" then
+                cont.scheduled = false
+            end
+        end
+        return
+    end
+    SoftDeleteRuntime._histEffectiveSyncDrainDepth = depth + 1
+    for i = 1, #q do
+        local item = q[i]
+        if type(item) == "table" and type(item.run) == "function" then
+            item.run()
+        elseif type(item) == "function" then
+            item()
+        end
+    end
+    SoftDeleteRuntime._histEffectiveSyncDrainDepth = depth
+end
+
+--- Resume paced include-deleted historical rebuild, then publish pending facts.
+function SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
+    if type(record) ~= "table" then
         return
     end
     local cont = SoftDeleteRuntime.histEffectiveContinuation[record]
@@ -8582,13 +8623,90 @@ function SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
         return
     end
     cont.scheduled = true
-    C_Timer.After(0, function()
+    local function run()
         local state = SoftDeleteRuntime.histEffectiveContinuation[record]
         if type(state) == "table" then
             state.scheduled = false
         end
-        SoftDeleteRuntime.rebuildHistEffectiveActive(record)
-    end)
+        SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
+    end
+    -- Sync-drain adoption never flushes After(0); queue until rebuild leaves busy.
+    if GS._adoptionReplaySyncDrain == true then
+        SoftDeleteRuntime._histEffectiveSyncDrain =
+            SoftDeleteRuntime._histEffectiveSyncDrain or {}
+        SoftDeleteRuntime._histEffectiveSyncDrain[
+            #SoftDeleteRuntime._histEffectiveSyncDrain + 1] = {
+            record = record,
+            run = run,
+        }
+        return
+    end
+    if not (C_Timer and C_Timer.After) then
+        cont.scheduled = false
+        return
+    end
+    C_Timer.After(0, run)
+end
+
+--- Finish include-deleted rebuild then coherently refresh deletion facts (#465).
+function SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    local owned = false
+    if GS.BeginOuterCreditProjectionCallbackBudget then
+        owned = GS.BeginOuterCreditProjectionCallbackBudget()
+    end
+    local ok, err = SoftDeleteRuntime.rebuildHistEffectiveActive(record)
+    if ok == false then
+        if GS.EndOuterCreditProjectionCallbackBudget then
+            GS.EndOuterCreditProjectionCallbackBudget(owned)
+        end
+        -- work_budget already scheduled via ScheduleCreditProjectionContinuation.
+        return false, err or "engine_error"
+    end
+    local pending = SoftDeleteRuntime._pendingFactRefresh
+        and SoftDeleteRuntime._pendingFactRefresh[record]
+    if SoftDeleteRuntime._pendingFactRefresh then
+        SoftDeleteRuntime._pendingFactRefresh[record] = nil
+    end
+    local factOk, factErr = true, nil
+    if type(pending) == "table" then
+        if pending.fullRebuild == true and GS.RebuildEventDeletionProjection then
+            factOk = GS.RebuildEventDeletionProjection(record, nil)
+            if not factOk then
+                factErr = "work_budget"
+            end
+        elseif pending.correctionBody ~= nil then
+            factOk = SoftDeleteRuntime.refreshDeletionAttributionForTarget(
+                record, pending.correctionBody)
+            if not factOk then
+                factErr = "work_budget"
+            end
+        end
+    end
+    if GS.EndOuterCreditProjectionCallbackBudget then
+        GS.EndOuterCreditProjectionCallbackBudget(owned)
+    end
+    if factOk == false then
+        return false, factErr or "work_budget"
+    end
+    return ok, err
+end
+
+function SoftDeleteRuntime.notePendingFactRefresh(record, pending)
+    if type(record) ~= "table" or type(pending) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime._pendingFactRefresh = SoftDeleteRuntime._pendingFactRefresh
+        or setmetatable({}, { __mode = "k" })
+    SoftDeleteRuntime._pendingFactRefresh[record] = pending
+    SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
+    -- Outside an in-flight rebuild, sync-drain queues must run immediately.
+    if GS._adoptionReplaySyncDrain == true
+        and not SoftDeleteRuntime._rebuildingHistEffective then
+        SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    end
 end
 
 --- Dependency stamp for include-deleted historical effectiveness (#465).
@@ -8601,7 +8719,8 @@ function SoftDeleteRuntime.histEffectiveDependencyStamp(record)
 end
 
 --- Rebuild include-deleted active correction map via the live engine (#465).
--- Shares activate/prune/tie/bind semantics; publishes to histEffectiveActive only.
+-- Shares activate/prune/tie/bind semantics and the parent callback allowance;
+-- publishes to histEffectiveActive only. Never disables C_Timer.After.
 function SoftDeleteRuntime.rebuildHistEffectiveActive(record)
     if type(record) ~= "table" then
         return false, "invalid_value"
@@ -8631,32 +8750,34 @@ function SoftDeleteRuntime.rebuildHistEffectiveActive(record)
         deactivations = GS._creditProjectionDeactivations,
         lookup = GS._creditProjectionLookupMisses,
     }
-    -- Detach from parent credit-projection callback allowance so include-deleted
-    -- historical rebuild cannot inflate #459 soft/hard ceilings. Nested work is
-    -- still measured on soft-delete counters.
-    local parentAccumulating = GS._creditProjectionAccumulating == true
-    local parentWork = tonumber(GS._creditProjectionCallbackWork) or 0
-    local parentLimit = GS._creditProjectionCallbackLimit
-    local parentHard = GS._creditProjectionCallbackHardLimit
-    local parentOwned = GS._creditProjectionOwnedCallbackBudget
-    if parentAccumulating then
-        GS._creditProjectionAccumulating = false
-        GS._creditProjectionOwnedCallbackBudget = false
+    local entered = false
+    local callOk, retOk, retErr, retDetails = pcall(function()
+        SoftDeleteRuntime.enterIncludeDeletedProjection(record)
+        entered = true
+        if GS._ForceHistEffectiveEngineErrorForTest then
+            error("forced hist-effective engine failure")
+        end
+        return GS.RebuildCreditCorrectionProjection(record, nil)
+    end)
+    if entered then
+        SoftDeleteRuntime.leaveIncludeDeletedProjection(record)
+    else
+        -- enter failed before swapping ownership; clear include-deleted gate.
+        GS._creditProjectionIncludeSoftDeleted = false
+        SoftDeleteRuntime._includeDeletedDepth = 0
+        SoftDeleteRuntime._savedLiveProjection = nil
     end
-    local savedAfter = nil
-    if SoftDeleteRuntime._syncHistEffective and C_Timer then
-        savedAfter = C_Timer.After
-        C_Timer.After = nil
+    local rowVisits = 0
+    local workUnits = 0
+    if callOk then
+        if type(retDetails) ~= "table" and type(retErr) == "table" then
+            retDetails = retErr
+            retErr = nil
+        end
+        rowVisits = retDetails and tonumber(retDetails.rowVisits)
+            or tonumber(GS._creditProjectionRowVisits) or 0
+        workUnits = retDetails and tonumber(retDetails.workUnits) or rowVisits
     end
-    SoftDeleteRuntime.enterIncludeDeletedProjection(record)
-    local ok, err, details = GS.RebuildCreditCorrectionProjection(record, nil)
-    SoftDeleteRuntime.leaveIncludeDeletedProjection(record)
-    if savedAfter ~= nil and C_Timer then
-        C_Timer.After = savedAfter
-    end
-    local rowVisits = details and tonumber(details.rowVisits)
-        or tonumber(GS._creditProjectionRowVisits) or 0
-    local workUnits = details and tonumber(details.workUnits) or rowVisits
     GS._softDeleteHistEffectivenessRowVisits = rowVisits
     GS._softDeleteHistEffectivenessWorkUnits = workUnits
     GS._softDeleteCumulativeHistEffectivenessRowVisits =
@@ -8670,20 +8791,31 @@ function SoftDeleteRuntime.rebuildHistEffectiveActive(record)
     GS._creditProjectionProvenanceVisits = savedVisits.provenance
     GS._creditProjectionDeactivations = savedVisits.deactivations
     GS._creditProjectionLookupMisses = savedVisits.lookup
-    if parentAccumulating then
-        GS._creditProjectionAccumulating = true
-        GS._creditProjectionCallbackWork = parentWork
-        GS._creditProjectionCallbackLimit = parentLimit
-        GS._creditProjectionCallbackHardLimit = parentHard
-        GS._creditProjectionOwnedCallbackBudget = parentOwned
-    end
     SoftDeleteRuntime._rebuildingHistEffective = false
-    if type(details) ~= "table" then
-        details = {}
+    if not callOk then
+        SoftDeleteRuntime.includeDeletedCache[record] = {
+            stamp = SoftDeleteRuntime.histEffectiveDependencyStamp(record),
+            ok = false,
+            err = "engine_error",
+        }
+        SoftDeleteRuntime.histEffectiveActive[record] = nil
+        if geterrorhandler then
+            pcall(geterrorhandler(), retOk)
+        end
+        if SF and SF.Debug and SF.Debug.Error then
+            SF.Debug:Error("GUILD_SUPPLIES",
+                "hist-effective engine error: %s", tostring(retOk))
+        end
+        SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+        return false, "engine_error"
     end
-    details.rowVisits = rowVisits
-    details.workUnits = workUnits
-    return ok, err, details
+    if type(retDetails) ~= "table" then
+        retDetails = {}
+    end
+    retDetails.rowVisits = rowVisits
+    retDetails.workUnits = workUnits
+    SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    return retOk, retErr, retDetails
 end
 
 ---------------------------------------------------------------------------
@@ -11218,15 +11350,22 @@ function SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
     end
     if not hasDeleteWork then
         GS._softDeleteHistEffectivenessVisits = visits
-        return visits
+        return visits, true
     end
-    SoftDeleteRuntime._syncHistEffective = true
+    -- Production pacing: keep C_Timer.After and share parent callback budgets.
+    -- Incomplete rebuilds leave hist.effective=false and return work_budget so
+    -- callers do not publish partial affected facts (assessment 6829598989).
     local ok, err, details = SoftDeleteRuntime.rebuildHistEffectiveActive(record)
-    SoftDeleteRuntime._syncHistEffective = false
+    local nested = (details and tonumber(details.workUnits))
+        or (tonumber(GS._softDeleteHistEffectivenessWorkUnits) or 0)
+    if ok == false then
+        GS._softDeleteHistEffectivenessVisits = visits + nested
+        return visits, false, err or "engine_error"
+    end
     local active = SoftDeleteRuntime.histEffectiveActive[record]
     if type(active) ~= "table" then
-        GS._softDeleteHistEffectivenessVisits = visits
-        return visits
+        GS._softDeleteHistEffectivenessVisits = visits + nested
+        return visits, true
     end
     for canon, hist in pairs(histIndex) do
         visits = visits + 1
@@ -11250,13 +11389,8 @@ function SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
             end
         end
     end
-    local nested = (details and tonumber(details.workUnits))
-        or (tonumber(GS._softDeleteHistEffectivenessWorkUnits) or 0)
-    if ok == false and err == "work_budget" then
-        nested = nested + 1
-    end
     GS._softDeleteHistEffectivenessVisits = visits + nested
-    return visits
+    return visits, true
 end
 
 --- Pure verified soft-delete facts from evidence + hist (no durable write).
@@ -11515,9 +11649,12 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
     end
     local needFullHist = type(scratch.histIndex) ~= "table"
         or scratch.histAliasGen ~= (d.aliasGen or 0)
+    local annotOk, annotErr = true, nil
     if needFullHist then
         local histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
-        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
         scratch.histIndex = histIndex
         scratch.histVisits = histVisits
         scratch.histAliasGen = d.aliasGen or 0
@@ -11533,7 +11670,9 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
                 scratch.histIndex, record, correctionBody, lookup)
             histTouch = 1
         end
-        SoftDeleteRuntime.annotateHistEffectiveness(record, scratch.histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, scratch.histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
         scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
         scratch.histAliasGen = d.aliasGen or 0
         GS._softDeleteHistCorrectionVisits = histTouch
@@ -11541,6 +11680,18 @@ function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctio
             GS._softDeleteCumulativeHistVisits =
                 (tonumber(GS._softDeleteCumulativeHistVisits) or 0) + histTouch
         end
+    end
+    if not annotOk then
+        -- Keep prior deletion facts coherent; resume via shared scheduling.
+        SoftDeleteRuntime.notePendingFactRefresh(record, {
+            correctionBody = correctionBody,
+        })
+        eventDeletionCache[record] = {
+            stamp = EventDeletionDependencyStamp(record),
+            ok = false,
+            err = annotErr or "work_budget",
+        }
+        return false
     end
     local ops = record.operations
     local byObj = scratch.eventIndex and scratch.eventIndex.byObj
@@ -11815,15 +11966,20 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
         GS._softDeleteColdLedgerBuilds =
             (tonumber(GS._softDeleteColdLedgerBuilds) or 0) + 1
     end
+    local annotOk, annotErr = true, nil
     if scratch.histStamp == histStamp and type(scratch.histIndex) == "table" then
         histIndex = scratch.histIndex
         histVisits = tonumber(scratch.histVisits) or 0
         GS._softDeleteHistCorrectionVisits = 0
         -- Re-annotate: floor context may have changed since the cached hist build.
-        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
     else
         histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
-        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
         scratch.histStamp = histStamp
         scratch.histIndex = histIndex
         scratch.histVisits = histVisits
@@ -11835,6 +11991,16 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     do
         local dHist = SoftDeleteRuntime.depsFor(record)
         scratch.histAliasGen = dHist.aliasGen or 0
+    end
+    if not annotOk then
+        -- Do not publish a partial deletion map; resume via shared scheduling.
+        SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+        eventDeletionCache[record] = {
+            stamp = EventDeletionDependencyStamp(record),
+            ok = false,
+            err = annotErr or "work_budget",
+        }
+        return false
     end
     GS._softDeleteIndexReuse = reusedLedger
     GS._softDeleteRebuildFindLedgerCalls = 0
@@ -12014,11 +12180,23 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
     local lookup = scratch.lookup
     local eventIndex = scratch.eventIndex
     local histIndex = scratch.histIndex
+    local annotOk = true
     if SoftDeleteRuntime.histIndexStamp(record) ~= scratch.histStamp
         or type(histIndex) ~= "table" then
         local hv
         histIndex, hv = BuildHistoricalCorrectionAttributionIndex(record, lookup)
-        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk = okAnnot ~= false
+        if not annotOk then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            eventDeletionCache[record] = {
+                stamp = EventDeletionDependencyStamp(record),
+                ok = false,
+                err = errAnnot or "work_budget",
+            }
+            return false
+        end
         scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
         scratch.histIndex = histIndex
         scratch.histVisits = hv
@@ -12027,7 +12205,18 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
             (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
             + (tonumber(hv) or 0)
     else
-        SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk = okAnnot ~= false
+        if not annotOk then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            eventDeletionCache[record] = {
+                stamp = EventDeletionDependencyStamp(record),
+                ok = false,
+                err = errAnnot or "work_budget",
+            }
+            return false
+        end
         GS._softDeleteHistCorrectionVisits = 0
     end
     do
@@ -12127,12 +12316,20 @@ end
 -- fallback) so intervening debt-floor consumers never read stale allowances and
 -- correction-heavy replay does not rebuild history/heads per admission.
 -- @param correctionBody table|nil accepted correct-contributor body (preferred)
-function GS.NoteAcceptedCorrectionHistoryMutation(record, correctionBody)
+function GS.NoteAcceptedCorrectionHistoryMutation(record, correctionBody, opts)
     if type(record) ~= "table" then
         return
     end
     SoftDeleteRuntime.bumpDep(record, "histGen")
     if type(record.eventDeletions) ~= "table" or next(record.eventDeletions) == nil then
+        return
+    end
+    opts = opts or {}
+    -- Adoption correction replay: invalidate and coalesce; one Ensure after the
+    -- replay settles publishes all affected facts coherently (#465).
+    if opts.deferRefresh == true then
+        eventDeletionCache[record] = nil
+        SoftDeleteRuntime.invalidateHistEffective(record)
         return
     end
     local body = correctionBody
@@ -12143,24 +12340,23 @@ function GS.NoteAcceptedCorrectionHistoryMutation(record, correctionBody)
         and SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, body) then
         return
     end
+    -- Paced hist-effective work owns the refresh via shared continuation.
+    local pending = SoftDeleteRuntime._pendingFactRefresh
+        and SoftDeleteRuntime._pendingFactRefresh[record]
+    if type(pending) == "table" then
+        return
+    end
     -- Unknown target: full Ensure preserves ordinary immediate correctness.
     if GS.EnsureEventDeletionProjection then
         GS.EnsureEventDeletionProjection(record, nil)
     end
 end
 
---- Test seam: include-deleted historical effectiveness rebuild (#465 6826134902).
+--- Test seam: include-deleted historical effectiveness rebuild (#465).
+-- Always uses production pacing (never disables C_Timer.After).
 function GS._RebuildHistEffectiveActiveForTest(record, opts)
     opts = opts or {}
-    local priorSync = SoftDeleteRuntime._syncHistEffective
-    if opts.sync == false then
-        SoftDeleteRuntime._syncHistEffective = false
-    elseif opts.sync == true then
-        SoftDeleteRuntime._syncHistEffective = true
-    end
-    local ok, err, details = SoftDeleteRuntime.rebuildHistEffectiveActive(record)
-    SoftDeleteRuntime._syncHistEffective = priorSync
-    return ok, err, details
+    return SoftDeleteRuntime.rebuildHistEffectiveActive(record)
 end
 
 --- Test/repair seam: drop reusable soft-delete ledger indexes (#465).
@@ -12195,6 +12391,19 @@ function GS.EnsureEventDeletionProjection(record, extraOp)
         and type(extraOp) ~= "table"
         and type(record.eventDeletions) == "table" then
         return true
+    end
+    -- Incomplete paced hist-effective work resumes via shared scheduling;
+    -- do not treat pending effectiveness as a completed deletion map (#465).
+    if type(cache) == "table" and cache.stamp == stamp and cache.ok == false
+        and cache.err == "work_budget" and type(extraOp) ~= "table" then
+        SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+        local after = eventDeletionCache[record]
+        local stampNow = EventDeletionDependencyStamp(record)
+        if type(after) == "table" and after.stamp == stampNow and after.ok == true
+            and type(record.eventDeletions) == "table" then
+            return true
+        end
+        return false
     end
     return GS.RebuildEventDeletionProjection(record, extraOp)
 end
