@@ -682,6 +682,33 @@ do
     assertEq(#world.placed, 0, "partial unknown-link offer defers exact variant")
 end
 
+-- Deferred exact offers reserve unidentified quantities away from bare IDs.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK1 },
+        [2] = { itemId = 123, count = 2, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "ambiguous bare test queues exact link")
+    assertTrue(TA:HandleCommand("123 1") == true, "ambiguous bare test queues bare id")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "ambiguous bare test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK1 }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    assertEq(#world.placed, 1, "ambiguous bare test places the bare unit")
+    assertEq(world.placed[1].count, 1, "ambiguous bare test places one unit")
+end
+
 -- Player-first acceptance still settles when the trade closes without a cancel.
 do
     resetWorld()

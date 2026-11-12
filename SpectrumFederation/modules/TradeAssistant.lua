@@ -834,6 +834,33 @@ local function HasAmbiguousExactOffer(existingOffers, item)
     return false
 end
 
+local function ConsumeAmbiguousExactOfferQuantity(existingOffers, item, limit)
+    local consumed = 0
+    limit = FloorQty(limit)
+    if limit < 1 or not item or not item.linkKey then
+        return 0
+    end
+    local displayName = ItemDisplayName(item)
+    local itemId = tonumber(item.itemId)
+    for _, offer in ipairs(existingOffers or {}) do
+        if consumed >= limit then
+            break
+        end
+        if FloorQty(offer.quantity) > 0 and offer.linkKey == nil and offer.name == displayName then
+            local offerId = tonumber(offer.itemId)
+            if not (offerId and itemId and offerId ~= itemId) then
+                local quantity = FloorQty(offer.quantity)
+                local take = math.min(quantity, limit - consumed)
+                if take > 0 then
+                    offer.quantity = quantity - take
+                    consumed = consumed + take
+                end
+            end
+        end
+    end
+    return consumed
+end
+
 local function PlanMoves(entry, freeSlots, existingOffers)
     local moves = {}
     local slotsLeft = FloorQty(freeSlots)
@@ -847,6 +874,14 @@ local function PlanMoves(entry, freeSlots, existingOffers)
             slot = offer.slot,
             name = offer.name,
         }
+    end
+
+    local deferredExactNames = {}
+    for _, itemKey in ipairs(entry.itemOrder) do
+        local item = entry.items[itemKey]
+        if item and item.linkKey and HasAmbiguousExactOffer(remainingOffers, item) then
+            deferredExactNames[ItemDisplayName(item)] = true
+        end
     end
 
     local orderedItemKeys = {}
@@ -869,9 +904,13 @@ local function PlanMoves(entry, freeSlots, existingOffers)
             local needed = FloorQty(item.quantity)
             local already = ConsumeExistingOfferQuantity(remainingOffers, item, needed)
             local remaining = math.max(0, needed - already)
-            if item.linkKey and remaining > 0 and HasAmbiguousExactOffer(remainingOffers, item) then
-                Debug("Info", "Trade prefill deferred for %s: unidentified matching offer present", tostring(itemKey))
-                remaining = 0
+            if item.linkKey and remaining > 0 then
+                local displayName = ItemDisplayName(item)
+                if deferredExactNames[displayName] then
+                    ConsumeAmbiguousExactOfferQuantity(remainingOffers, item, remaining)
+                    Debug("Info", "Trade prefill deferred for %s: unidentified matching offer present", tostring(itemKey))
+                    remaining = 0
+                end
             end
             if remaining > 0 then
                 local stacks = CollectStacksForItem(item)
