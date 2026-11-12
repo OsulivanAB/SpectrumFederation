@@ -1344,14 +1344,6 @@ local function MergeAcceptedOffers(accepted, unknown, offered, queuedItems)
                     match = slotOffer
                 end
             end
-            if not match then
-                local slotOffer = slot and offeredBySlot[slot] or nil
-                if slotOffer and not usedOffers[slotOffer] and slotOffer.linkKey == nil and tonumber(slotOffer.itemId) ~= nil
-                    and TradeOfferNameCompatible(slotOffer.name, tradeName)
-                    and FloorQty(slotOffer.quantity) == quantity then
-                    match = slotOffer
-                end
-            end
         else
             local slotOffer = slot and offeredBySlot[slot] or nil
             if slotOffer and not usedOffers[slotOffer] and not ambiguousOffers[slotOffer]

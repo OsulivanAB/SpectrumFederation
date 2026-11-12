@@ -717,10 +717,10 @@ do
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
-    assertEq(#snapshot, 2, "ambiguous bare settlement keeps both players queued")
-    assertEq(snapshot[1].name, "Alice", "ambiguous bare settlement keeps Alice queued")
-    assertEq(snapshot[1].itemCount, 1, "ambiguous bare settlement retains only the exact item")
-    assertEq(snapshot[2].itemCount, 2, "ambiguous bare settlement leaves Bob untouched")
+    assertEq(#snapshot, 2, "ambiguous bare linkless settlement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "ambiguous bare linkless settlement keeps Alice queued")
+    assertEq(snapshot[1].itemCount, 2, "ambiguous bare linkless settlement retains both items")
+    assertEq(snapshot[2].itemCount, 2, "ambiguous bare linkless settlement leaves Bob untouched")
 end
 
 -- Player-first acceptance still settles when the trade closes without a cancel.
