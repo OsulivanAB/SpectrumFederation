@@ -707,6 +707,20 @@ do
 
     assertEq(#world.placed, 1, "ambiguous bare test places the bare unit")
     assertEq(world.placed[1].count, 1, "ambiguous bare test places one unit")
+
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "ambiguous bare settlement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "ambiguous bare settlement keeps Alice queued")
+    assertEq(snapshot[1].itemCount, 1, "ambiguous bare settlement retains only the exact item")
+    assertEq(snapshot[2].itemCount, 2, "ambiguous bare settlement leaves Bob untouched")
 end
 
 -- Player-first acceptance still settles when the trade closes without a cancel.
