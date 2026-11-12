@@ -589,6 +589,69 @@ do
     assertEq(world.placed[1].count, 1, "only the missing quantity is placed")
 end
 
+-- Existing offers remain settlement evidence when acceptance links are unreadable.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 2") == true, "existing settlement test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "existing settlement test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK1 }
+    runAfter()
+    assertEq(#world.placed, 1, "existing settlement test places missing quantity")
+    assertEq(world.placed[1].count, 1, "existing settlement test places one unit")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "existing settlement test removes Alice after full settlement")
+    assertEq(snapshot[1].name, "Bob", "existing settlement test leaves Bob queued")
+end
+
+-- Unidentified offers are not assigned to bare IDs by display name alone.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK1 },
+        [2] = { itemId = 456, count = 2, link = LINK2 },
+    }
+    local originalGetItemInfo = GetItemInfo
+    GetItemInfo = function(itemId)
+        if tonumber(itemId) == 123 or tonumber(itemId) == 456 then
+            return "Shared Rune"
+        end
+        return nil
+    end
+    assertTrue(TA:HandleCommand("123 1") == true, "same-name bare test queues item 123")
+    assertTrue(TA:HandleCommand("456 1") == true, "same-name bare test queues item 456")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "same-name bare test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { count = 1, link = "|Hitem:999:0:0:0:0:0:80:::|h[Shared Rune]|h|r" }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+    GetItemInfo = originalGetItemInfo
+
+    assertEq(#world.placed, 2, "same-name bare test places both unidentified-safe units")
+    assertEq(world.placed[1].itemId, 123, "same-name bare test places first bare id")
+    assertEq(world.placed[2].itemId, 456, "same-name bare test places second bare id")
+end
+
 -- Prefill reserves exact variants before fungible bare IDs.
 do
     resetWorld()

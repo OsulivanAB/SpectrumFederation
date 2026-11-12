@@ -798,10 +798,10 @@ local function OfferMatchesQueuedItem(offer, item)
     if offerId and itemId then
         return true
     end
-    return offer.name ~= nil and offer.name == ItemDisplayName(item)
+    return false
 end
 
-local function ConsumeExistingOfferQuantity(existingOffers, item, need)
+local function ConsumeExistingOfferQuantity(existingOffers, item, need, allocatedOffers, allocatedBySlot)
     local consumed = 0
     need = FloorQty(need)
     if need < 1 then
@@ -817,6 +817,25 @@ local function ConsumeExistingOfferQuantity(existingOffers, item, need)
             if take > 0 then
                 offer.quantity = quantity - take
                 consumed = consumed + take
+                if allocatedOffers then
+                    local slot = tonumber(offer.slot)
+                    local key = slot and tostring(slot) or ("offer:" .. tostring(#allocatedOffers + 1))
+                    local record = allocatedBySlot and allocatedBySlot[key]
+                    if not record then
+                        record = {
+                            itemId = offer.itemId,
+                            linkKey = offer.linkKey,
+                            quantity = 0,
+                            slot = offer.slot,
+                            name = offer.name,
+                        }
+                        if allocatedBySlot then
+                            allocatedBySlot[key] = record
+                        end
+                        allocatedOffers[#allocatedOffers + 1] = record
+                    end
+                    record.quantity = FloorQty(record.quantity) + take
+                end
             end
         end
     end
@@ -871,6 +890,8 @@ local function PlanMoves(entry, freeSlots, existingOffers)
     local moves = {}
     local slotsLeft = FloorQty(freeSlots)
     local planned = {}
+    local allocatedOffers = {}
+    local allocatedBySlot = {}
     local remainingOffers = {}
     for index, offer in ipairs(existingOffers or {}) do
         remainingOffers[index] = {
@@ -908,7 +929,7 @@ local function PlanMoves(entry, freeSlots, existingOffers)
         local item = entry.items[itemKey]
         if item and slotsLeft > 0 then
             local needed = FloorQty(item.quantity)
-            local already = ConsumeExistingOfferQuantity(remainingOffers, item, needed)
+            local already = ConsumeExistingOfferQuantity(remainingOffers, item, needed, allocatedOffers, allocatedBySlot)
             local remaining = math.max(0, needed - already)
             if item.linkKey and remaining > 0 then
                 local displayName = ItemDisplayName(item)
@@ -945,7 +966,7 @@ local function PlanMoves(entry, freeSlots, existingOffers)
             end
         end
     end
-    return moves
+    return moves, allocatedOffers
 end
 
 local function PlaceOfferFromStack(bag, slot, quantity)
@@ -1030,8 +1051,13 @@ function TA:TryPrefillTrade(lifecycle, key)
     end
 
     local existingOffers = CaptureCurrentOffers()
+    local moves, allocatedOffers = PlanMoves(entry, freeSlots, existingOffers)
     trade.offeredOffers = {}
-    local moves = PlanMoves(entry, freeSlots, existingOffers)
+    for _, offer in ipairs(allocatedOffers or {}) do
+        if FloorQty(offer.quantity) > 0 then
+            trade.offeredOffers[#trade.offeredOffers + 1] = offer
+        end
+    end
     local placed = 0
     local attempted = 0
     for _, move in ipairs(moves) do
