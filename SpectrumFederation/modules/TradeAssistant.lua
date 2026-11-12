@@ -787,10 +787,7 @@ local function OfferMatchesQueuedItem(offer, item)
         return false
     end
     if item.linkKey then
-        if offer.linkKey then
-            return offer.linkKey == item.linkKey
-        end
-        return offer.name ~= nil and offer.name == ItemDisplayName(item)
+        return offer.linkKey ~= nil and offer.linkKey == item.linkKey
     end
     if offerId and itemId then
         return true
@@ -798,24 +795,63 @@ local function OfferMatchesQueuedItem(offer, item)
     return offer.name ~= nil and offer.name == ItemDisplayName(item)
 end
 
-local function ExistingOfferQuantity(existingOffers, item)
-    local total = 0
+local function ConsumeExistingOfferQuantity(existingOffers, item, need)
+    local consumed = 0
+    need = FloorQty(need)
+    if need < 1 then
+        return 0
+    end
     for _, offer in ipairs(existingOffers or {}) do
+        if consumed >= need then
+            break
+        end
         if OfferMatchesQueuedItem(offer, item) then
-            total = total + FloorQty(offer.quantity)
+            local quantity = FloorQty(offer.quantity)
+            local take = math.min(quantity, need - consumed)
+            if take > 0 then
+                offer.quantity = quantity - take
+                consumed = consumed + take
+            end
         end
     end
-    return total
+    return consumed
 end
 
 local function PlanMoves(entry, freeSlots, existingOffers)
     local moves = {}
     local slotsLeft = FloorQty(freeSlots)
     local planned = {}
+    local remainingOffers = {}
+    for index, offer in ipairs(existingOffers or {}) do
+        remainingOffers[index] = {
+            itemId = offer.itemId,
+            linkKey = offer.linkKey,
+            quantity = FloorQty(offer.quantity),
+            slot = offer.slot,
+            name = offer.name,
+        }
+    end
+
+    local orderedItemKeys = {}
     for _, itemKey in ipairs(entry.itemOrder) do
         local item = entry.items[itemKey]
+        if item and item.linkKey then
+            orderedItemKeys[#orderedItemKeys + 1] = itemKey
+        end
+    end
+    for _, itemKey in ipairs(entry.itemOrder) do
+        local item = entry.items[itemKey]
+        if item and not item.linkKey then
+            orderedItemKeys[#orderedItemKeys + 1] = itemKey
+        end
+    end
+
+    for _, itemKey in ipairs(orderedItemKeys) do
+        local item = entry.items[itemKey]
         if item and slotsLeft > 0 then
-            local remaining = math.max(0, FloorQty(item.quantity) - ExistingOfferQuantity(existingOffers, item))
+            local needed = FloorQty(item.quantity)
+            local already = ConsumeExistingOfferQuantity(remainingOffers, item, needed)
+            local remaining = math.max(0, needed - already)
             if remaining > 0 then
                 local stacks = CollectStacksForItem(item)
                 for _, stack in ipairs(stacks) do

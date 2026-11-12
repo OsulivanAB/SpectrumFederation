@@ -159,10 +159,12 @@ only when later changes do not invalidate it, and explain why.
   current-code evidence. Resolve a thread only after its IMPLEMENT fix is
   verified in current HEAD; leave DEFER, DO NOT IMPLEMENT, OWNER DECISION,
   unverified, or disputed threads unresolved for the owner.
-- For iterative PR review loops, drive automated reviewers to a clean state:
-  finish Devin Review findings first, then trigger/evaluate Codex review
-  comments, implement valid findings, resolve implemented threads, and repeat
-  `@codex review` until Codex is clean or only minor/deferred items remain.
+- When the owner has authorized an iterative PR review loop for the operation,
+  drive automated reviewers to a clean state: finish Devin Review findings
+  first, then trigger/evaluate Codex review comments, implement valid
+  findings, resolve implemented threads, and repeat `@codex review` only while
+  that authorization covers the next round. Stop and report when Codex is
+  clean, only minor/deferred items remain, or the authorization is exhausted.
 - After delivery, report and stop. No subscriptions, watchers, polling, or
   event-driven continuation; incoming comments/CI/pushes do not renew
   authority.

@@ -589,6 +589,76 @@ do
     assertEq(world.placed[1].count, 1, "only the missing quantity is placed")
 end
 
+-- Prefill reserves exact variants before fungible bare IDs.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 4, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand("123 2") == true, "bare-first strand test queues bare id")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "bare-first strand test queues variant A")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "bare-first strand test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+
+    assertEq(#world.placed, 3, "bare-first strand test places exact and bare units")
+    assertEq(world.placed[1].count, 1, "bare-first strand test places exact variant first")
+    assertEq(world.placed[2].count, 1, "bare-first strand test places remaining variant unit")
+    assertEq(world.placed[3].count, 1, "bare-first strand test places bare unit")
+end
+
+-- Existing offers are allocated once across exact and bare queue entries.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 2, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand("123 1") == true, "single-count test queues bare id")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "single-count test queues variant A")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "single-count test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK_VARIANT_A }
+    runAfter()
+
+    assertEq(#world.placed, 1, "single-count test still places the bare unit")
+    assertEq(world.placed[1].count, 1, "single-count test places only the missing bare unit")
+end
+
+-- Unknown-link existing offers do not satisfy exact variants by name.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 1
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_A },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "unknown-link offer test queues variant A")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "unknown-link offer test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK_VARIANT_A }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    assertEq(#world.placed, 1, "unknown-link offer does not suppress exact variant")
+    assertEq(world.placed[1].count, 1, "unknown-link offer test places the exact unit")
+end
+
 -- Player-first acceptance still settles when the trade closes without a cancel.
 do
     resetWorld()
