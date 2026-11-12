@@ -567,6 +567,12 @@ function TA:RemovePlayer(playerId)
             table.remove(state.order, index)
         end
     end
+    if state.activeTrade and state.activeTrade.key == key then
+        state.activeTrade.cancelled = true
+    end
+    if state.pendingTrade and state.pendingTrade.key == key then
+        state.pendingTrade.cancelled = true
+    end
     Debug("Info", "Removed %s from trade queue", tostring(entry.name or key))
     RefreshQueueUI()
     return true

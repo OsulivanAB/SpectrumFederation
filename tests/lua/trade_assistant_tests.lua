@@ -723,6 +723,39 @@ do
     assertEq(snapshot[2].itemCount, 2, "ambiguous bare linkless settlement leaves Bob untouched")
 end
 
+-- Removing a player invalidates settlement for an open assistant trade.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 1
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 5, link = LINK1 },
+    }
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "settlement invalidation queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "settlement invalidation trades Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 1, "settlement invalidation prefill places item")
+
+    assertTrue(TA:RemovePlayer("Alice-TestRealm") == true, "settlement invalidation removes Alice")
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "settlement invalidation requeues item")
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
+
+    local snapshot = TA:GetQueueSnapshot()
+    local aliceRow = nil
+    for _, row in ipairs(snapshot) do
+        if row.name == "Alice" then
+            aliceRow = row
+        end
+    end
+    assertTrue(aliceRow ~= nil, "settlement invalidation keeps requeued Alice")
+    assertEq(aliceRow.itemCount, 1, "settlement invalidation retains requeued item")
+    assertEq(aliceRow.totalQuantity, 1, "settlement invalidation retains requeued quantity")
+end
+
 -- Player-first acceptance still settles when the trade closes without a cancel.
 do
     resetWorld()

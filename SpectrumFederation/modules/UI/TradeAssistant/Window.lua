@@ -157,7 +157,7 @@ local function EnsureRow(index)
     end)
     row.Remove.Text = row.Remove:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.Remove.Text:SetPoint("CENTER", row.Remove, "CENTER", 0, 0)
-    row.Remove.Text:SetText("x")
+    row.Remove.Text:SetText(Loc("TRADE_ASSISTANT_REMOVE", "x"))
     row.Remove.Text:SetTextColor(0.9, 0.25, 0.25, 1)
 
     rows[index] = row
