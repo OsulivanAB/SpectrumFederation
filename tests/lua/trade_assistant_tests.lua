@@ -658,6 +658,31 @@ do
     assertEq(#world.placed, 0, "unknown-link matching offer defers exact variant")
 end
 
+-- Partial unknown-link offers cover only their quantity for exact variants.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 1
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 4, link = LINK_VARIANT_A },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 2") == true, "partial unknown-link test queues variant A")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "partial unknown-link test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK_VARIANT_A }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    assertEq(#world.placed, 1, "partial unknown-link offer places only the shortage")
+    assertEq(world.placed[1].count, 1, "partial unknown-link offer shortage is one")
+end
+
 -- Player-first acceptance still settles when the trade closes without a cancel.
 do
     resetWorld()
