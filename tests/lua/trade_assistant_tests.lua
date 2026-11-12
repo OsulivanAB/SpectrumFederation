@@ -647,9 +647,27 @@ do
     GetTradePlayerItemLink = originalTradeLink
     GetItemInfo = originalGetItemInfo
 
-    assertEq(#world.placed, 2, "same-name bare test places both unidentified-safe units")
-    assertEq(world.placed[1].itemId, 123, "same-name bare test places first bare id")
-    assertEq(world.placed[2].itemId, 456, "same-name bare test places second bare id")
+    assertEq(#world.placed, 0, "same-name bare test defers ambiguous unidentified offer")
+end
+
+-- A single bare ID also defers when its existing offer link is unreadable.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand("123 1") == true, "unreadable bare offer test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "unreadable bare offer test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { count = 1, link = "|Hitem:999:0:0:0:0:0:80:::|h[Rune One]|h|r" }
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    assertEq(#world.placed, 0, "unreadable bare offer defers prefill instead of duplicating")
 end
 
 -- Prefill reserves exact variants before fungible bare IDs.

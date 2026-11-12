@@ -859,6 +859,19 @@ local function HasAmbiguousExactOffer(existingOffers, item)
     return false
 end
 
+local function HasAmbiguousBareOffer(existingOffers, item)
+    if not item or item.linkKey then
+        return false
+    end
+    local displayName = ItemDisplayName(item)
+    for _, offer in ipairs(existingOffers or {}) do
+        if FloorQty(offer.quantity) > 0 and offer.linkKey == nil and offer.name == displayName and tonumber(offer.itemId) == nil then
+            return true
+        end
+    end
+    return false
+end
+
 local function ConsumeAmbiguousExactOfferQuantity(existingOffers, item, limit)
     local consumed = 0
     limit = FloorQty(limit)
@@ -938,6 +951,10 @@ local function PlanMoves(entry, freeSlots, existingOffers)
                     Debug("Info", "Trade prefill deferred for %s: unidentified matching offer present", tostring(itemKey))
                     remaining = 0
                 end
+            end
+            if not item.linkKey and remaining > 0 and HasAmbiguousBareOffer(remainingOffers, item) then
+                Debug("Info", "Trade prefill deferred for %s: unidentified matching offer present", tostring(itemKey))
+                remaining = 0
             end
             if remaining > 0 then
                 local stacks = CollectStacksForItem(item)
