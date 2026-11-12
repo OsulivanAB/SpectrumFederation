@@ -634,7 +634,7 @@ do
     assertEq(world.placed[1].count, 1, "single-count test places only the missing bare unit")
 end
 
--- Unknown-link existing offers do not satisfy exact variants by name.
+-- Unknown-link matching offers defer exact variants to avoid duplicates.
 do
     resetWorld()
     resetAssistant()
@@ -655,8 +655,7 @@ do
     runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
-    assertEq(#world.placed, 1, "unknown-link offer does not suppress exact variant")
-    assertEq(world.placed[1].count, 1, "unknown-link offer test places the exact unit")
+    assertEq(#world.placed, 0, "unknown-link matching offer defers exact variant")
 end
 
 -- Player-first acceptance still settles when the trade closes without a cancel.
