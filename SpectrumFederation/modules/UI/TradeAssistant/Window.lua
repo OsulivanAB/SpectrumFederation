@@ -110,7 +110,7 @@ local function EnsureRow(index)
             return
         end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText(model.name or model.playerId or "Player")
+        GameTooltip:SetText(self.playerName or model.name or model.playerId or "Player")
         local rangeKey = "TRADE_ASSISTANT_RANGE_UNKNOWN"
         local rangeDefault = "Range unavailable"
         if model.inRange == true then
@@ -122,7 +122,7 @@ local function EnsureRow(index)
         end
         GameTooltip:AddLine(Loc(rangeKey, rangeDefault))
         for _, item in ipairs(model.items or {}) do
-            GameTooltip:AddLine(string.format("%dx %s", item.quantity or 0, item.displayName or item.itemLink or "item"))
+            GameTooltip:AddLine(string.format(Loc("TRADE_ASSISTANT_ITEM_LINE", "%dx %s"), item.quantity or 0, item.displayName or item.itemLink or "item"))
         end
         GameTooltip:Show()
     end)
@@ -188,11 +188,21 @@ function Window:Refresh()
         end
     end
 
+    local nameCounts = {}
+    for _, model in ipairs(snapshot) do
+        local name = model.name or model.playerId or "Unknown"
+        nameCounts[name] = (nameCounts[name] or 0) + 1
+    end
+
     local y = -2
     for index, model in ipairs(snapshot) do
         local row = EnsureRow(index)
+        local displayName = model.name or model.playerId or "Unknown"
+        if nameCounts[displayName] > 1 and model.playerId then
+            displayName = model.playerId
+        end
         row.playerKey = model.key
-        row.playerName = model.name or model.playerId
+        row.playerName = displayName
         if row.Remove then
             row.Remove.playerKey = model.key
         end
@@ -202,7 +212,7 @@ function Window:Refresh()
         row:SetHeight(ROW_HEIGHT)
         row:Show()
         if row.Name then
-            row.Name:SetText(model.name or model.playerId or "Unknown")
+            row.Name:SetText(displayName)
         end
         if row.Count then
             row.Count:SetText(ItemSummaryText(model.itemCount))

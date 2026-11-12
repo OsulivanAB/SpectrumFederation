@@ -392,6 +392,11 @@ do
     assertTrue(defaulted ~= nil, "parse accepts bare item id")
     assertEq(defaulted.quantity, 1, "quantity defaults to 1")
 
+    for _, malformed in ipairs({ LINK1 .. " -1", LINK1 .. " 1.5", LINK1 .. " soon", LINK1 .. " 0" }) do
+        local parsed, err = TA:ParseCommand(malformed)
+        assertTrue(parsed == nil and err == "invalid_quantity", "malformed quantity suffix is rejected")
+    end
+
     local badQty = TA:ParseCommand("not-an-item 0")
     assertTrue(badQty == nil, "invalid item is rejected")
 end
@@ -488,6 +493,28 @@ do
     assertEq(snapshot[2].totalQuantity, 2, "variant reservation totals two for Bob")
 end
 
+-- Planned moves do not reuse bag stacks across queued item entries.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 2, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "planned depletion queues variant A")
+    assertTrue(TA:HandleCommand("123 1") == true, "planned depletion queues bare id")
+    world.bags[0][1].count = 1
+    world.bags[0][2].count = 1
+    assertTrue(TA:TradeWithPlayer("Bob-TestRealm") == true, "planned depletion can trade Bob")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 2, "planned depletion places both items")
+    assertEq(world.tradeSlots[1].link, LINK_VARIANT_A, "planned depletion reserves variant A slot")
+    assertEq(world.tradeSlots[2].link, LINK_VARIANT_B, "planned depletion moves bare id to variant B")
+end
+
 -- Clicking a queued player prefills every queued item; accepted trade removes only that player.
 do
     resetWorld()
@@ -515,6 +542,7 @@ do
 
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "completed trade removes only that player")
@@ -534,6 +562,7 @@ do
 
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 0)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "player-first completed trade removes Alice")
@@ -559,6 +588,7 @@ do
 
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "partial settlement keeps both players queued")
@@ -588,6 +618,7 @@ do
     world.tradeSlots[2] = nil -- simulate removing the second offer before accepting
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "edited offer keeps both players queued")
@@ -619,6 +650,7 @@ do
     world.tradeSlots[1] = { itemId = 1007, count = 1 } -- manually replace the first offer with the unoffered item
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "manual add settlement keeps both players queued")
@@ -651,6 +683,7 @@ do
     world.tradeSlots[1] = nil -- remove variant A; variant B remains offered
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "variant settlement keeps both players queued")
@@ -682,6 +715,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -711,6 +745,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -745,6 +780,7 @@ do
     world.tradeSlots[1] = nil -- remove item one before reaccepting
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -778,6 +814,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -812,6 +849,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -819,6 +857,41 @@ do
     assertEq(snapshot[1].name, "Alice", "Alice is not settled by an ambiguous variant")
     assertEq(snapshot[1].itemCount, 2, "Alice retains both ambiguous variants")
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after ambiguous settlement")
+end
+
+-- Missing-link same-name fallback does not settle when the queue has an unoffered variant.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_SHARED_A },
+        [2] = { itemId = 123, count = 2, link = LINK_VARIANT_SHARED_B },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_A .. " 1") == true, "missing-link replacement test queues variant A")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_SHARED_B .. " 1") == true, "missing-link replacement test queues variant B")
+    world.bags[0][2] = nil -- variant B is no longer available, so only A is prefilled
+
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "missing-link replacement test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    assertEq(#world.placed, 1, "missing-link replacement prefill places only variant A")
+
+    local originalTradeLink = GetTradePlayerItemLink
+    GetTradePlayerItemLink = function()
+        return nil
+    end
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
+    GetTradePlayerItemLink = originalTradeLink
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "missing-link replacement keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice is not settled by an incomplete identity set")
+    assertEq(snapshot[1].itemCount, 2, "Alice retains both same-name variants")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after missing-link replacement")
 end
 
 -- Unchanged same-name variants settle by their original slots.
@@ -847,6 +920,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -885,6 +959,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -919,6 +994,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
 
     local snapshot = TA:GetQueueSnapshot()
@@ -959,6 +1035,7 @@ do
     end
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
     GetTradePlayerItemLink = originalTradeLink
     GetItemInfo = originalGetItemInfo
     C_Item = originalCItem
@@ -966,6 +1043,28 @@ do
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "bare id settles when name resolves through C_Item")
     assertEq(snapshot[1].name, "Bob", "Alice is removed after bare id settlement")
+end
+
+-- A close followed by cancel does not settle the trade.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "close-before-cancel test queues item one")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "close-before-cancel test can trade Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    frame.scripts.OnEvent(frame, "TRADE_REQUEST_CANCEL")
+    runAfter()
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "close followed by cancel keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains queued after close-before-cancel")
+    assertEq(snapshot[1].itemCount, 1, "Alice retains the cancelled item")
+    assertEq(snapshot[2].name, "Bob", "Bob remains queued after close-before-cancel")
 end
 
 -- A declined/cancelled trade leaves the player queued.
@@ -981,6 +1080,7 @@ do
     frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 0)
     frame.scripts.OnEvent(frame, "TRADE_REQUEST_CANCEL")
     frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    runAfter()
 
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "cancelled trade keeps both players queued")

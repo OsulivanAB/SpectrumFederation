@@ -9,16 +9,17 @@ local NameUtil = SF.NameUtil
 
 TA.TRADE_SLOTS = 6
 TA.RANGE_CHECK_INDEX = 2 -- CheckInteractDistance trade range
-TA.AUTO_FILL_WINDOW_SECONDS = 5
+TA.SETTLEMENT_DELAY_SECONDS = 0.2
 
 local state = {
     players = {}, -- lowercased Name-Realm -> entry
     order = {}, -- stable display order of player keys
-    activeTrade = nil, -- { key, name, lifecycle, playerAccepted, targetAccepted, autoFill }
+    activeTrade = nil, -- { key, name, lifecycle, playerAccepted, targetAccepted, autoFill, cancelled }
+    pendingTrade = nil, -- accepted trade awaiting cancellation ordering before settlement
     tradeLifecycle = 0,
     listenersAttached = false,
     frame = nil,
-    lastAutoFill = nil, -- { key, at }
+    lastAutoFill = nil, -- { key }
 }
 
 local function Loc(key, default)
@@ -44,16 +45,6 @@ local function FloorQty(value)
         return 0
     end
     return math.floor(value)
-end
-
-local function NowSeconds()
-    if GetTime then
-        local ok, value = pcall(GetTime)
-        if ok and type(value) == "number" and value == value then
-            return value
-        end
-    end
-    return 0
 end
 
 local function InCombat()
@@ -157,10 +148,22 @@ function TA:ParseCommand(args)
 
     local linkPart = text
     local quantity = 1
-    local beforeQty, qtyText = text:match("^(.-)%s+(%d+)%s*$")
-    if beforeQty and qtyText then
-        linkPart = Trim(beforeQty)
-        quantity = tonumber(qtyText) or 0
+    local _, linkEnd = text:find("|h|r", 1, true)
+    if linkEnd then
+        linkPart = Trim(text:sub(1, linkEnd))
+        local suffix = Trim(text:sub(linkEnd + 1))
+        if suffix ~= "" then
+            if not suffix:match("^%d+$") then
+                return nil, "invalid_quantity"
+            end
+            quantity = tonumber(suffix) or 0
+        end
+    else
+        local beforeQty, qtyText = text:match("^(.-)%s+(%d+)%s*$")
+        if beforeQty and qtyText then
+            linkPart = Trim(beforeQty)
+            quantity = tonumber(qtyText) or 0
+        end
     end
 
     if linkPart == "" then
@@ -611,6 +614,7 @@ function TA:ClearQueue()
     state.players = {}
     state.order = {}
     state.activeTrade = nil
+    state.pendingTrade = nil
     state.lastAutoFill = nil
     RefreshQueueUI()
 end
@@ -619,6 +623,7 @@ function TA:ResetRuntime()
     state.players = {}
     state.order = {}
     state.activeTrade = nil
+    state.pendingTrade = nil
     state.lastAutoFill = nil
 end
 
@@ -701,6 +706,7 @@ end
 local function PlanMoves(entry, freeSlots)
     local moves = {}
     local slotsLeft = FloorQty(freeSlots)
+    local planned = {}
     for _, itemKey in ipairs(entry.itemOrder) do
         local item = entry.items[itemKey]
         if item and slotsLeft > 0 then
@@ -710,14 +716,17 @@ local function PlanMoves(entry, freeSlots)
                 if remaining < 1 or slotsLeft < 1 then
                     break
                 end
-                if not stack.locked and stack.count > 0 then
-                    local take = math.min(stack.count, remaining)
+                local stackKey = tostring(stack.bag) .. ":" .. tostring(stack.slot)
+                local availableCount = stack.count - (planned[stackKey] or 0)
+                if not stack.locked and availableCount > 0 then
+                    local take = math.min(availableCount, remaining)
                     moves[#moves + 1] = {
                         item = item,
                         bag = stack.bag,
                         slot = stack.slot,
                         quantity = take,
                     }
+                    planned[stackKey] = (planned[stackKey] or 0) + take
                     remaining = remaining - take
                     slotsLeft = slotsLeft - 1
                 end
@@ -861,11 +870,7 @@ end
 
 local function ShouldAutoFill(key)
     local last = state.lastAutoFill
-    if not last or last.key ~= key then
-        return false
-    end
-    local now = NowSeconds()
-    return (now - last.at) <= TA.AUTO_FILL_WINDOW_SECONDS
+    return last ~= nil and last.key == key
 end
 
 local function OnTradeShow()
@@ -994,7 +999,31 @@ local function TradeOffersInterchangeable(first, candidates)
     return true
 end
 
-local function MergeAcceptedOffers(accepted, unknown, offered)
+local function ItemIdentityString(item)
+    return tostring(tonumber(item and item.itemId) or "?") .. "|" .. tostring(item and item.linkKey)
+end
+
+local function IdentitySetsEqual(a, b)
+    local countA = 0
+    for _ in pairs(a or {}) do
+        countA = countA + 1
+    end
+    local countB = 0
+    for _ in pairs(b or {}) do
+        countB = countB + 1
+    end
+    if countA ~= countB then
+        return false
+    end
+    for identity in pairs(a or {}) do
+        if not (b and b[identity]) then
+            return false
+        end
+    end
+    return true
+end
+
+local function MergeAcceptedOffers(accepted, unknown, offered, queuedItems)
     local merged = {}
     for _, offer in ipairs(accepted or {}) do
         merged[#merged + 1] = offer
@@ -1023,25 +1052,38 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
     end
     local ambiguousNames = {}
     local identitiesByName = {}
+    local offeredIdentitiesByName = {}
+    local queuedIdentitiesByName = {}
+    local function AddIdentity(map, name, identity)
+        if type(name) ~= "string" or name == "" then
+            return
+        end
+        local identities = map[name]
+        if not identities then
+            identities = {}
+            map[name] = identities
+        end
+        identities[identity] = true
+    end
     for _, offer in ipairs(offered or {}) do
         local offerName = offer and offer.name
-        if type(offerName) == "string" and offerName ~= "" then
-            local identity = tostring(tonumber(offer.itemId) or "?") .. "|" .. tostring(offer.linkKey)
-            local identities = identitiesByName[offerName]
-            if not identities then
-                identities = {}
-                identitiesByName[offerName] = identities
-            end
-            if not identities[identity] then
-                identities[identity] = true
-                local identityCount = 0
-                for _ in pairs(identities) do
-                    identityCount = identityCount + 1
-                end
-                if identityCount > 1 then
-                    ambiguousNames[offerName] = true
-                end
-            end
+        local identity = ItemIdentityString(offer)
+        AddIdentity(identitiesByName, offerName, identity)
+        AddIdentity(offeredIdentitiesByName, offerName, identity)
+    end
+    for _, item in ipairs(queuedItems or {}) do
+        local itemName = ItemDisplayName(item)
+        local identity = ItemIdentityString(item)
+        AddIdentity(identitiesByName, itemName, identity)
+        AddIdentity(queuedIdentitiesByName, itemName, identity)
+    end
+    for offerName, identities in pairs(identitiesByName) do
+        local identityCount = 0
+        for _ in pairs(identities) do
+            identityCount = identityCount + 1
+        end
+        if identityCount > 1 then
+            ambiguousNames[offerName] = true
         end
     end
     local safeAmbiguousNames = {}
@@ -1076,7 +1118,7 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
                 end
             end
         end
-        if unchanged then
+        if unchanged and IdentitySetsEqual(offeredIdentitiesByName[offerName], queuedIdentitiesByName[offerName]) then
             safeAmbiguousNames[offerName] = true
             safeAmbiguousSlotOffers[offerName] = {}
             for _, offer in ipairs(offered or {}) do
@@ -1145,12 +1187,64 @@ local function MergeAcceptedOffers(accepted, unknown, offered)
     return merged
 end
 
+local function SettleCompletedTrade(trade)
+    if trade.autoFill then
+        local settlement = trade.acceptedOffers
+        local queuedItems = {}
+        local entry = FindPlayer(trade.key)
+        if entry then
+            for _, itemKey in ipairs(entry.itemOrder) do
+                local item = entry.items[itemKey]
+                if item then
+                    queuedItems[#queuedItems + 1] = item
+                end
+            end
+        end
+        if settlement ~= nil and trade.acceptedComplete == false then
+            settlement = MergeAcceptedOffers(settlement, trade.acceptedUnknown, trade.offeredOffers, queuedItems)
+        elseif settlement == nil then
+            settlement = trade.offeredOffers
+        end
+        if settlement ~= nil then
+            SettlePlayerItems(trade.key, settlement)
+        else
+            TA:RemovePlayer(trade.key)
+        end
+    else
+        TA:RemovePlayer(trade.key)
+    end
+end
+
+local function FinalizePendingTrade(trade)
+    if state.pendingTrade ~= trade then
+        return
+    end
+    state.pendingTrade = nil
+    if not trade or not trade.key or trade.cancelled then
+        Debug("Info", "Trade closed without completion for %s", tostring(trade and (trade.name or trade.key) or "unknown"))
+        return
+    end
+    SettleCompletedTrade(trade)
+end
+
+local function ScheduleTradeSettlement(trade)
+    state.pendingTrade = trade
+    if C_Timer and C_Timer.After then
+        C_Timer.After(TA.SETTLEMENT_DELAY_SECONDS, function()
+            FinalizePendingTrade(trade)
+        end)
+    else
+        FinalizePendingTrade(trade)
+    end
+end
+
 local function OnTradeRequestCancel()
-    local trade = state.activeTrade
+    local trade = state.activeTrade or state.pendingTrade
     if not trade then
         return
     end
     trade.cancelled = true
+    state.lastAutoFill = nil
     Debug("Info", "Trade cancelled for %s", tostring(trade.name or trade.key))
 end
 
@@ -1161,21 +1255,7 @@ local function OnTradeClosed()
         return
     end
     if trade.playerAccepted and not trade.cancelled then
-        if trade.autoFill then
-            local settlement = trade.acceptedOffers
-            if settlement ~= nil and trade.acceptedComplete == false then
-                settlement = MergeAcceptedOffers(settlement, trade.acceptedUnknown, trade.offeredOffers)
-            elseif settlement == nil then
-                settlement = trade.offeredOffers
-            end
-            if settlement ~= nil then
-                SettlePlayerItems(trade.key, settlement)
-            else
-                TA:RemovePlayer(trade.key)
-            end
-        else
-            TA:RemovePlayer(trade.key)
-        end
+        ScheduleTradeSettlement(trade)
     else
         Debug("Info", "Trade closed without completion for %s", tostring(trade.name or trade.key))
     end
@@ -1203,7 +1283,6 @@ function TA:TradeWithPlayer(playerId)
     end
     state.lastAutoFill = {
         key = entry.key,
-        at = NowSeconds(),
     }
     local ok, err = pcall(InitiateTrade, unit)
     if not ok then
