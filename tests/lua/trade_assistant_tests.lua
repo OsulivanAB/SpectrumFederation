@@ -1067,6 +1067,24 @@ do
     assertEq(snapshot[2].name, "Bob", "Bob remains queued after close-before-cancel")
 end
 
+-- A cancelled request does not arm autofill for a later manual trade.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "cancelled-request test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "cancelled-request test can request Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_REQUEST_CANCEL")
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+
+    assertEq(#world.placed, 0, "cancelled request does not prefill a later trade")
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 2, "cancelled request keeps both players queued")
+    assertEq(snapshot[1].name, "Alice", "Alice remains queued after cancelled request")
+end
+
 -- A declined/cancelled trade leaves the player queued.
 do
     resetWorld()

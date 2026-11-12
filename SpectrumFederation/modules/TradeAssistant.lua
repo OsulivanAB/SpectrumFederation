@@ -1239,12 +1239,12 @@ local function ScheduleTradeSettlement(trade)
 end
 
 local function OnTradeRequestCancel()
+    state.lastAutoFill = nil
     local trade = state.activeTrade or state.pendingTrade
     if not trade then
         return
     end
     trade.cancelled = true
-    state.lastAutoFill = nil
     Debug("Info", "Trade cancelled for %s", tostring(trade.name or trade.key))
 end
 
