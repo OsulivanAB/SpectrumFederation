@@ -223,13 +223,16 @@ local function SlotMatchesItem(bag, slot, item)
     if not info or tonumber(info.itemID) ~= tonumber(item.itemId) then
         return false
     end
-    if item.linkKey and C_Container.GetContainerItemLink then
+    if item.linkKey then
+        if not C_Container.GetContainerItemLink then
+            return false
+        end
         local link = C_Container.GetContainerItemLink(bag, slot)
-        if link then
-            local linkKey = NormalizeLinkKey(link)
-            if linkKey ~= item.linkKey then
-                return false
-            end
+        if not link then
+            return false
+        end
+        if NormalizeLinkKey(link) ~= item.linkKey then
+            return false
         end
     end
     return true
@@ -249,15 +252,31 @@ local function EachBagSlot(callback)
     end
 end
 
-local function CountCarriedItem(item)
+local function SupplyCountsForItemId(itemId)
+    local supply = {}
     local total = 0
+    local wantedId = tonumber(itemId)
+    if not wantedId or not C_Container.GetContainerItemInfo then
+        return supply, total
+    end
     EachBagSlot(function(bag, slot)
-        if SlotMatchesItem(bag, slot, item) then
-            local info = C_Container.GetContainerItemInfo(bag, slot)
-            total = total + FloorQty(info and info.stackCount)
+        local info = C_Container.GetContainerItemInfo(bag, slot)
+        if info and tonumber(info.itemID) == wantedId then
+            local variant = "unknown"
+            if C_Container.GetContainerItemLink then
+                local link = C_Container.GetContainerItemLink(bag, slot)
+                if link then
+                    variant = NormalizeLinkKey(link) or "unknown"
+                end
+            end
+            local count = FloorQty(info.stackCount)
+            if count > 0 then
+                supply[variant] = (supply[variant] or 0) + count
+                total = total + count
+            end
         end
     end)
-    return total
+    return supply, total
 end
 
 local function CollectStacksForItem(item)
@@ -285,12 +304,12 @@ local function CollectStacksForItem(item)
     return stacks
 end
 
-local function QueuedTotalForItem(item)
-    local total = 0
-    local wantedId = tonumber(item and item.itemId)
-    local wantedLinkKey = item and item.linkKey
+local function QueuedDemandForItemId(itemId)
+    local exact = {}
+    local bare = 0
+    local wantedId = tonumber(itemId)
     if not wantedId then
-        return 0
+        return exact, bare
     end
     for _, key in ipairs(state.order) do
         local player = state.players[key]
@@ -298,18 +317,42 @@ local function QueuedTotalForItem(item)
             for _, itemKey in ipairs(player.itemOrder) do
                 local queued = player.items[itemKey]
                 if queued and tonumber(queued.itemId) == wantedId then
-                    local include = true
-                    if wantedLinkKey then
-                        include = queued.linkKey == wantedLinkKey or queued.linkKey == nil
-                    end
-                    if include then
-                        total = total + FloorQty(queued.quantity)
+                    local qty = FloorQty(queued.quantity)
+                    if qty > 0 then
+                        if queued.linkKey then
+                            exact[queued.linkKey] = (exact[queued.linkKey] or 0) + qty
+                        else
+                            bare = bare + qty
+                        end
                     end
                 end
             end
         end
     end
-    return total
+    return exact, bare
+end
+
+local function QueuedInventoryFeasible(item, memberCount)
+    local wantedId = tonumber(item and item.itemId)
+    if not wantedId then
+        return false
+    end
+    local supply, totalSupply = SupplyCountsForItemId(wantedId)
+    local exact, bare = QueuedDemandForItemId(wantedId)
+    local additional = FloorQty(item.quantity) * FloorQty(memberCount)
+    if item.linkKey then
+        exact[item.linkKey] = (exact[item.linkKey] or 0) + additional
+    else
+        bare = bare + additional
+    end
+    local exactTotal = 0
+    for linkKey, demand in pairs(exact) do
+        if (supply[linkKey] or 0) < demand then
+            return false
+        end
+        exactTotal = exactTotal + demand
+    end
+    return bare <= (totalSupply - exactTotal)
 end
 
 local function BuildRaidUnitMap()
@@ -656,11 +699,9 @@ function TA:HandleCommand(args)
         return false
     end
 
-    local available = CountCarriedItem(item)
-    local required = QueuedTotalForItem(item) + (FloorQty(item.quantity) * #members)
-    if available < required then
+    if not QueuedInventoryFeasible(item, #members) then
         SF:PrintError(Loc("TRADE_ASSISTANT_ERR_INSUFFICIENT", "SF Trade failed."))
-        Debug("Info", "Rejected /sf trade: available=%d required=%d item=%s", available, required, tostring(item.itemId))
+        Debug("Info", "Rejected /sf trade: infeasible item=%s quantity=%d members=%d", tostring(item.itemId), FloorQty(item.quantity), #members)
         return false
     end
 
@@ -703,36 +744,102 @@ local function CountFreeTradeSlots()
     return free
 end
 
-local function PlanMoves(entry, freeSlots)
+local function CaptureCurrentOffers()
+    local offers = {}
+    if not GetTradePlayerItemInfo then
+        return offers
+    end
+    for slot = 1, TA.TRADE_SLOTS do
+        local itemName, _, count = GetTradePlayerItemInfo(slot)
+        if itemName then
+            local itemId = nil
+            local linkKey = nil
+            if GetTradePlayerItemLink then
+                local link = GetTradePlayerItemLink(slot)
+                if type(link) == "string" then
+                    itemId = tonumber(link:match("item:(%d+)"))
+                    linkKey = NormalizeLinkKey(link)
+                end
+            end
+            local quantity = FloorQty(count)
+            if quantity < 1 then
+                quantity = 1
+            end
+            offers[#offers + 1] = {
+                itemId = itemId,
+                linkKey = linkKey,
+                quantity = quantity,
+                slot = slot,
+                name = itemName,
+            }
+        end
+    end
+    return offers
+end
+
+local function OfferMatchesQueuedItem(offer, item)
+    if not offer or not item then
+        return false
+    end
+    local offerId = tonumber(offer.itemId)
+    local itemId = tonumber(item.itemId)
+    if offerId and itemId and offerId ~= itemId then
+        return false
+    end
+    if item.linkKey then
+        if offer.linkKey then
+            return offer.linkKey == item.linkKey
+        end
+        return offer.name ~= nil and offer.name == ItemDisplayName(item)
+    end
+    if offerId and itemId then
+        return true
+    end
+    return offer.name ~= nil and offer.name == ItemDisplayName(item)
+end
+
+local function ExistingOfferQuantity(existingOffers, item)
+    local total = 0
+    for _, offer in ipairs(existingOffers or {}) do
+        if OfferMatchesQueuedItem(offer, item) then
+            total = total + FloorQty(offer.quantity)
+        end
+    end
+    return total
+end
+
+local function PlanMoves(entry, freeSlots, existingOffers)
     local moves = {}
     local slotsLeft = FloorQty(freeSlots)
     local planned = {}
     for _, itemKey in ipairs(entry.itemOrder) do
         local item = entry.items[itemKey]
         if item and slotsLeft > 0 then
-            local remaining = FloorQty(item.quantity)
-            local stacks = CollectStacksForItem(item)
-            for _, stack in ipairs(stacks) do
-                if remaining < 1 or slotsLeft < 1 then
-                    break
-                end
-                local stackKey = tostring(stack.bag) .. ":" .. tostring(stack.slot)
-                local availableCount = stack.count - (planned[stackKey] or 0)
-                if not stack.locked and availableCount > 0 then
-                    local take = math.min(availableCount, remaining)
-                    moves[#moves + 1] = {
-                        item = item,
-                        bag = stack.bag,
-                        slot = stack.slot,
-                        quantity = take,
-                    }
-                    planned[stackKey] = (planned[stackKey] or 0) + take
-                    remaining = remaining - take
-                    slotsLeft = slotsLeft - 1
-                end
-            end
+            local remaining = math.max(0, FloorQty(item.quantity) - ExistingOfferQuantity(existingOffers, item))
             if remaining > 0 then
-                Debug("Info", "Trade prefill deferred for %s: %d units did not fit", tostring(itemKey), remaining)
+                local stacks = CollectStacksForItem(item)
+                for _, stack in ipairs(stacks) do
+                    if remaining < 1 or slotsLeft < 1 then
+                        break
+                    end
+                    local stackKey = tostring(stack.bag) .. ":" .. tostring(stack.slot)
+                    local availableCount = stack.count - (planned[stackKey] or 0)
+                    if not stack.locked and availableCount > 0 then
+                        local take = math.min(availableCount, remaining)
+                        moves[#moves + 1] = {
+                            item = item,
+                            bag = stack.bag,
+                            slot = stack.slot,
+                            quantity = take,
+                        }
+                        planned[stackKey] = (planned[stackKey] or 0) + take
+                        remaining = remaining - take
+                        slotsLeft = slotsLeft - 1
+                    end
+                end
+                if remaining > 0 then
+                    Debug("Info", "Trade prefill deferred for %s: %d units did not fit", tostring(itemKey), remaining)
+                end
             end
         end
     end
@@ -820,8 +927,9 @@ function TA:TryPrefillTrade(lifecycle, key)
         return false
     end
 
+    local existingOffers = CaptureCurrentOffers()
     trade.offeredOffers = {}
-    local moves = PlanMoves(entry, freeSlots)
+    local moves = PlanMoves(entry, freeSlots, existingOffers)
     local placed = 0
     local attempted = 0
     for _, move in ipairs(moves) do
@@ -877,9 +985,7 @@ local function OnTradeShow()
     state.tradeLifecycle = state.tradeLifecycle + 1
     local key, name = GetTradeTargetKey()
     local autoFill = key ~= nil and ShouldAutoFill(key)
-    if autoFill then
-        state.lastAutoFill = nil
-    end
+    state.lastAutoFill = nil
     state.activeTrade = {
         key = key,
         name = name,
@@ -1239,7 +1345,12 @@ local function ScheduleTradeSettlement(trade)
 end
 
 local function OnTradeRequestCancel()
+    local hadAutoFillIntent = state.lastAutoFill ~= nil
     state.lastAutoFill = nil
+    if hadAutoFillIntent then
+        Debug("Info", "Trade request cancelled before trade window")
+        return
+    end
     local trade = state.activeTrade or state.pendingTrade
     if not trade then
         return

@@ -441,6 +441,17 @@ do
     assertEq(#TA:GetQueueSnapshot(), 2, "overbook rejection leaves first queue intact")
 end
 
+-- Exact links do not match stacks whose link is unavailable.
+do
+    resetWorld()
+    resetAssistant()
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 5, link = nil },
+    }
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == false, "exact link rejects unknown bag link")
+    assertEq(#TA:GetQueueSnapshot(), 0, "unknown bag link queues nothing")
+end
+
 -- Items carried only in the reagent bag are visible to queue and prefill.
 do
     resetWorld()
@@ -491,6 +502,21 @@ do
     assertEq(snapshot[1].totalQuantity, 2, "variant reservation totals two for Alice")
     assertEq(snapshot[2].itemCount, 2, "variant reservation keeps both entries for Bob")
     assertEq(snapshot[2].totalQuantity, 2, "variant reservation totals two for Bob")
+end
+
+-- Bare-ID obligations can be satisfied by other variants of the same item.
+do
+    resetWorld()
+    resetAssistant()
+    world.bagSlots = 2
+    world.bags[0] = {
+        [1] = { itemId = 123, count = 2, link = LINK_VARIANT_A },
+        [2] = { itemId = 123, count = 2, link = LINK_VARIANT_B },
+    }
+    assertTrue(TA:HandleCommand("123 1") == true, "bare-first allocation queues bare id")
+    assertTrue(TA:HandleCommand(LINK_VARIANT_A .. " 1") == true, "exact variant queues after bare id")
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(snapshot[1].itemCount, 2, "bare and exact entries merge for Alice")
 end
 
 -- Planned moves do not reuse bag stacks across queued item entries.
@@ -547,6 +573,20 @@ do
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 1, "completed trade removes only that player")
     assertEq(snapshot[1].name, "Bob", "Bob remains queued")
+end
+
+-- Prefill subtracts offers already present in the trade window.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 2") == true, "existing-offer test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "existing-offer test can trade Alice")
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    world.tradeSlots[1] = { itemId = 123, count = 1, link = LINK1 }
+    runAfter()
+    assertEq(#world.placed, 1, "existing offer reduces prefill moves")
+    assertEq(world.placed[1].count, 1, "only the missing quantity is placed")
 end
 
 -- Player-first acceptance still settles when the trade closes without a cancel.
@@ -1083,6 +1123,27 @@ do
     local snapshot = TA:GetQueueSnapshot()
     assertEq(#snapshot, 2, "cancelled request keeps both players queued")
     assertEq(snapshot[1].name, "Alice", "Alice remains queued after cancelled request")
+end
+
+-- A cancelled next request does not cancel pending settlement.
+do
+    resetWorld()
+    resetAssistant()
+    assertTrue(TA:HandleCommand(LINK1 .. " 1") == true, "settlement-scope test queues item")
+    assertTrue(TA:TradeWithPlayer("Alice-TestRealm") == true, "settlement-scope test trades Alice")
+
+    local frame = listenerFrame()
+    frame.scripts.OnEvent(frame, "TRADE_SHOW")
+    runAfter()
+    frame.scripts.OnEvent(frame, "TRADE_ACCEPT_UPDATE", 1, 1)
+    frame.scripts.OnEvent(frame, "TRADE_CLOSED")
+    assertTrue(TA:TradeWithPlayer("Bob-TestRealm") == true, "settlement-scope test requests Bob")
+    frame.scripts.OnEvent(frame, "TRADE_REQUEST_CANCEL")
+    runAfter()
+
+    local snapshot = TA:GetQueueSnapshot()
+    assertEq(#snapshot, 1, "next request cancel keeps Alice settlement")
+    assertEq(snapshot[1].name, "Bob", "Bob remains queued after Alice settles")
 end
 
 -- A declined/cancelled trade leaves the player queued.
