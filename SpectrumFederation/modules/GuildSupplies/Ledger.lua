@@ -11483,20 +11483,21 @@ function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex
                     if hist.effective ~= false then
                         creditName, creditGuid = hist.attributed, hist.attributedGuid
                     else
-                        -- Explicitly ineffective. If include-deleted active map is
-                        -- empty, annotation is incomplete — keep prior verified
+                        -- Explicitly ineffective. Once include-deleted
+                        -- effectiveness has completed for the current
+                        -- dependencies, an empty active map is a real prune
+                        -- result: use durable donor identity. While
+                        -- reconstruction is still pending, keep prior verified
                         -- facts rather than collapsing to durable donor Alice
-                        -- (async adopt Ensure; 6834988628). A non-empty active map
-                        -- means a real prune/tie: use durable donor (#465-dep).
-                        local active = SoftDeleteRuntime.histEffectiveActive[record]
-                        local activeEmpty = true
-                        if type(active) == "table" then
-                            for _ in pairs(active) do
-                                activeEmpty = false
-                                break
-                            end
-                        end
-                        if activeEmpty and type(priorEntry) == "table"
+                        -- (async adopt Ensure; 6834988628 / 5895068773).
+                        local histEffCache = SoftDeleteRuntime.includeDeletedCache[record]
+                        local histEffComplete = type(histEffCache) == "table"
+                            and histEffCache.ok == true
+                            and histEffCache.stamp
+                                == SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+                        if histEffComplete then
+                            creditName, creditGuid = DurableCreditIdentity(event)
+                        elseif type(priorEntry) == "table"
                             and priorEntry.verified == true then
                             creditName, creditGuid =
                                 priorEntry.attributed, priorEntry.attributedGuid

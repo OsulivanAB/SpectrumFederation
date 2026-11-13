@@ -6927,6 +6927,113 @@ do
         "465-async-local: idle after dataset replace")
 end
 
+do
+    -- #465 r4566287270: retention full must surface rejected/full, not a phantom
+    -- pending/work_budget that has no retained op to redrive.
+    local itemId = 9305
+    local record = seedLiveCampaignWithItem(itemId, 40)
+    injectProductionDonation(record, {
+        id = "local-full-don", itemId = itemId, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9600,
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("local-full-don"))
+    assertTrue(del ~= nil, "465-local-full: prepare delete")
+    local pendingStore = record.operations.pending
+    assertTrue(type(pendingStore) == "table", "465-local-full: pending store")
+    local maxPending = tonumber(GS.MAX_PENDING_OPERATIONS) or 128
+    for i = 1, maxPending do
+        local id = "local-full-fill-" .. tostring(i)
+        pendingStore[id] = {
+            id = id,
+            reason = "pending_event",
+            body = {
+                id = id,
+                kind = "adjust-quantity",
+                target = tostring(itemId),
+            },
+            at = world.time or 0,
+        }
+    end
+    local realRebuild = GS.RebuildEventDeletionProjection
+    GS.RebuildEventDeletionProjection = function()
+        return false, "work_budget"
+    end
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    local stFull, reasonFull = GS:ApplyStagedConfigOperation(del)
+    GS.RebuildEventDeletionProjection = realRebuild
+    assertEq(stFull, "rejected",
+        "465-local-full: retention full rejected got " .. tostring(stFull)
+            .. "/" .. tostring(reasonFull))
+    assertEq(reasonFull, "full",
+        "465-local-full: full reason got " .. tostring(reasonFull))
+    assertNil(record.operations.records[del.id],
+        "465-local-full: no accepted record leaked")
+    assertNil(pendingStore[del.id],
+        "465-local-full: no phantom pending body")
+    assertTrue(not GS.IsEventSoftDeleted(record, "local-full-don"),
+        "465-local-full: no deletion fact leaked")
+end
+
+do
+    -- #465 review 5895068773: a completed include-deleted effectiveness rebuild
+    -- can legitimately prune every correction (empty active map). The deleted
+    -- donation must then use durable donor identity, not the stale corrected
+    -- recipient retained from prior verified facts.
+    local itemId = 9306
+    local record = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(record, {
+        id = "empty-prune-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9700,
+    })
+    injectProductionDonation(record, {
+        id = "empty-prune-d2", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9701,
+    })
+    world.time = 9800
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "empty-prune-d1", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-empty-prune: prepare Bob corr")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted",
+        "465-empty-prune: Bob corr")
+    local del = select(1, GS:NewSoftDeleteOperation("empty-prune-d1"))
+    assertTrue(del ~= nil, "465-empty-prune: prepare delete")
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted",
+        "465-empty-prune: delete")
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil),
+        "465-empty-prune: warm deletion projection")
+    assertEq(record.eventDeletions["empty-prune-d1"].attributed, "Bob-Garona",
+        "465-empty-prune: starts on corrected recipient")
+
+    -- Create floor pressure that prunes the only retained correction. The
+    -- include-deleted engine then completes with an empty active map.
+    injectProductionAdjustment(record, {
+        id = "empty-prune-alice-adj", itemId = itemId, quantity = -20,
+        attributed = "Alice-Garona", attributedGuid = "Player-1-Alice",
+        timestamp = 9801,
+    })
+    if GS._BumpAccountingMutation then
+        GS._BumpAccountingMutation(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil),
+        "465-empty-prune: rebuilt deletion projection")
+    assertEq(record.eventDeletions["empty-prune-d1"].attributed, "Alice-Garona",
+        "465-empty-prune: completed empty active map uses durable donor")
+    assertEq(GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", itemId), 0,
+        "465-empty-prune: Bob keeps no stale debt")
+    assertTrue((tonumber(GS.PersonalContributorItemTotal(
+        record, "Alice-Garona", "Player-1-Alice", itemId)) or 0) <= 0,
+        "465-empty-prune: Alice carries signed debt")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

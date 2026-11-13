@@ -2047,20 +2047,27 @@ function GS:ApplyStagedConfigOperation(op, context)
             -- actorName; remote admit uses transport sender).
             local pendingSender = (context and (context.sender or context.actorName))
                 or stored.actorName
+            local retainStatus, retainReason = "rejected", "full"
             if GS._AdmitPendingOrConflict then
-                GS._AdmitPendingOrConflict(
+                retainStatus, retainReason = GS._AdmitPendingOrConflict(
                     ops, stored, "work_budget", pendingSender)
             end
-            if GS.RedrivePendingSoftDeletes then
+            local retained = retainStatus == "pending"
+                and type(ops.pending) == "table"
+                and type(ops.pending[stored.id]) == "table"
+                and DeepEqual(ops.pending[stored.id].body, stored)
+            if retained and GS.RedrivePendingSoftDeletes then
                 GS.RedrivePendingSoftDeletes(record, {
                     eventId = stored.target
                         or (stored.value and stored.value.eventId),
                     itemId = stored.value and stored.value.itemId,
                     _shareCallbackBudget = true,
                 })
+                releaseCreditBudget()
+                return "pending", "work_budget"
             end
             releaseCreditBudget()
-            return "pending", "work_budget"
+            return retainStatus or "rejected", retainReason or "full"
         end
         releaseCreditBudget()
         return "rejected", applyErr or "apply_failed"
