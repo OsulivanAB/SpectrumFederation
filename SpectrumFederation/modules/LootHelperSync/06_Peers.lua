@@ -119,7 +119,7 @@ function Sync:UpdatePeersFromRoster()
             if full then
                 local peer = self:GetPeer(full)
                 peer.inGroup = true
-                peer.online = online
+                peer.online = (online == 1 or online == true)
                 peer.rank = rank
                 peer.subgroup = subgroup
                 peer.role = role
