@@ -15,9 +15,11 @@ GS.PROVIDER_ID = "sf.guildsupplies.config"
 -- not understand corrections; advertising 5 for the combined protocol would
 -- let them pass Guild Gossip's strict equality and then reject
 -- correct-contributor as unsupported_kind while computing stale credit.
+-- 7: officer soft-delete-event (#465). Schema 6 peers would ignore deletions
+-- while appearing accounting-compatible under GG equality.
 -- Older schemas are incompatible under GG equality and must update before
 -- sync/adoption resumes. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 6
+GS.PROVIDER_SCHEMA = 7
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -45,6 +47,11 @@ GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
 -- Required credit-event alias pages for adoption (#459 A). Worst case one
 -- binding per page under the 2048-byte wrapper-inclusive wire budget.
 GS.MAX_CREDIT_ALIAS_PAGE_COUNT = 512
+-- Soft-delete verified facts: worst case one fact per page under the same
+-- wrapper-inclusive wire budget; ceiling matches transferable fact capacity
+-- (MAX_ACCEPTED_OPERATIONS / MAX_SOFT_DELETE_VERIFIED_FACTS) (#465 r4529162866).
+GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT = 4096
+GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 4096
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -74,6 +81,7 @@ GS.MAX_MANIFEST_PAGES = math.max(
 do
     local maxCampaigns = GS.MAX_CAMPAIGNS or 64
     local pagesPerArchive = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    local softFactPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
     GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
         + (GS.MAX_LEDGER_EVENTS or 4096)
         + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
@@ -86,6 +94,7 @@ do
         + maxCampaigns
         + (maxCampaigns * pagesPerArchive)
         + (maxCampaigns * pagesPerArchive)
+        + softFactPages
         + 512
 end
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
@@ -1243,6 +1252,9 @@ local function OperationTargetKey(record, op)
     if op.kind == GS.KIND.CORRECT_CONTRIBUTOR and GS.CorrectionTargetKey then
         return GS.CorrectionTargetKey(record, op.target)
     end
+    if op.kind == GS.KIND.SOFT_DELETE_EVENT and GS.SoftDeleteTargetKey then
+        return GS.SoftDeleteTargetKey(record, op.target)
+    end
     if GS._TargetKey then
         return GS._TargetKey(op.kind, op.target)
     end
@@ -1325,18 +1337,20 @@ local function ClassifyStaleBase(record, op, targetKey)
             and headBody.id == policyNow then
             return "conflict", "divergent_edit"
         end
-        -- #459 C: contributor corrections authored under an older accepted policy
-        -- must still converge when the transport sender is currently authorized.
-        -- Do not treat known superseded policy bases as permanent stale_policy
-        -- rejection (mirrors campaign-head exemption). Missing predecessors stay
-        -- pending. Other kinds keep obsolete/stale_policy.
-        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+        -- #459 C / #465: contributor corrections and soft-deletes authored under
+        -- an older accepted policy must still converge when the transport sender
+        -- is currently authorized. Do not treat known superseded policy bases as
+        -- permanent stale_policy rejection (mirrors campaign-head exemption).
+        -- Missing predecessors stay pending. Other kinds keep obsolete/stale_policy.
+        if op.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            or op.kind == GS.KIND.SOFT_DELETE_EVENT then
             if not HasAcceptedId(ops, op.basePolicyRevision)
                 and op.basePolicyRevision ~= record.datasetId then
                 return "pending", "missing_policy_predecessor"
             end
             -- Known older/current-dataset policy base: fall through to target
-            -- causality (apply / stale_credit / conflict) under current authority.
+            -- causality (apply / stale_credit / stale_delete / conflict) under
+            -- current authority.
         else
             -- Missing policy predecessor → wait; superseded by newer rank op → obsolete.
             if HasAcceptedId(ops, op.basePolicyRevision) then
@@ -1370,13 +1384,14 @@ local function ClassifyStaleBase(record, op, targetKey)
             end
             return "conflict", "campaign_conflict"
         end
-        -- #424 / #459: rename and contributor-correction authorship campaignId /
-        -- baseCampaignId are prepare-time current. After rollover, accepted
-        -- corrections must still replay (and renames must still LWW) rather than
-        -- permanent stale_campaign rejection. Do not relax campaign-head
-        -- causality for any other kind.
+        -- #424 / #459 / #465: rename, contributor-correction, and soft-delete
+        -- authorship campaignId / baseCampaignId are prepare-time current. After
+        -- rollover, accepted corrections/deletes must still replay (and renames
+        -- must still LWW) rather than permanent stale_campaign rejection. Do not
+        -- relax campaign-head causality for any other kind.
         if op.kind ~= GS.KIND.RENAME_CAMPAIGN
-            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR then
+            and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
+            and op.kind ~= GS.KIND.SOFT_DELETE_EVENT then
             -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
             local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
             local headBody = headId and ops.records[headId]
@@ -1415,6 +1430,21 @@ local function ClassifyStaleBase(record, op, targetKey)
             if not (GS.CreditCorrectionRevisionWins
                 and GS.CreditCorrectionRevisionWins(op, headBody)) then
                 return "obsolete", "stale_credit"
+            end
+        end
+        return "apply", nil
+    end
+
+    -- #465 soft-delete: LWW per delete:<eventId>. Missing-event dependencies
+    -- stay pending; negative balances are not pending. Never open Troubleshooting
+    -- conflicts.
+    if op.kind == GS.KIND.SOFT_DELETE_EVENT then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) == "table" and headBody.id ~= op.id then
+            if not (GS.SoftDeleteRevisionWins
+                and GS.SoftDeleteRevisionWins(op, headBody)) then
+                return "obsolete", "stale_delete"
             end
         end
         return "apply", nil
@@ -2028,6 +2058,119 @@ local function AssembleCreditAliasesFromAdoption(adop, desc)
     return map, nil
 end
 
+--- Validate one exported verified soft-delete fact entry (#465).
+-- Arbitrary delete-payload fields are never admitted as verified authority.
+local function IsValidSoftDeleteVerifiedFactEntry(eventId, entry)
+    if type(eventId) ~= "string" or eventId == "" or type(entry) ~= "table" then
+        return false
+    end
+    if entry.verified ~= true then
+        return false
+    end
+    local canon = entry.eventId
+    if type(canon) ~= "string" or canon == "" or canon ~= eventId then
+        return false
+    end
+    local kind = entry.eventKind
+    if kind ~= "donation" and kind ~= "adjustment" and kind ~= "withdrawal" then
+        return false
+    end
+    local itemId = tonumber(entry.itemId)
+    local qty = tonumber(entry.quantity)
+    if not itemId or itemId ~= math.floor(itemId) or itemId < 1 then
+        return false
+    end
+    if not qty or qty ~= math.floor(qty) or qty == 0 then
+        return false
+    end
+    if entry.attributed ~= nil and type(entry.attributed) ~= "string" then
+        return false
+    end
+    if entry.attributedGuid ~= nil and type(entry.attributedGuid) ~= "string" then
+        return false
+    end
+    if entry.campaignId ~= nil and type(entry.campaignId) ~= "string" then
+        return false
+    end
+    if entry.gsProductionCredit ~= nil and entry.gsProductionCredit ~= true
+        and entry.gsProductionCredit ~= false then
+        return false
+    end
+    return true
+end
+
+local function SoftDeleteVerifiedFactsEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    return a.verified == true and b.verified == true
+        and a.eventId == b.eventId
+        and a.eventKind == b.eventKind
+        and tonumber(a.itemId) == tonumber(b.itemId)
+        and tonumber(a.quantity) == tonumber(b.quantity)
+        and a.campaignId == b.campaignId
+        and a.attributed == b.attributed
+        and a.attributedGuid == b.attributedGuid
+        and (a.gsProductionCredit == true) == (b.gsProductionCredit == true)
+end
+
+--- Merge inline descriptor verified soft-delete facts with buffered pages (#465).
+-- @return table|nil map, string|nil err
+local function AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+    local map = {}
+    local function absorb(incoming)
+        if incoming == nil then
+            return true
+        end
+        if type(incoming) ~= "table" then
+            return false, "invalid_soft_delete_verified_facts"
+        end
+        for eventId, entry in pairs(incoming) do
+            if not IsValidSoftDeleteVerifiedFactEntry(eventId, entry) then
+                return false, "invalid_soft_delete_verified_facts"
+            end
+            local prior = map[eventId]
+            if type(prior) == "table" and not SoftDeleteVerifiedFactsEqual(prior, entry) then
+                return false, "soft_delete_fact_conflict"
+            end
+            map[eventId] = {
+                verified = true,
+                eventId = eventId,
+                eventKind = entry.eventKind,
+                itemId = tonumber(entry.itemId),
+                quantity = tonumber(entry.quantity),
+                campaignId = entry.campaignId,
+                attributed = entry.attributed,
+                attributedGuid = entry.attributedGuid,
+                gsProductionCredit = entry.gsProductionCredit == true,
+            }
+        end
+        return true
+    end
+    local ok, err = absorb(desc and desc.softDeleteVerifiedFacts)
+    if not ok then
+        return nil, err
+    end
+    local info = adop and adop._softDeleteFactIndex
+    local expectPages = tonumber(desc and desc.softDeleteVerifiedFactPageCount) or 0
+    if expectPages > 0 then
+        if type(info) ~= "table" or type(info.pages) ~= "table" then
+            return nil, "incomplete_transfer"
+        end
+        for page = 1, expectPages do
+            local pageBody = info.pages[page]
+            if type(pageBody) ~= "table" then
+                return nil, "incomplete_transfer"
+            end
+            ok, err = absorb(pageBody.facts)
+            if not ok then
+                return nil, err
+            end
+        end
+    end
+    return map, nil
+end
+
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
     local adop = GS._adoption
@@ -2208,6 +2351,53 @@ function GS:IsAdoptionTransferComplete()
                 return false, "incomplete_transfer"
             end
             for page = 1, expectAliasPages do
+                if type(info.pages[page]) ~= "table" then
+                    return false, "incomplete_transfer"
+                end
+            end
+        end
+    end
+    -- Verified soft-delete fact transfer (#465): when the source advertises a
+    -- count, inline and/or paged facts must assemble to exactly that set.
+    local hasFactManifest = desc.softDeleteVerifiedFactCount ~= nil
+    if hasFactManifest then
+        local expectFactCount = tonumber(desc.softDeleteVerifiedFactCount)
+        local expectFactPages = tonumber(desc.softDeleteVerifiedFactPageCount) or 0
+        if expectFactCount == nil
+            or expectFactCount ~= math.floor(expectFactCount)
+            or expectFactCount < 0
+            or expectFactPages ~= math.floor(expectFactPages)
+            or expectFactPages < 0 then
+            return false, "incomplete_transfer"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactCount ~= expectFactCount then
+            return false, "source_changed"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactPageCount ~= expectFactPages then
+            return false, "source_changed"
+        end
+        local assembled, assembleErr = AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+        if not assembled then
+            return false, assembleErr or "incomplete_transfer"
+        end
+        local n = 0
+        for _ in pairs(assembled) do
+            n = n + 1
+        end
+        if n ~= expectFactCount then
+            return false, "incomplete_transfer"
+        end
+        if expectFactPages > 0 then
+            local info = adop._softDeleteFactIndex
+            if type(info) ~= "table" or type(info.pages) ~= "table" then
+                return false, "incomplete_transfer"
+            end
+            if info.pageCount and info.pageCount ~= expectFactPages then
+                return false, "incomplete_transfer"
+            end
+            for page = 1, expectFactPages do
                 if type(info.pages[page]) ~= "table" then
                     return false, "incomplete_transfer"
                 end
@@ -2405,6 +2595,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _confirmByTarget = {},
         _archiveIndex = {},
         _creditAliasIndex = { pages = {}, pageCount = nil },
+        _softDeleteFactIndex = { pages = {}, pageCount = nil },
         -- Incremental receive-stage completeness (avoids full-history recounts).
         _bufCounts = {
             acceptedOps = 0,
@@ -2439,6 +2630,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedValuationCount = nil,
         pinnedCreditEventAliasCount = nil,
         pinnedCreditEventAliasPageCount = nil,
+        pinnedSoftDeleteVerifiedFactCount = nil,
+        pinnedSoftDeleteVerifiedFactPageCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2930,6 +3123,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local valuations = tonumber(descBody.valuationCount)
         local aliasCount = tonumber(descBody.creditEventAliasCount)
         local aliasPages = tonumber(descBody.creditEventAliasPageCount)
+        local softFactCount = tonumber(descBody.softDeleteVerifiedFactCount)
+        local softFactPages = tonumber(descBody.softDeleteVerifiedFactPageCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -3025,6 +3220,30 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Verified soft-delete fact manifest pins (#465). Omission after pin is
+        -- source_changed; older descriptors that never advertised stay unpinned.
+        if adop.pinnedSoftDeleteVerifiedFactCount == nil then
+            if softFactCount ~= nil then
+                adop.pinnedSoftDeleteVerifiedFactCount = softFactCount
+            end
+        elseif softFactCount == nil
+            or softFactCount ~= adop.pinnedSoftDeleteVerifiedFactCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount == nil then
+            if softFactPages ~= nil then
+                adop.pinnedSoftDeleteVerifiedFactPageCount = softFactPages
+            end
+        elseif softFactPages == nil
+            or softFactPages ~= adop.pinnedSoftDeleteVerifiedFactPageCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return nil
     end
 
@@ -3078,6 +3297,13 @@ function GS:BufferAdoptionRecord(recordId, body)
         -- drift; leave the prior active dataset intact.
         if body.kind == "gs-credit-aliases-page"
             and adop.records[recordId].kind == "gs-credit-aliases-page" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if body.kind == "gs-soft-delete-facts-page"
+            and adop.records[recordId].kind == "gs-soft-delete-facts-page" then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -3258,6 +3484,51 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
+    elseif body.kind == "gs-soft-delete-facts-page" then
+        local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
+        if type(body.datasetId) ~= "string" or body.datasetId ~= adop.sourceDatasetId then
+            return "rejected", "invalid_operation"
+        end
+        if type(body.facts) ~= "table" then
+            return "rejected", "invalid_soft_delete_verified_facts"
+        end
+        for eventId, entry in pairs(body.facts) do
+            if not IsValidSoftDeleteVerifiedFactEntry(eventId, entry) then
+                return "rejected", "invalid_soft_delete_verified_facts"
+            end
+        end
+        local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxPages)
+        if pcErr then
+            return "rejected", pcErr
+        end
+        if not pc then
+            return "rejected", "invalid_operation"
+        end
+        local page, pageErr = ValidateAdoptionPageIndex(body.page, pc)
+        if pageErr then
+            return "rejected", pageErr
+        end
+        adop._softDeleteFactIndex = adop._softDeleteFactIndex or { pages = {}, pageCount = nil }
+        local info = adop._softDeleteFactIndex
+        if info.pageCount and info.pageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if adop.pinnedSoftDeleteVerifiedFactPageCount ~= nil
+            and adop.pinnedSoftDeleteVerifiedFactPageCount ~= pc then
+            return "rejected", "invalid_operation"
+        end
+        if type(info.pages[page]) == "table" then
+            if DeepEqual(info.pages[page], body) then
+                -- Fall through to same-id duplicate handling below.
+            else
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("source_changed")
+                InvalidateAdoptionDeliveryOutcomes("source_changed")
+                return "rejected", "source_changed"
+            end
+        end
+        info.pages[page] = body
+        info.pageCount = info.pageCount or pc
     end
 
     -- Reject malformed / unmintable gs-valuation before buffering/counting.
@@ -3367,6 +3638,7 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
                 },
                 txnRegistry = {},
                 creditEventAliases = {},
+                softDeleteVerifiedFacts = {},
             },
             _consumableEvents = {},
             _consumableEventArchive = {},
@@ -3430,6 +3702,96 @@ local function InstallCreditEventAliasesFromDesc(temp, desc, adop)
     local declared = tonumber(desc and desc.creditEventAliasCount)
     if declared ~= nil and declared ~= n then
         return false, "incomplete_transfer"
+    end
+    return true
+end
+
+--- Provisional soft-delete fact scope from authenticated adoption buffers (#465).
+-- Fact→deletion binding is enforced before publish; mid-replay floors may only
+-- count durable facts whose targets appear on accepted soft-delete ops in the
+-- transfer (fact-before-delete / reordered debt still allowed).
+local function BuildSoftDeleteFactScopeFromAdoption(adop)
+    local scope = {}
+    if type(adop) ~= "table" then
+        return scope
+    end
+    local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+    if not kindDel then
+        return scope
+    end
+    local function noteOp(op)
+        if type(op) ~= "table" or op.kind ~= kindDel then
+            return
+        end
+        local tid = op.target or (op.value and op.value.eventId)
+        if type(tid) == "string" and tid ~= "" then
+            scope[tid] = true
+        end
+        local vid = op.value and op.value.eventId
+        if type(vid) == "string" and vid ~= "" then
+            scope[vid] = true
+        end
+    end
+    if type(adop.records) == "table" then
+        for _, body in pairs(adop.records) do
+            if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
+                noteOp(body.op)
+            end
+        end
+    end
+    return scope
+end
+
+--- Install verified soft-delete accounting facts before op replay (#465).
+-- Survives source evidence eviction: adoptees rebuild debt floors from these
+-- facts rather than raw soft-delete payloads. Older descriptors omit the
+-- manifest entirely and remain compatible.
+-- @return boolean ok, string|nil err
+local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
+    if type(temp) ~= "table" or type(temp.accounting) ~= "table" then
+        return false, "invalid_record"
+    end
+    local cfg = temp.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false, "invalid_record"
+    end
+    if type(cfg.softDeleteVerifiedFacts) ~= "table" then
+        cfg.softDeleteVerifiedFacts = {}
+    end
+    if desc and desc.softDeleteVerifiedFactCount == nil
+        and desc.softDeleteVerifiedFacts == nil
+        and (tonumber(desc.softDeleteVerifiedFactPageCount) or 0) < 1 then
+        return true
+    end
+    local incoming, assembleErr = AssembleSoftDeleteVerifiedFactsFromAdoption(adop, desc)
+    if not incoming then
+        return false, assembleErr or "incomplete_transfer"
+    end
+    local map = cfg.softDeleteVerifiedFacts
+    local maxN = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 4096
+    local n = 0
+    for eventId, entry in pairs(incoming) do
+        n = n + 1
+        if n > maxN then
+            return false, "full"
+        end
+        local prior = map[eventId]
+        if type(prior) == "table" and not SoftDeleteVerifiedFactsEqual(prior, entry) then
+            return false, "soft_delete_fact_conflict"
+        end
+        map[eventId] = entry
+    end
+    local declared = tonumber(desc and desc.softDeleteVerifiedFactCount)
+    if declared ~= nil and declared ~= n then
+        return false, "incomplete_transfer"
+    end
+    -- Provisional scope for mid-replay floors; final publish still binds facts
+    -- to accepted canonical deletions (r4529162877).
+    local scope = BuildSoftDeleteFactScopeFromAdoption(adop)
+    if GS.NoteSoftDeleteFactScope then
+        GS.NoteSoftDeleteFactScope(temp, scope)
+    else
+        temp._gsSoftDeleteFactScope = scope
     end
     return true
 end
@@ -5363,6 +5725,241 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             end
         end
     end
+    -- Soft-delete debt facts must bind to accepted canonical deletions before
+    -- publish. Shape/count alone is insufficient (r4529162877). Orphaned
+    -- evidence, aliases, and losing revisions remain valid when the winning
+    -- soft-delete head / projected deletion is present.
+    -- Charged/resumable under the existing completeness budget (r4529162895):
+    -- shared canonical lookup — never per-delete FindLedger scans.
+    do
+        local durable = temp.accounting and temp.accounting._consumables
+            and temp.accounting._consumables.softDeleteVerifiedFacts
+        if type(durable) == "table" and next(durable) ~= nil then
+            local bind = opts.softDeleteBind
+            if type(bind) ~= "table" then
+                bind = { phase = "ensure" }
+                opts.softDeleteBind = bind
+            end
+            if bind.phase == "ensure" then
+                if visited >= budget then
+                    opts.cursor = #adop.order + 1
+                    opts.budgetExhausted = true
+                    publishCompletenessStats()
+                    return false, "budget"
+                end
+                if GS.EnsureEventDeletionProjection then
+                    GS.EnsureEventDeletionProjection(temp, nil)
+                end
+                visited = visited + 1
+                adop._workStats.completenessVisited =
+                    (adop._workStats.completenessVisited or 0) + 1
+                -- Late evidence that conflicted with transferred/orphan facts
+                -- must fail closed before publish (#465 r4539041882).
+                if temp._gsSoftDeleteFactEvidenceConflict == true then
+                    opts.cursor = nil
+                    opts.budgetExhausted = false
+                    opts.softDeleteBind = nil
+                    publishCompletenessStats()
+                    return false, "soft_delete_fact_conflict"
+                end
+                bind.phase = "lookup"
+            end
+            if bind.phase == "lookup" then
+                if visited >= budget then
+                    opts.cursor = #adop.order + 1
+                    opts.budgetExhausted = true
+                    publishCompletenessStats()
+                    return false, "budget"
+                end
+                if GS.BuildCreditCanonicalLookup then
+                    bind.lookup = GS.BuildCreditCanonicalLookup(temp)
+                    local lv = tonumber(GS._creditCanonicalLookupVisits) or 0
+                    visited = visited + math.max(1, lv)
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + math.max(1, lv)
+                else
+                    bind.lookup = nil
+                    visited = visited + 1
+                end
+                bind.phase = "targets"
+                bind.targetList = nil
+                bind.targetPos = 1
+                bind.deleteTargets = {}
+            end
+            if bind.phase == "targets" then
+                local ops = temp.operations
+                local kindDel = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+                if type(bind.targetList) ~= "table" then
+                    local list = {}
+                    if type(ops) == "table" and kindDel and type(ops.records) == "table" then
+                        for _, body in pairs(ops.records) do
+                            if type(body) == "table" and body.kind == kindDel then
+                                list[#list + 1] = body
+                            end
+                        end
+                    end
+                    bind.targetList = list
+                    bind.targetPos = 1
+                    bind.deleteTargets = bind.deleteTargets or {}
+                end
+                local list = bind.targetList
+                local pos = tonumber(bind.targetPos) or 1
+                local deleteTargets = bind.deleteTargets
+                local lookup = bind.lookup
+                while pos <= #list do
+                    if visited >= budget then
+                        bind.targetPos = pos
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    visited = visited + 1
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + 1
+                    local body = list[pos]
+                    pos = pos + 1
+                    local tid = body.target or (body.value and body.value.eventId)
+                    if type(tid) == "string" and tid ~= "" then
+                        deleteTargets[tid] = true
+                        if GS.CanonicalCreditEventId then
+                            local tCanon = GS.CanonicalCreditEventId(temp, tid, lookup)
+                            if type(tCanon) == "string" and tCanon ~= "" then
+                                deleteTargets[tCanon] = true
+                            end
+                        end
+                    end
+                end
+                bind.targetPos = pos
+                bind.phase = "eventIndex"
+            end
+            if bind.phase == "eventIndex" then
+                -- One reusable event-object index for evidence checks; charge
+                -- construction under the completeness budget (#465 r4539832738).
+                if type(bind.eventIndex) ~= "table" then
+                    if visited >= budget then
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    if GS.BuildSoftDeleteEventObjectIndex then
+                        bind.eventIndex = GS.BuildSoftDeleteEventObjectIndex(
+                            temp, bind.lookup)
+                        local ev = tonumber(bind.eventIndex and bind.eventIndex.visits) or 0
+                        visited = visited + math.max(1, ev)
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + math.max(1, ev)
+                        adop._workStats.softDeleteEventIndexVisits = ev
+                    else
+                        bind.eventIndex = { byObj = {}, visits = 0 }
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                    end
+                end
+                bind.phase = "facts"
+                bind.factList = nil
+                bind.factPos = 1
+            end
+            if bind.phase == "facts" then
+                if type(bind.factList) ~= "table" then
+                    local list = {}
+                    for eventId, entry in pairs(durable) do
+                        if type(entry) == "table" and entry.verified == true then
+                            list[#list + 1] = { id = eventId, entry = entry }
+                        end
+                    end
+                    bind.factList = list
+                    bind.factPos = 1
+                end
+                local delMap = temp.eventDeletions
+                local deleteTargets = bind.deleteTargets or {}
+                local lookup = bind.lookup
+                local byObj = bind.eventIndex and bind.eventIndex.byObj
+                local list = bind.factList
+                local pos = tonumber(bind.factPos) or 1
+                while pos <= #list do
+                    if visited >= budget then
+                        bind.factPos = pos
+                        opts.cursor = #adop.order + 1
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    visited = visited + 1
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + 1
+                    local row = list[pos]
+                    pos = pos + 1
+                    local eventId = row.id
+                    local entry = row.entry
+                    local canon = entry.eventId
+                    if type(canon) ~= "string" or canon == "" then
+                        canon = eventId
+                    end
+                    local bound = false
+                    if type(delMap) == "table" then
+                        local projected = delMap[eventId] or delMap[canon]
+                        if type(projected) == "table" and projected.verified == true then
+                            bound = true
+                        end
+                    end
+                    if not bound then
+                        if deleteTargets[eventId] or deleteTargets[canon] then
+                            bound = true
+                        elseif GS.CanonicalCreditEventId then
+                            local tCanon = GS.CanonicalCreditEventId(temp, canon, lookup)
+                            if type(tCanon) == "string" and deleteTargets[tCanon] then
+                                bound = true
+                            end
+                        end
+                    end
+                    if not bound then
+                        opts.cursor = nil
+                        opts.budgetExhausted = false
+                        opts.softDeleteBind = nil
+                        publishCompletenessStats()
+                        return false, "soft_delete_fact_unbound"
+                    end
+                    -- Available canonical evidence must agree with durable /
+                    -- projected item/quantity before atomic publish
+                    -- (#465 r4539041882). Truly missing evidence stays orphan-OK.
+                    -- Resolve via the budgeted event-object index — never
+                    -- FindLedgerEventById per fact (#465 r4539832738).
+                    local evidence = nil
+                    if type(byObj) == "table" then
+                        evidence = byObj[canon] or byObj[eventId]
+                        if evidence == false then
+                            evidence = nil
+                        end
+                    end
+                    if type(evidence) == "table" then
+                        local projected = type(delMap) == "table"
+                            and (delMap[eventId] or delMap[canon]) or nil
+                        local check = (type(projected) == "table"
+                            and projected.verified == true) and projected or entry
+                        if tonumber(evidence.itemId) ~= tonumber(check.itemId)
+                            or tonumber(evidence.quantity) ~= tonumber(check.quantity) then
+                            opts.cursor = nil
+                            opts.budgetExhausted = false
+                            opts.softDeleteBind = nil
+                            publishCompletenessStats()
+                            return false, "soft_delete_fact_conflict"
+                        end
+                    end
+                end
+                bind.factPos = pos
+                bind.phase = "done"
+            end
+            opts.softDeleteBind = nil
+        end
+        if GS.ClearSoftDeleteFactScope then
+            GS.ClearSoftDeleteFactScope(temp)
+        else
+            temp._gsSoftDeleteFactScope = nil
+        end
+    end
     opts.cursor = nil
     opts.budgetExhausted = false
     if opts.evidenceScanCursor then
@@ -5747,9 +6344,17 @@ local function ContinueAdoptionReplay(adop)
     -- legal reverse-order history merely because search/assembly charged many
     -- budgeted continuation slices.
 
-    local moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
-        return ReplayAdoptionSlice(temp, adop, member, state)
-    end)
+    -- Resume after a deletion-projection work_budget yield must not re-enter
+    -- ReplayAdoptionSlice: quiet no-progress counters would eventually abort a
+    -- legal transfer as incomplete_transfer (#465 r4555245945).
+    local moreWork, err, progress
+    if state.deletionProjectionPending then
+        moreWork, err, progress = false, nil, false
+    else
+        moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
+            return ReplayAdoptionSlice(temp, adop, member, state)
+        end)
+    end
     if err then
         AbortAdoptionReplay(adop, err)
         GS._adoption = nil
@@ -5816,6 +6421,79 @@ local function ContinueAdoptionReplay(adop)
         end
     end
 
+    -- Coalesced soft-delete hist/fact readiness after correction-heavy replay
+    -- (#465 r4538978963 / 6829598989 / r4555245945). Deferred NoteAccepted only
+    -- invalidated; do not publish while Ensure is work_budget-pending, and abort
+    -- on terminal reconstruction errors without replacing the old dataset.
+    -- Test-only hook after replay settles, before the deletion Ensure gate.
+    if type(GS._adoptionBeforeDeletionEnsureForTest) == "function" then
+        GS._adoptionBeforeDeletionEnsureForTest(temp, adop, state)
+    end
+    do
+        local delOk, delErr = true, nil
+        if GS.EnsureEventDeletionProjection then
+            delOk, delErr = GS.EnsureEventDeletionProjection(temp, nil)
+        end
+        if not delOk then
+            delErr = delErr or "work_budget"
+            if delErr == "work_budget" then
+                if GS._adoptionReplaySyncDrain then
+                    local guard = 0
+                    local maxGuard = math.max(
+                        32,
+                        (#(adop.order or {}) * 2) + 16
+                    )
+                    while not delOk and delErr == "work_budget" and guard < maxGuard do
+                        guard = guard + 1
+                        local ctxOkD, ctxErrD, memberD = ValidateAdoptionCommitContext(adop)
+                        if not ctxOkD then
+                            AbortAdoptionReplay(adop, ctxErrD)
+                            GS._adoption = nil
+                            NotifyAdoptionStateChanged("failed")
+                            return "rejected", ctxErrD or "unauthorized"
+                        end
+                        member = memberD or member
+                        adop.replayMember = member
+                        -- Ensure re-enters notePendingFactRefresh → sync drain.
+                        delOk, delErr = GS.EnsureEventDeletionProjection(temp, nil)
+                        delErr = (not delOk) and (delErr or "work_budget") or nil
+                    end
+                    if not delOk then
+                        local failReason = (delErr == "work_budget")
+                            and "incomplete_transfer" or delErr
+                        AbortAdoptionReplay(adop, failReason)
+                        GS._adoption = nil
+                        NotifyAdoptionStateChanged("failed")
+                        return "rejected", failReason or "incomplete_transfer"
+                    end
+                else
+                    state.deletionProjectionPending = true
+                    if not adop._replayScheduled then
+                        adop._replayScheduled = true
+                        local function contDel()
+                            if GS._adoption ~= adop or adop.committed then
+                                return
+                            end
+                            ContinueAdoptionReplay(adop)
+                        end
+                        if C_Timer and C_Timer.After then
+                            C_Timer.After(0, contDel)
+                        else
+                            contDel()
+                        end
+                    end
+                    NotifyAdoptionStateChanged("replay")
+                    return "pending", "work_budget"
+                end
+            else
+                AbortAdoptionReplay(adop, delErr)
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("failed")
+                return "rejected", delErr or "engine_error"
+            end
+        end
+        state.deletionProjectionPending = nil
+    end
     -- Final completeness is indexed/resumable; source-authored ops skip searches.
     -- Optional test override keeps replay slice size unchanged while forcing
     -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
@@ -5979,6 +6657,14 @@ function GS:CommitDatasetAdoption()
         local aliasOk, aliasErr = InstallCreditEventAliasesFromDesc(temp, desc, adop)
         if not aliasOk then
             return "rejected", aliasErr or "invalid_credit_event_aliases"
+        end
+    end
+    -- Transfer verified soft-delete accounting facts before op replay so
+    -- eviction-orphaned deletes keep signed debt floors (#465).
+    do
+        local factOk, factErr = InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
+        if not factOk then
+            return "rejected", factErr or "invalid_soft_delete_verified_facts"
         end
     end
     -- Active source descriptors install their authenticated liveCutover onto the
@@ -6164,6 +6850,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.RENAME_CAMPAIGN
             -- Credit corrections are keyed by event id, not authorship campaign.
             and op.kind ~= GS.KIND.CORRECT_CONTRIBUTOR
+            -- Soft-deletes are keyed by event id, not authorship campaign (#465).
+            and op.kind ~= GS.KIND.SOFT_DELETE_EVENT
     end
 
     local promoteOps = {}
@@ -8292,6 +8980,13 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 GS._pendingCampaignBoundaries[step.cid] = nil
             end
         end
+        -- Winning correction from conflict resolution is accepted history (#465).
+        if chosen.kind == GS.KIND.CORRECT_CONTRIBUTOR
+            and GS.NoteAcceptedCorrectionHistoryMutation then
+            GS.NoteAcceptedCorrectionHistoryMutation(record, chosen, {
+                deferRefresh = admissionCtx.adoptionReplay == true,
+            })
+        end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-resolve")
         end
@@ -8328,8 +9023,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             stPend, reasonPend = GS._AdmitPendingOrConflict(
                 ops, stored, classReason or "stale_base", admissionCtx.sender)
         end
-        -- Alias-targeted pending corrections must own a durable binding before
-        -- registry eviction + capacity prune can drop it (#459 A).
+        -- Alias-targeted pending corrections/soft-deletes must own a durable
+        -- binding before registry eviction + capacity prune can drop it
+        -- (#459 A / #465 discussion_r4518383396).
         if (stPend == "pending" or stPend == "duplicate")
             and stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
             and GS.EnsureContributorCorrectionDurableAliases
@@ -8347,6 +9043,23 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     end
                     return "rejected", aliasErr or "full"
                 end
+            end
+        end
+        if (stPend == "pending" or stPend == "duplicate")
+            and stored.kind == GS.KIND.SOFT_DELETE_EVENT
+            and GS.EnsureSoftDeleteDurableAliases then
+            local pendEvent = nil
+            if GS.FindLedgerEventById then
+                pendEvent = GS.FindLedgerEventById(record, stored.target
+                    or (stored.value and stored.value.eventId))
+            end
+            local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(
+                record, stored, pendEvent)
+            if not aliasOk then
+                if ops.pending then
+                    ops.pending[stored.id] = nil
+                end
+                return "rejected", aliasErr or "full"
             end
         end
         -- Successful durable missing-predecessor / pending evidence must notify
@@ -8472,10 +9185,117 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 if GS.EnsureCreditCorrectionProjection then
                     GS.EnsureCreditCorrectionProjection(record, nil)
                 end
+                -- Retained loser history still feeds soft-delete attribution.
+                -- Notify after StoreAccepted (r4529162895); skip only when the
+                -- body was already present and history is unchanged.
+                if newlyRetained and GS.NoteAcceptedCorrectionHistoryMutation then
+                    GS.NoteAcceptedCorrectionHistoryMutation(record, stored, {
+                        deferRefresh = admissionCtx.adoptionReplay == true,
+                    })
+                end
                 -- Warm providers must export newly retained older corrections.
                 if newlyRetained and not admissionCtx.adoptionReplay
                     and GS._NotifyLocalDurableChange then
                     GS._NotifyLocalDurableChange("remote-correction-history")
+                end
+                return "accepted", nil
+            end
+        end
+        -- #465: retain LWW-losing soft-deletes without replacing the winning head.
+        -- Ordinary authenticated gossip and adoption keep prior accepted evidence
+        -- under capacity/export rules (mirrors stale_credit retention).
+        if stored.kind == GS.KIND.SOFT_DELETE_EVENT
+            and classReason == "stale_delete" then
+            local allowRetain = true
+            if admissionCtx.adoptionReplay then
+                allowRetain = type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+            end
+            if allowRetain then
+                -- Same narrowly authenticated orphan allowance as the winning
+                -- apply path: source-accepted adoption may retain a losing
+                -- delete after retention trimmed its base evidence (#465).
+                -- Ordinary unknown-target ingress stays pending_event.
+                local orphanedAccepted = admissionCtx.adoptionReplay == true
+                    and type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+                local scopeEvent = nil
+                if GS.ValidateSoftDeleteScope then
+                    local scopeOk, scopeErr, scopedEvent = GS.ValidateSoftDeleteScope(
+                        record, stored, {
+                            allowMissingEvent = true,
+                            remoteAdmit = true,
+                            allowOrphanedAcceptedDelete = orphanedAccepted,
+                        })
+                    if not scopeOk then
+                        if scopeErr == "pending_event" or scopeErr == "missing_event" then
+                            local stPend, reasonPend = "pending", scopeErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, scopeErr, admissionCtx.sender)
+                            end
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", scopeErr or classReason or "stale_delete"
+                    end
+                    scopeEvent = scopedEvent
+                end
+                -- Eligibility still runs when the base event is absent so orphan
+                -- retention requires a well-shaped eventKind on the op value.
+                if GS.ValidateSoftDeleteEventEligibility then
+                    local eligOk, eligErr = GS.ValidateSoftDeleteEventEligibility(
+                        record, stored, scopeEvent)
+                    if not eligOk then
+                        if eligErr == "not_credited" then
+                            local stPend, reasonPend = "pending", eligErr
+                            if GS._AdmitPendingOrConflict then
+                                stPend, reasonPend = GS._AdmitPendingOrConflict(
+                                    ops, stored, eligErr, admissionCtx.sender)
+                            end
+                            if (stPend == "pending" or stPend == "duplicate")
+                                and not admissionCtx.adoptionReplay
+                                and GS._NotifyLocalDurableChange then
+                                GS._NotifyLocalDurableChange("remote-pending")
+                            end
+                            return stPend, reasonPend
+                        end
+                        return "rejected", eligErr or "invalid_event"
+                    end
+                end
+                -- Durable alias binding before every accepted retention path,
+                -- including LWW-losing soft-deletes (#465 discussion_r4518383396).
+                if GS.EnsureSoftDeleteDurableAliases then
+                    local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(
+                        record, stored, scopeEvent)
+                    if not aliasOk then
+                        return "rejected", aliasErr or "full"
+                    end
+                end
+                local newlyRetained = not (ops.records and ops.records[stored.id])
+                if newlyRetained then
+                    if GS._AcceptedCount
+                        and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                        return "rejected", "full"
+                    end
+                    if GS._StoreAccepted then
+                        -- nil targetKey: keep current winning delete head.
+                        GS._StoreAccepted(ops, stored, nil)
+                    end
+                end
+                if GS.InvalidateEventDeletionProjection then
+                    GS.InvalidateEventDeletionProjection(record)
+                end
+                if GS.EnsureEventDeletionProjection then
+                    GS.EnsureEventDeletionProjection(record, nil)
+                end
+                if newlyRetained and not admissionCtx.adoptionReplay
+                    and GS._NotifyLocalDurableChange then
+                    GS._NotifyLocalDurableChange("remote-delete-history")
                 end
                 return "accepted", nil
             end
@@ -8580,6 +9400,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         local ownedCreditBudget = false
         local creditKind = stored.kind == GS.KIND.CORRECT_CONTRIBUTOR
             or stored.kind == GS.KIND.ADJUST_QUANTITY
+            or stored.kind == GS.KIND.SOFT_DELETE_EVENT
         if creditKind and GS.BeginOuterCreditProjectionCallbackBudget then
             ownedCreditBudget = GS.BeginOuterCreditProjectionCallbackBudget()
         end
@@ -8590,7 +9411,47 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
         end
         if GS._ApplyMutations then
-            local ok, err = GS._ApplyMutations(record, stored)
+            local applyOpts = nil
+            if stored.kind == GS.KIND.SOFT_DELETE_EVENT then
+                -- Source-accepted deletions may outlive trimmed base evidence (#465).
+                applyOpts = {
+                    adoptionReplay = admissionCtx.adoptionReplay == true,
+                    sourceAcceptedDelete = admissionCtx.adoptionReplay == true
+                        and type(admissionCtx.sourceAcceptedSet) == "table"
+                        and admissionCtx.sourceAcceptedSet[stored.id] == true,
+                    allowOrphanedAcceptedDelete = admissionCtx.adoptionReplay == true
+                        and type(admissionCtx.sourceAcceptedSet) == "table"
+                        and admissionCtx.sourceAcceptedSet[stored.id] == true,
+                }
+            elseif stored.kind == GS.KIND.CORRECT_CONTRIBUTOR then
+                -- Source-accepted corrections may outlive trimmed target evidence
+                -- when a verified soft-delete still accounts for that event (#465).
+                local sourceAccepted = admissionCtx.adoptionReplay == true
+                    and type(admissionCtx.sourceAcceptedSet) == "table"
+                    and admissionCtx.sourceAcceptedSet[stored.id] == true
+                local tid = stored.target or (stored.value and stored.value.eventId)
+                local verifiedOrDeleted = false
+                if type(tid) == "string" and tid ~= "" then
+                    if GS.EnsureEventDeletionProjection then
+                        GS.EnsureEventDeletionProjection(record, nil)
+                    end
+                    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, tid) then
+                        verifiedOrDeleted = true
+                    else
+                        local facts = record.accounting and record.accounting._consumables
+                            and record.accounting._consumables.softDeleteVerifiedFacts
+                        if type(facts) == "table" and type(facts[tid]) == "table"
+                            and facts[tid].verified == true then
+                            verifiedOrDeleted = true
+                        end
+                    end
+                end
+                applyOpts = {
+                    adoptionReplay = admissionCtx.adoptionReplay == true,
+                    allowOrphanedAcceptedCorrection = sourceAccepted and verifiedOrDeleted,
+                }
+            end
+            local ok, err = GS._ApplyMutations(record, stored, applyOpts)
             if not ok then
                 if stored.kind == GS.KIND.ADJUST_QUANTITY
                     and (err == "item_negative" or err == "player_negative"
@@ -8650,6 +9511,36 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     releaseCreditBudget()
                     return stPend, reasonPend
                 end
+                -- #465: soft-delete-before-event stays pending. Negative balances
+                -- are not pending dependencies (owner decision: honor deletions).
+                -- work_budget: retain the exact authenticated delete and resume via
+                -- existing soft-delete redrive (assessment 6834988628).
+                if stored.kind == GS.KIND.SOFT_DELETE_EVENT
+                    and (err == "pending_event" or err == "missing_event"
+                        or err == "not_credited" or err == "work_budget") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(
+                            ops, stored, err, admissionCtx.sender)
+                    end
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingSoftDeletes then
+                        GS.RedrivePendingSoftDeletes(record, {
+                            eventId = stored.target
+                                or (stored.value and stored.value.eventId),
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    releaseCreditBudget()
+                    return stPend, reasonPend
+                end
                 releaseCreditBudget()
                 return "rejected", err or "apply_failed"
             end
@@ -8665,6 +9556,15 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             if GS.SealCreditCorrectionProjection then
                 GS.SealCreditCorrectionProjection(record, true)
             end
+            -- Soft-delete hist/facts refresh AFTER accepted history is stored
+            -- (delete-first / prior-correction-second; r4529162895).
+            -- Adoption replay defers fact refresh until one coherent Ensure after
+            -- the full transfer (assessment 6829598989).
+            if GS.NoteAcceptedCorrectionHistoryMutation then
+                GS.NoteAcceptedCorrectionHistoryMutation(record, stored, {
+                    deferRefresh = admissionCtx.adoptionReplay == true,
+                })
+            end
             if not admissionCtx.adoptionReplay and not admissionCtx._creditRedrive
                 and GS.RedrivePendingContributorCorrections then
                 GS.RedrivePendingContributorCorrections(record, {
@@ -8672,6 +9572,33 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     itemId = stored.value and stored.value.itemId,
                     _shareCallbackBudget = true,
                 })
+            end
+        elseif stored.kind == GS.KIND.SOFT_DELETE_EVENT then
+            if GS.SealEventDeletionProjection then
+                GS.SealEventDeletionProjection(record, true)
+            end
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureCreditCorrectionProjection then
+                GS.EnsureCreditCorrectionProjection(record, nil)
+            end
+            -- Nested soft-delete redrive must not re-enter the full pending scan
+            -- on the same UI callback (#465 P1). Top-level admits coalesce a
+            -- bounded continuation; _softDeleteRedrive skips the wake entirely.
+            if not admissionCtx.adoptionReplay and not admissionCtx._softDeleteRedrive then
+                if GS.RedrivePendingSoftDeletes then
+                    GS.RedrivePendingSoftDeletes(record, {
+                        itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
+                    })
+                end
+                if GS.RedrivePendingContributorCorrections then
+                    GS.RedrivePendingContributorCorrections(record, {
+                        itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
+                    })
+                end
             end
         elseif stored.kind == GS.KIND.ADJUST_QUANTITY then
             -- AppendLedgerEvent already Ensure'd under the shared outer allowance.
@@ -8684,6 +9611,13 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     })
                 elseif GS.EnsureCreditCorrectionProjection then
                     GS.EnsureCreditCorrectionProjection(record, nil)
+                end
+                if not admissionCtx._softDeleteRedrive
+                    and GS.RedrivePendingSoftDeletes then
+                    GS.RedrivePendingSoftDeletes(record, {
+                        itemId = stored.value and stored.value.itemId,
+                        _shareCallbackBudget = true,
+                    })
                 end
             elseif GS.EnsureCreditCorrectionProjection then
                 GS.EnsureCreditCorrectionProjection(record, nil)
