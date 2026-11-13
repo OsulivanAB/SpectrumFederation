@@ -153,12 +153,12 @@ only when later changes do not invalidate it, and explain why.
 - Resolution: only a verified fixed finding, only with resolution
   authorization. Classification alone never authorizes closure. Leave
   unsupported, disputed, decision-dependent, or unresolved findings open.
-- When the owner has authorized review-comment disposition for the operation,
-  post or update each handled thread with an explicit determination —
-  IMPLEMENT, DEFER, DO NOT IMPLEMENT, or OWNER DECISION — plus the reason and
-  current-code evidence. Resolve a thread only after its IMPLEMENT fix is
-  verified in current HEAD; leave DEFER, DO NOT IMPLEMENT, OWNER DECISION,
-  unverified, or disputed threads unresolved for the owner.
+- Audit every PR review thread before reporting a review round complete. For
+  each handled thread, post or update an explicit determination — IMPLEMENT,
+  DEFER, DO NOT IMPLEMENT, or OWNER DECISION — plus the reason and current-code
+  evidence. Resolve a thread only after its IMPLEMENT fix is verified in
+  current HEAD; leave DEFER, DO NOT IMPLEMENT, OWNER DECISION, unverified, or
+  disputed threads unresolved for the owner.
 - When the owner has authorized an iterative PR review loop for the operation,
   drive automated reviewers to a clean state: finish Devin Review findings
   first, then trigger/evaluate Codex review comments, implement valid
