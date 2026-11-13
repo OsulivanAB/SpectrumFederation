@@ -6344,9 +6344,17 @@ local function ContinueAdoptionReplay(adop)
     -- legal reverse-order history merely because search/assembly charged many
     -- budgeted continuation slices.
 
-    local moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
-        return ReplayAdoptionSlice(temp, adop, member, state)
-    end)
+    -- Resume after a deletion-projection work_budget yield must not re-enter
+    -- ReplayAdoptionSlice: quiet no-progress counters would eventually abort a
+    -- legal transfer as incomplete_transfer (#465 r4555245945).
+    local moreWork, err, progress
+    if state.deletionProjectionPending then
+        moreWork, err, progress = false, nil, false
+    else
+        moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
+            return ReplayAdoptionSlice(temp, adop, member, state)
+        end)
+    end
     if err then
         AbortAdoptionReplay(adop, err)
         GS._adoption = nil
@@ -6413,10 +6421,78 @@ local function ContinueAdoptionReplay(adop)
         end
     end
 
-    -- Coalesced soft-delete hist/fact refresh after correction-heavy replay
-    -- (#465 r4538978963 / 6829598989). Deferred NoteAccepted only invalidated.
-    if GS.EnsureEventDeletionProjection then
-        GS.EnsureEventDeletionProjection(temp, nil)
+    -- Coalesced soft-delete hist/fact readiness after correction-heavy replay
+    -- (#465 r4538978963 / 6829598989 / r4555245945). Deferred NoteAccepted only
+    -- invalidated; do not publish while Ensure is work_budget-pending, and abort
+    -- on terminal reconstruction errors without replacing the old dataset.
+    -- Test-only hook after replay settles, before the deletion Ensure gate.
+    if type(GS._adoptionBeforeDeletionEnsureForTest) == "function" then
+        GS._adoptionBeforeDeletionEnsureForTest(temp, adop, state)
+    end
+    do
+        local delOk, delErr = true, nil
+        if GS.EnsureEventDeletionProjection then
+            delOk, delErr = GS.EnsureEventDeletionProjection(temp, nil)
+        end
+        if not delOk then
+            delErr = delErr or "work_budget"
+            if delErr == "work_budget" then
+                if GS._adoptionReplaySyncDrain then
+                    local guard = 0
+                    local maxGuard = math.max(
+                        32,
+                        (#(adop.order or {}) * 2) + 16
+                    )
+                    while not delOk and delErr == "work_budget" and guard < maxGuard do
+                        guard = guard + 1
+                        local ctxOkD, ctxErrD, memberD = ValidateAdoptionCommitContext(adop)
+                        if not ctxOkD then
+                            AbortAdoptionReplay(adop, ctxErrD)
+                            GS._adoption = nil
+                            NotifyAdoptionStateChanged("failed")
+                            return "rejected", ctxErrD or "unauthorized"
+                        end
+                        member = memberD or member
+                        adop.replayMember = member
+                        -- Ensure re-enters notePendingFactRefresh → sync drain.
+                        delOk, delErr = GS.EnsureEventDeletionProjection(temp, nil)
+                        delErr = (not delOk) and (delErr or "work_budget") or nil
+                    end
+                    if not delOk then
+                        local failReason = (delErr == "work_budget")
+                            and "incomplete_transfer" or delErr
+                        AbortAdoptionReplay(adop, failReason)
+                        GS._adoption = nil
+                        NotifyAdoptionStateChanged("failed")
+                        return "rejected", failReason or "incomplete_transfer"
+                    end
+                else
+                    state.deletionProjectionPending = true
+                    if not adop._replayScheduled then
+                        adop._replayScheduled = true
+                        local function contDel()
+                            if GS._adoption ~= adop or adop.committed then
+                                return
+                            end
+                            ContinueAdoptionReplay(adop)
+                        end
+                        if C_Timer and C_Timer.After then
+                            C_Timer.After(0, contDel)
+                        else
+                            contDel()
+                        end
+                    end
+                    NotifyAdoptionStateChanged("replay")
+                    return "pending", "work_budget"
+                end
+            else
+                AbortAdoptionReplay(adop, delErr)
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("failed")
+                return "rejected", delErr or "engine_error"
+            end
+        end
+        state.deletionProjectionPending = nil
     end
     -- Final completeness is indexed/resumable; source-authored ops skip searches.
     -- Optional test override keeps replay slice size unchanged while forcing
@@ -9437,13 +9513,25 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 end
                 -- #465: soft-delete-before-event stays pending. Negative balances
                 -- are not pending dependencies (owner decision: honor deletions).
+                -- work_budget: retain the exact authenticated delete and resume via
+                -- existing soft-delete redrive (assessment 6834988628).
                 if stored.kind == GS.KIND.SOFT_DELETE_EVENT
                     and (err == "pending_event" or err == "missing_event"
-                        or err == "not_credited") then
+                        or err == "not_credited" or err == "work_budget") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(
                             ops, stored, err, admissionCtx.sender)
+                    end
+                    if err == "work_budget" and (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS.RedrivePendingSoftDeletes then
+                        GS.RedrivePendingSoftDeletes(record, {
+                            eventId = stored.target
+                                or (stored.value and stored.value.eventId),
+                            itemId = stored.value and stored.value.itemId,
+                            _shareCallbackBudget = true,
+                        })
                     end
                     if (stPend == "pending" or stPend == "duplicate")
                         and not admissionCtx.adoptionReplay

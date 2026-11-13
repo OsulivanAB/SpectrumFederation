@@ -6512,6 +6512,421 @@ do
         "465-eff-err: subsequent delete attributed")
 end
 
+do
+    -- #465 assessment 6834988628 / r4538978963: valid remote soft-delete under a
+    -- paced projection yield parks the exact authenticated op (pending/work_budget),
+    -- schedules acceptance without sender redelivery, settles exactly once, and
+    -- duplicate receipt does not double-apply accounting.
+    local itemId = 9301
+    local record = seedLiveCampaignWithItem(itemId, 120)
+    injectProductionDonation(record, {
+        id = "async-del-don", itemId = itemId, quantity = 12,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9001,
+    })
+    world.time = 9100
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "async-del-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-async-del: prepare Bob corr")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-async-del: Bob corr")
+    local del = select(1, GS:NewSoftDeleteOperation("async-del-don"))
+    assertTrue(del ~= nil, "465-async-del: prepare delete")
+    local snap = select(1, GS._SnapshotPublicOp(del))
+    assertTrue(type(snap) == "table", "465-async-del: snapshot")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    initGS()
+    local peer = seedLiveCampaignWithItem(itemId, 120)
+    injectProductionDonation(peer, {
+        id = "async-del-don", itemId = itemId, quantity = 12,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9001,
+    })
+    world.time = 9100
+    local corrPeer = select(1, GS:NewContributorCorrectionOperation(
+        "async-del-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corrPeer ~= nil, "465-async-del: peer corr")
+    assertEq(GS:ApplyStagedConfigOperation(corrPeer), "accepted",
+        "465-async-del: peer Bob corr")
+    local body = {}
+    for k, v in pairs(snap) do body[k] = v end
+    body.guildKey = select(1, GS:GetCurrentContext()).guildKey
+    body.datasetId = peer.datasetId
+    body.campaignId = peer.currentCampaignId
+    body.baseCampaignId = peer.currentCampaignId
+    body.basePolicyRevision = peer.permission and peer.permission.revisionId
+    body.baseTargetRevision = peer.datasetId
+
+    local realRebuild = GS.RebuildEventDeletionProjection
+    local allowRebuild = false
+    GS.RebuildEventDeletionProjection = function(rec, op)
+        if not allowRebuild then
+            return false, "work_budget"
+        end
+        return realRebuild(rec, op)
+    end
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(peer)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(peer)
+    end
+    local priorTotal = GS.PersonalContributorItemTotal(
+        peer, "Bob-Garona", "Player-1-Bob", itemId)
+    local stPend, reasonPend = GS:AdmitRemoteOperation(body, {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertEq(stPend, "pending",
+        "465-async-del: paced yield parks delete got "
+            .. tostring(stPend) .. "/" .. tostring(reasonPend))
+    assertEq(reasonPend, "work_budget",
+        "465-async-del: pending reason work_budget got " .. tostring(reasonPend))
+    assertTrue(type(peer.operations.pending[body.id]) == "table",
+        "465-async-del: authenticated op retained in pending")
+    assertEq(peer.operations.pending[body.id].sender, "Alice-Garona",
+        "465-async-del: pending sender retained")
+    assertNil(peer.operations.records[body.id],
+        "465-async-del: not StoreAccepted while pending")
+    assertTrue(not GS.IsEventSoftDeleted(peer, "async-del-don"),
+        "465-async-del: no speculative soft-delete fact while pending")
+    -- Unauthorized retry must not settle while projection is still blocked.
+    local stBad, reasonBad = GS:AdmitRemoteOperation(body, {
+        sender = "Dave-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertTrue(stBad == "pending" or stBad == "rejected",
+        "465-async-del: unauthorized retry not accepted got "
+            .. tostring(stBad) .. "/" .. tostring(reasonBad))
+    assertNil(peer.operations.records[body.id],
+        "465-async-del: unauthorized retry did not StoreAccepted")
+
+    allowRebuild = true
+    local g = 0
+    while type(peer.operations.pending[body.id]) == "table" and g < 64 do
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        g = g + 1
+    end
+    GS.RebuildEventDeletionProjection = realRebuild
+    assertTrue(type(peer.operations.records[body.id]) == "table",
+        "465-async-del: scheduled acceptance without sender redelivery slices="
+            .. tostring(g))
+    assertTrue(GS.IsEventSoftDeleted(peer, "async-del-don"),
+        "465-async-del: soft-deleted after settle")
+    assertEq(peer.eventDeletions["async-del-don"].attributed, "Bob-Garona",
+        "465-async-del: corrected attribution at acceptance")
+    local afterTotal = GS.PersonalContributorItemTotal(
+        peer, "Bob-Garona", "Player-1-Bob", itemId)
+    assertTrue((tonumber(afterTotal) or 0) <= (tonumber(priorTotal) or 0),
+        "465-async-del: signed debt settled once")
+    local stDup, reasonDup = GS:AdmitRemoteOperation(body, {
+        sender = "Alice-Garona", offlineRecord = peer, preserveAttribution = true,
+    })
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "465-async-del: duplicate receipt got "
+            .. tostring(stDup) .. "/" .. tostring(reasonDup))
+    local dupTotal = GS.PersonalContributorItemTotal(
+        peer, "Bob-Garona", "Player-1-Bob", itemId)
+    assertEq(dupTotal, afterTotal,
+        "465-async-del: duplicate does not re-apply accounting")
+    flushTimers()
+    assertTrue(#timers == 0 or GS._softDeleteRedriveAdmitActive == false,
+        "465-async-del: eventual idle")
+end
+
+do
+    -- #465 assessment 6834988628 / r4555245945: async Begin/Buffer/Commit adoption
+    -- must not publish while deletion reconstruction is work_budget-pending;
+    -- terminal engine_error aborts without replacing the old dataset; success
+    -- publishes completed attribution + signed debt.
+    local itemId = 9302
+    local record = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(record, {
+        id = "async-ad-don", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9200,
+    })
+    world.time = 9300
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "async-ad-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-async-ad: prepare Bob")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-async-ad: Bob corr")
+    local del = select(1, GS:NewSoftDeleteOperation("async-ad-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-async-ad: delete")
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil), "465-async-ad: warm")
+    assertEq(record.eventDeletions["async-ad-don"].attributed, "Bob-Garona",
+        "465-async-ad: source attribution")
+    local sourceDebt = GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", itemId)
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 1, "465-async-ad: export bodies")
+    local sourceDataset = record.datasetId
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    -- Sync-drain Commit so the deletion Ensure work_budget gate can yield and
+    -- resume in-process (same ContinueAdoptionReplay scheduling contract as
+    -- async After(0), without quiet-Replay timer races). A second pass below
+    -- covers real async Begin/Buffer/Commit settlement.
+    GS._adoptionReplaySyncDrain = true
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local priorLive = GS:GetCurrentRecord()
+    local priorDataset = priorLive and priorLive.datasetId
+    assertTrue(type(priorDataset) == "string", "465-async-ad: prior dataset")
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-async-ad: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "465-async-ad: ready")
+
+    local gateSeen = false
+    local liveAtGate = nil
+    local ensurePendingObserved = false
+    local realEnsure = GS.EnsureEventDeletionProjection
+    local forcePending = true
+    GS._adoptionBeforeDeletionEnsureForTest = function(temp, adop)
+        gateSeen = true
+        liveAtGate = GS:GetCurrentRecord() and GS:GetCurrentRecord().datasetId
+        adop._asyncAdGateArmed = true
+    end
+    GS.EnsureEventDeletionProjection = function(rec, extra)
+        local adop = GS._adoption
+        if forcePending and adop and adop.replayTemp == rec
+            and type(extra) ~= "table" and adop._asyncAdGateArmed == true then
+            forcePending = false
+            ensurePendingObserved = true
+            assertEq((GS:GetCurrentRecord() and GS:GetCurrentRecord().datasetId),
+                priorDataset,
+                "465-async-ad: no publish while Ensure work_budget")
+            return false, "work_budget"
+        end
+        return realEnsure(rec, extra)
+    end
+    local stA, rA = GS:CommitDatasetAdoption()
+    local gA = 0
+    while stA == "pending" and gA < 256 do
+        flushTimers()
+        stA, rA = GS:CommitDatasetAdoption()
+        gA = gA + 1
+    end
+    GS.EnsureEventDeletionProjection = realEnsure
+    GS._adoptionBeforeDeletionEnsureForTest = nil
+    assertTrue(gateSeen, "465-async-ad: deletion Ensure gate reached")
+    assertEq(liveAtGate, priorDataset, "465-async-ad: gate ran before publish")
+    assertTrue(ensurePendingObserved,
+        "465-async-ad: observed Ensure work_budget before publish")
+    assertEq(stA, "accepted",
+        "465-async-ad: adopt commit got " .. tostring(stA) .. "/" .. tostring(rA)
+            .. " slices=" .. tostring(gA))
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(type(adopted) == "table", "465-async-ad: adopted record")
+    assertEq(adopted.datasetId, sourceDataset, "465-async-ad: published source dataset")
+    assertTrue(GS.EnsureEventDeletionProjection(adopted, nil), "465-async-ad: ensure")
+    assertEq(adopted.eventDeletions and adopted.eventDeletions["async-ad-don"]
+        and adopted.eventDeletions["async-ad-don"].attributed, "Bob-Garona",
+        "465-async-ad: attribution complete at acceptance")
+    assertEq(GS.PersonalContributorItemTotal(
+        adopted, "Bob-Garona", "Player-1-Bob", itemId), sourceDebt,
+        "465-async-ad: signed debt complete at acceptance")
+
+    -- Real async timer path (no Ensure stub): settle without speculative publish.
+    SpectrumFederationDB = {}
+    switchPlayer("Dave", "Player-1-Dave", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS._adoptionReplaySyncDrain = false
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local prior2 = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-async-ad2: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local st2, r2 = GS:CommitDatasetAdoption()
+    assertTrue(st2 == "pending" or st2 == "accepted",
+        "465-async-ad2: commit start got " .. tostring(st2) .. "/" .. tostring(r2))
+    local g2 = 0
+    while GS._adoption and GS._adoption.replayTemp and g2 < 8000 do
+        assertEq(GS:GetCurrentRecord().datasetId, prior2,
+            "465-async-ad2: no publish while pending")
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+        g2 = g2 + 1
+    end
+    if GS:GetCurrentRecord().datasetId == sourceDataset then
+        st2, r2 = "accepted", nil
+    elseif GS._adoption and GS._adoption.replayTemp then
+        st2, r2 = GS:CommitDatasetAdoption()
+        local guard2 = 0
+        while st2 == "pending" and guard2 < 256 do
+            if not runOneDueTimer() then
+                world.time = (world.time or 0) + 1
+                if not runOneDueTimer() then
+                    st2, r2 = GS:CommitDatasetAdoption()
+                end
+            elseif GS:GetCurrentRecord().datasetId == sourceDataset then
+                st2, r2 = "accepted", nil
+            elseif GS._adoption and GS._adoption.replayTemp then
+                st2, r2 = GS:CommitDatasetAdoption()
+            end
+            guard2 = guard2 + 1
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertEq(st2, "accepted",
+        "465-async-ad2: async commit got " .. tostring(st2) .. "/" .. tostring(r2)
+            .. " slices=" .. tostring(g2))
+    local adopted2 = GS:GetCurrentRecord()
+    assertEq(adopted2.datasetId, sourceDataset, "465-async-ad2: published")
+    assertTrue(GS.EnsureEventDeletionProjection(adopted2, nil), "465-async-ad2: ensure")
+    assertEq(adopted2.eventDeletions["async-ad-don"].attributed, "Bob-Garona",
+        "465-async-ad2: attribution")
+    assertEq(GS.PersonalContributorItemTotal(
+        adopted2, "Bob-Garona", "Player-1-Bob", itemId), sourceDebt,
+        "465-async-ad2: signed debt")
+    flushTimers()
+end
+
+do
+    -- Terminal deletion reconstruction failure aborts adoption without publish.
+    local itemId = 9303
+    local record = seedLiveCampaignWithItem(itemId, 80)
+    injectProductionDonation(record, {
+        id = "async-term-don", itemId = itemId, quantity = 8,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9400,
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("async-term-don"))
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-async-term: delete")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS._adoptionReplaySyncDrain = true
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local priorDataset = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "465-async-term: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local realEnsure = GS.EnsureEventDeletionProjection
+    GS.EnsureEventDeletionProjection = function(rec, extra)
+        if GS._adoption and GS._adoption.replayTemp == rec and type(extra) ~= "table" then
+            return false, "engine_error"
+        end
+        return realEnsure(rec, extra)
+    end
+    local stT, rT = GS:CommitDatasetAdoption()
+    local gT = 0
+    while stT == "pending" and gT < 64 do
+        flushTimers()
+        stT, rT = GS:CommitDatasetAdoption()
+        gT = gT + 1
+    end
+    GS.EnsureEventDeletionProjection = realEnsure
+    assertEq(stT, "rejected",
+        "465-async-term: terminal abort got " .. tostring(stT) .. "/" .. tostring(rT))
+    assertEq(rT, "engine_error",
+        "465-async-term: engine_error reason got " .. tostring(rT))
+    assertEq(GS:GetCurrentRecord().datasetId, priorDataset,
+        "465-async-term: old dataset preserved")
+    assertTrue(GS._adoption == nil, "465-async-term: adoption cleared")
+end
+
+do
+    -- ApplySoftDeleteMutation maps paced yield to work_budget (not invalid_value);
+    -- local ApplyStagedConfigOperation parks + settles via existing redrive.
+    local itemId = 9304
+    local record = seedLiveCampaignWithItem(itemId, 60)
+    injectProductionDonation(record, {
+        id = "async-local-don", itemId = itemId, quantity = 6,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9500,
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("async-local-don"))
+    assertTrue(del ~= nil, "465-async-local: prepare")
+    local realRebuild = GS.RebuildEventDeletionProjection
+    local allowRebuild = false
+    GS.RebuildEventDeletionProjection = function(rec, op)
+        if not allowRebuild then
+            return false, "work_budget"
+        end
+        return realRebuild(rec, op)
+    end
+    if GS.InvalidateSoftDeleteLedgerIndexes then
+        GS.InvalidateSoftDeleteLedgerIndexes(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    local applied, applyErr = GS.ApplySoftDeleteMutation(record, del, {
+        localProductionAuthority = true,
+    })
+    assertEq(applied, false, "465-async-local: Apply yields")
+    assertEq(applyErr, "work_budget",
+        "465-async-local: Apply returns work_budget not invalid_value got "
+            .. tostring(applyErr))
+    local stL, rL = GS:ApplyStagedConfigOperation(del)
+    assertEq(stL, "pending",
+        "465-async-local: local save pending got " .. tostring(stL) .. "/" .. tostring(rL))
+    assertEq(rL, "work_budget", "465-async-local: local work_budget reason")
+    assertTrue(type(record.operations.pending[del.id]) == "table",
+        "465-async-local: op parked in pending")
+    allowRebuild = true
+    local gL = 0
+    while type(record.operations.pending[del.id]) == "table" and gL < 64 do
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        gL = gL + 1
+    end
+    GS.RebuildEventDeletionProjection = realRebuild
+    assertTrue(type(record.operations.records[del.id]) == "table",
+        "465-async-local: settled via redrive slices=" .. tostring(gL))
+    assertTrue(GS.IsEventSoftDeleted(record, "async-local-don"),
+        "465-async-local: soft-deleted after settle")
+    -- Cancellation/replacement: replace staged record leaves redrive idle.
+    SpectrumFederationDB = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS:CreateStagedRecord()
+    flushTimers()
+    assertEq(GS._softDeleteRedriveAdmitActive, false,
+        "465-async-local: idle after dataset replace")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

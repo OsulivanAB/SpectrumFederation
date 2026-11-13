@@ -8670,12 +8670,39 @@ function SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
     if SoftDeleteRuntime._pendingFactRefresh then
         SoftDeleteRuntime._pendingFactRefresh[record] = nil
     end
+    -- Hist-effective just settled: any published deletion map may have been
+    -- sealed under incomplete effectiveness. Force a coherent fact refresh when
+    -- deletions exist even if notePendingFactRefresh was not set (async adopt).
+    if type(pending) ~= "table" then
+        local hasDeletes = false
+        if type(record.eventDeletions) == "table" and next(record.eventDeletions) ~= nil then
+            hasDeletes = true
+        else
+            local heads = record.operations and record.operations.heads
+            if type(heads) == "table" then
+                for targetKey in pairs(heads) do
+                    if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                        hasDeletes = true
+                        break
+                    end
+                end
+            end
+        end
+        if hasDeletes then
+            pending = { fullRebuild = true }
+        end
+    end
     local factOk, factErr = true, nil
     if type(pending) == "table" then
         if pending.fullRebuild == true and GS.RebuildEventDeletionProjection then
-            factOk = GS.RebuildEventDeletionProjection(record, nil)
+            -- Hist-effective stamp is part of EventDeletionDependencyStamp, so a
+            -- prior completed deletion cache cannot match after this settle.
+            if GS.InvalidateEventDeletionProjection then
+                GS.InvalidateEventDeletionProjection(record)
+            end
+            factOk, factErr = GS.RebuildEventDeletionProjection(record, nil)
             if not factOk then
-                factErr = "work_budget"
+                factErr = factErr or "work_budget"
             end
         elseif pending.correctionBody ~= nil then
             factOk = SoftDeleteRuntime.refreshDeletionAttributionForTarget(
@@ -8690,6 +8717,14 @@ function SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
     end
     if factOk == false then
         return false, factErr or "work_budget"
+    end
+    -- Wake retained soft-deletes once hist-effective + facts settle (#465
+    -- assessment 6834988628). Continuation rebuild does not carry the op body;
+    -- admission/local pending + redrive re-applies the authenticated delete.
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {
+            _shareCallbackBudget = true,
+        })
     end
     return ok, err
 end
@@ -11012,8 +11047,26 @@ local eventDeletionCache = setmetatable({}, { __mode = "k" })
 -- force Ensure to refresh verified deletion attribution (r4529162895).
 local function EventDeletionDependencyStamp(record)
     local d = SoftDeleteRuntime.depsFor(record)
+    -- Include include-deleted hist-effective readiness so Ensure cannot serve a
+    -- deletion map sealed before async hist-effective settles (#465 r4555245945).
+    local histEff = SoftDeleteRuntime.includeDeletedCache[record]
+    local histEffPart = "none"
+    if type(histEff) == "table" then
+        if histEff.ok == true then
+            histEffPart = tostring(histEff.stamp or "ok")
+        elseif histEff.err == "work_budget" then
+            histEffPart = "pending"
+        else
+            histEffPart = tostring(histEff.err or "err")
+        end
+    end
+    local cont = SoftDeleteRuntime.histEffectiveContinuation
+        and SoftDeleteRuntime.histEffectiveContinuation[record]
+    if type(cont) == "table" and cont.scheduled == true then
+        histEffPart = histEffPart .. ":sched"
+    end
     return tostring(d.delGen or 0) .. ":" .. tostring(d.aliasGen or 0)
-        .. ":" .. tostring(d.histGen or 0)
+        .. ":" .. tostring(d.histGen or 0) .. ":" .. histEffPart
 end
 
 --- Ledger/alias stamp for reusable soft-delete event indexes (#465 r4529162895).
@@ -11426,9 +11479,36 @@ function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex
                     and type(event.txnId) == "string" and event.txnId ~= "" then
                     hist = histIndex[event.txnId]
                 end
-                if type(hist) == "table" and hist.present == true
-                    and hist.effective ~= false then
-                    creditName, creditGuid = hist.attributed, hist.attributedGuid
+                if type(hist) == "table" and hist.present == true then
+                    if hist.effective ~= false then
+                        creditName, creditGuid = hist.attributed, hist.attributedGuid
+                    else
+                        -- Explicitly ineffective. If include-deleted active map is
+                        -- empty, annotation is incomplete — keep prior verified
+                        -- facts rather than collapsing to durable donor Alice
+                        -- (async adopt Ensure; 6834988628). A non-empty active map
+                        -- means a real prune/tie: use durable donor (#465-dep).
+                        local active = SoftDeleteRuntime.histEffectiveActive[record]
+                        local activeEmpty = true
+                        if type(active) == "table" then
+                            for _ in pairs(active) do
+                                activeEmpty = false
+                                break
+                            end
+                        end
+                        if activeEmpty and type(priorEntry) == "table"
+                            and priorEntry.verified == true then
+                            creditName, creditGuid =
+                                priorEntry.attributed, priorEntry.attributedGuid
+                        else
+                            creditName, creditGuid = DurableCreditIdentity(event)
+                        end
+                    end
+                elseif type(priorEntry) == "table" and priorEntry.verified == true then
+                    -- Soft-deleted rebuild with no hist row yet: keep previously
+                    -- verified attribution so Ensure does not invent donor Alice.
+                    creditName, creditGuid =
+                        priorEntry.attributed, priorEntry.attributedGuid
                 else
                     creditName, creditGuid = DurableCreditIdentity(event)
                 end
@@ -11928,7 +12008,7 @@ end
 -- @return boolean ok
 function GS.RebuildEventDeletionProjection(record, extraOp)
     if type(record) ~= "table" then
-        return false
+        return false, "invalid_value"
     end
     local map = {}
     local ops = record.operations
@@ -11995,12 +12075,13 @@ function GS.RebuildEventDeletionProjection(record, extraOp)
     if not annotOk then
         -- Do not publish a partial deletion map; resume via shared scheduling.
         SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+        local rebuildErr = annotErr or "work_budget"
         eventDeletionCache[record] = {
             stamp = EventDeletionDependencyStamp(record),
             ok = false,
-            err = annotErr or "work_budget",
+            err = rebuildErr,
         }
-        return false
+        return false, rebuildErr
     end
     GS._softDeleteIndexReuse = reusedLedger
     GS._softDeleteRebuildFindLedgerCalls = 0
@@ -12190,12 +12271,13 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
         annotOk = okAnnot ~= false
         if not annotOk then
             SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local incrErr = errAnnot or "work_budget"
             eventDeletionCache[record] = {
                 stamp = EventDeletionDependencyStamp(record),
                 ok = false,
-                err = errAnnot or "work_budget",
+                err = incrErr,
             }
-            return false
+            return false, incrErr
         end
         scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
         scratch.histIndex = histIndex
@@ -12210,12 +12292,13 @@ function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
         annotOk = okAnnot ~= false
         if not annotOk then
             SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local incrErr = errAnnot or "work_budget"
             eventDeletionCache[record] = {
                 stamp = EventDeletionDependencyStamp(record),
                 ok = false,
-                err = errAnnot or "work_budget",
+                err = incrErr,
             }
-            return false
+            return false, incrErr
         end
         GS._softDeleteHistCorrectionVisits = 0
     end
@@ -12383,7 +12466,27 @@ end
 
 function GS.EnsureEventDeletionProjection(record, extraOp)
     if type(record) ~= "table" then
-        return false
+        return false, "invalid_value"
+    end
+    -- Never treat deletion facts as complete while include-deleted hist-effective
+    -- work is still paced/scheduled (#465 assessment 6834988628).
+    do
+        local histEff = SoftDeleteRuntime.includeDeletedCache[record]
+        local cont = SoftDeleteRuntime.histEffectiveContinuation
+            and SoftDeleteRuntime.histEffectiveContinuation[record]
+        local histPending = (type(histEff) == "table" and histEff.ok == false
+            and histEff.err == "work_budget")
+            or (type(cont) == "table" and cont.scheduled == true)
+        if histPending and type(extraOp) ~= "table" then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local after = eventDeletionCache[record]
+            local stampNow = EventDeletionDependencyStamp(record)
+            if type(after) == "table" and after.stamp == stampNow and after.ok == true
+                and type(record.eventDeletions) == "table" then
+                return true
+            end
+            return false, "work_budget"
+        end
     end
     local stamp = EventDeletionDependencyStamp(record)
     local cache = eventDeletionCache[record]
@@ -12403,9 +12506,14 @@ function GS.EnsureEventDeletionProjection(record, extraOp)
             and type(record.eventDeletions) == "table" then
             return true
         end
-        return false
+        local pendingErr = (type(after) == "table" and after.err) or "work_budget"
+        return false, pendingErr
     end
-    return GS.RebuildEventDeletionProjection(record, extraOp)
+    local rebuilt, rebuildErr = GS.RebuildEventDeletionProjection(record, extraOp)
+    if rebuilt then
+        return true
+    end
+    return false, rebuildErr or "work_budget"
 end
 
 --- True when the canonical event is soft-deleted (#465).
@@ -12647,8 +12755,16 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
         if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
             return true, "accepted"
         end
-        if not GS.RebuildEventDeletionProjection(record, op) then
-            return false, "invalid_value"
+        local rebuiltReplace, rebuildReplaceErr =
+            GS.RebuildEventDeletionProjection(record, op)
+        if not rebuiltReplace then
+            -- Paced yield is pending work_budget, not invalid_value (#465
+            -- assessment 6834988628 / r4538978963). Terminal engine_error aborts.
+            local errReplace = rebuildReplaceErr or "work_budget"
+            if errReplace == "engine_error" then
+                return false, "engine_error"
+            end
+            return false, (errReplace == "work_budget") and "work_budget" or errReplace
         end
         return true, "accepted"
     end
@@ -12683,8 +12799,17 @@ function GS.ApplySoftDeleteMutation(record, op, opts)
     -- Warm indexes once via Rebuild when incremental cannot run yet.
     if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
         -- ok
-    elseif not GS.RebuildEventDeletionProjection(record, op) then
-        return false, "invalid_value"
+    else
+        local rebuilt, rebuildErr = GS.RebuildEventDeletionProjection(record, op)
+        if not rebuilt then
+            -- Carry completed/pending/terminal through mutation paths; do not
+            -- map a yielded projection rebuild to invalid_value (r4538978963).
+            local errRebuild = rebuildErr or "work_budget"
+            if errRebuild == "engine_error" then
+                return false, "engine_error"
+            end
+            return false, (errRebuild == "work_budget") and "work_budget" or errRebuild
+        end
     end
     -- Capacity counts logical deletions (shared entry tables), not alias keys.
     local count = SoftDeleteRuntime.countCanonical(record.eventDeletions)
