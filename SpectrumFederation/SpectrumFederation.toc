@@ -27,6 +27,8 @@ modules/debug.lua
 modules/Integrations/TSM.lua
 modules/NameUtil.lua
 modules/SlashCommands.lua
+modules/TradeAssistant.lua
+modules/UI/TradeAssistant/Window.lua
 modules/MessageHelpers.lua
 modules/core.lua
 
