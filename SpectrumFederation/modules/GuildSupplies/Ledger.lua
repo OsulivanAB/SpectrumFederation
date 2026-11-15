@@ -3387,7 +3387,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     return promoted, attempts, tonumber(GS._creditProjectionCallbackWork) or 0
 end
 
-local function AppendLedgerEvent(record, event)
+local function AppendLedgerEvent(record, event, preserveProductionCredit)
     local cfg = record.accounting and record.accounting._consumables
     local curGen = tonumber(cfg and cfg.generation)
     local eventGen = type(event) == "table" and tonumber(event.generation) or nil
@@ -3395,6 +3395,12 @@ local function AppendLedgerEvent(record, event)
     -- self-declared flag to bypass the live cutover boundary.
     if GS.AssignProductionCredit then
         GS.AssignProductionCredit(record, event)
+    end
+    -- Authenticated adoption export marker is durable proof for an already-accepted
+    -- row; replay must not erase it when the historical evidence time predates the
+    -- installed live-cutover boundary (#465 async adoption).
+    if preserveProductionCredit == true and type(event) == "table" then
+        event.gsProductionCredit = true
     end
     -- Historical rows belong in the archive list once the live generation advanced.
     if eventGen and curGen and eventGen < curGen then
@@ -4779,6 +4785,16 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
 
     local isDonation = event.type == GS.LEDGER_EVENT.DONATION or event.type == "CONSUMABLE_DONATION"
     local isAdjustment = event.type == GS.LEDGER_EVENT.ADJUSTMENT or event.type == "CONSUMABLE_ADJUSTMENT"
+    -- Adoption replay restores export-attested production credit. The transport
+    -- body.cutoverMarker is emitted only for rows that already carried verified
+    -- live provenance; it is not the self-declared event.gsProductionCredit flag.
+    local adoptedProductionCredit = admissionCtx.adoptionReplay == true
+        and admissionCtx.preserveAttribution == true
+        and type(admissionCtx.sourceCutoverMarker) == "string"
+        and admissionCtx.sourceCutoverMarker ~= ""
+        and GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and record.liveCutover.cutoverMarker == admissionCtx.sourceCutoverMarker
 
     -- Adjustment idempotency uses the original operation id when present.
     local adjustmentEventId = nil
@@ -5142,7 +5158,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 and admissionCtx.sourceCutoverMarker ~= "" then
                 stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
             end
-            local appendOk, appendErr = AppendLedgerEvent(record, stored)
+            local appendOk, appendErr = AppendLedgerEvent(record, stored, adoptedProductionCredit)
             if not appendOk then
                 return "rejected", appendErr or "full"
             end
@@ -5281,7 +5297,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
             end
         end
-        local appendOk, appendErr = AppendLedgerEvent(record, stored)
+        local appendOk, appendErr = AppendLedgerEvent(record, stored, adoptedProductionCredit)
         if not appendOk then
             return "rejected", appendErr or "full"
         end
