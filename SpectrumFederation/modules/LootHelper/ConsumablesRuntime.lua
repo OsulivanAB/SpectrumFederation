@@ -1043,10 +1043,12 @@ function Runtime:EnsureBannerMobileButton()
     if not holder then
         holder = CreateFrame("Frame", "SpectrumFederationRaidSuppliesBannerMobile", UIParent)
         holder:SetSize(BANNER_MOBILE_SIZE, BANNER_MOBILE_SIZE)
-        if holder.SetFrameStrata then holder:SetFrameStrata("DIALOG") end
+        if holder.SetFrameStrata then holder:SetFrameStrata("MEDIUM") end
         holder:Hide()
         self.bannerMobileHolder = holder
     end
+    -- Match the Loot Helper window strata so other windows can cover the detached icon.
+    if holder.SetFrameStrata then holder:SetFrameStrata("MEDIUM") end
     -- Detached SecureActionButton only. Do not protect the movable Loot Helper window.
     local button = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate")
     button:SetSize(BANNER_MOBILE_SIZE, BANNER_MOBILE_SIZE)
