@@ -678,6 +678,26 @@ assertTrue(not listHas(preferredTargets, KINO), "former helper preferred target 
 assertTrue(listHas(preferredTargets, SUSPENDERS), "current helper remains a route")
 assertTrue(listHas(preferredTargets, COORD), "current coordinator remains a route")
 
+-- Request retries only whisper current in-group online peers.
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = false, online = true }
+local departedReq = seedRequest("need-departed-route", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(departedReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "request timeout skips an out-of-group target")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 1, "request timeout falls back to the in-group coordinator")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = true, online = false }
+local offlineReq = seedRequest("need-offline-route", "NEED_LOGS", { KINO })
+Sync:OnRequestTimeout(offlineReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "request timeout skips an offline target")
+end)()
+
 -- Authorized coordinator NEW_LOG is not rejected as unauthorized.
 reset(MEMBER)
 local before = warningCount("not an admin")
