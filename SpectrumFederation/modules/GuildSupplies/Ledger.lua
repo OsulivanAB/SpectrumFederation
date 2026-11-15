@@ -8174,8 +8174,11 @@ local function CreditProjectionDependencyStamp(record)
     if GS._creditProjectionIncludeSoftDeleted
         and SoftDeleteRuntime.histIndexStamp
         and SoftDeleteRuntime.ledgerIndexStamp then
+        local acctMut = GS.GetAccountingMutationSeq
+            and GS.GetAccountingMutationSeq(record) or 0
         return SoftDeleteRuntime.histIndexStamp(record) .. ":"
             .. SoftDeleteRuntime.ledgerIndexStamp(record) .. ":"
+            .. tostring(acctMut) .. ":"
             .. tostring(record.datasetId or "")
     end
     local opsGen = 0
@@ -8764,8 +8767,11 @@ end
 -- Soft-delete admits do not bump histGen / ledger row counts, so multi-delete
 -- slices reuse the cached active map instead of rebuilding per deletion.
 function SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+    local acctMut = GS.GetAccountingMutationSeq
+        and GS.GetAccountingMutationSeq(record) or 0
     return SoftDeleteRuntime.histIndexStamp(record) .. ":"
         .. SoftDeleteRuntime.ledgerIndexStamp(record) .. ":"
+        .. tostring(acctMut) .. ":"
         .. tostring(record.datasetId or "")
 end
 
@@ -11057,10 +11063,9 @@ GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
 local eventDeletionCache = setmetatable({}, { __mode = "k" })
 
 --- O(1) deletion-projection dependency stamp (#465).
--- Mutation-owned soft-delete/alias/hist gens — not ops.generation, ledger
--- length, or accounting mut — so ordinary adjustment admits do not rebuild
--- the deletion map. Accepted correction-history changes bump histGen and
--- force Ensure to refresh verified deletion attribution (r4529162895).
+-- Mutation-owned soft-delete/alias/hist gens plus the fresh include-deleted
+-- dependency stamp. Ordinary ledger/balance repairs advance the accounting
+-- mutation token, so a warm deletion map cannot keep pre-repair attribution.
 local function EventDeletionDependencyStamp(record)
     local d = SoftDeleteRuntime.depsFor(record)
     -- Include include-deleted hist-effective readiness so Ensure cannot serve a
@@ -11069,7 +11074,7 @@ local function EventDeletionDependencyStamp(record)
     local histEffPart = "none"
     if type(histEff) == "table" then
         if histEff.ok == true then
-            histEffPart = tostring(histEff.stamp or "ok")
+            histEffPart = SoftDeleteRuntime.histEffectiveDependencyStamp(record)
         elseif histEff.err == "work_budget" then
             histEffPart = "pending"
         else

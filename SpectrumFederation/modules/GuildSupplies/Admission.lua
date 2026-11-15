@@ -9668,6 +9668,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if GS.RedrivePendingContributorCorrections then
             GS.RedrivePendingContributorCorrections(record, {})
         end
+        -- Soft-deletes retained on missing_policy_predecessor wake the same way:
+        -- bounded redrive reauthenticates each retained sender (#465 review).
+        if GS.RedrivePendingSoftDeletes then
+            GS.RedrivePendingSoftDeletes(record, {})
+        end
     end
     local guildKey = member.guildKey or (record and record._guildKey)
     if guildKey then

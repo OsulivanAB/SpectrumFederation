@@ -5779,6 +5779,93 @@ do
             "465-pol: missing pred does not delete")
     end
 
+    -- Delete-before-policy wakes through policy acceptance redrive: no delete
+    -- redelivery and no manual RedrivePendingSoftDeletes call.
+    do
+        local record = seedDeletePolicyFixture()
+        local policy0 = record.permission and record.permission.revisionId
+        local futurePolicy = "pol-rank-wake"
+        local del = makeDeleteBody(record, futurePolicy, "pol-del-wake", world.time + 1)
+        local st, r = GS:AdmitRemoteOperation(del, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending", "465-pol-wake: delete pending got " .. tostring(st) .. "/" .. tostring(r))
+        assertEq(r, "missing_policy_predecessor", "465-pol-wake: missing predecessor got " .. tostring(r))
+        assertTrue(not GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol-wake: not deleted before policy")
+        local rank = makeRankBody(record, policy0, futurePolicy, world.time + 2)
+        assertEq(select(1, GS:AdmitRemoteOperation(rank, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "465-pol-wake: policy accepted")
+        flushTimers()
+        assertTrue(GS.IsEventSoftDeleted(record, "pol-don"),
+            "465-pol-wake: policy acceptance woke delete")
+        local pending = record.operations and record.operations.pending or {}
+        assertNil(pending[del.id], "465-pol-wake: pending entry cleared")
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Alice-Garona", "Player-1-Alice", itemId), 0,
+            "465-pol-wake: delete accounted once")
+        local stDup, rDup = GS:AdmitRemoteOperation(del, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertTrue(stDup == "duplicate" or stDup == "accepted",
+            "465-pol-wake: duplicate re-admit got " .. tostring(stDup) .. "/" .. tostring(rDup))
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Alice-Garona", "Player-1-Alice", itemId), 0,
+            "465-pol-wake: duplicate idempotent")
+        assertTrue(not runOneDueTimer(), "465-pol-wake: idle after converge")
+    end
+
+    -- Revoked-sender control: policy acceptance reauthenticates the retained
+    -- sender instead of inheriting the policy admitter's authority.
+    do
+        local record = seedDeletePolicyFixture()
+        injectProductionDonation(record, {
+            id = "pol-don-bob", itemId = itemId, quantity = 3,
+            actor = "Bob-Garona", actorGuid = "Player-1-Bob", timestamp = world.time,
+        })
+        local policy0 = record.permission and record.permission.revisionId
+        local futurePolicy = "pol-rank-revoke"
+        local del = makeDeleteBody(record, futurePolicy, "pol-del-revoke", world.time + 1)
+        del.target = "pol-don-bob"
+        del.value.eventId = "pol-don-bob"
+        del.value.quantity = 3
+        del.value.attributed = "Bob-Garona"
+        del.value.attributedGuid = "Player-1-Bob"
+        del.actorGuid = "Player-1-Bob"
+        del.actorName = "Bob-Garona"
+        local st, r = GS:AdmitRemoteOperation(del, {
+            sender = "Bob-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+        assertEq(st, "pending", "465-pol-revoke: delete pending got " .. tostring(st) .. "/" .. tostring(r))
+        assertEq(r, "missing_policy_predecessor",
+            "465-pol-revoke: missing predecessor got " .. tostring(r))
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Bob" then
+                m.rankOrder = 4
+            end
+        end
+        settleRoster()
+        local rank = makeRankBody(record, policy0, futurePolicy, world.time + 2)
+        assertEq(select(1, GS:AdmitRemoteOperation(rank, {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })), "accepted", "465-pol-revoke: policy accepted")
+        flushTimers()
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Bob" then
+                m.rankOrder = 2
+            end
+        end
+        settleRoster()
+        flushTimers()
+        assertTrue(not GS.IsEventSoftDeleted(record, "pol-don-bob"),
+            "465-pol-revoke: revoked sender not promoted")
+        assertEq(GS.PersonalContributorItemTotal(
+            record, "Bob-Garona", "Player-1-Bob", itemId), 3,
+            "465-pol-revoke: Bob donation remains credited")
+        assertTrue(not runOneDueTimer(), "465-pol-revoke: idle after converge")
+    end
+
     -- Unauthorized member cannot prepare a soft-delete (auth control).
     do
         local record = seedDeletePolicyFixture()
@@ -7032,6 +7119,101 @@ do
     assertTrue((tonumber(GS.PersonalContributorItemTotal(
         record, "Alice-Garona", "Player-1-Alice", itemId)) or 0) <= 0,
         "465-empty-prune: Alice carries signed debt")
+end
+
+do
+    -- #465 review: a warm corrected deletion/debt map must not survive an
+    -- ordinary credited balance repair that advances accounting mutation.
+    local itemId = 9307
+    local record = seedLiveCampaignWithItem(itemId, 100)
+    injectProductionDonation(record, {
+        id = "fresh-d1", itemId = itemId, quantity = 10,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice", timestamp = 9700,
+    })
+    local corr = select(1, GS:NewContributorCorrectionOperation(
+        "fresh-d1", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(corr ~= nil, "465-fresh: prepare Bob corr")
+    assertEq(GS:ApplyStagedConfigOperation(corr), "accepted", "465-fresh: Bob corr")
+    injectProductionAdjustment(record, {
+        id = "fresh-adj", itemId = itemId, quantity = -8,
+        attributed = "Bob-Garona", attributedGuid = "Player-1-Bob", timestamp = 9701,
+    })
+    local del = select(1, GS:NewSoftDeleteOperation("fresh-d1"))
+    assertTrue(del ~= nil, "465-fresh: prepare delete")
+    assertEq(GS:ApplyStagedConfigOperation(del), "accepted", "465-fresh: delete")
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil), "465-fresh: warm deletion projection")
+    assertEq(record.eventDeletions["fresh-d1"].attributed, "Bob-Garona",
+        "465-fresh: warm corrected recipient")
+    assertEq(GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", itemId), -8,
+        "465-fresh: warm Bob signed debt")
+    -- Unchanged warm-cache reuse control before the repair.
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil), "465-fresh: warm reuse ensure")
+    assertEq(record.eventDeletions["fresh-d1"].attributed, "Bob-Garona",
+        "465-fresh: unchanged warm cache keeps Bob")
+
+    local function remoteAdjust(id, qty, attr)
+        return {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = id,
+            guildKey = select(1, GS:GetCurrentContext()).guildKey,
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            kind = GS.KIND.ADJUST_QUANTITY,
+            target = { itemId = itemId },
+            value = { itemId = itemId, quantity = qty, attributed = attr,
+                attributedGuid = attr == "Bob-Garona" and "Player-1-Bob" or nil },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = world.time + 1,
+            baseTargetRevision = record.datasetId,
+            basePolicyRevision = record.permission and record.permission.revisionId,
+            baseCampaignId = record.currentCampaignId,
+        }
+    end
+    local function admitRemote(id, qty, attr)
+        return GS:AdmitRemoteOperation(remoteAdjust(id, qty, attr), {
+            sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true,
+        })
+    end
+    local okPre, errPre = GS.AdjustmentFloorOk(record, itemId, -1, "Bob-Garona",
+        record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Bob",
+        })
+    assertTrue(not okPre, "465-fresh: Bob -1 floor rejected before repair got "
+        .. tostring(errPre))
+    local stPre, rPre = admitRemote("fresh-probe-pre", -3, "Bob-Garona")
+    assertEq(stPre, "pending", "465-fresh: Bob -3 remote pending before repair got "
+        .. tostring(stPre) .. "/" .. tostring(rPre))
+    assertEq(rPre, "item_negative", "465-fresh: Bob -3 remote floor before repair got "
+        .. tostring(stPre) .. "/" .. tostring(rPre))
+
+    -- Credited public balance repair: repair Bob's signed debt and leave a
+    -- positive allowance so refreshed debt floors are observable.
+    world.time = (tonumber(world.time) or 0) + 100000
+    local repair, repairSt, repairReason = GS:NewAdjustmentOperation(itemId, 10, "Bob-Garona")
+    assertTrue(repair ~= nil, "465-fresh: prepare Bob repair got "
+        .. tostring(repairSt) .. "/" .. tostring(repairReason))
+    assertEq(GS:ApplyStagedConfigOperation(repair), "accepted", "465-fresh: Bob repair")
+    flushTimers()
+    assertTrue(GS.EnsureEventDeletionProjection(record, nil), "465-fresh: ensure after repair")
+    assertEq(record.eventDeletions["fresh-d1"].attributed, "Bob-Garona",
+        "465-fresh: recipient remains corrected Bob")
+    assertEq(GS.PersonalContributorItemTotal(
+        record, "Bob-Garona", "Player-1-Bob", itemId), 2,
+        "465-fresh: Bob repaired balance")
+    local okPost, errPost = GS.AdjustmentFloorOk(record, itemId, -1, "Bob-Garona",
+        record.currentCampaignId, {
+            respectSoftDeleteDebt = true,
+            attributedGuid = "Player-1-Bob",
+        })
+    assertTrue(okPost, "465-fresh: Bob -1 floor ok after repair got "
+        .. tostring(errPost))
+    local stP, rP = admitRemote("fresh-probe-post", -3, "Bob-Garona")
+    assertEq(stP, "accepted", "465-fresh: Bob -3 remote admission after repair got "
+        .. tostring(stP) .. "/" .. tostring(rP))
+    flushTimers()
+    assertTrue(not runOneDueTimer(), "465-fresh: idle after converge")
 end
 
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
