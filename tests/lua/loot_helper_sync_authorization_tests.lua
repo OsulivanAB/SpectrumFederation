@@ -696,6 +696,18 @@ Sync.state.peers[KINO] = { inGroup = true, online = false }
 local offlineReq = seedRequest("need-offline-route", "NEED_LOGS", { KINO })
 Sync:OnRequestTimeout(offlineReq.id)
 assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "request timeout skips an offline target")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = true, online = false }
+Sync.state.peers[COORD] = { inGroup = true, online = false }
+assertEq(Sync:RequestProfileSnapshot("offline-profile"), true, "profile request registers while targets are unreachable")
+assertEq(Sync.state._profileReqInFlight, nil, "a synchronously failed profile request does not latch in-flight")
+Sync.state.peers[KINO] = { inGroup = true, online = true }
+Sync.state.peers[COORD] = { inGroup = true, online = true }
+assertEq(Sync:RequestProfileSnapshot("online-profile"), true, "profile request retries after targets return")
+assertEq(sendCount(Sync.MSG.NEED_PROFILE), 1, "returned profile target receives NEED_PROFILE")
 end)()
 
 -- Authorized coordinator NEW_LOG is not rejected as unauthorized.
