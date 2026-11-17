@@ -83,7 +83,7 @@ local SUMMARY_PAD_TOP = 2
 local SUMMARY_HEADING_H = 18
 local SUMMARY_HEADING_GAP = 4
 local SUMMARY_PAD_BOTTOM = 8
-local GROUP_PER_COL = 8
+local GROUP_PER_COL = 4
 local CLASS_COUNT_WIDTH = 24
 local CLASS_COL_GAP = 16
 
@@ -1153,9 +1153,9 @@ PaintSummary = function(host, planId)
 	local majorCats = (rs and rs.MAJOR_CATEGORIES) or {}
 	local utilityCats = (rs and rs.UTILITY_CATEGORIES) or {}
 
-	-- Content-sized height: two balanced class columns beside the coverage
+	-- Content-sized height: three balanced class columns beside the coverage
 	-- groups; the shorter class layout no longer reserves a full column.
-	local classRows = math.max(1, math.ceil(#order / 2))
+	local classRows = math.max(1, math.ceil(#order / 3))
 	local function GroupRows(categories)
 		return math.max(1, math.ceil(#(categories or {}) / GroupColumns(categories)))
 	end
@@ -1169,7 +1169,7 @@ PaintSummary = function(host, planId)
 	if not host.__sfSummaryBuilt then
 		ReleaseHostChildren(host)
 		local classColPitch = ICON + 6 + CLASS_COUNT_WIDTH
-		local classesWidth = classColPitch * 2 + CLASS_COL_GAP
+		local classesWidth = classColPitch * 3 + CLASS_COL_GAP * 2
 
 		local classArea = AcquireFrame(host)
 		classArea:SetPoint("TOPLEFT", host, "TOPLEFT", 0,
@@ -1183,11 +1183,11 @@ PaintSummary = function(host, planId)
 		classesTitle:SetText(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"))
 
 		-- Column-major split keeps CLASS_ORDER reading down each column.
-		local half = math.ceil(#order / 2)
+		local perCol = math.ceil(#order / 3)
 		for i = 1, #order do
 			local classFile = order[i]
-			local col = (i <= half) and 1 or 2
-			local rowIndex = (col == 1) and i or (i - half)
+			local col = math.ceil(i / perCol)
+			local rowIndex = i - (col - 1) * perCol
 			local x = (col - 1) * (classColPitch + CLASS_COL_GAP)
 			local y = -(rowIndex - 1) * (ICON + 2)
 			local icon = TrackRegionCreate(classArea:CreateTexture(nil, "ARTWORK"))
@@ -1224,17 +1224,24 @@ PaintSummary = function(host, planId)
 					py = py + ICON + 2
 				end
 			end
-			return label, buttons
+			-- The group label is wider than the icon grid for sparse groups;
+			-- reserve the label width so the next group never overlaps it.
+			local labelW = 0
+			if label.GetStringWidth then
+				labelW = label:GetStringWidth() or 0
+			end
+			local blockW = math.max(GroupWidth(categories) + 8, labelW + 8)
+			return label, buttons, blockW
 		end
 
 		local majorX = classesWidth + 24
-		local _, majorButtons = paintGroup(
+		local _, majorButtons, majorBlockW = paintGroup(
 			Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
 			majorCats,
 			summary.major,
 			majorX
 		)
-		local utilityX = majorX + GroupWidth(majorCats) + 24
+		local utilityX = majorX + majorBlockW + 24
 		local _, utilityButtons = paintGroup(
 			Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
 			utilityCats,

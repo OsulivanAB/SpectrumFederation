@@ -2874,7 +2874,7 @@ do
     assertEq(snap.canCreateEntry, true, "member keeps signup access")
     assertTrue(memberPanel.__sfRaidSignupEntriesHost ~= nil, "member entries board painted")
 
-    -- Class summary: every class once, two columns, zero counts, content height
+    -- Class summary: every class once, three columns, zero counts, content height
     local host = memberPanel.__sfRaidSignupSummaryHost
     assertTrue(host ~= nil, "summary host painted for member")
     local counts = host.__sfClassCounts
@@ -2900,17 +2900,25 @@ do
             end
         end
     end
-    assertEq(colXs[0], math.ceil(#RS.CLASS_ORDER / 2), "first column holds half the classes")
-    assertEq(colXs[68], #RS.CLASS_ORDER - math.ceil(#RS.CLASS_ORDER / 2), "second column holds the rest")
-    local majorCols = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / 8))
-    local utilityCols = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / 8))
-    local expectedRows = math.max(
-        math.ceil(#RS.CLASS_ORDER / 2),
-        math.ceil(#RS.MAJOR_CATEGORIES / majorCols),
-        math.ceil(#RS.UTILITY_CATEGORIES / utilityCols))
-    local expectedH = 2 + 18 + 4 + expectedRows * 24 + 8
-    assertEq(host:GetHeight(), expectedH, "summary height sized to content rows")
-    assertEq(memberPanel.__sfRaidSignupSummaryRow:GetHeight(), expectedH, "summary row height synced")
+    do
+        local classColPitch = 22 + 6 + 24
+        local colGap = 16
+        local perCol = math.ceil(#RS.CLASS_ORDER / 3)
+        assertEq(colXs[0], perCol, "first column holds its share")
+        assertEq(colXs[classColPitch + colGap], perCol, "second column holds its share")
+        assertEq(colXs[2 * (classColPitch + colGap)], #RS.CLASS_ORDER - 2 * perCol,
+            "third column holds the rest")
+        local groupPerCol = 4
+        local majorCols = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / groupPerCol))
+        local utilityCols = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / groupPerCol))
+        local expectedRows = math.max(
+            math.ceil(#RS.CLASS_ORDER / 3),
+            math.ceil(#RS.MAJOR_CATEGORIES / majorCols),
+            math.ceil(#RS.UTILITY_CATEGORIES / utilityCols))
+        local expectedH = 2 + 18 + 4 + expectedRows * 24 + 8
+        assertEq(host:GetHeight(), expectedH, "summary height sized to content rows")
+        assertEq(memberPanel.__sfRaidSignupSummaryRow:GetHeight(), expectedH, "summary row height synced")
+    end
 
     -- Main-only counts update; alternatives excluded
     local upsertStatus = select(1, RS:UpsertEntry({
