@@ -6006,11 +6006,13 @@ end
 function GS.CollectSoftDeleteVerifiedFacts(record)
     local out = {}
     local n = 0
+    local ready = true
     if type(record) ~= "table" then
-        return out, 0
+        return out, 0, ready
     end
     if GS.EnsureEventDeletionProjection then
-        GS.EnsureEventDeletionProjection(record, nil)
+        local ensured = GS.EnsureEventDeletionProjection(record, nil)
+        ready = ensured == true
     end
     local delMap = record.eventDeletions
     local durable = record.accounting and record.accounting._consumables
@@ -6059,7 +6061,7 @@ function GS.CollectSoftDeleteVerifiedFacts(record)
             end
         end
     end
-    return out, n
+    return out, n, ready
 end
 
 --- Drop durable alias bindings not required by retained accepted/pending corrections.
@@ -6969,11 +6971,18 @@ function SoftDeleteRuntime.buildDebtFloorAggregates(record)
         if type(canon) ~= "string" or canon == "" or seen[canon] then
             return
         end
-        if fromDurable and type(scope) == "table" then
+        local scopedDurable = fromDurable and type(scope) == "table"
+        if scopedDurable then
             if not scope[canon]
                 and not (type(entry.eventId) == "string" and scope[entry.eventId]) then
                 return
             end
+        end
+        -- Descriptor facts are claims until bound to a delete op/evidence.
+        -- During adoption replay the provisional scope is that binding; outside
+        -- it, explicit unproven facts cannot fund debt floors.
+        if entry.evidenceBacked == false and not scopedDurable then
+            return
         end
         local itemId = tonumber(entry.itemId)
         if not itemId then
@@ -7634,7 +7643,8 @@ end
 -- arbitrary soft-delete payload snapshots (discussion_r4518378042).
 local function ApplyVerifiedSoftDeleteDebtFloor(
     debtFloors, record, facts, relationshipsReady, resolveCache)
-    if type(debtFloors) ~= "table" or type(facts) ~= "table" or facts.verified ~= true then
+    if type(debtFloors) ~= "table" or type(facts) ~= "table" or facts.verified ~= true
+        or facts.evidenceBacked == false then
         return
     end
     local eventKind = facts.eventKind
@@ -7691,7 +7701,8 @@ local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsR
             delEntry = delMap[event.txnId]
         end
     end
-    if type(delEntry) == "table" and delEntry.verified == true then
+    if type(delEntry) == "table" and delEntry.verified == true
+        and delEntry.evidenceBacked ~= false then
         ApplyVerifiedSoftDeleteDebtFloor(
             debtFloors, record, delEntry, relationshipsReady, resolveCache)
         return
@@ -8744,6 +8755,13 @@ function SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
         GS.RedrivePendingSoftDeletes(record, {
             _shareCallbackBudget = true,
         })
+    end
+    if GS._NotifyLocalDurableChange and GS.GetCurrentRecord
+        and not GS._adoptionReplaySyncDrain then
+        local current = GS.GetCurrentRecord(GS)
+        if current == record then
+            GS._NotifyLocalDurableChange("ledger")
+        end
     end
     return ok, err
 end
@@ -11207,6 +11225,7 @@ local function RememberSoftDeleteVerifiedFacts(record, facts)
         attributed = NormName(facts.attributed),
         attributedGuid = ValidGuid(facts.attributedGuid),
         gsProductionCredit = facts.gsProductionCredit == true,
+        evidenceBacked = facts.evidenceBacked,
     }
     map[canon] = nextFacts
     -- Bump only when content changes so rebuild remember-passes are not O(n)
@@ -11218,7 +11237,8 @@ local function RememberSoftDeleteVerifiedFacts(record, facts)
         or prior.campaignId ~= nextFacts.campaignId
         or prior.attributed ~= nextFacts.attributed
         or prior.attributedGuid ~= nextFacts.attributedGuid
-        or (prior.gsProductionCredit == true) ~= (nextFacts.gsProductionCredit == true) then
+        or (prior.gsProductionCredit == true) ~= (nextFacts.gsProductionCredit == true)
+        or prior.evidenceBacked ~= nextFacts.evidenceBacked then
         SoftDeleteRuntime.bumpDep(record, "factGen")
     end
 end
@@ -11546,10 +11566,29 @@ function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex
             attributed = creditName,
             attributedGuid = creditGuid,
             gsProductionCredit = event.gsProductionCredit == true,
+            evidenceBacked = true,
         }
     end
     -- Orphaned: retain previously verified facts only — never invent from payload.
     if type(priorEntry) == "table" and priorEntry.verified == true then
+        local evidenceBacked = priorEntry.evidenceBacked
+        if evidenceBacked == false and type(op) == "table"
+            and op.kind == GS.KIND.SOFT_DELETE_EVENT then
+            local target = op.target
+            if type(target) ~= "string" or target == "" then
+                local value = type(op.value) == "table" and op.value or nil
+                target = value and value.eventId or nil
+            end
+            if type(target) == "string" and target ~= "" then
+                local canonTarget = target
+                if GS.CanonicalCreditEventId then
+                    canonTarget = GS.CanonicalCreditEventId(record, target) or target
+                end
+                if canonTarget == priorEntry.eventId then
+                    evidenceBacked = true
+                end
+            end
+        end
         return {
             verified = true,
             eventId = priorEntry.eventId,
@@ -11560,6 +11599,7 @@ function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex
             attributed = priorEntry.attributed,
             attributedGuid = priorEntry.attributedGuid,
             gsProductionCredit = priorEntry.gsProductionCredit == true,
+            evidenceBacked = evidenceBacked,
         }
     end
     local value = type(op) == "table" and op.value or nil
@@ -11586,6 +11626,7 @@ function SoftDeleteRuntime.factsContentEqual(a, b)
         and a.attributed == b.attributed
         and a.attributedGuid == b.attributedGuid
         and (a.gsProductionCredit == true) == (b.gsProductionCredit == true)
+        and a.evidenceBacked == b.evidenceBacked
 end
 
 function SoftDeleteRuntime.headEntry(op, facts)
@@ -11610,6 +11651,7 @@ function SoftDeleteRuntime.headEntry(op, facts)
         entry.attributed = NormName(facts.attributed)
         entry.attributedGuid = ValidGuid(facts.attributedGuid)
         entry.gsProductionCredit = facts.gsProductionCredit == true
+        entry.evidenceBacked = facts.evidenceBacked
     end
     return entry
 end

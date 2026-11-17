@@ -7216,6 +7216,126 @@ do
     assertTrue(not runOneDueTimer(), "465-fresh: idle after converge")
 end
 
+-- #465 r4579789503: descriptor-installed facts are claims until this record has
+-- evidence-backed provenance; they must not authorize signed debt floors.
+do
+    local itemId = 9411
+    local record = seedLiveCampaignWithItem(itemId, 50)
+    local fact = {
+        verified = true,
+        eventId = "465-orphan-don",
+        eventKind = "donation",
+        itemId = itemId,
+        quantity = 5,
+        campaignId = record.currentCampaignId,
+        attributed = "Bob-Garona",
+        attributedGuid = "Player-1-Bob",
+        gsProductionCredit = true,
+        evidenceBacked = false,
+    }
+    record.eventDeletions = { ["465-orphan-don"] = fact }
+    local cfg = record.accounting._consumables
+    cfg.softDeleteVerifiedFacts = cfg.softDeleteVerifiedFacts or {}
+    cfg.softDeleteVerifiedFacts["465-orphan-don"] = fact
+    local floorOpts = {
+        respectSoftDeleteDebt = true,
+        attributedGuid = "Player-1-Bob",
+    }
+    local okUnproven, errUnproven = GS.AdjustmentFloorOk(record, itemId, -5,
+        "Bob-Garona", record.currentCampaignId, floorOpts)
+    assertTrue(not okUnproven, "465-orphan-provenance: unproven fact granted debt got "
+        .. tostring(errUnproven))
+
+    fact.evidenceBacked = true
+    GS.InvalidateSoftDeleteLedgerIndexes(record)
+    local okProven, errProven = GS.AdjustmentFloorOk(record, itemId, -5,
+        "Bob-Garona", record.currentCampaignId, floorOpts)
+    assertTrue(okProven, "465-orphan-provenance: evidence-backed fact missing debt got "
+        .. tostring(errProven))
+end
+
+-- #465 r4579793615: paced deletion projection must not publish a fresh empty or
+-- partially rebuilt soft-delete fact manifest; reuse the last coherent export.
+do
+    local itemId = 9412
+    local record = seedLiveCampaignWithItem(itemId, 50)
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    local guildKey = select(1, GS:GetCurrentContext()).guildKey
+    local descId = "gs:desc:" .. record.datasetId
+    local function freshDesc(dataset)
+        return {
+            kind = "dataset-desc",
+            schemaVersion = GS.PROVIDER_SCHEMA,
+            guildKey = guildKey,
+            datasetId = dataset or record.datasetId,
+            softDeleteVerifiedFacts = {},
+            softDeleteVerifiedFactCount = 0,
+            softDeleteVerifiedFactPageCount = 0,
+            acceptedOpCount = 0,
+            transferOpCount = 0,
+            campaignCount = 0,
+            archiveCount = 0,
+            acceptedLedgerCount = 0,
+            donationEvidenceCount = 0,
+            valuationCount = 0,
+            hasBankTab = true,
+        }
+    end
+    local realCollect = GS.CollectSoftDeleteVerifiedFacts
+    local fakeFacts = {
+        ["465-cache-don"] = {
+            verified = true,
+            eventId = "465-cache-don",
+            eventKind = "donation",
+            itemId = itemId,
+            quantity = 1,
+            campaignId = record.currentCampaignId,
+            attributed = "Alice-Garona",
+            attributedGuid = "Player-1-Alice",
+            gsProductionCredit = true,
+        },
+    }
+    GS.CollectSoftDeleteVerifiedFacts = function()
+        return fakeFacts, 1, true
+    end
+    local readyDesc = freshDesc()
+    local _, readyCount, readyPages = GS._SyncSoftDeleteVerifiedFactsExportPagesForTest(
+        record, descId, readyDesc, function() end)
+    assertEq(readyCount, 1, "465-fact-cache: ready export count")
+    assertEq(readyPages, 0, "465-fact-cache: ready export inline")
+    assertTrue(readyDesc.softDeleteVerifiedFacts["465-cache-don"] ~= nil,
+        "465-fact-cache: ready export carried fact")
+
+    GS.CollectSoftDeleteVerifiedFacts = function()
+        return {}, 0, false
+    end
+    local pendingDesc = freshDesc()
+    local _, pendingCount, pendingPages, pendingState =
+        GS._SyncSoftDeleteVerifiedFactsExportPagesForTest(
+            record, descId, pendingDesc, function() end)
+    GS.CollectSoftDeleteVerifiedFacts = realCollect
+    assertEq(pendingState, "cached", "465-fact-cache: pending reused coherent export")
+    assertEq(pendingCount, 1, "465-fact-cache: pending kept fact count")
+    assertEq(pendingPages, 0, "465-fact-cache: pending kept page count")
+    assertTrue(pendingDesc.softDeleteVerifiedFacts["465-cache-don"] ~= nil,
+        "465-fact-cache: pending kept fact body")
+
+    GS.CollectSoftDeleteVerifiedFacts = function()
+        return {}, 0, false
+    end
+    local otherDesc = freshDesc("465-cache-other")
+    local _, _, _, deferredState = GS._SyncSoftDeleteVerifiedFactsExportPagesForTest(
+        record, "gs:desc:465-cache-other", otherDesc, function() end)
+    GS.CollectSoftDeleteVerifiedFacts = realCollect
+    assertEq(deferredState, "deferred", "465-fact-cache: no coherent snapshot defers")
+    assertTrue(otherDesc.softDeleteVerifiedFactCount == nil
+        and otherDesc.softDeleteVerifiedFacts == nil
+        and otherDesc.softDeleteVerifiedFactPageCount == nil,
+        "465-fact-cache: deferred export omitted stale manifest")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

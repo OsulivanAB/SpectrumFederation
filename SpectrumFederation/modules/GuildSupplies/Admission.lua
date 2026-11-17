@@ -3779,6 +3779,10 @@ local function InstallSoftDeleteVerifiedFactsFromDesc(temp, desc, adop)
         if type(prior) == "table" and not SoftDeleteVerifiedFactsEqual(prior, entry) then
             return false, "soft_delete_fact_conflict"
         end
+        -- Descriptor facts are transfer claims, not local evidence. Keep them
+        -- unproven for debt authority until this record re-derives the fact
+        -- from retained ledger evidence or an already-proven durable fact.
+        entry.evidenceBacked = false
         map[eventId] = entry
     end
     local declared = tonumber(desc and desc.softDeleteVerifiedFactCount)

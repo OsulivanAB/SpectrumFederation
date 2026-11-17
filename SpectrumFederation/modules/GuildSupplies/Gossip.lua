@@ -67,6 +67,8 @@ local exportState = {
     ledgerArchiveWarmPos = 0,
     donationEvidenceBuildNeeded = false,
     donationEvidenceBuildCursor = nil,
+    -- Last coherent soft-delete fact export while paced projection is pending.
+    softDeleteFactExport = nil,
     -- #397 paced cold construction for accepted donation valuations.
     valuationBuildNeeded = false,
     valuationBuildCursor = nil,
@@ -512,9 +514,27 @@ end
 -- as gs-soft-delete-facts-page. Never exports unverified/raw payload snapshots.
 -- @return pages, factCount, pageCount
 local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody)
-    local facts, factCount = {}, 0
+    local facts, factCount, ready = {}, 0, true
     if GS.CollectSoftDeleteVerifiedFacts then
-        facts, factCount = GS.CollectSoftDeleteVerifiedFacts(record)
+        facts, factCount, ready = GS.CollectSoftDeleteVerifiedFacts(record)
+    end
+    if ready == false then
+        local cache = exportState.softDeleteFactExport
+        if type(cache) == "table"
+            and cache.datasetId == descBody.datasetId
+            and cache.guildKey == descBody.guildKey
+            and cache.epoch == (tonumber(GS._adoptionEpoch) or 0)
+            and cache.localGuid == exportState.localGuid then
+            descBody.softDeleteVerifiedFactCount = cache.factCount
+            descBody.softDeleteVerifiedFactPageCount = cache.pageCount
+            descBody.softDeleteVerifiedFacts =
+                (cache.pageCount == 0 and cache.facts) or {}
+            return cache.pages or {}, cache.factCount, cache.pageCount, "cached"
+        end
+        descBody.softDeleteVerifiedFacts = nil
+        descBody.softDeleteVerifiedFactCount = nil
+        descBody.softDeleteVerifiedFactPageCount = nil
+        return {}, 0, 0, "deferred"
     end
     factCount = tonumber(factCount) or 0
     descBody.softDeleteVerifiedFactCount = factCount
@@ -627,8 +647,11 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
 end
 
 local function SyncSoftDeleteVerifiedFactsExportPages(record, descId, descBody, upsertFn)
-    local pages, factCount, pageCount =
+    local pages, factCount, pageCount, state =
         ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody)
+    if state == "deferred" then
+        return pages, factCount, pageCount, state
+    end
     if type(upsertFn) == "function" then
         for i = 1, #pages do
             upsertFn(pages[i].id, pages[i].body)
@@ -649,7 +672,20 @@ local function SyncSoftDeleteVerifiedFactsExportPages(record, descId, descBody, 
             exportState.byId[stale[i]] = nil
         end
     end
-    return pages, factCount, pageCount
+    local pageN = tonumber(pageCount) or 0
+    if (pageN == 0 or #pages == pageN) and type(descBody) == "table" then
+        exportState.softDeleteFactExport = {
+            datasetId = descBody.datasetId,
+            guildKey = descBody.guildKey,
+            epoch = tonumber(GS._adoptionEpoch) or 0,
+            localGuid = exportState.localGuid,
+            factCount = tonumber(factCount) or 0,
+            pageCount = pageN,
+            facts = pageN == 0 and descBody.softDeleteVerifiedFacts or nil,
+            pages = pages,
+        }
+    end
+    return pages, factCount, pageCount, state
 end
 
 --- Inputs that affect required alias collection / packing (#459 export maint).
@@ -4549,6 +4585,7 @@ function GS:DisableGossipProvider()
     exportState.ledgerBuildNeeded = false
     exportState.donationEvidenceBuildNeeded = false
     exportState.valuationBuildNeeded = false
+    exportState.softDeleteFactExport = nil
     exportState.valuationBuildCursor = nil
     exportState.valuationBuildKeys = nil
     exportState.valuationBuildKeysStore = nil
