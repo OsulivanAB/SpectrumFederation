@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.19-beta.6] - 2026-11-13
+
+### Added
+- Add /sf trade raid trade assistant
+
 ## [1.5.19-beta.5] - 2026-11-09
 
 ### Added
