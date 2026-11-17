@@ -49,6 +49,7 @@ local session = {
 	editing = nil, -- { entryId, slot = "main"|"alt", draft = ... }
 	status = nil,
 	statusKind = nil,
+	view = "signup", -- "signup" | "manage" (manage is officer-only)
 	newPlanName = "",
 	renamePlanName = "",
 	openCount = 0,
@@ -70,6 +71,20 @@ local typingFocus = nil
 
 local ICON = 22
 local ICON_GAP = 4
+
+local VIEW_SIGNUP = "signup"
+local VIEW_MANAGE = "manage"
+local TAB_BAR_TOP_OFFSET = -2
+local TAB_BAR_RIGHT_INSET = -24
+local TAB_BAR_SCROLL_DROP = 34 -- 2px top pad + 28px bar + 4px gap
+
+local SUMMARY_PAD_TOP = 2
+local SUMMARY_HEADING_H = 18
+local SUMMARY_HEADING_GAP = 4
+local SUMMARY_PAD_BOTTOM = 8
+local GROUP_PER_COL = 8
+local CLASS_COUNT_WIDTH = 24
+local CLASS_COL_GAP = 16
 
 local function TrackCreate(frame)
 	session.frameCreateCount = session.frameCreateCount + 1
@@ -740,6 +755,168 @@ local function CurrentPlanOptions()
 	return planOptions
 end
 
+local function MakePlanDropdownItem()
+	return {
+		type = "dropdown",
+		label = Loc("RAID_SIGNUP_PLAN_SELECT", "Active plan"),
+		get = function()
+			return CurrentSelectedId()
+		end,
+		set = function(value)
+			local mod = RS()
+			if not mod then
+				return
+			end
+			DiscardEphemeral()
+			mod:SelectPlan(value)
+			QueueRefresh({ force = true })
+		end,
+		options = function()
+			return CurrentPlanOptions()
+		end,
+		enabled = function()
+			return Caps().canRead and #CurrentPlanOptions() > 0
+		end,
+	}
+end
+
+-- One tab bar per panel; reused across rebuilds so tab switching never
+-- accumulates widgets or callbacks.
+local function EnsureTabBar(panel)
+	local existing = panel.__sfRaidSignupTabBar
+	if existing then
+		return existing
+	end
+	local ui = SF.SettingsUI
+	if not (ui and ui.TabBar and ui.TabBar.Create) then
+		return nil
+	end
+	local bar = ui.TabBar:Create(panel)
+	bar:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, TAB_BAR_TOP_OFFSET)
+	bar:SetPoint("TOPRIGHT", panel, "TOPRIGHT", TAB_BAR_RIGHT_INSET, TAB_BAR_TOP_OFFSET)
+	local preferred = bar.GetPreferredHeight and bar:GetPreferredHeight() or 28
+	bar:SetHeight(preferred)
+	panel.__sfRaidSignupTabDrop = 2 + preferred + 4
+	bar:SetOnSelect(function(tabId)
+		if tabId ~= VIEW_SIGNUP and tabId ~= VIEW_MANAGE then
+			return
+		end
+		if tabId == VIEW_MANAGE then
+			local caps = Caps()
+			if not caps.canManagePlans then
+				return
+			end
+		end
+		if session.view == tabId then
+			return
+		end
+		session.view = tabId
+		if Page.Refresh then
+			Page:Refresh(Page.panel or panel, { force = true })
+		end
+	end)
+	bar:Hide()
+	panel.__sfRaidSignupTabBar = bar
+	return bar
+end
+
+-- Inline action/error feedback via the active view's section message row
+-- (same pattern as other settings pages); never chat output.
+local function SyncFeedback(panel, view)
+	local sections = panel.__sfRaidSignupSections
+	if not sections then
+		return
+	end
+	local targetId = (view == VIEW_MANAGE) and "raidSignupPlans" or "raidSignupEntries"
+	local applied = panel.__sfRaidSignupMessages
+	if not applied then
+		applied = {}
+		panel.__sfRaidSignupMessages = applied
+	end
+	for id, section in pairs(sections) do
+		if section.SetMessage and section.ClearMessage then
+			local wantText, wantKind = nil, nil
+			if id == targetId and session.status and session.status ~= "" then
+				wantText, wantKind = session.status, session.statusKind
+			end
+			local cur = applied[id]
+			local unchanged = (cur and cur.text or nil) == wantText
+				and (wantText == nil or (cur ~= nil and cur.kind == wantKind))
+			if not unchanged then
+				if wantText then
+					section:SetMessage(wantText, wantKind)
+				else
+					section:ClearMessage()
+				end
+				applied[id] = wantText and { text = wantText, kind = wantKind } or nil
+			end
+		end
+	end
+end
+
+-- Apply the active view: officer-only Manage tab, section visibility, scroll
+-- offset for the tab bar, and inline feedback. Safe fallback to the normal
+-- signup view when management eligibility is lost.
+local function SyncChrome(panel)
+	if not panel then
+		return
+	end
+	local caps = Caps()
+	local canManage = caps.canManagePlans and true or false
+	if session.view == VIEW_MANAGE and not canManage then
+		session.view = VIEW_SIGNUP
+	end
+	local view = (session.view == VIEW_MANAGE) and VIEW_MANAGE or VIEW_SIGNUP
+
+	local sections = panel.__sfRaidSignupSections
+	if sections then
+		for _, section in pairs(sections) do
+			local want = (section.__sfRaidSignupView or VIEW_SIGNUP) == view
+			if section.SetShown then
+				section:SetShown(want)
+			end
+		end
+	end
+
+	local pb = panel.__sfPageBuilder
+	local bar = panel.__sfRaidSignupTabBar
+	if canManage then
+		bar = EnsureTabBar(panel)
+		if bar then
+			local tabs = {
+				{ id = VIEW_SIGNUP, label = Loc("RAID_SIGNUP_TAB_SIGNUP", "Signup") },
+				{ id = VIEW_MANAGE, label = Loc("RAID_SIGNUP_TAB_MANAGE", "Manage") },
+			}
+			if not bar.HasSameTabs or not bar:HasSameTabs(tabs) then
+				bar:SetTabs(tabs)
+			end
+			if bar.SetSelected then
+				bar:SetSelected(view)
+			end
+			bar:Show()
+		end
+	else
+		if bar then
+			bar:Hide()
+		end
+	end
+
+	local scroll = pb and pb.scrollFrame
+	if scroll and scroll.SetPoint then
+		if canManage then
+			scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, panel.__sfRaidSignupTabDrop or TAB_BAR_SCROLL_DROP)
+		else
+			scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
+		end
+	end
+
+	SyncFeedback(panel, view)
+
+	if pb and pb.Reflow then
+		pb:Reflow()
+	end
+end
+
 -- Forward-declare page-local paint/host helpers used by Definition closures
 -- before their bodies (avoids accidental globals).
 local PaintSummary, PaintEntries, EnsureSummaryHost, EnsureEntriesHost
@@ -752,57 +929,19 @@ local function Definition()
 		caps = Caps(),
 		sections = {
 			{
-				id = "raidSignupStatus",
-				title = Loc("RAID_SIGNUP_SECTION_STATUS", "Status"),
+				id = "raidSignupPlanSelect",
+				view = VIEW_SIGNUP,
+				title = Loc("RAID_SIGNUP_SECTION_PLAN", "Roster plan"),
 				items = {
-					{
-						type = "display",
-						label = Loc("RAID_SIGNUP_STATUS_LABEL", "Access"),
-						get = function()
-							if session.status then
-								return session.status
-							end
-							local caps = Caps()
-							if not caps.canRead then
-								return Loc("RAID_SIGNUP_STATUS_NEED_GUILD",
-									"Join a guild to view shared Raid Signup plans.")
-							end
-							if caps.canManagePlans then
-								return Loc("RAID_SIGNUP_STATUS_OFFICER",
-									"You can manage plans and edit any signup entry.")
-							end
-							return Loc("RAID_SIGNUP_STATUS_MEMBER",
-								"You can add entries and edit ones you created. Officers manage plans.")
-						end,
-					},
+					MakePlanDropdownItem(),
 				},
 			},
 			{
 				id = "raidSignupPlans",
+				view = VIEW_MANAGE,
 				title = Loc("RAID_SIGNUP_SECTION_PLANS", "Roster plans"),
 				items = {
-					{
-						type = "dropdown",
-						label = Loc("RAID_SIGNUP_PLAN_SELECT", "Active plan"),
-						get = function()
-							return CurrentSelectedId()
-						end,
-						set = function(value)
-							local mod = RS()
-							if not mod then
-								return
-							end
-							DiscardEphemeral()
-							mod:SelectPlan(value)
-							QueueRefresh({ force = true })
-						end,
-						options = function()
-							return CurrentPlanOptions()
-						end,
-						enabled = function()
-							return Caps().canRead and #CurrentPlanOptions() > 0
-						end,
-					},
+					MakePlanDropdownItem(),
 					{
 						type = "editbox_button",
 						label = Loc("RAID_SIGNUP_PLAN_CREATE", "Create plan"),
@@ -903,6 +1042,7 @@ local function Definition()
 			},
 			{
 				id = "raidSignupSummary",
+				view = VIEW_SIGNUP,
 				title = Loc("RAID_SIGNUP_SECTION_SUMMARY", "Summary"),
 				items = {
 					{
@@ -915,6 +1055,7 @@ local function Definition()
 			},
 			{
 				id = "raidSignupEntries",
+				view = VIEW_SIGNUP,
 				title = Loc("RAID_SIGNUP_SECTION_ENTRIES", "Signups"),
 				items = {
 					{
@@ -948,82 +1089,137 @@ local function Definition()
 	}
 end
 
+local function SyncSummaryRowHeight(host, height)
+	local panel = Page.panel
+	local row = panel and panel.__sfRaidSignupSummaryRow
+	if row then
+		row.__sfBaseHeight = height
+		row:SetHeight(height)
+	end
+	host:SetHeight(height)
+	local section = panel and panel.__sfRaidSignupSummarySection
+	if section and section.ReflowRows then
+		section:ReflowRows()
+	end
+	if section and section._NotifyPageReflow then
+		section:_NotifyPageReflow()
+	elseif panel and panel.__sfPageBuilder and panel.__sfPageBuilder.Reflow then
+		panel.__sfPageBuilder:Reflow()
+	end
+end
+
+local function GroupColumns(categories)
+	return math.max(1, math.ceil(#(categories or {}) / GROUP_PER_COL))
+end
+
+local function GroupWidth(categories)
+	local cols = GroupColumns(categories)
+	return cols * (ICON + 2) + (cols - 1) * 8
+end
+
 PaintSummary = function(host, planId)
 	session.boardPaintCount = session.boardPaintCount + 1
 	local rs = RS()
 	local summary = rs and rs.GetPlanSummary and rs:GetPlanSummary(planId) or {
 		classCounts = {}, major = {}, utility = {},
 	}
-	local height = math.max(13 * (ICON + 2), (#(rs and rs.MAJOR_CATEGORIES or {}) + 1) * 18)
-	host:SetHeight(height + 8)
+	local order = ClassOrder()
+	local majorCats = (rs and rs.MAJOR_CATEGORIES) or {}
+	local utilityCats = (rs and rs.UTILITY_CATEGORIES) or {}
+
+	-- Content-sized height: two balanced class columns beside the coverage
+	-- groups; the shorter class layout no longer reserves a full column.
+	local classRows = math.max(1, math.ceil(#order / 2))
+	local function GroupRows(categories)
+		return math.max(1, math.ceil(#(categories or {}) / GroupColumns(categories)))
+	end
+	local contentRows = math.max(classRows, GroupRows(majorCats), GroupRows(utilityCats))
+	local height = SUMMARY_PAD_TOP + SUMMARY_HEADING_H + SUMMARY_HEADING_GAP
+		+ contentRows * (ICON + 2) + SUMMARY_PAD_BOTTOM
+	host:SetHeight(height)
+	SyncSummaryRowHeight(host, height)
 
 	-- Build once, then update counts / coverage greys in place so CreateFrame plateaus.
 	if not host.__sfSummaryBuilt then
 		ReleaseHostChildren(host)
-		local classCol = AcquireFrame(host)
-		classCol:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -2)
-		classCol:SetSize(120, height)
-		host.__sfClassCol = classCol
+		local classColPitch = ICON + 6 + CLASS_COUNT_WIDTH
+		local classesWidth = classColPitch * 2 + CLASS_COL_GAP
+
+		local classArea = AcquireFrame(host)
+		classArea:SetPoint("TOPLEFT", host, "TOPLEFT", 0,
+			-(SUMMARY_PAD_TOP + SUMMARY_HEADING_H + SUMMARY_HEADING_GAP))
+		classArea:SetSize(classesWidth, classRows * (ICON + 2))
+		host.__sfClassArea = classArea
 		host.__sfClassCounts = {}
-		local order = ClassOrder()
+
+		local classesTitle = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
+		classesTitle:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -SUMMARY_PAD_TOP)
+		classesTitle:SetText(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"))
+
+		-- Column-major split keeps CLASS_ORDER reading down each column.
+		local half = math.ceil(#order / 2)
 		for i = 1, #order do
 			local classFile = order[i]
-			local y = -(i - 1) * (ICON + 2)
-			local icon = TrackRegionCreate(classCol:CreateTexture(nil, "ARTWORK"))
+			local col = (i <= half) and 1 or 2
+			local rowIndex = (col == 1) and i or (i - half)
+			local x = (col - 1) * (classColPitch + CLASS_COL_GAP)
+			local y = -(rowIndex - 1) * (ICON + 2)
+			local icon = TrackRegionCreate(classArea:CreateTexture(nil, "ARTWORK"))
 			icon:SetSize(ICON, ICON)
-			icon:SetPoint("TOPLEFT", classCol, "TOPLEFT", 0, y)
+			icon:SetPoint("TOPLEFT", classArea, "TOPLEFT", x, y)
 			icon:SetTexture(TextureForClass(classFile))
-			local count = TrackRegionCreate(classCol:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+			local count = TrackRegionCreate(classArea:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
 			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
 			host.__sfClassCounts[classFile] = count
 		end
 
-		local function paintGroup(title, categories, coveredMap, anchor)
+		local function paintGroup(title, categories, coveredMap, x)
 			local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
-			label:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 24, 0)
+			label:SetPoint("TOPLEFT", host, "TOPLEFT", x, -SUMMARY_PAD_TOP)
 			label:SetText(title)
 			local wrap = AcquireFrame(host)
 			wrap:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
-			wrap:SetSize(280, height)
-			local x, y, colW = 0, 0, ICON + 2
-			local perCol = 8
+			wrap:SetSize(GroupWidth(categories) + 8, contentRows * (ICON + 2))
+			local px, py, colW = 0, 0, ICON + 2
+			local perCol = GROUP_PER_COL
 			local buttons = {}
 			for i = 1, #categories do
 				local cat = categories[i]
 				local btn = MakeIconButton(wrap, ICON)
-				btn:SetPoint("TOPLEFT", wrap, "TOPLEFT", x, -y)
+				btn:SetPoint("TOPLEFT", wrap, "TOPLEFT", px, -py)
 				SetIconVisual(btn, TextureForCategory(cat), true, not (coveredMap and coveredMap[cat.id]))
 				btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
 				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
 				buttons[cat.id] = btn
 				if (i % perCol) == 0 then
-					x = x + colW + 8
-					y = 0
+					px = px + colW + 8
+					py = 0
 				else
-					y = y + ICON + 2
+					py = py + ICON + 2
 				end
 			end
 			return label, buttons
 		end
 
-		local majorTitle, majorButtons = paintGroup(
+		local majorX = classesWidth + 24
+		local _, majorButtons = paintGroup(
 			Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
-			(rs and rs.MAJOR_CATEGORIES) or {},
+			majorCats,
 			summary.major,
-			classCol
+			majorX
 		)
+		local utilityX = majorX + GroupWidth(majorCats) + 24
 		local _, utilityButtons = paintGroup(
 			Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
-			(rs and rs.UTILITY_CATEGORIES) or {},
+			utilityCats,
 			summary.utility,
-			majorTitle
+			utilityX
 		)
 		host.__sfMajorButtons = majorButtons
 		host.__sfUtilityButtons = utilityButtons
 		host.__sfSummaryBuilt = true
 	end
 
-	local order = ClassOrder()
 	for i = 1, #order do
 		local classFile = order[i]
 		local fs = host.__sfClassCounts and host.__sfClassCounts[classFile]
@@ -1500,13 +1696,16 @@ EnsureSummaryHost = function(section)
 	if panel.__sfRaidSignupSummaryHost then
 		return
 	end
-	local height = 13 * (ICON + 2) + 8
-	section:AddRow(height, function(row)
-		local host = TrackCreate(CreateFrame("Frame", nil, row))
+	panel.__sfRaidSignupSummarySection = section
+	local row = section:AddRow(240, function(rowFrame)
+		local host = TrackCreate(CreateFrame("Frame", nil, rowFrame))
 		host:SetAllPoints()
 		panel.__sfRaidSignupSummaryHost = host
-		PaintSummary(host, CurrentSelectedId())
 	end)
+	panel.__sfRaidSignupSummaryRow = row
+	if panel.__sfRaidSignupSummaryHost then
+		PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
+	end
 end
 
 EnsureEntriesHost = function(section)
@@ -1546,6 +1745,10 @@ local function WipePageBuilder(panel)
 		panel.__sfPageBuilder = nil
 		panel.__sfRaidSignupSummaryHost = nil
 		panel.__sfRaidSignupEntriesHost = nil
+		panel.__sfRaidSignupSections = nil
+		panel.__sfRaidSignupMessages = nil
+		panel.__sfRaidSignupSummarySection = nil
+		panel.__sfRaidSignupSummaryRow = nil
 	end
 end
 
@@ -1561,6 +1764,7 @@ local function BuildWithPageBuilder(panel, opts)
 			panel.__sfPageBuilder:Refresh()
 		end
 		PaintOwnedBoards(panel)
+		SyncChrome(panel)
 		return true
 	end
 
@@ -1570,8 +1774,11 @@ local function BuildWithPageBuilder(panel, opts)
 	panel.__sfPageBuilder = pageBuilder
 	local controls = SF.SettingsUI.Controls
 	local def = Definition()
+	panel.__sfRaidSignupSections = {}
 	for _, secDef in ipairs(def.sections or {}) do
 		local section = pageBuilder:AddSection({ title = secDef.title or secDef.id })
+		section.__sfRaidSignupView = secDef.view or VIEW_SIGNUP
+		panel.__sfRaidSignupSections[secDef.id] = section
 		for _, item in ipairs(secDef.items or {}) do
 			if item.type == "custom" and item.build then
 				item.build(section)
@@ -1587,6 +1794,7 @@ local function BuildWithPageBuilder(panel, opts)
 		end
 	end
 	pageBuilder:Finalize()
+	SyncChrome(panel)
 	return true
 end
 
@@ -1652,6 +1860,8 @@ end
 function Page._ResetSessionForTests()
 	DiscardEphemeral()
 	session.status = nil
+	session.statusKind = nil
+	session.view = VIEW_SIGNUP
 	session.newPlanName = ""
 	session.renamePlanName = ""
 	session.frameCreateCount = 0
@@ -1673,7 +1883,37 @@ function Page._GetDefinitionSnapshotForTests()
 		renameEnabled = Caps().canManagePlans
 			and CurrentSelectedPlan() ~= nil
 			and not (CurrentSelectedPlan() and CurrentSelectedPlan().archived),
+		view = session.view,
 	}
+end
+
+function Page._GetViewForTests()
+	return session.view
+end
+
+function Page._SetViewForTests(view)
+	session.view = view
+end
+
+function Page._GetSectionVisibilityForTests(panel)
+	panel = panel or Page.panel
+	local out = {}
+	local sections = panel and panel.__sfRaidSignupSections
+	if sections then
+		for id, section in pairs(sections) do
+			if section.IsShown then
+				out[id] = section:IsShown() and true or false
+			elseif section._shown ~= nil then
+				out[id] = section._shown and true or false
+			end
+		end
+	end
+	return out
+end
+
+function Page._GetTabBarForTests(panel)
+	panel = panel or Page.panel
+	return panel and panel.__sfRaidSignupTabBar or nil
 end
 
 function Page._GetDraftForTests()
@@ -1694,6 +1934,10 @@ end
 
 function Page._GetRenamePlanNameForTests()
 	return session.renamePlanName
+end
+
+function Page._SetRenamePlanNameForTests(name)
+	session.renamePlanName = name
 end
 
 function Page._FindEditBoxesForTests(root, field)

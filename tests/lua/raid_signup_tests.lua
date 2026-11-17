@@ -943,6 +943,9 @@ local SCRIPT_SUPPORT = {
     },
     Texture = {},
     FontString = {},
+    ScrollFrame = {
+        OnShow = true, OnHide = true, OnMouseWheel = true,
+    },
 }
 
 local function makeRegion(objectType)
@@ -1062,6 +1065,12 @@ local function makeRegion(objectType)
     function r:GetFrameLevel() return self._frameLevel or 0 end
     function r:EnableMouse() end
     function r:RegisterForClicks() end
+    function r:SetColorTexture() end
+    function r:GetStringWidth() return #(self._text or "") * 7 end
+    function r:SetScrollChild() end
+    function r:GetHorizontalScroll() return 0 end
+    function r:SetHorizontalScroll() end
+    function r:EnableMouseWheel() end
     function r:SetScript(name, fn)
         if not self:HasScript(name) then
             error(string.format("script '%s' isn't supported by widget of type %s",
@@ -1198,7 +1207,22 @@ function SF.SettingsUI:CreatePage(panel)
         local section = {
             title = opts and opts.title,
             rows = {},
+            _shown = true,
         }
+        function section:Show() self._shown = true end
+        function section:Hide() self._shown = false end
+        function section:IsShown() return self._shown end
+        function section:SetShown(v) self._shown = v and true or false end
+        function section:SetMessage(text, kind)
+            self._message = text
+            self._messageKind = kind
+        end
+        function section:ClearMessage()
+            self._message = nil
+            self._messageKind = nil
+        end
+        function section:ReflowRows() end
+        function section:_NotifyPageReflow() end
         function section:AddRow(height, fn)
             local row = CreateFrame("Frame", nil, panel)
             row:SetHeight(height)
@@ -1210,6 +1234,9 @@ function SF.SettingsUI:CreatePage(panel)
         return section
     end
     function pb:Finalize() end
+    function pb:Reflow()
+        self.reflowCount = (self.reflowCount or 0) + 1
+    end
     function pb:Refresh()
         for i = 1, #self.refreshCallbacks do
             self.refreshCallbacks[i]()
@@ -1228,6 +1255,7 @@ SF.SettingsUI.Controls = {
 }
 
 SF.RaidSignup = RS
+load("SpectrumFederation/modules/UI/Settings/Widgets/TabBar.lua")
 load("SpectrumFederation/modules/UI/Settings/Pages/RaidSignup.lua")
 local UIPage = SF.RaidSignupUIPage or registeredPage
 assertTrue(UIPage ~= nil, "Raid Signup page registered")
@@ -2670,6 +2698,195 @@ do
     local afterFp = provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)]
         and provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
     assertTrue(afterFp ~= nil and afterFp ~= beforeFp, "physical fingerprint updated after rename")
+end
+
+---------------------------------------------------------------------------
+-- UI: Status removal, officer-only Manage tab, class summary layout
+---------------------------------------------------------------------------
+
+do
+    ActAs("Alice-Garona", "Player-1-Alice")
+    world.impersonationActive = false
+    UIPage._ResetSessionForTests()
+
+    local function NewPagePanel()
+        local p = CreateFrame("Frame", nil, nil)
+        function p:IsShown() return true end
+        function p:HookScript(name, fn)
+            self._scripts = self._scripts or {}
+            self._scripts[name] = fn
+        end
+        return p
+    end
+
+    local tabPlanStatus = select(1, RS:CreatePlan("Tab Layout Plan"))
+    assertEq(tabPlanStatus, "accepted", "officer creates tab test plan")
+    local tabPlanId
+    for _, p in ipairs(RS:GetSortedPlans(true)) do
+        if p.name == "Tab Layout Plan" and not p.archived then
+            tabPlanId = p.planId
+            break
+        end
+    end
+    assertTrue(tabPlanId ~= nil, "tab test plan id found")
+    RS:SelectPlan(tabPlanId)
+
+    -- Officer view: default Signup tab, Manage hidden sections
+    local panel = NewPagePanel()
+    UIPage:Build(panel)
+    assertEq(UIPage._GetViewForTests(), "signup", "default view is signup")
+    local bar = UIPage._GetTabBarForTests(panel)
+    assertTrue(bar ~= nil, "officer gets tab bar")
+    assertTrue(bar:IsShown(), "tab bar visible for officer")
+    assertEq(#bar.tabs, 2, "two tabs for officer")
+    assertEq(bar.tabs[1].id, "signup", "first tab is signup")
+    assertEq(bar.tabs[2].id, "manage", "second tab is manage")
+    local vis = UIPage._GetSectionVisibilityForTests(panel)
+    assertEq(vis.raidSignupPlanSelect, true, "signup plan selector visible")
+    assertEq(vis.raidSignupSummary, true, "summary visible in signup view")
+    assertEq(vis.raidSignupEntries, true, "entries visible in signup view")
+    assertEq(vis.raidSignupPlans, false, "manage section hidden in signup view")
+    assertEq(vis.raidSignupStatus, nil, "status/access section removed")
+
+    -- Switch to Manage; shared selected plan
+    bar.buttons[2]:Click()
+    assertEq(UIPage._GetViewForTests(), "manage", "manage tab selects manage view")
+    vis = UIPage._GetSectionVisibilityForTests(panel)
+    assertEq(vis.raidSignupPlans, true, "roster plans visible in manage view")
+    assertEq(vis.raidSignupPlanSelect, false, "signup selector hidden in manage view")
+    assertEq(vis.raidSignupSummary, false, "summary hidden in manage view")
+    assertEq(vis.raidSignupEntries, false, "entries hidden in manage view")
+    local snap = UIPage._GetDefinitionSnapshotForTests()
+    assertEq(snap.selectedId, tabPlanId, "manage view shares selected plan")
+    assertEq(snap.canManagePlans, true, "officer capability retained")
+
+    -- Rename draft scoped to selection survives tab switches
+    UIPage._SetRenamePlanNameForTests("Renamed Tab Plan")
+    bar.buttons[1]:Click()
+    assertEq(UIPage._GetViewForTests(), "signup", "back to signup view")
+    assertEq(UIPage._GetRenamePlanNameForTests(), "Renamed Tab Plan", "rename text survives switch")
+    bar.buttons[2]:Click()
+    assertEq(UIPage._GetRenamePlanNameForTests(), "Renamed Tab Plan", "rename text intact in manage")
+    bar.buttons[1]:Click()
+
+    -- Incomplete draft survives view changes and is never persisted
+    UIPage._ResetSessionForTests()
+    local entriesBefore = #RS:GetSortedEntries(tabPlanId)
+    local draft = RS.MakeDraft(tabPlanId)
+    RS.UpdateDraftField(draft, "classFile", "MAGE")
+    RS.UpdateDraftField(draft, "specId", 62)
+    UIPage._SetDraftForTests(draft)
+    assertEq(RS.DraftReadyToPersist(draft), false, "test draft is incomplete")
+    bar.buttons[2]:Click()
+    assertTrue(UIPage._GetDraftForTests() ~= nil, "incomplete draft survives manage switch")
+    bar.buttons[1]:Click()
+    assertTrue(UIPage._GetDraftForTests() ~= nil, "incomplete draft survives signup return")
+    assertEq(#RS:GetSortedEntries(tabPlanId), entriesBefore, "view switches never persist drafts")
+
+    -- Repeated switching/reopening: no widget churn, tab bar reused
+    UIPage:Refresh(panel, { force = true })
+    local life = UIPage._GetLifecycleCounters()
+    local framesBefore = life.frameCreateCount
+    local regionsBefore = life.regionCreateCount
+    local rebuildsBefore = life.fullRebuildCount
+    bar.buttons[2]:Click()
+    bar.buttons[1]:Click()
+    bar.buttons[2]:Click()
+    bar.buttons[1]:Click()
+    life = UIPage._GetLifecycleCounters()
+    assertEq(life.fullRebuildCount, rebuildsBefore, "tab switches never rebuild page")
+    assertEq(life.frameCreateCount, framesBefore, "tab switches create no frames")
+    assertEq(life.regionCreateCount, regionsBefore, "tab switches create no regions")
+    UIPage:Build(panel)
+    assertTrue(UIPage._GetTabBarForTests(panel) == bar, "tab bar reused across rebuild")
+    UIPage._ResetSessionForTests()
+    UIPage:Refresh(panel, { force = true })
+
+    -- Permission loss while Manage is open: safe fallback to Signup, tab hidden
+    bar.buttons[2]:Click()
+    assertEq(UIPage._GetViewForTests(), "manage", "manage view active before loss")
+    world.impersonationActive = true
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetViewForTests(), "signup", "eligibility loss returns to signup view")
+    assertTrue(not bar:IsShown(), "tab bar hidden when manage eligibility lost")
+    vis = UIPage._GetSectionVisibilityForTests(panel)
+    assertEq(vis.raidSignupPlans, false, "manage section hidden after eligibility loss")
+    assertEq(vis.raidSignupEntries, true, "signup view still shown after eligibility loss")
+    world.impersonationActive = false
+    UIPage:Refresh(panel, { force = true })
+
+    -- Member: no tabs, signup view with plan selector and boards
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage._ResetSessionForTests()
+    local memberPanel = NewPagePanel()
+    UIPage:Build(memberPanel)
+    assertEq(UIPage._GetViewForTests(), "signup", "member default view is signup")
+    assertTrue(UIPage._GetTabBarForTests(memberPanel) == nil, "member gets no tab bar")
+    vis = UIPage._GetSectionVisibilityForTests(memberPanel)
+    assertEq(vis.raidSignupPlanSelect, true, "member plan selector visible")
+    assertEq(vis.raidSignupSummary, true, "member summary visible")
+    assertEq(vis.raidSignupEntries, true, "member entries visible")
+    assertEq(vis.raidSignupPlans, false, "member never sees manage section")
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(memberPanel, { force = true })
+    snap = UIPage._GetDefinitionSnapshotForTests()
+    assertEq(snap.selectedId, tabPlanId, "member selects roster plan")
+    assertEq(snap.canManagePlans, false, "member cannot manage plans")
+    assertEq(snap.canCreateEntry, true, "member keeps signup access")
+    assertTrue(memberPanel.__sfRaidSignupEntriesHost ~= nil, "member entries board painted")
+
+    -- Class summary: every class once, two columns, zero counts, content height
+    local host = memberPanel.__sfRaidSignupSummaryHost
+    assertTrue(host ~= nil, "summary host painted for member")
+    local counts = host.__sfClassCounts
+    local seen, n = {}, 0
+    for classFile, fs in pairs(counts) do
+        n = n + 1
+        seen[classFile] = true
+        assertEq(fs:GetText(), "0", "zero count shown for " .. tostring(classFile))
+    end
+    assertEq(n, #RS.CLASS_ORDER, "every class shown exactly once")
+    for _, classFile in ipairs(RS.CLASS_ORDER) do
+        assertTrue(seen[classFile], "class present in summary: " .. tostring(classFile))
+    end
+    local classArea = host.__sfClassArea
+    assertTrue(classArea ~= nil, "class area exists")
+    local colXs = {}
+    for _, region in ipairs(classArea._regions or {}) do
+        if region._type == "Texture" then
+            for _, pt in ipairs(region._points) do
+                if pt[1] == "TOPLEFT" then
+                    colXs[pt[4]] = (colXs[pt[4]] or 0) + 1
+                end
+            end
+        end
+    end
+    assertEq(colXs[0], math.ceil(#RS.CLASS_ORDER / 2), "first column holds half the classes")
+    assertEq(colXs[68], #RS.CLASS_ORDER - math.ceil(#RS.CLASS_ORDER / 2), "second column holds the rest")
+    local majorCols = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / 8))
+    local utilityCols = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / 8))
+    local expectedRows = math.max(
+        math.ceil(#RS.CLASS_ORDER / 2),
+        math.ceil(#RS.MAJOR_CATEGORIES / majorCols),
+        math.ceil(#RS.UTILITY_CATEGORIES / utilityCols))
+    local expectedH = 2 + 18 + 4 + expectedRows * 24 + 8
+    assertEq(host:GetHeight(), expectedH, "summary height sized to content rows")
+    assertEq(memberPanel.__sfRaidSignupSummaryRow:GetHeight(), expectedH, "summary row height synced")
+
+    -- Main-only counts update; alternatives excluded
+    local upsertStatus = select(1, RS:UpsertEntry({
+        planId = tabPlanId,
+        nickname = "CountMain",
+        mainClass = "MAGE",
+        mainSpec = 62,
+        altClass = "WARRIOR",
+        altSpec = 71,
+    }))
+    assertEq(upsertStatus, "accepted", "member entry with alternative created")
+    UIPage:Refresh(memberPanel, { force = true })
+    counts = memberPanel.__sfRaidSignupSummaryHost.__sfClassCounts
+    assertEq(counts.MAGE:GetText(), "1", "main class counted in summary")
+    assertEq(counts.WARRIOR:GetText(), "0", "alternative class excluded from summary counts")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
