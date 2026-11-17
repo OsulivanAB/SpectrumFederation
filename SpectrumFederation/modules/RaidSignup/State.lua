@@ -179,6 +179,57 @@ function RS.ParseEntryRecordId(recordId)
     return recordId:match("^rs%-e:(.+)$")
 end
 
+-- Truncate to at most maxBytes without splitting a multibyte UTF-8 sequence.
+-- maxLen values are byte caps; a naive byte sub can leave a dangling lead or
+-- continuation byte, which persists malformed UTF-8 through gossip.
+local function Utf8SafePrefix(s, maxBytes)
+    if #s <= maxBytes then
+        return s
+    end
+    local prefix = s:sub(1, maxBytes)
+    -- Trailing continuation bytes (10xxxxxx) belong to the sequence started
+    -- just before them; an incomplete sequence is dropped from its starter.
+    local i = #prefix
+    local cont = 0
+    while i > 0 do
+        local b = prefix:byte(i)
+        if b >= 0x80 and b < 0xC0 then
+            cont = cont + 1
+            i = i - 1
+        else
+            break
+        end
+    end
+    if cont == 0 then
+        -- Last byte is ASCII (complete) or a bare sequence starter (incomplete).
+        local last = prefix:byte(#prefix)
+        if last and last >= 0xC2 and last <= 0xF4 then
+            prefix = prefix:sub(1, #prefix - 1)
+        end
+        return prefix
+    end
+    if i > 0 then
+        local starter = prefix:byte(i)
+        local expected = nil
+        if starter >= 0xC2 and starter <= 0xDF then
+            expected = 2
+        elseif starter >= 0xE0 and starter <= 0xEF then
+            expected = 3
+        elseif starter >= 0xF0 and starter <= 0xF4 then
+            expected = 4
+        end
+        -- cont + 1 bytes of the sequence are present; drop when incomplete or
+        -- when the byte before the continuations is not a valid starter.
+        if not expected or cont + 1 < expected then
+            prefix = prefix:sub(1, i - 1)
+        end
+    else
+        -- Only continuation bytes in the prefix: drop them all.
+        prefix = ""
+    end
+    return prefix
+end
+
 local function ClampString(s, maxLen)
     if type(s) ~= "string" then
         return nil
@@ -187,10 +238,7 @@ local function ClampString(s, maxLen)
     if s == "" then
         return nil
     end
-    if #s > maxLen then
-        s = s:sub(1, maxLen)
-    end
-    return s
+    return Utf8SafePrefix(s, maxLen)
 end
 
 function RS.NormalizeNickname(nickname)
@@ -205,10 +253,7 @@ function RS.NormalizeNotes(notes)
         return nil
     end
     notes = notes:gsub("^%s+", ""):gsub("%s+$", "")
-    if #notes > RS.MAX_NOTES then
-        notes = notes:sub(1, RS.MAX_NOTES)
-    end
-    return notes
+    return Utf8SafePrefix(notes, RS.MAX_NOTES)
 end
 
 function RS.NormalizePlanName(name)

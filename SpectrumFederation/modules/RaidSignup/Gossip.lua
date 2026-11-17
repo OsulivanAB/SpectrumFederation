@@ -554,6 +554,17 @@ function RS.NotifyLocalDurableChange(reason)
             if g and g.NotifyProviderChanged then
                 g.NotifyProviderChanged(RS.PROVIDER_ID)
             end
+            -- RebuildExportIndex ran synchronously above, so a walk that starts
+            -- now already covers this mutation. NotifyProviderChanged sees the
+            -- post-bump dirty index and classifies it as walk-in-progress,
+            -- arming a redundant follow-up pass; only keep that coalescing when
+            -- a budgeted walk is genuinely mid-enumeration.
+            if exportState.enumPos == nil then
+                local entry = ProviderEntry()
+                if entry then
+                    entry._reconcileFollowUp = nil
+                end
+            end
         end
     end
     RS.NotifyUI(reason)

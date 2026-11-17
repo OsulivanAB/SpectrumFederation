@@ -414,6 +414,29 @@ assertEq(name62, "Arcane", "SpecDisplayName uses name return")
 assertTrue(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1]) ~= nil, "category icon present")
 assertTrue(tostring(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1])):find("Spell_Holy_MagicalSentry", 1, true) ~= nil,
     "intellect uses ability icon not class icon")
+for _, cat in ipairs(RS.MAJOR_CATEGORIES) do
+    assertTrue(type(cat.icon) == "string" and cat.icon ~= "",
+        "major category has icon: " .. tostring(cat.id))
+end
+for _, cat in ipairs(RS.UTILITY_CATEGORIES) do
+    assertTrue(type(cat.icon) == "string" and cat.icon ~= "",
+        "utility category has icon: " .. tostring(cat.id))
+end
+
+-- UTF-8-safe byte-cap truncation never persists split multibyte characters.
+local nick47 = ("a"):rep(47) .. "\195\169" -- 47 ASCII + é (2 bytes) = 49 > 48 cap
+assertEq(RS.NormalizeNickname(nick47), ("a"):rep(47), "nickname drops dangling lead byte")
+assertEq(#RS.NormalizeNickname(nick47), 47, "nickname stays within byte cap")
+local nickExact = ("a"):rep(46) .. "\195\169" -- exactly 48 bytes
+assertEq(RS.NormalizeNickname(nickExact), nickExact, "complete 2-byte char within cap kept")
+local nick3 = ("a"):rep(45) .. "\226\130\172" -- 45 + € (3 bytes) = exactly 48
+assertEq(RS.NormalizeNickname(nick3), nick3, "complete 3-byte char within cap kept")
+local nickOver3 = ("a"):rep(46) .. "\226\130\172" -- 46 + € (3 bytes) = 49 > 48 cap
+assertEq(#RS.NormalizeNickname(nickOver3), 46, "incomplete 3-byte sequence dropped")
+local plan63 = ("p"):rep(63) .. "\195\169" -- 63 + é = 65 > 64 cap
+assertEq(#RS.NormalizePlanName(plan63), 63, "plan name truncation is UTF-8 safe")
+local notes159 = ("b"):rep(159) .. "\195\169" -- 159 + é = 161 > 160 cap
+assertEq(#RS.NormalizeNotes(notes159), 159, "notes truncation is UTF-8 safe")
 
 ---------------------------------------------------------------------------
 -- Plan + entry local lifecycle
@@ -2698,6 +2721,22 @@ do
     local afterFp = provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)]
         and provEntry.index.byId[RS.PlanRecordId(targetPlan.planId)].versionFp
     assertTrue(afterFp ~= nil and afterFp ~= beforeFp, "physical fingerprint updated after rename")
+
+    -- Local mutation on an idle index must not arm a redundant follow-up pass.
+    driveProvider(8, 512)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "index idle before follow-up check")
+    provEntry._reconcileFollowUp = nil
+    RS.NotifyLocalDurableChange("local")
+    assertEq(provEntry._reconcileFollowUp, nil, "idle mutation arms no reconcile follow-up")
+    driveProvider(8, 512)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "index completes after idle mutation")
+    assertTrue(not provEntry.indexFailed, "idle mutation rebuild did not fail index")
+
+    -- Consecutive idle mutations stay clean (no double full pass per mutation).
+    RS.NotifyLocalDurableChange("local")
+    assertEq(provEntry._reconcileFollowUp, nil, "second idle mutation arms no follow-up")
+    driveProvider(8, 4096)
+    assertTrue(provEntry.index.buildComplete and not provEntry.index.dirty, "index completes after second mutation")
 end
 
 ---------------------------------------------------------------------------
@@ -3063,6 +3102,23 @@ do
     UIPage._ResetSessionForTests()
     RS:SelectPlan(tabPlanId)
     UIPage:Refresh(panel, { force = true })
+
+    -- Two hosts (Blizzard Settings panel + standalone window) each get rebuilt
+    -- and refreshed; hosts keep their own panel association.
+    local savedPanels = UIPage._builtPanels
+    UIPage._builtPanels = {}
+    local panelA2 = NewPagePanel()
+    local panelB2 = NewPagePanel()
+    UIPage:Build(panelA2)
+    UIPage:Build(panelB2)
+    UIPage._ResetSessionForTests()
+    local refreshedPanels = UIPage._RefreshShownPanelsForTests()
+    assertEq(refreshedPanels, 2, "queued refresh reaches every shown host")
+    assertEq(panelA2.__sfRaidSignupSummaryHost.__sfRaidSignupPanel, panelA2,
+        "summary host bound to first panel")
+    assertEq(panelB2.__sfRaidSignupSummaryHost.__sfRaidSignupPanel, panelB2,
+        "summary host bound to second panel")
+    UIPage._builtPanels = savedPanels
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

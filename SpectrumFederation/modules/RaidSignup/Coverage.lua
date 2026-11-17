@@ -295,6 +295,7 @@ RS.UTILITY_CATEGORIES = {
         nameDefault = "Cast Speed Reduction",
         tipKey = "RAID_SIGNUP_COV_CAST_SLOW_TIP",
         tipDefault = "Cast-speed reduction such as Curse of Tongues or Numbing Poison.",
+        icon = "Interface\\Icons\\Spell_Shadow_CurseOfTongues",
         providers = { ClassAll("WARLOCK"), ClassAll("ROGUE") },
     },
 }

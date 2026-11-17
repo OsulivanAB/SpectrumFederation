@@ -65,6 +65,7 @@ local session = {
 
 local refreshQueued = false
 local deferredRefresh = false
+local buildPanel = nil
 local uiHooked = false
 local officerHooked = false
 local typingFocus = nil
@@ -96,6 +97,17 @@ local function TrackRegionCreate(region)
 	return region
 end
 
+-- Refresh every shown host that built this page (Blizzard Settings panel and
+-- the standalone window can each hold one); Page.panel alone would leave the
+-- visible host stale when another host was built last.
+local function EachShownBuiltPanel(fn)
+	for builtPanel in pairs(Page._builtPanels or {}) do
+		if builtPanel and builtPanel.IsShown and builtPanel:IsShown() then
+			fn(builtPanel)
+		end
+	end
+end
+
 local function HasTypingFocus()
 	return typingFocus ~= nil
 		and typingFocus.HasFocus
@@ -115,9 +127,9 @@ local function BindTypingFocus(edit, onLost)
 		end
 		if deferredRefresh then
 			deferredRefresh = false
-			if Page.panel and Page.panel:IsShown() and Page.Refresh then
-				Page:Refresh(Page.panel, { force = true })
-			end
+			EachShownBuiltPanel(function(builtPanel)
+				Page:Refresh(builtPanel, { force = true })
+			end)
 		end
 	end)
 end
@@ -135,15 +147,15 @@ local function QueueRefresh(opts)
 	if C_Timer and C_Timer.After then
 		C_Timer.After(0, function()
 			refreshQueued = false
-			if Page.panel and Page.panel:IsShown() and Page.Refresh then
-				Page:Refresh(Page.panel, opts)
-			end
+			EachShownBuiltPanel(function(builtPanel)
+				Page:Refresh(builtPanel, opts)
+			end)
 		end)
 	else
 		refreshQueued = false
-		if Page.panel and Page.Refresh then
-			Page:Refresh(Page.panel, opts)
-		end
+		EachShownBuiltPanel(function(builtPanel)
+			Page:Refresh(builtPanel, opts)
+		end)
 	end
 end
 
@@ -820,7 +832,7 @@ local function EnsureTabBar(panel)
 		end
 		session.view = tabId
 		if Page.Refresh then
-			Page:Refresh(Page.panel or panel, { force = true })
+			Page:Refresh(panel, { force = true })
 		end
 	end)
 	bar:Hide()
@@ -1104,7 +1116,7 @@ local function Definition()
 end
 
 local function SyncSummaryRowHeight(host, height)
-	local panel = Page.panel
+	local panel = (host and host.__sfRaidSignupPanel) or Page.panel
 	local row = panel and panel.__sfRaidSignupSummaryRow
 	if row then
 		row.__sfBaseHeight = height
@@ -1258,7 +1270,7 @@ PaintSummary = function(host, planId)
 end
 
 local function SyncEntriesRowHeight(host, height)
-	local panel = Page.panel
+	local panel = (host and host.__sfRaidSignupPanel) or Page.panel
 	local row = panel and panel.__sfRaidSignupEntriesRow
 	if row then
 		row.__sfBaseHeight = height
@@ -1709,7 +1721,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 end
 
 EnsureSummaryHost = function(section)
-	local panel = Page.panel
+	local panel = buildPanel or Page.panel
 	if not panel then
 		return
 	end
@@ -1720,6 +1732,7 @@ EnsureSummaryHost = function(section)
 	local row = section:AddRow(240, function(rowFrame)
 		local host = TrackCreate(CreateFrame("Frame", nil, rowFrame))
 		host:SetAllPoints()
+		host.__sfRaidSignupPanel = panel
 		panel.__sfRaidSignupSummaryHost = host
 	end)
 	panel.__sfRaidSignupSummaryRow = row
@@ -1729,7 +1742,7 @@ EnsureSummaryHost = function(section)
 end
 
 EnsureEntriesHost = function(section)
-	local panel = Page.panel
+	local panel = buildPanel or Page.panel
 	if not panel then
 		return
 	end
@@ -1740,6 +1753,7 @@ EnsureEntriesHost = function(section)
 	local row = section:AddRow(220, function(rowFrame)
 		local host = TrackCreate(CreateFrame("Frame", nil, rowFrame))
 		host:SetAllPoints()
+		host.__sfRaidSignupPanel = panel
 		panel.__sfRaidSignupEntriesHost = host
 		PaintEntries(host, CurrentSelectedId(), CurrentPlanOpen(), Caps())
 	end)
@@ -1777,6 +1791,7 @@ local function BuildWithPageBuilder(panel, opts)
 	if not (SF.SettingsUI and SF.SettingsUI.CreatePage) then
 		return false
 	end
+	buildPanel = panel
 
 	-- Soft refresh: keep the page builder and durable board hosts; repaint boards.
 	if panel.__sfPageBuilder and not opts.forceRebuild then
@@ -1785,6 +1800,7 @@ local function BuildWithPageBuilder(panel, opts)
 		end
 		PaintOwnedBoards(panel)
 		SyncChrome(panel)
+		buildPanel = nil
 		return true
 	end
 
@@ -1815,6 +1831,7 @@ local function BuildWithPageBuilder(panel, opts)
 	end
 	pageBuilder:Finalize()
 	SyncChrome(panel)
+	buildPanel = nil
 	return true
 end
 
@@ -1822,6 +1839,8 @@ function Page:Build(panel)
 	EnsureUIListener()
 	session.openCount = session.openCount + 1
 	self.panel = panel
+	Page._builtPanels = Page._builtPanels or {}
+	Page._builtPanels[panel] = true
 	BuildWithPageBuilder(panel, { forceRebuild = true })
 	if panel.HookScript and not panel.__sfRaidSignupHook then
 		panel.__sfRaidSignupHook = true
@@ -1958,6 +1977,15 @@ end
 
 function Page._SetAltDraftForTests(altDraft)
 	session.altDraft = altDraft
+end
+
+function Page._RefreshShownPanelsForTests(opts)
+	local n = 0
+	EachShownBuiltPanel(function(builtPanel)
+		n = n + 1
+		Page:Refresh(builtPanel, opts or {})
+	end)
+	return n
 end
 
 function Page._GetRenamePlanNameForTests()
