@@ -255,6 +255,14 @@ local function SpecName(specId)
 	return tostring(specId)
 end
 
+local function ClassName(classFile)
+	local rs = RS()
+	if rs and rs.ClassDisplayName then
+		return rs.ClassDisplayName(classFile) or tostring(classFile or "")
+	end
+	return tostring(classFile or "")
+end
+
 local function TryPersistDraft()
 	local rs = RS()
 	local draft = session.draft
@@ -659,7 +667,7 @@ local function LayoutPicker(host, draft, opts)
 			local classFile = order[i]
 			local btn = MakeIconButton(host, ICON)
 			SetIconVisual(btn, TextureForClass(classFile), true, false)
-			btn.tooltipTitle = classFile
+			btn.tooltipTitle = ClassName(classFile)
 			btn:SetScript("OnClick", function()
 				if opts.onClass then
 					opts.onClass(classFile)
@@ -675,7 +683,7 @@ local function LayoutPicker(host, draft, opts)
 			selected.tooltipTitle = SpecName(draft.specId)
 		else
 			SetIconVisual(selected, TextureForClass(draft.classFile), true, false)
-			selected.tooltipTitle = draft.classFile
+			selected.tooltipTitle = ClassName(draft.classFile)
 		end
 		selected.tooltipText = Loc("RAID_SIGNUP_TIP_CHANGE_CLASS",
 			"Click to choose a different class.")
@@ -904,7 +912,8 @@ local function SyncChrome(panel)
 	local scroll = pb and pb.scrollFrame
 	if scroll and scroll.SetPoint then
 		if canManage then
-			scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, panel.__sfRaidSignupTabDrop or TAB_BAR_SCROLL_DROP)
+			-- Negative Y: content starts below the tab strip, never under it.
+			scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, -(panel.__sfRaidSignupTabDrop or TAB_BAR_SCROLL_DROP))
 		else
 			scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
 		end
@@ -920,6 +929,23 @@ end
 -- Forward-declare page-local paint/host helpers used by Definition closures
 -- before their bodies (avoids accidental globals).
 local PaintSummary, PaintEntries, EnsureSummaryHost, EnsureEntriesHost
+
+local function SubmitCreatePlan(text)
+	session.newPlanName = text or ""
+	local mod = RS()
+	if not mod then
+		return
+	end
+	local status, reason, planId = mod:CreatePlan(text)
+	Report(status, reason)
+	if status == "accepted" and planId then
+		session.newPlanName = ""
+		-- Creating a plan switches selection; never carry an in-progress
+		-- signup/edit draft into the new roster.
+		DiscardEphemeral()
+		mod:SelectPlan(planId)
+	end
+end
 
 local function Definition()
 	return {
@@ -950,19 +976,7 @@ local function Definition()
 						get = function()
 							return session.newPlanName
 						end,
-						onSubmit = function(text)
-							session.newPlanName = text or ""
-							local mod = RS()
-							if not mod then
-								return
-							end
-							local status, reason, planId = mod:CreatePlan(text)
-							Report(status, reason)
-							if status == "accepted" and planId then
-								session.newPlanName = ""
-								mod:SelectPlan(planId)
-							end
-						end,
+						onSubmit = SubmitCreatePlan,
 						enabled = function()
 							return Caps().canManagePlans
 						end,
@@ -1285,7 +1299,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 		y = y - height - 4
 	end
 
-	if session.draft and planOpen then
+	if session.draft and planOpen and session.draft.planId == planId then
 		placeRow(56, function(row)
 			local nick = AcquireEditBox(row)
 			nick.__sfRaidSignupField = "nickname"
@@ -1401,7 +1415,13 @@ PaintEntries = function(host, planId, planOpen, caps)
 			local nickBox = AcquireEditBox(row)
 			nickBox.__sfRaidSignupField = "nickname"
 			nickBox:SetSize(120, 20)
-			nickBox:SetPoint("LEFT", row, "LEFT", 4, editingThis and 12 or 0)
+			if editingThis or altThis then
+				-- Expanded rows reserve the band below the controls for the
+				-- class/spec picker; keep the control cluster out of its way.
+				nickBox:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -4)
+			else
+				nickBox:SetPoint("LEFT", row, "LEFT", 4, 0)
+			end
 			nickBox:SetMaxLetters(RS().MAX_NICKNAME or 48)
 			SafeSetEditText(nickBox, entry.nickname or "")
 			if nickBox.Instructions then
@@ -1448,7 +1468,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 			-- Informative hover tooltips stay assigned even when the button is disabled.
 			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), canEdit, false)
 			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
-			mainBtn.tooltipText = (entry.mainClass or "") .. " · " .. SpecName(entry.mainSpec)
+			mainBtn.tooltipText = ClassName(entry.mainClass) .. " · " .. SpecName(entry.mainSpec)
 			mainBtn:SetScript("OnClick", function()
 				if not canEdit then
 					return
@@ -1477,7 +1497,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), canEdit, false)
 				altBtn.tooltipTitle = SpecName(entry.altSpec)
 				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
-					.. ": " .. (entry.altClass or "") .. " · " .. SpecName(entry.altSpec)
+					.. ": " .. ClassName(entry.altClass) .. " · " .. SpecName(entry.altSpec)
 				altBtn:SetScript("OnClick", function()
 					if not canEdit then
 						return
@@ -1924,12 +1944,20 @@ function Page._SetDraftForTests(draft)
 	session.draft = draft
 end
 
+function Page._SubmitCreatePlanForTests(text)
+	SubmitCreatePlan(text)
+end
+
 function Page._GetEditingForTests()
 	return session.editing
 end
 
 function Page._GetAltDraftForTests()
 	return session.altDraft
+end
+
+function Page._SetAltDraftForTests(altDraft)
+	session.altDraft = altDraft
 end
 
 function Page._GetRenamePlanNameForTests()

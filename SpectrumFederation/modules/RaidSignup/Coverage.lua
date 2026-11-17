@@ -344,6 +344,29 @@ function RS.SpecDisplayName(specId)
     return RS.SPEC_NAMES[specId]
 end
 
+-- Stable Retail class IDs for localized display names (match CLASS_ORDER).
+RS.CLASS_IDS = {
+    WARRIOR = 1, PALADIN = 2, HUNTER = 3, ROGUE = 4, PRIEST = 5,
+    DEATHKNIGHT = 6, SHAMAN = 7, MAGE = 8, WARLOCK = 9, MONK = 10,
+    DRUID = 11, DEMONHUNTER = 12, EVOKER = 13,
+}
+
+function RS.ClassDisplayName(classFile)
+    classFile = NormalizeClass(classFile)
+    if not classFile then
+        return nil
+    end
+    local classId = RS.CLASS_IDS[classFile]
+    if classId and C_CreatureInfo and C_CreatureInfo.GetClassInfo then
+        local ok, info = pcall(C_CreatureInfo.GetClassInfo, classId)
+        if ok and type(info) == "table"
+            and type(info.className) == "string" and info.className ~= "" then
+            return info.className
+        end
+    end
+    return classFile
+end
+
 function RS.ClassIconTexture(classFile)
     classFile = NormalizeClass(classFile)
     local data = classFile and SF.WOW_CLASSES and SF.WOW_CLASSES[classFile]

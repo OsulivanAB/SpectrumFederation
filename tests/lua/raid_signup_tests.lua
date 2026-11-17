@@ -2887,6 +2887,182 @@ do
     counts = memberPanel.__sfRaidSignupSummaryHost.__sfClassCounts
     assertEq(counts.MAGE:GetText(), "1", "main class counted in summary")
     assertEq(counts.WARRIOR:GetText(), "0", "alternative class excluded from summary counts")
+
+    -- Review repairs: scroll offset, create-plan draft safety, plan-bound
+    -- draft rendering, localized class names, expanded-row layout.
+    local function LastScrollTopY(scroll)
+        local y = nil
+        for _, pt in ipairs((scroll and scroll._points) or {}) do
+            if pt[1] == "TOPLEFT" then
+                y = pt[5]
+            end
+        end
+        return y
+    end
+
+    ActAs("Alice-Garona", "Player-1-Alice")
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
+    local officerScroll = panel.__sfPageBuilder and panel.__sfPageBuilder.scrollFrame
+    assertTrue(officerScroll ~= nil, "officer page builder scroll frame exists")
+    local officerScrollY = LastScrollTopY(officerScroll)
+    assertTrue(officerScrollY ~= nil and officerScrollY < 0,
+        "officer scroll content starts below the tab strip")
+
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(memberPanel, { force = true })
+    local memberScroll = memberPanel.__sfPageBuilder and memberPanel.__sfPageBuilder.scrollFrame
+    local memberScrollY = LastScrollTopY(memberScroll)
+    assertEq(memberScrollY, 0, "member scroll content starts at panel top")
+
+    -- Localized class display names with token fallback
+    local savedCreatureInfo = C_CreatureInfo
+    C_CreatureInfo = {
+        GetClassInfo = function(classId)
+            return { classID = classId, className = "Localized" .. classId, classFile = "TOKEN" }
+        end,
+    }
+    assertEq(RS.ClassDisplayName("MAGE"), "Localized8", "class display name localized")
+    assertEq(RS.ClassDisplayName("mage"), "Localized8", "class display name normalizes token")
+    C_CreatureInfo = nil
+    assertEq(RS.ClassDisplayName("MAGE"), "MAGE", "class display name falls back to token")
+    C_CreatureInfo = savedCreatureInfo
+
+    -- Creating a plan discards an in-progress signup draft instead of leaking
+    -- it into the previously selected roster.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(tabPlanId)
+    local draftForCreate = RS.MakeDraft(tabPlanId)
+    RS.UpdateDraftField(draftForCreate, "nickname", "Unsaved Draft")
+    UIPage._SetDraftForTests(draftForCreate)
+    local entriesBeforeCreate = #RS:GetSortedEntries(tabPlanId)
+    UIPage._SubmitCreatePlanForTests("Created With Draft")
+    assertTrue(UIPage._GetDraftForTests() == nil, "create plan discards in-progress draft")
+    local snapAfterCreate = UIPage._GetDefinitionSnapshotForTests()
+    assertTrue(snapAfterCreate.selectedId ~= tabPlanId, "create plan selects the new roster")
+    assertEq(#RS:GetSortedEntries(tabPlanId), entriesBeforeCreate,
+        "create plan never persists the stale draft")
+    local createdPlanId = snapAfterCreate.selectedId
+
+    -- Defense in depth: a draft bound to another plan never renders.
+    local function CountDraftRows(host)
+        local n = 0
+        if not host then
+            return n
+        end
+        for _, child in ipairs({ host:GetChildren() }) do
+            if child._h == 56 and child.IsShown and child:IsShown() then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    UIPage._SetDraftForTests(RS.MakeDraft(tabPlanId))
+    UIPage:Refresh(panel, { force = true })
+    assertEq(CountDraftRows(panel.__sfRaidSignupEntriesHost), 0,
+        "foreign-plan draft is not painted")
+    UIPage._SetDraftForTests(RS.MakeDraft(createdPlanId))
+    UIPage:Refresh(panel, { force = true })
+    assertEq(CountDraftRows(panel.__sfRaidSignupEntriesHost), 1,
+        "matching-plan draft is painted")
+    UIPage._SetDraftForTests(nil)
+
+    -- Localized class names reach entry tooltips and the class picker.
+    C_CreatureInfo = {
+        GetClassInfo = function(classId)
+            return { classID = classId, className = "Localized" .. classId, classFile = "TOKEN" }
+        end,
+    }
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(memberPanel, { force = true })
+    local entryHost = memberPanel.__sfRaidSignupEntriesHost
+    local mainBtns = UIPage._FindSpecButtonsForTests(entryHost, "main")
+    assertTrue(#mainBtns >= 1, "main spec button present for tooltip check")
+    assertEq(mainBtns[1].tooltipText, "Localized8 · Arcane",
+        "main tooltip uses localized class name")
+    local altBtns = UIPage._FindSpecButtonsForTests(entryHost, "alt")
+    assertTrue(#altBtns >= 1, "alt spec button present for tooltip check")
+    assertEq(altBtns[1].tooltipText, "Alternative: Localized1 · Arms",
+        "alt tooltip uses localized class name")
+    local function FindBySize(root, w, h)
+        local found = nil
+        local function walk(f)
+            if found or not f then
+                return
+            end
+            if f._w == w and f._h == h then
+                found = f
+                return
+            end
+            for _, k in ipairs({ f:GetChildren() }) do
+                walk(k)
+            end
+        end
+        walk(root)
+        return found
+    end
+    -- Expanded alt row: control cluster stays above the picker band.
+    local entriesForAlt = RS:GetSortedEntries(tabPlanId)
+    assertTrue(#entriesForAlt >= 1, "entry available for alt row check")
+    UIPage._SetAltDraftForTests({
+        entryId = entriesForAlt[1].entryId,
+        draft = RS.MakeAltDraft(entriesForAlt[1]),
+    })
+    UIPage._SetDraftForTests(nil)
+    UIPage:Refresh(memberPanel, { force = true })
+    local nickBoxes = UIPage._FindEditBoxesForTests(entryHost, "nickname")
+    assertEq(#nickBoxes, 1, "exactly one entry nickname box in alt row check")
+    local nickBox = nickBoxes[1]
+    local nickTopY = nil
+    for _, pt in ipairs(nickBox._points or {}) do
+        if pt[1] == "TOPLEFT" then
+            nickTopY = pt[5]
+        end
+    end
+    assertEq(nickTopY, -4, "expanded row nickname anchored to top band")
+    local altPicker = FindBySize(entryHost, 520, 24)
+    assertTrue(altPicker ~= nil, "alt class picker painted")
+    local pickerTopY = nil
+    for _, pt in ipairs(altPicker._points or {}) do
+        if pt[1] == "TOPLEFT" then
+            pickerTopY = pt[5]
+        end
+    end
+    assertEq(pickerTopY, -28, "alt picker anchored below control band")
+    assertTrue(pickerTopY <= nickTopY - (nickBox._h or 20) - 2,
+        "nickname cluster clears the picker band")
+
+    -- The class picker itself shows localized class names.
+    local classPickerBtn = nil
+    local function FindClassPickerBtn(root)
+        local function walk(f)
+            if classPickerBtn or not f then
+                return
+            end
+            if f.tooltipTitle == "Localized8" then
+                classPickerBtn = f
+                return
+            end
+            for _, k in ipairs({ f:GetChildren() }) do
+                walk(k)
+            end
+        end
+        walk(root)
+    end
+    FindClassPickerBtn(entryHost)
+    assertTrue(classPickerBtn ~= nil, "class picker button uses localized class name")
+    UIPage._SetAltDraftForTests(nil)
+    C_CreatureInfo = savedCreatureInfo
+    ActAs("Alice-Garona", "Player-1-Alice")
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
