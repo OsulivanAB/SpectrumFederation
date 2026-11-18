@@ -1768,11 +1768,21 @@ EnsureEntriesHost = function(section)
 end
 
 local function PaintOwnedBoards(panel)
-	if panel.__sfRaidSignupSummaryHost then
-		PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
-	end
-	if panel.__sfRaidSignupEntriesHost then
-		PaintEntries(panel.__sfRaidSignupEntriesHost, CurrentSelectedId(), CurrentPlanOpen(), Caps())
+	-- A paint failure must not take down the whole refresh; log and continue.
+	local ok, err = pcall(function()
+		if panel.__sfRaidSignupSummaryHost then
+			PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
+		end
+		if panel.__sfRaidSignupEntriesHost then
+			PaintEntries(panel.__sfRaidSignupEntriesHost, CurrentSelectedId(), CurrentPlanOpen(), Caps())
+		end
+	end)
+	if not ok then
+		local detail = tostring(err)
+		if SF.Debug and SF.Debug.Warn then
+			SF.Debug:Warn("RAID_SIGNUP_UI", "board paint failed: %s", detail)
+		end
+		SetStatus(Loc("RAID_SIGNUP_UI_ERROR", "Raid Signup UI error") .. ": " .. detail, "error")
 	end
 end
 
@@ -1822,17 +1832,30 @@ local function BuildWithPageBuilder(panel, opts)
 		local section = pageBuilder:AddSection({ title = secDef.title or secDef.id })
 		section.__sfRaidSignupView = secDef.view or VIEW_SIGNUP
 		panel.__sfRaidSignupSections[secDef.id] = section
-		for _, item in ipairs(secDef.items or {}) do
-			if item.type == "custom" and item.build then
-				item.build(section)
-			elseif controls and item.type == "display" then
-				controls:AddDisplay(section, item)
-			elseif controls and item.type == "button" then
-				controls:AddButton(section, item)
-			elseif controls and item.type == "dropdown" then
-				controls:AddDropdown(section, item)
-			elseif controls and item.type == "editbox_button" then
-				controls:AddEditBoxWithButton(section, item)
+		for itemIndex, item in ipairs(secDef.items or {}) do
+			-- One failing item must not blank the rest of the page; log and continue.
+			local ok, err = pcall(function()
+				if item.type == "custom" and item.build then
+					item.build(section)
+				elseif controls and item.type == "display" then
+					controls:AddDisplay(section, item)
+				elseif controls and item.type == "button" then
+					controls:AddButton(section, item)
+				elseif controls and item.type == "dropdown" then
+					controls:AddDropdown(section, item)
+				elseif controls and item.type == "editbox_button" then
+					controls:AddEditBoxWithButton(section, item)
+				end
+			end)
+			if not ok then
+				local detail = tostring(err)
+				if SF.Debug and SF.Debug.Warn then
+					SF.Debug:Warn("RAID_SIGNUP_UI", "section %s item %d (%s) failed: %s",
+						tostring(secDef.id), itemIndex, tostring(item.type), detail)
+				end
+				-- Surface build failures in the section message row so they are
+				-- diagnosable without enabling debug logging.
+				SetStatus(Loc("RAID_SIGNUP_UI_ERROR", "Raid Signup UI error") .. ": " .. detail, "error")
 			end
 		end
 	end
