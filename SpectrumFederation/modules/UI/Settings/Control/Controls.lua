@@ -341,8 +341,9 @@ end
 -- @param parent Frame Parent frame
 -- @param atlas string|nil Atlas name for texture
 -- @param size number|nil Size of button (width/height)
+-- @param texture string|nil Fallback file texture when atlas is nil
 -- @return Button The created button
-local function CreateIconButton(parent, atlas, size)
+local function CreateIconButton(parent, atlas, size, texture)
 	local btn = CreateFrame("Button", nil, parent)
 	btn:SetSize(size or 20, size or 20)
 
@@ -350,8 +351,10 @@ local function CreateIconButton(parent, atlas, size)
 	icon:SetAllPoints(btn)
 	btn.Icon = icon
 
-	if atlas then
+	if type(atlas) == "string" and atlas ~= "" then
 		icon:SetAtlas(atlas, true)
+	elseif type(texture) == "string" and texture ~= "" then
+		icon:SetTexture(texture)
 	end
 
 	local hl = btn:CreateTexture(nil, "HIGHLIGHT")
@@ -1598,9 +1601,13 @@ end
 --       - text: The text to display for the item. (e.g. "|cFF00FF00Osully|r")
 --       - canRemove: Boolean indicating if the remove button should be shown
 --   - onRemove: Function(item) called when an item's remove button is clicked
+--   - onAction: Function(item) optional secondary icon action (e.g. promote)
+--   - actionAtlas / actionTexture: icon for the optional action button
+--   - actionTooltip: optional tooltip for the action button
 --   - height: Height of the scroll list control (default: 160)
 --   - rowHeight: Height of each row in the list (default: 20)
 --   - removeAtlas: Atlas name for the remove button icon (default: "common-icon-redx")
+--   - emptyText: string|function shown when getItems returns no rows
 -- Defaults for the opt-in shared leading column on AddScrollList (#440).
 -- textRightInset matches the non-compact Text RIGHT anchor (-24) so the clamp
 -- reserves drawable remainder after that inset, not only contentWidth - textLeft.
@@ -1667,7 +1674,12 @@ function Controls:AddScrollList(section, opts)
 	local compactColumns = opts.compactColumns and true or false
 	local removeColumnGap = opts.removeColumnGap or 4
 	local removeButtonSize = opts.removeButtonSize or 18
+	local actionButtonSize = opts.actionButtonSize or removeButtonSize
+	local actionColumnGap = opts.actionColumnGap or removeColumnGap
 	local compactTextPadding = opts.compactTextPadding or 10
+	local hasActionSupport = type(opts.onAction) == "function"
+		or type(opts.actionAtlas) == "string"
+		or type(opts.actionTexture) == "string"
 	-- Opt-in. Lists that omit showItemIcons keep the previous text-only layout.
 	local showItemIcons = opts.showItemIcons and true or false
 	local itemIconSize = opts.itemIconSize or 16
@@ -1736,7 +1748,29 @@ function Controls:AddScrollList(section, opts)
 		content:SetHeight(1)
 		scroll:SetScrollChild(content)
 
+		local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:Hide()
+
 		local rows = {}
+
+		local function ResolveEmptyText()
+			local empty = opts.emptyText
+			if type(empty) == "function" then
+				local ok, value = pcall(empty)
+				if ok then
+					empty = value
+				else
+					empty = nil
+				end
+			end
+			if type(empty) ~= "string" then
+				empty = ""
+			end
+			return empty
+		end
 
 		local function EnsureRow(i)
 			if rows[i] then return rows[i] end
@@ -1782,6 +1816,18 @@ function Controls:AddScrollList(section, opts)
 			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
 			remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 			r.Remove = remove
+
+			if hasActionSupport then
+				local action = CreateIconButton(
+					r,
+					opts.actionAtlas,
+					actionButtonSize,
+					opts.actionTexture
+						or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
+				)
+				action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
+				r.Action = action
+			end
 
 			rows[i] = r
 			return r
@@ -1851,7 +1897,16 @@ function Controls:AddScrollList(section, opts)
 				rows[i]:Hide()
 			end
 
-			local contentH = (y > 0) and (y - rowSpacing) or 0
+			local emptyMessage = ResolveEmptyText()
+			local contentH
+			if #items == 0 and emptyMessage ~= "" then
+				emptyText:SetText(emptyMessage)
+				emptyText:Show()
+				contentH = math.max(rowHeight, (emptyText:GetStringHeight() or 0) + 16)
+			else
+				emptyText:Hide()
+				contentH = (y > 0) and (y - rowSpacing) or 0
+			end
 			content:SetHeight(math.max(1, contentH))
 
 			-- Resolve scrollbar before measuring width so the leading-column
@@ -1925,9 +1980,13 @@ function Controls:AddScrollList(section, opts)
 			if showItemIcons and textBudget > 0 then
 				textBudget = math.max(1, textBudget - iconReserve)
 			end
+			local trailingReserve = removeButtonSize + removeColumnGap
+			if hasActionSupport then
+				trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
+			end
 			local compactTextWidth = maxTextWidth + compactTextPadding
 			if compactColumns and textBudget > 0 then
-				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - removeButtonSize - removeColumnGap))
+				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - trailingReserve))
 			end
 
 			for i = 1, #items do
@@ -1936,6 +1995,9 @@ function Controls:AddScrollList(section, opts)
 
 				r.Text:ClearAllPoints()
 				r.Remove:ClearAllPoints()
+				if r.Action then
+					r.Action:ClearAllPoints()
+				end
 				if r.Leading then
 					r.Leading:ClearAllPoints()
 				end
@@ -1957,6 +2019,33 @@ function Controls:AddScrollList(section, opts)
 				else
 					r.Remove:SetAlpha(0.45)
 					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local canAction = hasActionSupport and item.canAction and true or false
+				if r.Action then
+					r.Action:SetShown(canAction)
+					if canAction then
+						local actionEnabled = enabled
+						r.Action:EnableMouse(true)
+						r.Action:SetAlpha(actionEnabled and 1 or 0.45)
+						r.Action:SetScript("OnClick", function()
+							if not actionEnabled then return end
+							if opts.onAction then
+								opts.onAction(item)
+							end
+						end)
+						local tip = opts.actionTooltip
+						if type(tip) == "function" then
+							local ok, value = pcall(tip, item)
+							tip = ok and value or nil
+						end
+						if type(tip) == "string" and tip ~= "" then
+							AttachTooltip(r.Action, tip, tip)
+						end
+					else
+						r.Action:SetAlpha(0.45)
+						r.Action:SetScript("OnClick", nil)
+					end
 				end
 
 				local itemKey = item.clusterId or item.id or item.key or i
@@ -2021,14 +2110,24 @@ function Controls:AddScrollList(section, opts)
 				end
 
 				local textLeft = leadingReserve + iconReserve
+				local rightInset = 24
+				if hasActionSupport then
+					rightInset = removeButtonSize + actionButtonSize + actionColumnGap + removeColumnGap + 4
+				end
 				if compactColumns and availableWidth > 0 then
 					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
 					r.Text:SetWidth(compactTextWidth)
-					r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
+					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
 				else
 					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
-					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
+					r.Text:SetPoint("RIGHT", r, "RIGHT", -rightInset, 0)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
 				end
 			end
 
@@ -2041,6 +2140,474 @@ function Controls:AddScrollList(section, opts)
 		scroll:HookScript("OnSizeChanged", Refresh)
 	end)
 end
+
+--- Two independently scrollable side-by-side lists with panel titles (#468).
+-- Full-width row (no InitRow label column) so Main/Alts panels share the
+-- Assignments section evenly. Each panel reuses AddScrollList semantics via
+-- nested opts tables (`left` / `right`).
+function Controls:AddSideBySideScrollLists(section, opts)
+	opts = opts or {}
+	local gap = opts.gap or 12
+	local titleHeight = opts.titleHeight or 18
+	local panelHeight = opts.panelHeight or opts.height or 220
+	local totalHeight = titleHeight + panelHeight
+	local leftOpts = opts.left or {}
+	local rightOpts = opts.right or {}
+
+	return section:AddRow(totalHeight, function(row)
+		local function BuildPanel(parent, panelOpts, side)
+			local title = parent:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+			title:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+			title:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, 0)
+			title:SetJustifyH("LEFT")
+			title:SetHeight(titleHeight)
+			title:SetText(panelOpts.title or "")
+
+			local host = CreateFrame("Frame", nil, parent)
+			host:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -titleHeight)
+			host:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
+
+			-- Reuse AddScrollList by building into a temporary section-like shim
+			-- that mounts a single fixed-height bordered list without the label column.
+			local listOpts = CopyTable(panelOpts)
+			listOpts.label = nil
+			listOpts.resize = false
+			listOpts.border = listOpts.border ~= false
+			listOpts.height = panelHeight
+			listOpts.maxHeight = panelHeight
+
+			local getItems = listOpts.getItems
+			if type(getItems) ~= "function" then
+				getItems = function() return {} end
+			end
+
+			local rowHeight = listOpts.rowHeight or 20
+			local rowSpacing = listOpts.rowSpacing or 2
+			local compactColumns = listOpts.compactColumns and true or false
+			local removeColumnGap = listOpts.removeColumnGap or 4
+			local removeButtonSize = listOpts.removeButtonSize or 18
+			local actionButtonSize = listOpts.actionButtonSize or removeButtonSize
+			local actionColumnGap = listOpts.actionColumnGap or removeColumnGap
+			local compactTextPadding = listOpts.compactTextPadding or 10
+			local hasActionSupport = type(listOpts.onAction) == "function"
+				or type(listOpts.actionAtlas) == "string"
+				or type(listOpts.actionTexture) == "string"
+			local hasCopySupport = type(listOpts.onCopy) == "function"
+			local copyButtonSize = listOpts.copyButtonSize or 16
+			local copyColumnGap = listOpts.copyColumnGap or removeColumnGap
+			local borderInset = 4
+
+			local box = CreateFrame("Frame", nil, host, "BackdropTemplate")
+			box:SetAllPoints(host)
+			if box.SetBackdrop then
+				box:SetBackdrop({
+					bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+					edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+					tile = true,
+					tileSize = 8,
+					edgeSize = 12,
+					insets = {
+						left = borderInset,
+						right = borderInset,
+						top = borderInset,
+						bottom = borderInset,
+					},
+				})
+				box:SetBackdropColor(0, 0, 0, 0.12)
+				box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+			end
+
+			-- UIPanelScrollFrameTemplate places ScrollBar outside the scroll
+			-- frame to the right. Adjacent panels need an internal gutter, and
+			-- the bar must sit inside the backdrop edgeFile (edgeSize 12) — not
+			-- flush to the outer frame — or arrow/thumb art still bleeds past
+			-- the visible border. Right offset is slightly less inset than the
+			-- content chrome pad so the bar sits a few pixels farther right
+			-- while remaining inside the border stroke.
+			local chromePad = borderInset + 4 -- clears border stroke + small art pad
+			local scrollBarWidth = 18
+			local scrollBarGap = 2
+			local SCROLLBAR_RIGHT_OFFSET = -(borderInset + 2) -- 2px right of chromePad
+			local SCROLLBAR_INSET = (-SCROLLBAR_RIGHT_OFFSET) + scrollBarWidth + scrollBarGap
+			-- Arrow buttons are ~16px; keep the whole bar (arrows+track) inside
+			-- the bordered content area rather than overlapping the edgeFile.
+			local SCROLLBAR_BUTTON_CLEARANCE = 16
+
+			local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
+			scroll:SetPoint("TOPLEFT", box, "TOPLEFT", chromePad, -chromePad)
+			scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -SCROLLBAR_INSET, chromePad)
+
+			local sb = scroll.ScrollBar
+			if sb then
+				sb:ClearAllPoints()
+				sb:SetPoint(
+					"TOPRIGHT",
+					box,
+					"TOPRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					-(chromePad + SCROLLBAR_BUTTON_CLEARANCE)
+				)
+				sb:SetPoint(
+					"BOTTOMRIGHT",
+					box,
+					"BOTTOMRIGHT",
+					SCROLLBAR_RIGHT_OFFSET,
+					chromePad + SCROLLBAR_BUTTON_CLEARANCE
+				)
+				if sb.SetWidth then
+					sb:SetWidth(scrollBarWidth)
+				end
+			end
+
+			local content = CreateFrame("Frame", nil, scroll)
+			content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+			content:SetHeight(1)
+			scroll:SetScrollChild(content)
+
+			local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+			emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+			emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+			emptyText:SetJustifyH("LEFT")
+			emptyText:Hide()
+
+			local listRows = {}
+
+			local function ResolveEmptyText()
+				local empty = listOpts.emptyText
+				if type(empty) == "function" then
+					local ok, value = pcall(empty)
+					empty = ok and value or nil
+				end
+				if type(empty) ~= "string" then
+					empty = ""
+				end
+				return empty
+			end
+
+			local function EnsureRow(i)
+				if listRows[i] then
+					return listRows[i]
+				end
+				local r = CreateFrame("Button", nil, content)
+				r:SetHeight(rowHeight)
+				r:RegisterForClicks("LeftButtonUp")
+				r:EnableMouse(true)
+
+				local selected = r:CreateTexture(nil, "BACKGROUND")
+				selected:SetAllPoints()
+				selected:SetColorTexture(0.2, 0.55, 1.0, 0.22)
+				selected:Hide()
+				r.Selected = selected
+
+				local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+				fs:SetPoint("LEFT", r, "LEFT", 4, 0)
+				fs:SetJustifyH("LEFT")
+				if fs.SetWordWrap then fs:SetWordWrap(false) end
+				if fs.SetMaxLines then fs:SetMaxLines(1) end
+				r.Text = fs
+
+				local remove = CreateIconButton(r, listOpts.removeAtlas or "common-icon-redx", removeButtonSize)
+				remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
+				r.Remove = remove
+
+				if hasActionSupport then
+					local action = CreateIconButton(
+						r,
+						listOpts.actionAtlas,
+						actionButtonSize,
+						listOpts.actionTexture
+							or "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga"
+					)
+					action:SetPoint("RIGHT", remove, "LEFT", -actionColumnGap, 0)
+					r.Action = action
+				end
+
+				if hasCopySupport then
+					-- Always allocated so showing on hover never shifts text/layout.
+					local copy = CreateIconButton(
+						r,
+						listOpts.copyAtlas,
+						copyButtonSize,
+						listOpts.copyTexture or "Interface\\Buttons\\UI-GuildButton-PublicNote-Up"
+					)
+					local copyAnchor = r.Action or remove
+					copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
+					copy:SetAlpha(0)
+					copy:EnableMouse(true)
+					r.Copy = copy
+				end
+
+				listRows[i] = r
+				return r
+			end
+
+			local function SetScrollBarShown(show)
+				local sb = scroll.ScrollBar
+				if not sb then
+					return 0
+				end
+				sb:SetShown(show)
+				if not show then
+					scroll:SetVerticalScroll(0)
+					if sb.SetValue then sb:SetValue(0) end
+					if sb.Disable then sb:Disable() end
+					return 0
+				end
+				if sb.Enable then sb:Enable() end
+				return sb:GetWidth() or 20
+			end
+
+			local function RefreshPanel()
+				if host.__sfSidePanelRefreshing then
+					return
+				end
+				host.__sfSidePanelRefreshing = true
+
+				local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
+				local items = getItems() or {}
+				local selectedKey = nil
+				if type(listOpts.getSelectedKey) == "function" then
+					selectedKey = listOpts.getSelectedKey()
+				end
+
+				local y = 0
+				local maxTextWidth = 0
+				for i = 1, #items do
+					local item = items[i]
+					local r = EnsureRow(i)
+					r:ClearAllPoints()
+					r:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+					r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
+					r.Text:SetText(item.text or "")
+					maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)
+					r:Show()
+					y = y + rowHeight + rowSpacing
+				end
+				for i = #items + 1, #listRows do
+					listRows[i]:Hide()
+				end
+
+				local emptyMessage = ResolveEmptyText()
+				local contentH
+				if #items == 0 and emptyMessage ~= "" then
+					emptyText:SetText(emptyMessage)
+					emptyText:Show()
+					contentH = math.max(rowHeight, (emptyText:GetStringHeight() or 0) + 16)
+				else
+					emptyText:Hide()
+					contentH = (y > 0) and (y - rowSpacing) or 0
+				end
+				content:SetHeight(math.max(1, contentH))
+
+				-- Scroll frame already reserves a right gutter for the bar, so
+				-- do not subtract ScrollBar width again from content width.
+				local visibleH = math.max(1, (scroll:GetHeight() or 0))
+				local showScroll = contentH > visibleH
+				SetScrollBarShown(showScroll)
+				local w = scroll:GetWidth() or 0
+				local availableWidth = 0
+				if w > 0 then
+					availableWidth = math.max(1, w - 4)
+					content:SetWidth(availableWidth)
+				end
+
+				local trailingReserve = removeButtonSize + removeColumnGap
+				if hasActionSupport then
+					trailingReserve = trailingReserve + actionButtonSize + actionColumnGap
+				end
+				if hasCopySupport then
+					-- Reserve space even while alpha=0 so hover cannot reflow text.
+					trailingReserve = trailingReserve + copyButtonSize + copyColumnGap
+				end
+				local compactTextWidth = maxTextWidth + compactTextPadding
+				if compactColumns and availableWidth > 0 then
+					compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - trailingReserve - 8))
+				end
+
+				for i = 1, #items do
+					local item = items[i]
+					local r = listRows[i]
+					r.Text:ClearAllPoints()
+					r.Remove:ClearAllPoints()
+					if r.Action then
+						r.Action:ClearAllPoints()
+					end
+					if r.Copy then
+						r.Copy:ClearAllPoints()
+					end
+
+					local canRemove = item.canRemove and true or false
+					r.Remove:SetShown(canRemove)
+					r:SetAlpha(enabled and 1 or 0.45)
+					if canRemove then
+						r.Remove:EnableMouse(true)
+						r.Remove:SetAlpha(enabled and 1 or 0.45)
+						r.Remove:SetScript("OnClick", function()
+							if not enabled then return end
+							if listOpts.onRemove then
+								listOpts.onRemove(item)
+							end
+						end)
+					else
+						r.Remove:SetAlpha(0.45)
+						r.Remove:SetScript("OnClick", nil)
+					end
+
+					local canAction = hasActionSupport and item.canAction and true or false
+					if r.Action then
+						r.Action:SetShown(canAction)
+						if canAction then
+							r.Action:EnableMouse(true)
+							r.Action:SetAlpha(enabled and 1 or 0.45)
+							r.Action:SetScript("OnClick", function()
+								if not enabled then return end
+								if listOpts.onAction then
+									listOpts.onAction(item)
+								end
+							end)
+							local tip = listOpts.actionTooltip
+							if type(tip) == "function" then
+								local ok, value = pcall(tip, item)
+								tip = ok and value or nil
+							end
+							if type(tip) == "string" and tip ~= "" then
+								AttachTooltip(r.Action, tip, tip)
+							end
+						else
+							r.Action:SetAlpha(0.45)
+							r.Action:SetScript("OnClick", nil)
+						end
+					end
+
+					if r.Copy then
+						-- Keep the button shown (layout reserved) but invisible until hover.
+						r.Copy:Show()
+						r.Copy:SetAlpha(0)
+						r.Copy:EnableMouse(enabled and true or false)
+						r.Copy:SetScript("OnClick", function()
+							if not enabled then return end
+							if listOpts.onCopy then
+								listOpts.onCopy(item)
+							end
+						end)
+						local copyTip = listOpts.copyTooltip
+						if type(copyTip) == "function" then
+							local ok, value = pcall(copyTip, item)
+							copyTip = ok and value or nil
+						end
+						if type(copyTip) ~= "string" or copyTip == "" then
+							copyTip = "Copy name"
+						end
+						r.Copy:SetScript("OnEnter", function(self)
+							self:SetAlpha(1)
+							if GameTooltip then
+								GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+								GameTooltip:SetText(copyTip, 1, 1, 1)
+								GameTooltip:Show()
+							end
+						end)
+						r.Copy:SetScript("OnLeave", function(self)
+							if GameTooltip then
+								GameTooltip:Hide()
+							end
+							if not (r.IsMouseOver and r:IsMouseOver()) then
+								self:SetAlpha(0)
+							end
+						end)
+						r:SetScript("OnEnter", function()
+							if r.Copy then
+								r.Copy:SetAlpha(1)
+							end
+						end)
+						r:SetScript("OnLeave", function()
+							if r.Copy and not (r.Copy.IsMouseOver and r.Copy:IsMouseOver()) then
+								r.Copy:SetAlpha(0)
+							end
+						end)
+					end
+
+					-- Prefer guid so Alts-panel rows can highlight a single alt
+					-- without selecting every sibling that shares clusterId/mainGuid.
+					local itemKey = item.guid or item.clusterId or item.id or item.key or i
+					local isSelected = selectedKey ~= nil and selectedKey == itemKey
+					if r.Selected then
+						if isSelected then r.Selected:Show() else r.Selected:Hide() end
+					end
+					if type(listOpts.onSelect) == "function" then
+						r:SetScript("OnClick", function()
+							if not enabled then return end
+							listOpts.onSelect(item, i)
+						end)
+					else
+						r:SetScript("OnClick", nil)
+					end
+
+					local rightInset = trailingReserve + 4
+					r.Remove:SetPoint("RIGHT", r, "RIGHT", -2, 0)
+					if r.Action then
+						r.Action:SetPoint("RIGHT", r.Remove, "LEFT", -actionColumnGap, 0)
+					end
+					if r.Copy then
+						local copyAnchor = r.Action or r.Remove
+						r.Copy:SetPoint("RIGHT", copyAnchor, "LEFT", -copyColumnGap, 0)
+					end
+					r.Text:SetPoint("LEFT", r, "LEFT", 4, 0)
+					if compactColumns and availableWidth > 0 then
+						r.Text:SetWidth(compactTextWidth)
+					else
+						r.Text:SetPoint("RIGHT", r, "RIGHT", -rightInset, 0)
+					end
+				end
+
+				host.__sfSidePanelRefreshing = false
+			end
+
+			RefreshPanel()
+			RegisterRefresh(section, RefreshPanel)
+			scroll:HookScript("OnSizeChanged", RefreshPanel)
+			return RefreshPanel
+		end
+
+		local left = CreateFrame("Frame", nil, row)
+		local right = CreateFrame("Frame", nil, row)
+		left:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+		left:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+		right:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+		right:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+
+		local function LayoutPanels()
+			local width = row:GetWidth() or 0
+			if width <= 0 then
+				return
+			end
+			local panelWidth = math.max(80, math.floor((width - gap) / 2))
+			left:SetWidth(panelWidth)
+			right:SetWidth(panelWidth)
+			right:ClearAllPoints()
+			right:SetPoint("TOPRIGHT", row, "TOPRIGHT", 0, 0)
+			right:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			left:ClearAllPoints()
+			left:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			left:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+			left:SetPoint("RIGHT", right, "LEFT", -gap, 0)
+		end
+
+		BuildPanel(left, leftOpts, "left")
+		BuildPanel(right, rightOpts, "right")
+		LayoutPanels()
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, nil)
+			LayoutPanels()
+		end
+		Refresh()
+		RegisterRefresh(section, Refresh)
+		row:HookScript("OnSizeChanged", function()
+			LayoutPanels()
+		end)
+	end)
+end
+
 
 -- Pure gate for consumable goal edits. Used by AddConsumableRequestedList and tests.
 -- Returns true only when a genuine, still-bound edit should invoke onGoalCommit.
@@ -3032,6 +3599,15 @@ function Controls:AddContributionRankingChart(section, opts)
 				content:SetHeight(1)
 				return
 			end
+			if #rows == 0 and emptyReason == "credit_unavailable" then
+				scroll:Hide()
+				emptyText:Show()
+				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_CREDIT_UNAVAILABLE",
+					"Contribution credit is temporarily unavailable while corrections reconcile."))
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
 			if #rows == 0 and emptyReason == "no_contributions" then
 				scroll:Hide()
 				emptyText:Show()
@@ -3301,43 +3877,55 @@ function Controls:AddLogTable(section, opts)
 			dataRow.Cells = {}
 			for columnIndex, column in ipairs(columns) do
 				local cell = CreateFrame("Frame", nil, dataRow)
-				local text = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-				text:SetPoint("LEFT", cell, "LEFT", 4, 0)
-				text:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
-				text:SetJustifyH(column.justifyH or "LEFT")
-				if text.SetWordWrap then
-					text:SetWordWrap(false)
+				-- Opt-in action cells (#459). Default columns stay text-only so
+				-- Loot Logs and other consumers are unchanged.
+				if column.kind == "action" then
+					local button = CreateFrame("Button", nil, cell, "UIPanelButtonTemplate")
+					button:SetPoint("LEFT", cell, "LEFT", 2, 0)
+					button:SetPoint("RIGHT", cell, "RIGHT", -2, 0)
+					button:SetHeight(math.max(16, (rowHeight or 22) - 6))
+					button:Hide()
+					cell.ActionButton = button
+					cell:EnableMouse(false)
+				else
+					local text = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+					text:SetPoint("LEFT", cell, "LEFT", 4, 0)
+					text:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
+					text:SetJustifyH(column.justifyH or "LEFT")
+					if text.SetWordWrap then
+						text:SetWordWrap(false)
+					end
+					if text.SetMaxLines then
+						text:SetMaxLines(1)
+					end
+					cell.Text = text
+					cell:EnableMouse(true)
+					cell:SetScript("OnEnter", function()
+						dataRow.Hover:Show()
+						if cell.hyperlink and GameTooltip and GameTooltip.SetHyperlink then
+							GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
+							GameTooltip:SetHyperlink(cell.hyperlink)
+							GameTooltip:Show()
+						elseif dataRow.__sfTooltip then
+							ShowRowTooltip(dataRow)
+						end
+					end)
+					cell:SetScript("OnLeave", function()
+						dataRow.Hover:Hide()
+						if GameTooltip and GameTooltip.Hide then
+							GameTooltip:Hide()
+						end
+					end)
+					cell:SetScript("OnMouseUp", function()
+						local itemRef = cell.itemRef
+						if type(itemRef) ~= "string" or itemRef == "" then
+							return
+						end
+						if type(SetItemRef) == "function" then
+							SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
+						end
+					end)
 				end
-				if text.SetMaxLines then
-					text:SetMaxLines(1)
-				end
-				cell.Text = text
-				cell:EnableMouse(true)
-				cell:SetScript("OnEnter", function()
-					dataRow.Hover:Show()
-					if cell.hyperlink and GameTooltip and GameTooltip.SetHyperlink then
-						GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
-						GameTooltip:SetHyperlink(cell.hyperlink)
-						GameTooltip:Show()
-					elseif dataRow.__sfTooltip then
-						ShowRowTooltip(dataRow)
-					end
-				end)
-				cell:SetScript("OnLeave", function()
-					dataRow.Hover:Hide()
-					if GameTooltip and GameTooltip.Hide then
-						GameTooltip:Hide()
-					end
-				end)
-				cell:SetScript("OnMouseUp", function()
-					local itemRef = cell.itemRef
-					if type(itemRef) ~= "string" or itemRef == "" then
-						return
-					end
-					if type(SetItemRef) == "function" then
-						SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
-					end
-				end)
 				dataRow.Cells[columnIndex] = cell
 			end
 
@@ -3348,21 +3936,62 @@ function Controls:AddLogTable(section, opts)
 		local function BindRow(dataRow, rowData, enabled, availableWidth)
 			dataRow:SetAlpha(enabled and 1 or 0.45)
 			dataRow.__sfTooltip = type(rowData) == "table" and rowData.tooltip or nil
+			-- Bind against the current row payload (event id), never the pool index.
+			dataRow.__sfRowData = rowData
 			for columnIndex, column in ipairs(columns) do
-				local value = rowData and rowData[column.key]
 				local cell = dataRow.Cells[columnIndex]
-				cell.Text:SetText(value or "")
-				local hyperlink
-				local itemRef
-				if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
-					hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+				if column.kind == "action" then
+					local button = cell.ActionButton
+					if button then
+						button:SetScript("OnClick", nil)
+						-- Optional per-column field names so a table can host
+						-- more than one action (Edit + Delete) (#465).
+						local showKey = column.showKey or "showAction"
+						local actionKey = column.actionKey or "onAction"
+						local labelKey = column.labelKey or "actionLabel"
+						local show = enabled and type(rowData) == "table"
+							and rowData[showKey] == true
+							and type(rowData[actionKey]) == "function"
+						if show then
+							local label = rowData[labelKey]
+							if type(label) ~= "string" or label == "" then
+								label = column.label or "Edit"
+							end
+							button:SetText(label)
+							-- Capture durable id at bind time so recycled frames
+							-- always invoke the newly bound entry.
+							local boundId = rowData.id
+							local boundAction = rowData[actionKey]
+							button:SetScript("OnClick", function()
+								if type(boundAction) == "function" then
+									boundAction(boundId, dataRow.__sfRowData)
+								end
+							end)
+							button:Show()
+							if button.Enable then
+								button:Enable()
+							end
+						else
+							button:Hide()
+						end
+					end
+				else
+					local value = rowData and rowData[column.key]
+					if cell.Text then
+						cell.Text:SetText(value or "")
+					end
+					local hyperlink
+					local itemRef
+					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+					end
+					if SF.LootLog and SF.LootLog.ExtractItemRef then
+						itemRef = SF.LootLog.ExtractItemRef(value)
+					end
+					cell.hyperlink = hyperlink
+					cell.itemRef = itemRef
+					cell.itemLinkText = hyperlink and value or nil
 				end
-				if SF.LootLog and SF.LootLog.ExtractItemRef then
-					itemRef = SF.LootLog.ExtractItemRef(value)
-				end
-				cell.hyperlink = hyperlink
-				cell.itemRef = itemRef
-				cell.itemLinkText = hyperlink and value or nil
 			end
 			if availableWidth and availableWidth > 0 then
 				LayoutCells(dataRow, dataRow.Cells, availableWidth)
@@ -4247,16 +4876,50 @@ end
 -- @param section table Section to add row into
 -- @param opts table Options: label, get/set or unbound getText/setText,
 --   getSuggestions(prefix)->[{value,label,text}], onResolved(item|nil),
---   maxSuggestions, width, visible/enabled
+--   maxSuggestions, maxDropdownHeight (default 220, clamped 80–250),
+--   emptySuggestionsText, allowEmptyPrefix, width, visible/enabled
 -- @return Frame The created row
 function Controls:AddAutocomplete(section, opts)
 	opts = opts or {}
-	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 16))
+	-- Cap raised to 64 so Assignments list-search can return more matches;
+	-- the dropdown itself is height-capped and scrollable.
+	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 64))
+	local maxDropdownHeight = tonumber(opts.maxDropdownHeight) or 220
+	if maxDropdownHeight < 80 then
+		maxDropdownHeight = 80
+	elseif maxDropdownHeight > 250 then
+		maxDropdownHeight = 250
+	end
+	local allowEmptyPrefix = opts.allowEmptyPrefix and true or false
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
+	local suggestionRowHeight = 20
+	local dropPad = 4
+	local scrollBarWidth = 18
+	local scrollBarGap = 2
 	local bound = false
 	local get, set
 	if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
 		bound = true
 		get, set = ResolveGetSet(opts)
+	end
+
+	local function TrimmedPrefix(prefix)
+		if type(prefix) ~= "string" then
+			return ""
+		end
+		if strtrim then
+			return strtrim(prefix)
+		end
+		return (prefix:match("^%s*(.-)%s*$")) or prefix
+	end
+
+	local function IsBlankPrefix(prefix)
+		return TrimmedPrefix(prefix) == ""
 	end
 
 	return section:AddRow(26, function(row)
@@ -4301,12 +4964,79 @@ function Controls:AddAutocomplete(section, opts)
 			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 		end
 
+		local scroll = CreateFrame("ScrollFrame", nil, drop, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+		scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -dropPad, dropPad)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local emptyLabel = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyLabel:SetPoint("TOPLEFT", content, "TOPLEFT", 6, -4)
+		emptyLabel:SetPoint("TOPRIGHT", content, "TOPRIGHT", -6, -4)
+		emptyLabel:SetJustifyH("LEFT")
+		emptyLabel:Hide()
+
 		local suggestionButtons = {}
 		local ignore = false
 		local resolvedValue = nil
+		local selectingSuggestion = false
+
+		local function ResetSuggestionScroll()
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(0)
+			end
+			local sb = scroll.ScrollBar
+			if sb and sb.SetValue then
+				sb:SetValue(0)
+			end
+		end
 
 		local function HideDrop()
 			drop:Hide()
+			ResetSuggestionScroll()
+		end
+
+		-- Clear the MouseDown selection guard. Used after a completed click and
+		-- after a cancelled press (drag off / release without OnClick).
+		local function ClearSelectingSuggestion(hideIfUnfocused)
+			if not selectingSuggestion then
+				if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+					HideDrop()
+				end
+				return
+			end
+			selectingSuggestion = false
+			if hideIfUnfocused and not (edit.HasFocus and edit:HasFocus()) then
+				HideDrop()
+			end
+		end
+
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then
+				return 0
+			end
+			if sb.SetShown then
+				sb:SetShown(show)
+			elseif show and sb.Show then
+				sb:Show()
+			elseif (not show) and sb.Hide then
+				sb:Hide()
+			end
+			if not show then
+				ResetSuggestionScroll()
+				if sb.Disable then
+					sb:Disable()
+				end
+				return 0
+			end
+			if sb.Enable then
+				sb:Enable()
+			end
+			return sb.GetWidth and sb:GetWidth() or scrollBarWidth
 		end
 
 		local function NotifyResolved(item)
@@ -4320,6 +5050,9 @@ function Controls:AddAutocomplete(section, opts)
 			if not item then
 				return
 			end
+			-- Guard focus-loss hide so ClearFocus after click cannot race the
+			-- selection (dropdown click steals edit focus on Retail).
+			selectingSuggestion = true
 			ignore = true
 			local text = item.text or item.label or tostring(item.value or "")
 			edit:SetText(text)
@@ -4333,14 +5066,15 @@ function Controls:AddAutocomplete(section, opts)
 			NotifyResolved(item)
 			HideDrop()
 			edit:ClearFocus()
+			selectingSuggestion = false
 		end
 
 		local function EnsureSuggestionButton(i)
 			if suggestionButtons[i] then
 				return suggestionButtons[i]
 			end
-			local btn = CreateFrame("Button", nil, drop)
-			btn:SetHeight(20)
+			local btn = CreateFrame("Button", nil, content)
+			btn:SetHeight(suggestionRowHeight)
 			local fs = btn:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", btn, "LEFT", 6, 0)
 			fs:SetPoint("RIGHT", btn, "RIGHT", -6, 0)
@@ -4357,8 +5091,59 @@ function Controls:AddAutocomplete(section, opts)
 			btn:SetScript("OnLeave", function()
 				hl:Hide()
 			end)
+			-- MouseDown arms the focus-loss guard before EditBox blur runs.
+			btn:SetScript("OnMouseDown", function()
+				selectingSuggestion = true
+			end)
+			-- MouseUp always follows a press, even when the pointer is released
+			-- outside the button (no OnClick). Defer so a successful OnClick /
+			-- SelectItem can clear the guard first in the same release.
+			btn:SetScript("OnMouseUp", function()
+				local function afterRelease()
+					ClearSelectingSuggestion(true)
+				end
+				if C_Timer and C_Timer.After then
+					C_Timer.After(0, afterRelease)
+				else
+					afterRelease()
+				end
+			end)
 			suggestionButtons[i] = btn
 			return btn
+		end
+
+		local function LayoutDrop(contentHeight)
+			local fieldWidth = edit:GetWidth() or CONTROL_WIDTH
+			local innerHeight = math.max(suggestionRowHeight, contentHeight)
+			local frameHeight = math.min(innerHeight + (dropPad * 2), maxDropdownHeight)
+			local showScroll = (innerHeight + (dropPad * 2)) > maxDropdownHeight
+			drop:SetWidth(fieldWidth)
+			drop:SetHeight(frameHeight)
+			drop:ClearAllPoints()
+			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", 0, -2)
+			drop:SetPoint("TOPRIGHT", edit, "BOTTOMRIGHT", 0, -2)
+
+			local sbWidth = SetScrollBarShown(showScroll)
+			local rightInset = dropPad
+			if showScroll then
+				rightInset = dropPad + sbWidth + scrollBarGap
+				local sb = scroll.ScrollBar
+				if sb then
+					sb:ClearAllPoints()
+					sb:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -2, -(dropPad + 14))
+					sb:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -2, dropPad + 14)
+					if sb.SetWidth then
+						sb:SetWidth(scrollBarWidth)
+					end
+				end
+			end
+			scroll:ClearAllPoints()
+			scroll:SetPoint("TOPLEFT", drop, "TOPLEFT", dropPad, -dropPad)
+			scroll:SetPoint("BOTTOMRIGHT", drop, "BOTTOMRIGHT", -rightInset, dropPad)
+
+			local contentWidth = math.max(1, fieldWidth - dropPad - rightInset)
+			content:SetWidth(contentWidth)
+			content:SetHeight(math.max(1, innerHeight))
 		end
 
 		local function ShowSuggestions(prefix)
@@ -4367,33 +5152,62 @@ function Controls:AddAutocomplete(section, opts)
 				HideDrop()
 				return
 			end
-			local items = getSuggestions(prefix) or {}
-			if #items == 0 then
+			-- Default autocomplete UX: empty/whitespace focus does not open a
+			-- full-roster popup. Opt in with allowEmptyPrefix (e.g. attribution).
+			if IsBlankPrefix(prefix) and not allowEmptyPrefix then
 				HideDrop()
 				return
 			end
-			local width = edit:GetWidth() or CONTROL_WIDTH
-			local y = 4
+
+			local items = getSuggestions(prefix) or {}
 			local count = math.min(#items, maxSuggestions)
+			emptyLabel:Hide()
+			-- Always restart at the top when suggestion contents change so a
+			-- scrolled large set cannot hide leading matches of the next query.
+			ResetSuggestionScroll()
+
+			if count == 0 then
+				if IsBlankPrefix(prefix) then
+					HideDrop()
+					return
+				end
+				-- Nonempty query with no matches: compact empty state.
+				for i = 1, #suggestionButtons do
+					suggestionButtons[i]:Hide()
+				end
+				local emptyText = opts.emptySuggestionsText
+				if type(emptyText) ~= "string" or emptyText == "" then
+					emptyText = Loc("SETTINGS_AUTOCOMPLETE_NO_MATCHES", "No matches")
+				end
+				emptyLabel:SetText(emptyText)
+				emptyLabel:Show()
+				local emptyHeight = math.max(
+					suggestionRowHeight,
+					(emptyLabel.GetStringHeight and emptyLabel:GetStringHeight()) or suggestionRowHeight
+				) + 8
+				LayoutDrop(emptyHeight)
+				drop:Show()
+				return
+			end
+
+			local y = 0
 			for i = 1, count do
 				local item = items[i]
 				local btn = EnsureSuggestionButton(i)
 				btn:ClearAllPoints()
-				btn:SetPoint("TOPLEFT", drop, "TOPLEFT", 4, -y)
-				btn:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -4, -y)
+				btn:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+				btn:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 				btn.Text:SetText(item.label or item.text or tostring(item.value or ""))
 				btn:SetScript("OnClick", function()
 					SelectItem(item)
 				end)
 				btn:Show()
-				y = y + 20
+				y = y + suggestionRowHeight
 			end
 			for i = count + 1, #suggestionButtons do
 				suggestionButtons[i]:Hide()
 			end
-			drop:SetSize(width + 8, y + 4)
-			drop:ClearAllPoints()
-			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", -4, -2)
+			LayoutDrop(y)
 			drop:Show()
 		end
 
@@ -4418,14 +5232,20 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		edit:SetScript("OnEditFocusLost", function()
-			-- Delay hide so suggestion clicks register.
+			-- Delay hide so suggestion clicks register. Keep an active
+			-- MouseDown press protected until MouseUp/OnClick; cancelled
+			-- releases clear via OnMouseUp → ClearSelectingSuggestion.
 			if C_Timer and C_Timer.After then
 				C_Timer.After(0.15, function()
+					if selectingSuggestion then
+						-- Press still held: do not clear or hide yet.
+						return
+					end
 					if not edit:HasFocus() then
 						HideDrop()
 					end
 				end)
-			else
+			elseif not selectingSuggestion then
 				HideDrop()
 			end
 			if bound then
@@ -4483,13 +5303,18 @@ function Controls:AddAutocomplete(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, { edit })
 			local c = enabled and 1 or 0.6
 			edit:SetTextColor(c, c, c)
-			if not enabled then
+			-- Clear / external refresh with blank text must dismiss suggestions.
+			if (not enabled) or (IsBlankPrefix(text) and not allowEmptyPrefix) then
 				HideDrop()
 			end
 		end
 
 		row.__sfAutocompleteEdit = edit
 		row.__sfAutocompleteHide = HideDrop
+		row.__sfAutocompleteDrop = drop
+		row.__sfAutocompleteShow = ShowSuggestions
+		row.__sfAutocompleteScroll = scroll
+		row.__sfAutocompleteResetScroll = ResetSuggestionScroll
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)

@@ -1939,6 +1939,8 @@ local function Definition()
 						width = 220,
 						maxLetters = 96,
 						maxSuggestions = 8,
+						-- Empty focus keeps Unassigned + roster shortlist selectable.
+						allowEmptyPrefix = true,
 						hint = Loc("GUILD_SUPPLIES_ADJUST_ATTR_HINT",
 							"Unassigned (type a guild character to credit)"),
 						enabled = function()

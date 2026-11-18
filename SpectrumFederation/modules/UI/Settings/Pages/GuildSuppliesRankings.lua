@@ -377,4 +377,9 @@ EnsureRosterListener()
 EnsureDurableListener()
 EnsureItemDisplayListener()
 
+Page.__sfTest = {
+	QueueRefresh = QueueRefresh,
+	PanelVisible = PanelVisible,
+}
+
 SF.SettingsUI:RegisterPage(Page)

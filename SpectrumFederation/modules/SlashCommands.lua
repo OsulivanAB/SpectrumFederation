@@ -7,7 +7,8 @@ SF.SlashCommands = SF.SlashCommands or {}
 -- @param command: The command keyword (e.g., "loot", "debug")
 -- @param handler: Function to execute when command is called
 -- @param description: Help text for the command
-function SF:RegisterSlashCommand(command, handler, description)
+-- @param options: Optional table; preserveArgs keeps argument casing for handlers that need it
+function SF:RegisterSlashCommand(command, handler, description, options)
     if type(command) ~= "string" or command == "" then
         if SF.Debug then SF.Debug:Error("SLASH", "RegisterSlashCommand failed: Invalid command name") end
         return false
@@ -21,7 +22,8 @@ function SF:RegisterSlashCommand(command, handler, description)
     -- Store command in registry
     SF.SlashCommands[command:lower()] = {
         handler = handler,
-        description = description or "No description available."
+        description = description or "No description available.",
+        preserveArgs = options and options.preserveArgs == true or false
     }
     
     if SF.Debug then SF.Debug:Info("SLASH", "Registered command: /sf %s", command:lower()) end
@@ -55,8 +57,10 @@ end
 -- @param msg string Raw message after /sf
 -- @return nil
 local function SlashCommandHandler(msg)
-    -- Trim whitespace and convert to lowercase
-    msg = msg:trim():lower()
+    local rawMsg = msg:trim()
+    -- Commands are case-insensitive; most arguments are lowercased for lookup.
+    -- Handlers registered with preserveArgs receive the original argument casing.
+    msg = rawMsg:lower()
     
     -- Empty command or no arguments - open settings
     if msg == "" then
@@ -84,8 +88,13 @@ local function SlashCommandHandler(msg)
     -- Look up command in registry
     local cmdData = SF.SlashCommands[command]
     if cmdData and cmdData.handler then
+        local handlerArgs = args
+        if cmdData.preserveArgs then
+            local _, rawArgs = rawMsg:match("^(%S+)%s*(.*)")
+            handlerArgs = rawArgs or ""
+        end
         -- Execute the command handler
-        local success, err = pcall(cmdData.handler, args)
+        local success, err = pcall(cmdData.handler, handlerArgs)
         if not success then
             SF:PrintError("Error executing command: " .. tostring(err))
             if SF.Debug then SF.Debug:Error("SLASH", "Command '%s' failed: %s", command, tostring(err)) end

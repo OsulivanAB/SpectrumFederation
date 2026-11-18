@@ -1279,6 +1279,288 @@ local REVIEW_QW_RIGHT_PAD = 4
 local REVIEW_QW_NAME_WIDTH = REVIEW_ROW_WIDTH
     - REVIEW_ICON_SIZE - 4 - 4 - REVIEW_EDIT_WIDTH - REVIEW_QW_RIGHT_PAD
 local REVIEW_MOBILE_WIDTH = 140
+-- Square Rankings shortcut (about the size of a standard close control).
+local REVIEW_RANKINGS_BTN_SIZE = 24
+local REVIEW_RANKINGS_BTN_INSET_X = 14
+local REVIEW_RANKINGS_BTN_INSET_Y = -10
+-- Keep the chart graphic inset inside the red button chrome (breathing room).
+local REVIEW_RANKINGS_ICON_INSET = 6
+-- Packaged chart icon: three separated horizontal ranking bars (ivory for gold tint).
+local REVIEW_RANKINGS_ICON =
+    "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\RaidSuppliesRankings.tga"
+-- WoW-style gold accent (matches Settings section/title accents) for contrast on red.
+local REVIEW_RANKINGS_ICON_R, REVIEW_RANKINGS_ICON_G, REVIEW_RANKINGS_ICON_B = 1.00, 0.82, 0.18
+local REVIEW_RANKINGS_ICON_PRESSED_R = 0.82
+local REVIEW_RANKINGS_ICON_PRESSED_G = 0.66
+local REVIEW_RANKINGS_ICON_PRESSED_B = 0.12
+-- Blizzard SharedXML red three-slice chrome (128-RedButton art kit).
+local REVIEW_RANKINGS_BTN_TEMPLATE = "SharedButtonExtraSmallTemplate"
+
+local function TintRankingsIcon(icon, pressed)
+    if not icon or not icon.SetVertexColor then
+        return
+    end
+    if pressed then
+        icon:SetVertexColor(
+            REVIEW_RANKINGS_ICON_PRESSED_R,
+            REVIEW_RANKINGS_ICON_PRESSED_G,
+            REVIEW_RANKINGS_ICON_PRESSED_B,
+            1
+        )
+    else
+        icon:SetVertexColor(
+            REVIEW_RANKINGS_ICON_R,
+            REVIEW_RANKINGS_ICON_G,
+            REVIEW_RANKINGS_ICON_B,
+            1
+        )
+    end
+end
+
+-- Same effective Rankings gate as Settings page `guildSuppliesRankings`
+-- (`available` / CanViewRankings): shared Guild Supplies canEdit, fail closed.
+function Runtime:CanViewRankingsShortcut()
+    local g = SF.GuildSupplies
+    if not g or type(g.GetCapabilities) ~= "function" then
+        return false
+    end
+    local caps = g:GetCapabilities()
+    return type(caps) == "table" and caps.canEdit == true
+end
+
+function Runtime:SyncRankingsShortcut()
+    local frame = self.review
+    local btn = frame and frame.RankingsButton
+    if not btn then
+        return
+    end
+    local show = self:CanViewRankingsShortcut()
+    if btn.SetShown then
+        btn:SetShown(show and true or false)
+    elseif show then
+        btn:Show()
+    else
+        btn:Hide()
+    end
+end
+
+-- Listen for the same access-change paths Rankings/Settings already use.
+-- No polling; SyncRankingsShortcut is a cheap canEdit + SetShown.
+function Runtime:EnsureRankingsShortcutWatch()
+    if self._rankingsShortcutWatch then
+        return
+    end
+    self._rankingsShortcutWatch = true
+
+    local function sync()
+        self:SyncRankingsShortcut()
+    end
+
+    local impersonation = SF.LootHelperImpersonation
+    if impersonation and type(impersonation.RegisterCallback) == "function" then
+        impersonation:RegisterCallback(sync)
+    end
+
+    local supplies = SF.GuildSupplies
+    if supplies and type(supplies.RegisterUIListener) == "function" then
+        supplies.RegisterUIListener(sync)
+    end
+
+    local officer = SF.GuildOfficer
+    if officer and type(officer.RegisterUIListener) == "function" then
+        officer.RegisterUIListener(sync)
+    end
+
+    if type(CreateFrame) == "function" then
+        local watch = CreateFrame("Frame")
+        self._rankingsAuthFrame = watch
+        if watch.RegisterEvent then
+            pcall(watch.RegisterEvent, watch, "GUILD_ROSTER_UPDATE")
+            pcall(watch.RegisterEvent, watch, "PLAYER_GUILD_UPDATE")
+        end
+        watch:SetScript("OnEvent", function()
+            sync()
+        end)
+    end
+end
+
+function Runtime:OpenRankingsFromReview()
+    -- Fail closed if access disappeared between show and click.
+    if not self:CanViewRankingsShortcut() then
+        self:SyncRankingsShortcut()
+        return
+    end
+    local win = SF.SettingsWindow
+    if win and type(win.ShowPage) == "function" then
+        -- Established Settings navigation; respects page availability.
+        -- Must not close the guild bank or Raid Supplies panel. Elevate Settings
+        -- to FULLSCREEN_DIALOG so the whole window clears bank-side chrome that
+        -- can sit at or above DIALOG (same-strata Raise is not enough in Retail).
+        if type(win.ElevateAboveBankChrome) == "function" then
+            win:ElevateAboveBankChrome()
+        end
+        win:ShowPage("guildSuppliesRankings")
+    end
+end
+
+local function PlaceRankingsIcon(icon, btn, pressed)
+    if not icon or not btn then
+        return
+    end
+    local inset = REVIEW_RANKINGS_ICON_INSET
+    local dx, dy = 0, 0
+    if pressed then
+        dx, dy = 1, -1
+    end
+    if icon.ClearAllPoints then
+        icon:ClearAllPoints()
+    end
+    if icon.SetPoint then
+        icon:SetPoint("TOPLEFT", btn, "TOPLEFT", inset + dx, -(inset) + dy)
+        icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -(inset) + dx, inset + dy)
+    elseif icon.SetAllPoints then
+        icon:SetAllPoints(btn)
+    end
+end
+
+local function BindRankingsScript(btn, script, fn, preferHook)
+    if not btn or type(fn) ~= "function" then
+        return
+    end
+    if preferHook and type(btn.HookScript) == "function" then
+        btn:HookScript(script, fn)
+        return
+    end
+    if type(btn.SetScript) == "function" then
+        btn:SetScript(script, fn)
+    end
+end
+
+local function ApplyRankingsRedChromeFallback(btn)
+    if not btn then
+        return
+    end
+    -- Approximate Blizzard's shared red action chrome when the template is unavailable.
+    if btn.SetBackdrop then
+        btn:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true,
+            tileSize = 8,
+            edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 },
+        })
+    end
+    if btn.SetBackdropColor then
+        btn:SetBackdropColor(0.45, 0.06, 0.06, 0.95)
+    end
+    if btn.SetBackdropBorderColor then
+        btn:SetBackdropBorderColor(0.85, 0.22, 0.18, 1)
+    end
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    if highlight.SetAllPoints then
+        highlight:SetAllPoints(btn)
+    end
+    if highlight.SetColorTexture then
+        highlight:SetColorTexture(1, 0.35, 0.28, 0.22)
+    end
+    btn.Highlight = highlight
+end
+
+function Runtime:EnsureRankingsShortcut(frame)
+    if not frame then
+        return nil
+    end
+    if frame.RankingsButton then
+        return frame.RankingsButton
+    end
+
+    -- Prefer Blizzard SharedXML red three-slice chrome (128-RedButton), the same
+    -- art kit behind SharedButton*Template / Talent red buttons.
+    local btn
+    local usedTemplate = false
+    if type(CreateFrame) == "function" then
+        local ok, created = pcall(CreateFrame, "Button", nil, frame, REVIEW_RANKINGS_BTN_TEMPLATE)
+        if ok and created then
+            btn = created
+            usedTemplate = true
+        end
+    end
+    if not btn then
+        btn = CreateFrame("Button", nil, frame, "BackdropTemplate")
+        ApplyRankingsRedChromeFallback(btn)
+    end
+
+    btn:SetSize(REVIEW_RANKINGS_BTN_SIZE, REVIEW_RANKINGS_BTN_SIZE)
+    btn:SetPoint(
+        "TOPRIGHT",
+        frame,
+        "TOPRIGHT",
+        -REVIEW_RANKINGS_BTN_INSET_X,
+        REVIEW_RANKINGS_BTN_INSET_Y
+    )
+    if btn.EnableMouse then
+        btn:EnableMouse(true)
+    end
+    if btn.RegisterForClicks then
+        btn:RegisterForClicks("LeftButtonUp")
+    end
+    if btn.SetText then
+        -- Shared red templates are text buttons; keep chrome and show only the chart.
+        btn:SetText("")
+    end
+    btn:Hide()
+    btn.__sfRankingsRedTemplate = usedTemplate and REVIEW_RANKINGS_BTN_TEMPLATE or "BackdropFallback"
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    if icon.SetTexture then
+        icon:SetTexture(REVIEW_RANKINGS_ICON)
+    end
+    if icon.SetTexCoord then
+        icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    end
+    PlaceRankingsIcon(icon, btn, false)
+    TintRankingsIcon(icon, false)
+    btn.Icon = icon
+
+    -- Hook mouse scripts so Blizzard three-slice pressed/highlight chrome still runs.
+    BindRankingsScript(btn, "OnMouseDown", function()
+        TintRankingsIcon(icon, true)
+        PlaceRankingsIcon(icon, btn, true)
+    end, true)
+    BindRankingsScript(btn, "OnMouseUp", function()
+        TintRankingsIcon(icon, false)
+        PlaceRankingsIcon(icon, btn, false)
+    end, true)
+    BindRankingsScript(btn, "OnEnter", function(owner)
+        if not GameTooltip then
+            return
+        end
+        GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+        GameTooltip:SetText(
+            Loc("RAID_SUPPLIES_OPEN_RANKINGS", "Open Raid Supplies Rankings"),
+            1,
+            1,
+            1
+        )
+        GameTooltip:Show()
+    end, true)
+    BindRankingsScript(btn, "OnLeave", function()
+        TintRankingsIcon(icon, false)
+        PlaceRankingsIcon(icon, btn, false)
+        if GameTooltip and GameTooltip.Hide then
+            GameTooltip:Hide()
+        end
+    end, true)
+    btn:SetScript("OnClick", function()
+        self:OpenRankingsFromReview()
+    end)
+
+    frame.RankingsButton = btn
+    self:EnsureRankingsShortcutWatch()
+    self:SyncRankingsShortcut()
+    return btn
+end
 
 -- Deposit/progress layout (default AcquireRow geometry). Call when a pooled row
 -- leaves Quick Withdraw item layout so edit/button/goal-met stay in panel.
@@ -1450,7 +1732,10 @@ function Runtime:EnsureReview()
     local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     title:SetPoint("TOP", frame, "TOP", 0, -12)
     title:SetText("Raid supplies")
+    frame.Title = title
     -- No X/close control: visibility follows Guild Bank + configured-tab lifecycle.
+    -- Officer Rankings shortcut (#466): top-right chart button; title stays centered.
+    self:EnsureRankingsShortcut(frame)
     local status = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     status:SetPoint("TOPLEFT", frame, "TOPLEFT", REVIEW_PAD_X, -34)
     status:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -REVIEW_PAD_X, -34)
@@ -1735,6 +2020,7 @@ function Runtime:ShowReview()
     end
     -- Realign only when the helper opens again; keep manual drag while visible.
     self:AlignReviewToGuildBank(not wasShown)
+    self:SyncRankingsShortcut()
     self:RebuildReview()
 end
 
@@ -1742,6 +2028,8 @@ function Runtime:RebuildReview()
     local frame = self:EnsureReview()
     if not frame:IsShown() then return end
     self:EnsureItemIconWatch()
+    -- Keep Rankings shortcut visibility aligned with canEdit (Preview / roster).
+    self:SyncRankingsShortcut()
     local collected = self:Collect()
     self:ClearRows()
     if not collected then return end

@@ -7,6 +7,11 @@ local GI = SF.GuildInfo
 
 local cachedSnapshot = nil
 local cachedGeneration = nil
+-- Session-local Assignments search pool (visible mains + visible alts).
+-- Built once per roster/relationship fingerprint; keystrokes only filter it.
+local cachedSearchPool = nil
+local cachedSearchPoolKey = nil
+local searchPoolRebuildCount = 0
 
 local function NormalizeName(name)
     local NU = SF.NameUtil
@@ -221,21 +226,28 @@ function GI.BuildRosterSnapshot()
         return nil, "not_a_member"
     end
 
-    function snap:Suggest(prefix, limit)
+    --- Prefix/substring name suggestions from the current roster.
+    -- Optional `predicate(row)` is applied before counting toward `limit` so
+    -- role eligibility (and similar filters) cannot hide later eligible matches
+    -- behind the visible-results cap (#470).
+    function snap:Suggest(prefix, limit, predicate)
         limit = math.max(1, math.min(tonumber(limit) or 12, 32))
         local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
         local out = {}
         if q == "" then
             return out
         end
+        local filter = type(predicate) == "function" and predicate or nil
         for i = 1, #self.members do
             local row = self.members[i]
             local nameLower = string.lower(row.nameRealm)
             local short = nameLower:match("^([^-]+)") or nameLower
             if nameLower:sub(1, #q) == q or short:sub(1, #q) == q or nameLower:find(q, 1, true) then
-                out[#out + 1] = row
-                if #out >= limit then
-                    break
+                if not filter or filter(row) then
+                    out[#out + 1] = row
+                    if #out >= limit then
+                        break
+                    end
                 end
             end
         end
@@ -267,6 +279,17 @@ end
 function GI.InvalidateRosterSnapshot()
     cachedSnapshot = nil
     cachedGeneration = nil
+    cachedSearchPool = nil
+    cachedSearchPoolKey = nil
+end
+
+--- Test/diagnostics: how many times the list-search pool was rebuilt.
+function GI.GetListSearchPoolRebuildCount()
+    return searchPoolRebuildCount
+end
+
+function GI.ResetListSearchPoolRebuildCount()
+    searchPoolRebuildCount = 0
 end
 
 --- Membership presentation status for a stored character.
@@ -413,3 +436,439 @@ function GI:GetAssignmentDisplayRows(roster)
     end
     return rows, nil, displayGroups
 end
+
+--- GUID set of characters currently assigned as alts (read-only projection).
+-- Includes alts of departed mains. Does not mutate durable state.
+function GI.GetAssignedAltGuidSet(record)
+    local set = {}
+    if type(record) ~= "table" or type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+        return set
+    end
+    for guid, info in pairs(record.graph.byGuid) do
+        if type(guid) == "string" and type(info) == "table" and info.role == "alt" then
+            set[guid] = info.mainGuid or true
+        end
+    end
+    return set
+end
+
+--- Eligible Main-panel rows for the two-column Assignments UI (#468).
+-- Rostered non-alts only. Incomplete/syncing roster yields no rows (never
+-- treat unknown as departed). Confirmed departed mains are absent because they
+-- are not rostered; their backend relationships are untouched.
+function GI:GetEligibleMainDisplayRows(roster)
+    roster = roster or GI.GetRosterSnapshot()
+    if not roster or not roster.complete then
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+
+    local groups, reason, record = GI:GetRelationshipGroups()
+    if reason == "generation_syncing" then
+        return {}, reason
+    end
+    if groups == nil and reason then
+        return {}, reason
+    end
+
+    local altSet = GI.GetAssignedAltGuidSet(record)
+    local rows = {}
+    local seen = {}
+    for i = 1, #(roster.members or {}) do
+        local member = roster.members[i]
+        local guid = member and member.guid
+        if type(guid) == "string" and guid ~= "" and not seen[guid] and not altSet[guid] then
+            seen[guid] = true
+            local nameRealm = member.nameRealm or guid
+            local classFile = member.classFile
+            rows[#rows + 1] = {
+                id = "main:" .. guid,
+                clusterId = guid,
+                role = "main",
+                guid = guid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile),
+                canRemove = false,
+                canAction = false,
+                sortKey = string.lower(nameRealm),
+            }
+        end
+    end
+    table.sort(rows, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    return rows, nil
+end
+
+--- Alts-panel rows for a selected main (#468).
+-- Only currently rostered alts of that main. Confirmed departed alts are
+-- omitted from the projection; unknown is never treated as departure.
+-- Empty table when no main is selected or the main has no visible alts.
+function GI:GetSelectedAltDisplayRows(mainGuid, roster)
+    roster = roster or GI.GetRosterSnapshot()
+    if type(mainGuid) ~= "string" or mainGuid == "" then
+        return {}, nil
+    end
+    if not roster or not roster.complete then
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+
+    local groups, reason, record = GI:GetRelationshipGroups()
+    if reason == "generation_syncing" then
+        return {}, reason
+    end
+    if groups == nil and reason then
+        return {}, reason
+    end
+
+    local caps = GI:GetCapabilities()
+    local canEdit = caps.canEdit and true or false
+
+    local altGuids = {}
+    local seenAlt = {}
+    if record and record.graph then
+        local group = record.graph.mains and record.graph.mains[mainGuid]
+        if group and type(group.altGuids) == "table" then
+            for i = 1, #group.altGuids do
+                local ag = group.altGuids[i]
+                if type(ag) == "string" and ag ~= "" and not seenAlt[ag] then
+                    seenAlt[ag] = true
+                    altGuids[#altGuids + 1] = ag
+                end
+            end
+        end
+        for guid, info in pairs(record.graph.byGuid or {}) do
+            if type(info) == "table" and info.role == "alt" and info.mainGuid == mainGuid then
+                if type(guid) == "string" and guid ~= "" and not seenAlt[guid] then
+                    seenAlt[guid] = true
+                    altGuids[#altGuids + 1] = guid
+                end
+            end
+        end
+    end
+
+    local rows = {}
+    for i = 1, #altGuids do
+        local ag = altGuids[i]
+        local status, _, memberRow = GI.GetMembershipStatus(ag, roster, record)
+        if status == "in_guild" and memberRow then
+            local nameRealm = memberRow.nameRealm or ag
+            local classFile = memberRow.classFile
+            rows[#rows + 1] = {
+                id = "alt:" .. ag,
+                clusterId = mainGuid,
+                role = "alt",
+                guid = ag,
+                mainGuid = mainGuid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile),
+                canRemove = canEdit,
+                canAction = canEdit,
+                sortKey = string.lower(nameRealm),
+            }
+        elseif status == "unknown" then
+            -- Incomplete roster path: show truthful unknown, never as departed.
+            local nameRealm, classFile = ag, nil
+            if record and record.characters and record.characters[ag] then
+                nameRealm = record.characters[ag].nameRealm or nameRealm
+                classFile = record.characters[ag].classFile
+            end
+            rows[#rows + 1] = {
+                id = "alt:" .. ag,
+                clusterId = mainGuid,
+                role = "alt",
+                guid = ag,
+                mainGuid = mainGuid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                text = GI.ColorizeName(nameRealm, classFile) .. " " .. LocStatus("unknown"),
+                canRemove = canEdit,
+                canAction = false,
+                sortKey = string.lower(nameRealm),
+            }
+        end
+        -- status == "departed": hidden in this UI only; backend relationship retained.
+    end
+    table.sort(rows, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    return rows, nil
+end
+
+--- True when guid is still an eligible Main-panel selection.
+function GI:IsEligibleMainSelection(guid, roster)
+    if type(guid) ~= "string" or guid == "" then
+        return false
+    end
+    local rows = GI:GetEligibleMainDisplayRows(roster)
+    for i = 1, #rows do
+        if rows[i].guid == guid then
+            return true
+        end
+    end
+    return false
+end
+
+local function ListSearchPoolKey(roster, record, groupsReason)
+    local gen = cachedGeneration
+    if gen == nil then
+        local GG = SF.GuildGossip
+        gen = (GG and GG.GetGuildGeneration and GG.GetGuildGeneration()) or 0
+    end
+    local rev = record and tonumber(record.revision) or 0
+    local contentFp = record and record.baseline and record.baseline.contentFp or ""
+    local club = roster and (roster.guildKey or roster.clubId) or ""
+    local complete = roster and roster.complete and "1" or "0"
+    return table.concat({
+        tostring(gen),
+        tostring(complete),
+        tostring(club),
+        tostring(groupsReason or ""),
+        tostring(rev),
+        tostring(contentFp),
+    }, "|")
+end
+
+--- Build the unfiltered visible Main+Alt search pool once for a fingerprint.
+-- Mirrors GetEligibleMainDisplayRows + GetSelectedAltDisplayRows semantics with
+-- a single GetRelationshipGroups / record capture (no per-group revalidation).
+-- Caller supplies already-validated `groups`/`record` from one readiness peek.
+local function BuildListSearchPool(roster, groups, record)
+    if not roster or not roster.complete then
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+    if type(groups) ~= "table" then
+        return {}, "not_ready"
+    end
+
+    local candidates = {}
+    local seen = {}
+    -- Mains eligible for the Main panel in this same pass. Alts whose linked
+    -- main is absent (e.g. departed) stay out of the search UI without mutating
+    -- the underlying relationship record.
+    local visibleMainGuids = {}
+
+    -- Visible mains: rostered non-alts (same as GetEligibleMainDisplayRows).
+    local altSet = GI.GetAssignedAltGuidSet(record)
+    for i = 1, #(roster.members or {}) do
+        local member = roster.members[i]
+        local guid = member and member.guid
+        if type(guid) == "string" and guid ~= "" and not seen[guid] and not altSet[guid] then
+            seen[guid] = true
+            visibleMainGuids[guid] = true
+            local nameRealm = member.nameRealm or guid
+            local classFile = member.classFile
+            candidates[#candidates + 1] = {
+                value = guid,
+                guid = guid,
+                nameRealm = nameRealm,
+                classFile = classFile,
+                role = "main",
+                mainGuid = guid,
+                label = GI.ColorizeName(nameRealm, classFile),
+                text = nameRealm,
+                sortKey = string.lower(nameRealm),
+            }
+        end
+    end
+
+    -- Visible alts: one pass over relationship groups using the shared record.
+    -- Only include alts whose associated main is still a visible Main-panel row.
+    if type(groups) == "table" then
+        for i = 1, #groups do
+            local group = groups[i]
+            local mainGuid = group and group.mainGuid
+            if type(mainGuid) == "string" and mainGuid ~= "" and visibleMainGuids[mainGuid] then
+                local altGuids = {}
+                local seenAlt = {}
+                if type(group.altGuids) == "table" then
+                    for j = 1, #group.altGuids do
+                        local ag = group.altGuids[j]
+                        if type(ag) == "string" and ag ~= "" and not seenAlt[ag] then
+                            seenAlt[ag] = true
+                            altGuids[#altGuids + 1] = ag
+                        end
+                    end
+                end
+                if record and record.graph and type(record.graph.byGuid) == "table" then
+                    for guid, info in pairs(record.graph.byGuid) do
+                        if type(info) == "table" and info.role == "alt" and info.mainGuid == mainGuid then
+                            if type(guid) == "string" and guid ~= "" and not seenAlt[guid] then
+                                seenAlt[guid] = true
+                                altGuids[#altGuids + 1] = guid
+                            end
+                        end
+                    end
+                end
+                for j = 1, #altGuids do
+                    local ag = altGuids[j]
+                    if not seen[ag] then
+                        local status, _, memberRow = GI.GetMembershipStatus(ag, roster, record)
+                        if status == "in_guild" and memberRow then
+                            seen[ag] = true
+                            local nameRealm = memberRow.nameRealm or ag
+                            local classFile = memberRow.classFile
+                            candidates[#candidates + 1] = {
+                                value = ag,
+                                guid = ag,
+                                nameRealm = nameRealm,
+                                classFile = classFile,
+                                role = "alt",
+                                mainGuid = mainGuid,
+                                label = GI.ColorizeName(nameRealm, classFile),
+                                text = nameRealm,
+                                sortKey = string.lower(nameRealm),
+                            }
+                        elseif status == "unknown" then
+                            -- Incomplete roster path: show truthful unknown, never as departed.
+                            seen[ag] = true
+                            local nameRealm, classFile = ag, nil
+                            if record and record.characters and record.characters[ag] then
+                                nameRealm = record.characters[ag].nameRealm or nameRealm
+                                classFile = record.characters[ag].classFile
+                            end
+                            candidates[#candidates + 1] = {
+                                value = ag,
+                                guid = ag,
+                                nameRealm = nameRealm,
+                                classFile = classFile,
+                                role = "alt",
+                                mainGuid = mainGuid,
+                                label = GI.ColorizeName(nameRealm, classFile) .. " " .. LocStatus("unknown"),
+                                text = nameRealm,
+                                sortKey = string.lower(nameRealm),
+                            }
+                        end
+                        -- status == "departed": hidden in this UI only.
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.sortKey < b.sortKey
+    end)
+    return candidates, nil
+end
+
+local function GetOrBuildListSearchPool(roster)
+    roster = roster or GI.GetRosterSnapshot()
+    if not roster or not roster.complete then
+        cachedSearchPool = nil
+        cachedSearchPoolKey = nil
+        return {}, (roster and roster.reason) or "roster_incomplete"
+    end
+
+    -- One relationship readiness capture per pool build/reuse check.
+    local groups, reason, record = GI:GetRelationshipGroups()
+    if reason == "generation_syncing" then
+        cachedSearchPool = nil
+        cachedSearchPoolKey = nil
+        return {}, reason
+    end
+    if groups == nil and reason then
+        cachedSearchPool = nil
+        cachedSearchPoolKey = nil
+        return {}, reason
+    end
+
+    local key = ListSearchPoolKey(roster, record, reason)
+    if cachedSearchPool and cachedSearchPoolKey == key then
+        return cachedSearchPool, nil
+    end
+
+    local candidates, buildReason = BuildListSearchPool(roster, groups, record)
+    if buildReason then
+        cachedSearchPool = nil
+        cachedSearchPoolKey = nil
+        return {}, buildReason
+    end
+    cachedSearchPool = candidates
+    cachedSearchPoolKey = key
+    searchPoolRebuildCount = searchPoolRebuildCount + 1
+    return cachedSearchPool, nil
+end
+
+--- Assignments list-search candidates: visible mains + visible alts (#UI).
+-- Uses a session-local pool rebuilt only when roster/relationship fingerprints
+-- change. Per-keystroke work is prefix filter + result cap only. Requires a
+-- non-whitespace `prefix` (empty/whitespace ⇒ no suggestions). Preserves
+-- departed-member hiding and incomplete-roster/readiness handling. Session UI
+-- only — never mutates relationships.
+function GI:GetListSearchCandidates(roster, prefix, limit)
+    roster = roster or GI.GetRosterSnapshot()
+    limit = math.max(1, math.min(tonumber(limit) or 48, 64))
+    local q = type(prefix) == "string" and string.lower(strtrim(prefix)) or ""
+    -- Autocomplete UX: do not dump the full roster on empty focus/clear.
+    if q == "" then
+        return {}, nil
+    end
+
+    local pool, poolReason = GetOrBuildListSearchPool(roster)
+    if poolReason then
+        return {}, poolReason
+    end
+    if type(pool) ~= "table" then
+        return {}, nil
+    end
+
+    local out = {}
+    for i = 1, #pool do
+        local row = pool[i]
+        local nameRealm = row and row.nameRealm
+        if type(nameRealm) == "string" then
+            local nameLower = string.lower(nameRealm)
+            local short = nameLower:match("^([^-]+)") or nameLower
+            if nameLower:sub(1, #q) == q
+                or short:sub(1, #q) == q
+                or nameLower:find(q, 1, true) ~= nil then
+                out[#out + 1] = row
+                if #out >= limit then
+                    break
+                end
+            end
+        end
+    end
+    return out, nil
+end
+
+--- Resolve a list-search selection to the main to display and optional alt highlight.
+-- Returns mainGuid, highlightAltGuid|nil, status ("ok"|"not_visible"|"invalid").
+-- Does not mutate durable Guild Info state.
+function GI:ResolveListSearchSelection(guid, roster)
+    if type(guid) ~= "string" or guid == "" then
+        return nil, nil, "invalid"
+    end
+    roster = roster or GI.GetRosterSnapshot()
+
+    local role, linkedMain = GI:GetCharacterRole(guid)
+    if role == "alt" then
+        local mainGuid = linkedMain
+        if type(mainGuid) ~= "string" or mainGuid == "" then
+            return nil, nil, "not_visible"
+        end
+        -- Recheck main visibility at selection time so stale suggestions whose
+        -- main has since left the Main panel cannot focus an invisible group.
+        if not GI:IsEligibleMainSelection(mainGuid, roster) then
+            return nil, nil, "not_visible"
+        end
+        -- Prefer showing the alt when it is still in the selected-main projection.
+        local alts = GI:GetSelectedAltDisplayRows(mainGuid, roster)
+        for i = 1, #(alts or {}) do
+            if alts[i].guid == guid then
+                return mainGuid, guid, "ok"
+            end
+        end
+        -- Departed/hidden alt: still focus the associated eligible main.
+        return mainGuid, nil, "ok"
+    end
+
+    -- Main-with-alts, solo/unassigned eligible main, or any other Main-panel row.
+    if GI:IsEligibleMainSelection(guid, roster) then
+        return guid, nil, "ok"
+    end
+    return nil, nil, "not_visible"
+end
+

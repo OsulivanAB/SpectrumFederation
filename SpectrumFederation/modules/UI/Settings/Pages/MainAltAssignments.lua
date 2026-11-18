@@ -8,6 +8,18 @@ local function Loc(key, default)
 	return default or key
 end
 
+local function DebugInfo(fmt, ...)
+	if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+		SF.Debug:Info("GUILD_INFO", fmt, ...)
+	end
+end
+
+local function DebugWarn(fmt, ...)
+	if SF.Debug and SF.Debug.Warn and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+		SF.Debug:Warn("GUILD_INFO", fmt, ...)
+	end
+end
+
 SF.SettingsUI:RegisterCategory({
 	id = "guildInfo",
 	name = Loc("GUILD_INFO_CATEGORY_NAME", "Guild Settings"),
@@ -45,8 +57,12 @@ local mainText = ""
 local altText = ""
 local mainResolved = nil -- { guid, nameRealm, classFile }
 local altResolved = nil
-local selectedGroupMainGuid = nil
-local changeMainCandidate = nil
+local selectedMainGuid = nil -- ephemeral Main-panel selection (#468)
+-- Assignments list search (session-only; never mutates relationships).
+local listSearchText = ""
+local listSearchFilterMainGuid = nil -- when set, Main panel shows only this main
+local listSearchHighlightAltGuid = nil -- when set, Alts panel highlights this alt
+local listSearchStatus = nil -- optional banner after unresolved/empty selection
 
 local function BeginRenderPass()
 	passCache = {}
@@ -178,18 +194,77 @@ local function ReportStatus(ctx, status, reason, extra)
 	RefreshPageControls()
 end
 
-local function SuggestionItems(prefix)
+--- Role classification from an already-validated Guild Info record (#470/#472).
+-- Mirrors GI:GetCharacterRole solo-main semantics without re-entering
+-- GetCurrentRecord / ValidateGuildRecord per candidate.
+-- nil record (ready + not_configured) ⇒ every GUID is unassigned.
+local function RoleFromValidatedRecord(record, guid)
+	if type(guid) ~= "string" or guid == "" then
+		return nil
+	end
+	if not record or type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+		return nil
+	end
+	local info = record.graph.byGuid[guid]
+	if not info then
+		return nil
+	end
+	-- Solo main (no alts) is not a displayed relationship role.
+	if info.role == "main" then
+		local mainGroup = record.graph.mains and record.graph.mains[guid]
+		if not mainGroup or #(mainGroup.altGuids or {}) == 0 then
+			return nil
+		end
+	end
+	return info.role, info.mainGuid
+end
+
+--- Autocomplete suggestions for the Main or Alt field (#470).
+-- `field` is "main" or "alt". Role eligibility uses the Guild Info graph and is
+-- applied before the visible-results cap. Relationship readiness/validation is
+-- captured once per request; candidates use the validated record's graph.
+local function SuggestionItems(prefix, field)
 	local g = GI()
 	local roster = Roster()
 	if not roster or not roster.complete or not roster.Suggest then
 		return {}
 	end
-	local rows = roster:Suggest(prefix, 10)
+	-- Fail closed while relationship readiness is unknown/syncing; do not treat
+	-- missing roles as unassigned. ready + nil record is empty/unconfigured and
+	-- keeps every roster candidate eligible as unassigned.
+	if not g or not g.GetRelationshipReadiness then
+		return {}
+	end
+	local readiness, record = g:GetRelationshipReadiness()
+	if readiness ~= "ready" then
+		return {}
+	end
+
+	local excludeGuid = nil
+	if field == "main" and altResolved and altResolved.guid then
+		excludeGuid = altResolved.guid
+	elseif field == "alt" and mainResolved and mainResolved.guid then
+		excludeGuid = mainResolved.guid
+	end
+
+	local rows = roster:Suggest(prefix, 10, function(row)
+		if excludeGuid and row.guid == excludeGuid then
+			return false
+		end
+		-- "main" = main with ≥1 alts; "alt" = assigned alt;
+		-- nil = unassigned or solo main (eligible for both fields).
+		local role = RoleFromValidatedRecord(record, row.guid)
+		if field == "main" then
+			return role ~= "alt"
+		end
+		return role ~= "main"
+	end)
+
 	local out = {}
 	for i = 1, #rows do
 		local row = rows[i]
 		local label = row.nameRealm
-		if g and g.ColorizeName then
+		if g.ColorizeName then
 			label = g.ColorizeName(row.nameRealm, row.classFile)
 		end
 		out[#out + 1] = {
@@ -317,34 +392,180 @@ local function DoAssign(ctx, moveConfirmed, expectedOldMain)
 	ReportStatus(ctx, status, reason)
 end
 
-local function ChangeMainOptions()
+--- Keep Main selection valid after roster/relationship updates (#468).
+local function NormalizeMainSelection(roster)
 	local g = GI()
-	local roster = Roster()
-	local opts = {}
-	if not selectedGroupMainGuid or not g then
-		return opts
-	end
-	local _, _, displayGroups = g:GetAssignmentDisplayRows(roster)
-	if type(displayGroups) ~= "table" then
-		return opts
-	end
-	for i = 1, #displayGroups do
-		local group = displayGroups[i]
-		if group.mainGuid == selectedGroupMainGuid then
-			for j = 1, #group.alts do
-				local a = group.alts[j]
-				if a.status == "in_guild" then
-					local label = a.nameRealm
-					if g.ColorizeName then
-						label = g.ColorizeName(a.nameRealm, a.classFile)
-					end
-					opts[#opts + 1] = { value = a.guid, label = label }
-				end
-			end
-			break
+	if selectedMainGuid then
+		if not (g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(selectedMainGuid, roster)) then
+			selectedMainGuid = nil
 		end
 	end
-	return opts
+	-- Drop search filter/highlight when the focused main is no longer eligible.
+	if listSearchFilterMainGuid then
+		if not (g and g.IsEligibleMainSelection and g:IsEligibleMainSelection(listSearchFilterMainGuid, roster)) then
+			listSearchFilterMainGuid = nil
+			listSearchHighlightAltGuid = nil
+		elseif listSearchHighlightAltGuid then
+			-- Drop alt highlight if that alt is no longer under the filtered main.
+			local stillVisible = false
+			if g and g.GetSelectedAltDisplayRows then
+				local alts = g:GetSelectedAltDisplayRows(listSearchFilterMainGuid, roster)
+				for i = 1, #(alts or {}) do
+					if alts[i].guid == listSearchHighlightAltGuid then
+						stillVisible = true
+						break
+					end
+				end
+			end
+			if not stillVisible then
+				listSearchHighlightAltGuid = nil
+			end
+		end
+	end
+end
+
+local function ClearListSearch(opts)
+	opts = opts or {}
+	listSearchText = ""
+	listSearchFilterMainGuid = nil
+	listSearchHighlightAltGuid = nil
+	listSearchStatus = nil
+	if opts.refresh ~= false then
+		QueueFormRefresh()
+	end
+end
+
+--- Apply a list-search suggestion without mutating Guild Info relationships.
+local function ApplyListSearchSelection(item)
+	local g = GI()
+	if not item or not item.guid or not g or not g.ResolveListSearchSelection then
+		listSearchStatus = Loc(
+			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
+			"That character has no visible Main/Alt group right now."
+		)
+		DebugWarn(
+			"List search selection rejected: invalid item (guid=%s)",
+			tostring(item and item.guid)
+		)
+		QueueFormRefresh()
+		return
+	end
+	local mainGuid, highlightAlt, status = g:ResolveListSearchSelection(item.guid, Roster())
+	if status ~= "ok" or not mainGuid then
+		listSearchFilterMainGuid = nil
+		listSearchHighlightAltGuid = nil
+		listSearchStatus = Loc(
+			"GUILD_INFO_LIST_SEARCH_NO_GROUP",
+			"That character has no visible Main/Alt group right now."
+		)
+		DebugWarn(
+			"List search selection not visible: guid=%s status=%s",
+			tostring(item.guid),
+			tostring(status or "unknown")
+		)
+		QueueFormRefresh()
+		return
+	end
+	listSearchText = item.nameRealm or item.text or listSearchText
+	listSearchFilterMainGuid = mainGuid
+	listSearchHighlightAltGuid = highlightAlt
+	selectedMainGuid = mainGuid
+	listSearchStatus = nil
+	if highlightAlt then
+		DebugInfo(
+			"List search selected alt guid=%s → main=%s",
+			tostring(item.guid),
+			tostring(mainGuid)
+		)
+	else
+		DebugInfo(
+			"List search selected main guid=%s",
+			tostring(mainGuid)
+		)
+	end
+	QueueFormRefresh()
+end
+
+local function ListSearchSuggestions(prefix)
+	local g = GI()
+	if not g or not g.GetListSearchCandidates then
+		return {}
+	end
+	local rows = g:GetListSearchCandidates(Roster(), prefix, 48)
+	return rows or {}
+end
+
+local function CopyCharacterName(ctx, item)
+	if not item then
+		return
+	end
+	local nameRealm = item.nameRealm
+	if type(nameRealm) ~= "string" or nameRealm == "" then
+		return
+	end
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local message = Loc(
+		"GUILD_INFO_COPY_NAME_PROMPT",
+		"Press Ctrl+C to copy this character name (addons cannot write the clipboard on Retail)."
+	)
+	local closeText = Loc("GUILD_INFO_COPY_NAME_CLOSE", "Close")
+	if dialogs and dialogs.ShowCopyableText then
+		dialogs:ShowCopyableText(message, nameRealm, closeText)
+		return
+	end
+	-- Fallback for harnesses without StaticPopup: reuse Prompt highlight path.
+	if dialogs and dialogs.Prompt then
+		dialogs:Prompt(message, closeText, nameRealm, function() end)
+		return
+	end
+	if ctx and ctx.section and ctx.section.SetMessage then
+		ctx.section:SetMessage(nameRealm, "info")
+	end
+end
+
+local function PromoteAltToMain(ctx, altItem)
+	local gi = GI()
+	if not gi or not gi.ChangeMain then
+		return
+	end
+	if not altItem or altItem.role ~= "alt" or not altItem.guid or not altItem.mainGuid then
+		return
+	end
+	local oldMain = altItem.mainGuid
+	local newMain = altItem.guid
+	local record = select(1, gi:GetCurrentRecord())
+	local r = Roster()
+	local msg = Loc("GUILD_INFO_CHANGE_MAIN_CONFIRM",
+		"Promote %s to main? %s becomes an alt; all other alts stay in the group."):format(
+		CharacterLabel(newMain, record, r),
+		CharacterLabel(oldMain, record, r)
+	)
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local function commit()
+		-- Revalidate roster at confirm time; the dialog may outlive
+		-- the render-pass snapshot if the candidate leaves the guild.
+		if gi.InvalidateRosterSnapshot then
+			gi.InvalidateRosterSnapshot()
+		end
+		local freshRoster = gi.GetRosterSnapshot and gi.GetRosterSnapshot(true) or nil
+		if not freshRoster or not freshRoster.complete then
+			ReportStatus(ctx, "rejected",
+				(freshRoster and freshRoster.reason) or "roster_incomplete")
+			return
+		end
+		local status, reason = gi:ChangeMain(oldMain, newMain, {
+			roster = freshRoster,
+		})
+		if status == "accepted" then
+			selectedMainGuid = newMain
+		end
+		ReportStatus(ctx, status, reason)
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(msg, Loc("GUILD_INFO_PROMOTE_BUTTON", "Promote"), commit)
+	else
+		commit()
+	end
 end
 
 local function AccessStatusText()
@@ -651,7 +872,7 @@ local function Definition()
 							mainText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or mainText)
+							return SuggestionItems(prefix or mainText, "main")
 						end,
 						onResolved = function(_, item)
 							if item then
@@ -686,7 +907,7 @@ local function Definition()
 							altText = tostring(v or "")
 						end,
 						getSuggestions = function(_, prefix)
-							return SuggestionItems(prefix or altText)
+							return SuggestionItems(prefix or altText, "alt")
 						end,
 						onResolved = function(_, item)
 							if item then
@@ -730,126 +951,192 @@ local function Definition()
 				title = Loc("GUILD_INFO_SECTION_LIST", "Assignments"),
 				items = {
 					{
-						type = "scrollList",
-						label = Loc("GUILD_INFO_LIST_LABEL", "Mains and alts"),
-						height = 220,
-						border = true,
-						enabled = function()
-							return Caps().canRead
+						type = "display",
+						label = Loc("GUILD_INFO_LIST_SEARCH_STATUS_LABEL", "Search"),
+						visible = function()
+							return type(listSearchStatus) == "string" and listSearchStatus ~= ""
 						end,
-						getItems = function()
-							local gi = GI()
-							if not gi or not gi.GetAssignmentDisplayRows then
-								return {}
-							end
-							local rows = gi:GetAssignmentDisplayRows(Roster())
-							return rows or {}
-						end,
-						getSelectedKey = function()
-							return selectedGroupMainGuid
-						end,
-						onSelect = function(_, item)
-							if item and item.clusterId then
-								selectedGroupMainGuid = item.clusterId
-								changeMainCandidate = nil
-								RefreshPageControls()
-							end
-						end,
-						onRemove = function(ctx, item)
-							if not item or item.role ~= "alt" or not item.guid then
-								return
-							end
-							local gi = GI()
-							if not gi or not gi.UnassignAlt then
-								return
-							end
-							-- Capture the displayed relationship for stale confirmation.
-							local expectedMainGuid = item.mainGuid
-							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-							local msg = Loc("GUILD_INFO_UNASSIGN_CONFIRM",
-								"Unassign this alt from its main?")
-							local function commit()
-								local status, reason = gi:UnassignAlt(item.guid, {
-									expectedMainGuid = expectedMainGuid,
-								})
-								ReportStatus(ctx, status, reason)
-							end
-							if dialogs and dialogs.Confirm then
-								dialogs:Confirm(msg, Loc("GUILD_INFO_UNASSIGN_BUTTON", "Unassign"), commit)
-							else
-								commit()
-							end
+						get = function()
+							return listSearchStatus or ""
 						end,
 					},
 					{
-						type = "dropdown",
-						label = Loc("GUILD_INFO_CHANGE_MAIN_FIELD", "New main (selected group)"),
-						defaultText = Loc("GUILD_INFO_CHANGE_MAIN_DEFAULT", "Select a rostered alt"),
+						type = "autocomplete",
+						label = Loc("GUILD_INFO_LIST_SEARCH", "Find character"),
+						hint = Loc(
+							"GUILD_INFO_LIST_SEARCH_HINT",
+							"Type to search mains and alts"
+						),
+						width = 240,
+						maxLetters = 96,
+						maxSuggestions = 48,
+						maxDropdownHeight = 220,
+						emptySuggestionsText = Loc(
+							"GUILD_INFO_LIST_SEARCH_NO_MATCH",
+							"No matching mains or alts."
+						),
 						enabled = function()
-							return Caps().canEdit and selectedGroupMainGuid ~= nil and #ChangeMainOptions() > 0
+							return Caps().canRead
 						end,
 						get = function()
-							return changeMainCandidate
+							return listSearchText
 						end,
 						set = function(v)
-							changeMainCandidate = v
-							QueueFormRefresh()
+							listSearchText = tostring(v or "")
 						end,
-						options = function()
-							return ChangeMainOptions()
+						getSuggestions = function(_, prefix)
+							return ListSearchSuggestions(prefix or listSearchText)
+						end,
+						onResolved = function(_, item)
+							if item and item.guid then
+								ApplyListSearchSelection(item)
+							end
+						end,
+						onTextChanged = function(_, text)
+							listSearchText = text or ""
+							-- Typing only filters the dropdown; lists change on select/clear.
+							listSearchStatus = nil
+							QueueFormRefresh()
 						end,
 					},
 					{
 						type = "button",
-						label = Loc("GUILD_INFO_CHANGE_MAIN_LABEL", "Change Main"),
-						buttonText = Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"),
+						label = Loc("GUILD_INFO_LIST_SEARCH_CLEAR_LABEL", "Clear search"),
+						buttonText = Loc("GUILD_INFO_LIST_SEARCH_CLEAR", "Clear"),
+						width = 100,
 						enabled = function()
-							return Caps().canEdit
-								and selectedGroupMainGuid ~= nil
-								and changeMainCandidate ~= nil
+							return listSearchText ~= ""
+								or listSearchFilterMainGuid ~= nil
+								or listSearchHighlightAltGuid ~= nil
 						end,
-						onClick = function(ctx)
-							local gi = GI()
-							if not gi or not gi.ChangeMain then
-								return
-							end
-							local oldMain = selectedGroupMainGuid
-							local newMain = changeMainCandidate
-							local record = select(1, gi:GetCurrentRecord())
-							local r = Roster()
-							local msg = Loc("GUILD_INFO_CHANGE_MAIN_CONFIRM",
-								"Promote %s to main? %s becomes an alt; all other alts stay in the group."):format(
-								CharacterLabel(newMain, record, r),
-								CharacterLabel(oldMain, record, r)
-							)
-							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-							local function commit()
-								-- Revalidate roster at confirm time; the dialog may outlive
-								-- the render-pass snapshot if the candidate leaves the guild.
-								if gi.InvalidateRosterSnapshot then
-									gi.InvalidateRosterSnapshot()
+						onClick = function()
+							ClearListSearch()
+						end,
+					},
+					{
+						type = "sideBySideScrollLists",
+						panelHeight = 220,
+						gap = 12,
+						enabled = function()
+							return Caps().canRead
+						end,
+						left = {
+							title = Loc("GUILD_INFO_PANEL_MAIN", "Main"),
+							border = true,
+							resize = false,
+							height = 220,
+							compactColumns = true,
+							removeColumnGap = 6,
+							copyTooltip = Loc(
+								"GUILD_INFO_COPY_NAME_TIP",
+								"Copy Name-Realm"
+							),
+							getItems = function()
+								local gi = GI()
+								if not gi or not gi.GetEligibleMainDisplayRows then
+									return {}
 								end
-								local freshRoster = gi.GetRosterSnapshot and gi.GetRosterSnapshot(true) or nil
-								if not freshRoster or not freshRoster.complete then
-									ReportStatus(ctx, "rejected",
-										(freshRoster and freshRoster.reason) or "roster_incomplete")
+								local roster = Roster()
+								NormalizeMainSelection(roster)
+								local rows = gi:GetEligibleMainDisplayRows(roster) or {}
+								if not listSearchFilterMainGuid then
+									return rows
+								end
+								local filtered = {}
+								for i = 1, #rows do
+									if rows[i].guid == listSearchFilterMainGuid then
+										filtered[#filtered + 1] = rows[i]
+									end
+								end
+								return filtered
+							end,
+							getSelectedKey = function()
+								return selectedMainGuid
+							end,
+							onSelect = function(_, item)
+								if item and item.guid then
+									selectedMainGuid = item.guid
+									-- Manual Main click clears alt highlight but keeps
+									-- an active search filter only when it still matches.
+									listSearchHighlightAltGuid = nil
+									if listSearchFilterMainGuid
+										and listSearchFilterMainGuid ~= item.guid then
+										listSearchFilterMainGuid = nil
+										listSearchText = ""
+									end
+									-- Selection-only: refresh controls without roster rescan.
+									RefreshPageControls()
+								end
+							end,
+							onCopy = function(ctx, item)
+								CopyCharacterName(ctx, item)
+							end,
+						},
+						right = {
+							title = Loc("GUILD_INFO_PANEL_ALTS", "Alts"),
+							border = true,
+							resize = false,
+							height = 220,
+							compactColumns = true,
+							removeColumnGap = 6,
+							actionColumnGap = 6,
+							actionTexture = "Interface\\AddOns\\SpectrumFederation\\media\\Icons\\PromoteUpArrow.tga",
+							actionTooltip = Loc("GUILD_INFO_PROMOTE_TIP", "Promote this alt to Main"),
+							copyTooltip = Loc(
+								"GUILD_INFO_COPY_NAME_TIP",
+								"Copy Name-Realm"
+							),
+							emptyText = function()
+								if not selectedMainGuid then
+									return Loc("GUILD_INFO_ALTS_SELECT_MAIN",
+										"Select a main to view its alts.")
+								end
+								return Loc("GUILD_INFO_ALTS_EMPTY",
+									"No assigned alts.")
+							end,
+							getItems = function()
+								local gi = GI()
+								if not selectedMainGuid or not gi or not gi.GetSelectedAltDisplayRows then
+									return {}
+								end
+								local rows = gi:GetSelectedAltDisplayRows(selectedMainGuid, Roster())
+								return rows or {}
+							end,
+							getSelectedKey = function()
+								return listSearchHighlightAltGuid
+							end,
+							onAction = function(ctx, item)
+								PromoteAltToMain(ctx, item)
+							end,
+							onRemove = function(ctx, item)
+								if not item or item.role ~= "alt" or not item.guid then
 									return
 								end
-								local status, reason = gi:ChangeMain(oldMain, newMain, {
-									roster = freshRoster,
-								})
-								if status == "accepted" then
-									selectedGroupMainGuid = newMain
-									changeMainCandidate = nil
+								local gi = GI()
+								if not gi or not gi.UnassignAlt then
+									return
 								end
-								ReportStatus(ctx, status, reason)
-							end
-							if dialogs and dialogs.Confirm then
-								dialogs:Confirm(msg, Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"), commit)
-							else
-								commit()
-							end
-						end,
+								-- Capture the displayed relationship for stale confirmation.
+								local expectedMainGuid = item.mainGuid
+								local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+								local msg = Loc("GUILD_INFO_UNASSIGN_CONFIRM",
+									"Unassign this alt from its main?")
+								local function commit()
+									local status, reason = gi:UnassignAlt(item.guid, {
+										expectedMainGuid = expectedMainGuid,
+									})
+									ReportStatus(ctx, status, reason)
+								end
+								if dialogs and dialogs.Confirm then
+									dialogs:Confirm(msg, Loc("GUILD_INFO_UNASSIGN_BUTTON", "Unassign"), commit)
+								else
+									commit()
+								end
+							end,
+							onCopy = function(ctx, item)
+								CopyCharacterName(ctx, item)
+							end,
+						},
 					},
 				},
 			},
@@ -972,6 +1259,11 @@ function Page:Build(panel)
 		panel:HookScript("OnShow", function()
 			QueueRefresh()
 		end)
+		-- StandaloneWindow hides the panel on page switch without dispatching
+		-- Page:OnHide; hook the real panel lifecycle so search state resets.
+		panel:HookScript("OnHide", function()
+			Page:OnHide()
+		end)
 	end
 end
 
@@ -991,6 +1283,9 @@ end
 function Page:OnHide()
 	refreshQueued = false
 	rosterInvalidatePending = false
+	-- Drop ephemeral search filter when leaving the page; relationships untouched.
+	-- refresh=false: do not schedule control refresh while the panel is hidden.
+	ClearListSearch({ refresh = false })
 end
 
 EnsureRosterListener()

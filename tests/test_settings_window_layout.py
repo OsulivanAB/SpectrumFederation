@@ -14,7 +14,17 @@ OPACITY_TESTS = REPO_ROOT / "tests" / "lua" / "settings_window_opacity_tests.lua
 SECTION_LAYOUT_TESTS = REPO_ROOT / "tests" / "lua" / "settings_section_layout_tests.lua"
 LOG_TABLE_TESTS = REPO_ROOT / "tests" / "lua" / "settings_log_table_tests.lua"
 OPAQUE_MENU_TESTS = REPO_ROOT / "tests" / "lua" / "opaque_menu_style_tests.lua"
+AUTOCOMPLETE_TESTS = REPO_ROOT / "tests" / "lua" / "settings_autocomplete_tests.lua"
 WINDOW = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "StandaloneWindow.lua"
+CONTROLS = (
+    REPO_ROOT
+    / "SpectrumFederation"
+    / "modules"
+    / "UI"
+    / "Settings"
+    / "Control"
+    / "Controls.lua"
+)
 SECTION = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Widgets" / "Section.lua"
 PAGE_BUILDER = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "PageBuilder.lua"
 STYLE = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Style.lua"
@@ -119,4 +129,23 @@ def test_opaque_menu_style_production_lua():
             f"stderr:\n{result.stderr}"
         )
     assert "0 failed" in result.stdout
+    assert STYLE.exists()
+
+
+def test_settings_autocomplete_dropdown_production_lua():
+    result = subprocess.run(
+        [_lua51(), str(AUTOCOMPLETE_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Settings autocomplete dropdown tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert CONTROLS.exists()
     assert STYLE.exists()

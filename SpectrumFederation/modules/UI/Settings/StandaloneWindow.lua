@@ -10,6 +10,11 @@ local addonName, SF = ...
 local C = {
     -- Frame
     FRAME_NAME = "SF_SettingsWindow",
+    -- Default strata for slash/settings opens. Rankings-from-bank elevates to
+    -- FULLSCREEN_DIALOG so the whole Settings tree clears guild bank chrome
+    -- that can sit at or above DIALOG (Raise alone cannot cross strata).
+    FRAME_STRATA = "DIALOG",
+    FRAME_STRATA_ABOVE_BANK_CHROME = "FULLSCREEN_DIALOG",
     WIDTH = 900,
     HEIGHT = 900,
     SCREEN_MARGIN = 40,
@@ -886,7 +891,7 @@ function SettingsWindow:CreateWindow()
     local frame = CreateFrame("Frame", C.FRAME_NAME, UIParent, "BackdropTemplate")
     frame:SetSize(C.WIDTH, C.HEIGHT)
     frame:SetPoint("CENTER")
-    frame:SetFrameStrata("DIALOG")
+    frame:SetFrameStrata(C.FRAME_STRATA)
     frame:Hide()
 
     frame:SetBackdrop(C.BACKDROP)
@@ -902,6 +907,10 @@ function SettingsWindow:CreateWindow()
     frame:SetScript("OnDragStart", function(selfFrame) selfFrame:StartMoving() end)
     frame:SetScript("OnDragStop", function(selfFrame) selfFrame:StopMovingOrSizing() end)
     frame:SetClampedToScreen(true)
+    -- Close/Hide must drop elevated strata so the next normal open is DIALOG.
+    frame:HookScript("OnHide", function()
+        SettingsWindow:RestoreNormalFrameStrata()
+    end)
 
     local closeBtn = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
@@ -1275,6 +1284,34 @@ function SettingsWindow:Show()
     end
 end
 
+--- Elevate the Settings root above guild bank / Raid Supplies chrome (#466).
+-- Child frames inherit parent strata, so elevating the root covers content,
+-- scrollbars, and controls without per-child frame-level churn. Does not close
+-- bank or review frames. Pair with RestoreNormalFrameStrata on hide.
+function SettingsWindow:ElevateAboveBankChrome()
+    if not self.frame then
+        self:Init()
+    end
+    if not self.frame or type(self.frame.SetFrameStrata) ~= "function" then
+        return
+    end
+    self.frame:SetFrameStrata(C.FRAME_STRATA_ABOVE_BANK_CHROME)
+    self._elevatedAboveBankChrome = true
+    if self.frame.Raise then
+        self.frame:Raise()
+    end
+end
+
+function SettingsWindow:RestoreNormalFrameStrata()
+    if not self._elevatedAboveBankChrome then
+        return
+    end
+    self._elevatedAboveBankChrome = false
+    if self.frame and type(self.frame.SetFrameStrata) == "function" then
+        self.frame:SetFrameStrata(C.FRAME_STRATA)
+    end
+end
+
 function SettingsWindow:ShowPage(pageId)
     if not self.frame then
         self:Init()
@@ -1282,6 +1319,11 @@ function SettingsWindow:ShowPage(pageId)
 
     self:RefreshEnablementIfNeeded()
     self.frame:Show()
+    -- Raise helps among same-strata peers. Bank/Raid Supplies may sit at or
+    -- above DIALOG; Rankings-from-bank uses ElevateAboveBankChrome instead.
+    if self.frame.Raise then
+        self.frame:Raise()
+    end
 
     local model = Model()
     local ui = Registry()
@@ -1301,6 +1343,8 @@ function SettingsWindow:Hide()
     if self.frame then
         self.frame:Hide()
     end
+    -- Explicit restore covers fixtures without OnHide and keeps close idempotent.
+    self:RestoreNormalFrameStrata()
 end
 
 function SettingsWindow:Toggle()

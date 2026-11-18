@@ -248,8 +248,14 @@ local function ValidateRetainedAdmissionEntry(id, entry)
     return true
 end
 
-local function ValidateOperationsHeads(ops)
+local function ValidateOperationsHeads(ops, record)
     local headCount = 0
+    -- One pass-local canonical index for alias-aware correction heads so cold
+    -- validation does not rescan the ledger per head (#459 discussion_r4507527088).
+    local lookup = nil
+    if type(record) == "table" and GS.BuildCreditCanonicalLookup then
+        lookup = GS.BuildCreditCanonicalLookup(record)
+    end
     for targetKey, headId in pairs(ops.heads) do
         headCount = headCount + 1
         if headCount > GS.MAX_ACCEPTED_OPERATIONS then
@@ -269,7 +275,25 @@ local function ValidateOperationsHeads(ops)
             return false, "invalid_operations"
         end
         local expectedKey = GS.ComputeTargetKey(body.kind, body.target)
-        if expectedKey == nil or expectedKey ~= targetKey then
+        local okKey = expectedKey ~= nil and expectedKey == targetKey
+        -- #459: correction heads may be keyed by the canonical donation id while
+        -- the immutable body still names an alias target (or vice versa).
+        if not okKey and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+            and GS.CorrectionTargetKey and type(record) == "table" then
+            local canonKey = GS.CorrectionTargetKey(record, body.target, lookup)
+            if canonKey ~= nil and canonKey == targetKey then
+                okKey = true
+            end
+        end
+        -- #465: soft-delete heads are likewise alias-aware.
+        if not okKey and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT)
+            and GS.SoftDeleteTargetKey and type(record) == "table" then
+            local canonKey = GS.SoftDeleteTargetKey(record, body.target, lookup)
+            if canonKey ~= nil and canonKey == targetKey then
+                okKey = true
+            end
+        end
+        if not okKey then
             return false, "invalid_operations"
         end
     end
@@ -330,6 +354,24 @@ function GS._BumpOpsValidationGen(ops)
     end
 end
 
+--- Drop a cached ops-store validation result without advancing generation (#459).
+-- Used when a trusted credit alias binding is re-confirmed so a prior cached
+-- invalid_operations miss can recover without a manual ops-generation bump.
+function GS._ClearOpsValidationCache(ops)
+    if type(ops) ~= "table" then
+        return
+    end
+    opsStoreValidationCache[ops] = nil
+end
+
+--- Ephemeral ops mutation generation for projection invalidation (#459).
+function GS.GetOpsValidationGen(ops)
+    if type(ops) ~= "table" then
+        return 0
+    end
+    return tonumber(opsValidationGen[ops]) or 0
+end
+
 --- Test/diagnostic counters for ops-store validation work.
 GS._opsValidationBodyScans = 0
 GS._opsValidationFullScans = 0
@@ -348,7 +390,8 @@ end
 --- @param ops table
 -- @param guildKey string|nil owning guild key for body consistency
 -- @param datasetId string|nil owning dataset id for body consistency
-local function ValidateOperationsStore(ops, guildKey, datasetId)
+-- @param record table|nil owning guild record (alias-aware correction heads)
+local function ValidateOperationsStore(ops, guildKey, datasetId, record)
     if type(ops) ~= "table" then
         return false, "invalid_operations"
     end
@@ -463,7 +506,13 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         return false, "invalid_operations"
     end
 
-    local headsOk, headsErr = ValidateOperationsHeads(ops)
+    -- Reconstruct durable credit aliases from retained correction heads before
+    -- head-key checks so registry eviction cannot make accepted ops invalid (#459).
+    if type(record) == "table" and GS.ReconstructCreditEventAliasesFromOps then
+        GS.ReconstructCreditEventAliasesFromOps(record)
+    end
+
+    local headsOk, headsErr = ValidateOperationsHeads(ops, record)
     if not headsOk then
         CacheOpsValidationResult(ops, gen, guildKey, datasetId, false, headsErr)
         return false, headsErr
@@ -719,6 +768,147 @@ local function ValidateGuildRecordStructure(guildKey, record)
             end
         end
     end
+    -- Optional #465 soft-deletion heads: absent on older saves.
+    -- Capacity is distinct verified canons; alias keys must not inflate it
+    -- (#465 r4538978993). Shape-check every map entry.
+    if record.eventDeletions ~= nil then
+        if type(record.eventDeletions) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local canonCount = 0
+        local seenCanon = {}
+        local maxDel = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local override = tonumber(GS._softDeleteCanonicalCapacityMaxOverride)
+        if override and override >= 0 then
+            maxDel = override
+        end
+        for eventId, entry in pairs(record.eventDeletions) do
+            if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_record_shape"
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if not IsFiniteNonnegInt(entry.deletedAt) then
+                return false, "invalid_record_shape"
+            end
+            if entry.actorName ~= nil then
+                if type(entry.actorName) ~= "string" or entry.actorName == ""
+                    or #entry.actorName > 64 then
+                    return false, "invalid_record_shape"
+                end
+            end
+            if entry.actorGuid ~= nil then
+                if type(entry.actorGuid) ~= "string" or entry.actorGuid == ""
+                    or #entry.actorGuid > 64 then
+                    return false, "invalid_guid"
+                end
+            end
+            if entry.eventKind ~= nil
+                and entry.eventKind ~= "donation"
+                and entry.eventKind ~= "adjustment"
+                and entry.eventKind ~= "withdrawal" then
+                return false, "invalid_record_shape"
+            end
+            -- Optional #465 verified accounting facts (absent when unverified).
+            if entry.verified ~= nil and entry.verified ~= true and entry.verified ~= false then
+                return false, "invalid_record_shape"
+            end
+            if entry.verified == true then
+                if entry.eventId ~= nil then
+                    if type(entry.eventId) ~= "string" or entry.eventId == ""
+                        or #entry.eventId > GS.MAX_OPERATION_ID then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.itemId ~= nil and not IsFiniteNonnegInt(entry.itemId) then
+                    return false, "invalid_record_shape"
+                end
+                if entry.quantity ~= nil then
+                    local q = tonumber(entry.quantity)
+                    if not q or q ~= q or q == math.huge or q == -math.huge then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.campaignId ~= nil then
+                    if type(entry.campaignId) ~= "string" or entry.campaignId == "" then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributed ~= nil then
+                    if type(entry.attributed) ~= "string" or entry.attributed == ""
+                        or #entry.attributed > 64 then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributedGuid ~= nil then
+                    if type(entry.attributedGuid) ~= "string" or entry.attributedGuid == ""
+                        or #entry.attributedGuid > 64 then
+                        return false, "invalid_guid"
+                    end
+                end
+                if entry.gsProductionCredit ~= nil
+                    and entry.gsProductionCredit ~= true
+                    and entry.gsProductionCredit ~= false then
+                    return false, "invalid_record_shape"
+                end
+                local canon = entry.eventId
+                if type(canon) ~= "string" or canon == "" then
+                    canon = eventId
+                end
+                if type(canon) == "string" and canon ~= "" and not seenCanon[canon] then
+                    seenCanon[canon] = true
+                    canonCount = canonCount + 1
+                    if canonCount > maxDel then
+                        return false, "full"
+                    end
+                end
+            end
+        end
+    end
+    -- Optional #459 contributor correction heads: absent on older saves.
+    if record.creditCorrections ~= nil then
+        if type(record.creditCorrections) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local corrCount = 0
+        local maxCorr = GS.MAX_LEDGER_EVENTS or 4096
+        for eventId, entry in pairs(record.creditCorrections) do
+            corrCount = corrCount + 1
+            if corrCount > maxCorr then
+                return false, "full"
+            end
+            if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_record_shape"
+            end
+            if entry.attributed ~= nil then
+                if type(entry.attributed) ~= "string" or entry.attributed == ""
+                    or #entry.attributed > 64 then
+                    return false, "invalid_attribution"
+                end
+            end
+            if entry.attributedGuid ~= nil then
+                if type(entry.attributedGuid) ~= "string" or entry.attributedGuid == ""
+                    or #entry.attributedGuid > 64 then
+                    return false, "invalid_guid"
+                end
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if not IsFiniteNonnegInt(entry.correctedAt) then
+                return false, "invalid_record_shape"
+            end
+        end
+    end
     -- Optional #388 identity links: absent is fine for older staged records.
     if record.identityLinks ~= nil then
         if GS.ValidateIdentityLinks then
@@ -778,7 +968,8 @@ local function ValidateGuildRecordStructure(guildKey, record)
     -- Archived/other headers are retained even when malformed; ListInspectableCampaigns
     -- validates each before exposure. Do not fail the whole guild record for them.
 
-    local ok, err = ValidateOperationsStore(record.operations, guildKey, record.datasetId)
+    local ok, err = ValidateOperationsStore(
+        record.operations, guildKey, record.datasetId, record)
     if not ok then
         return false, err
     end
@@ -786,6 +977,8 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if not ok then
         return false, err
     end
+    -- #459: do not rebuild credit projections on ordinary record reads.
+    -- EnsureCreditCorrectionProjection reuses ops/accounting mutation stamps.
     return true
 end
 

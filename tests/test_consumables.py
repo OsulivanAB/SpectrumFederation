@@ -156,6 +156,21 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "SyncReviewWithGuildBank" in runtime
     assert "HideReviewForBankLifecycle" in runtime
     assert "UIPanelCloseButton" not in runtime
+    # #466: Rankings shortcut elevates Settings above bank chrome, then ShowPage.
+    assert "ElevateAboveBankChrome" in runtime
+    assert 'ShowPage("guildSuppliesRankings")' in runtime
+    assert "CanViewRankingsShortcut" in runtime
+    assert "RaidSuppliesRankings.tga" in runtime
+    assert "SharedButtonExtraSmallTemplate" in runtime
+    assert "REVIEW_RANKINGS_ICON_INSET = 6" in runtime
+    assert "REVIEW_RANKINGS_ICON_R, REVIEW_RANKINGS_ICON_G, REVIEW_RANKINGS_ICON_B = 1.00, 0.82, 0.18" in runtime
+    assert (
+        REPO_ROOT
+        / "SpectrumFederation"
+        / "media"
+        / "Icons"
+        / "RaidSuppliesRankings.tga"
+    ).is_file()
     assert "HasReminderPath" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRouting.lua"
     ).read_text(encoding="utf-8")

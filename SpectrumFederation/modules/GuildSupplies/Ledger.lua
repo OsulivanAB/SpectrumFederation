@@ -29,12 +29,22 @@ GS.MAX_LEDGER_EVENTS = 4096
 GS.MAX_ARCHIVED_EVENTS = 4096
 GS.MAX_TXN_REGISTRY = 512
 GS.MAX_TXN_ID = 160
+-- Trusted alias→canonical credit bindings that must outlive txn-registry eviction (#459).
+GS.MAX_CREDIT_EVENT_ALIASES = 2048
+-- One verified fact per canonical deletion; align with MAX_ACCEPTED_OPERATIONS so
+-- a legal source (>2048 deletes) remains transferable (#465 r4529162866).
+GS.MAX_SOFT_DELETE_VERIFIED_FACTS = 4096
 GS.MAX_OBS_QUANTITY = 100000
 GS.MAX_PENDING_ADJUSTMENTS = 32
 GS.MAX_PENDING_DONATION_CANDIDATES = 256
 GS.MAX_DIRECT_EVIDENCE_EXPORTS = 256
 GS.MAX_TXN_CONFLICT_KEYS = 64
 GS.MAX_TXN_CONFLICT_BODIES = 8
+--- Max seconds a correction timestamp may exceed GetServerTime() at admission (#459).
+-- Wall-clock skew is an acceptance check only — never part of saved-body shape validation.
+-- Small production clock-skew ceiling (not fixture chronology). Catch-up makes authored
+-- timestamps older at the receiver, not hours ahead; synthetic tests must use realistic clocks.
+GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW = 600
 
 GS.LEDGER_EVENT = {
     DONATION = "donation",
@@ -47,6 +57,19 @@ GS.VERIFICATION = {
     WITNESSES = "witnesses",
     OFFICER = "officer",
 }
+
+--- Distinct from legitimate Unassigned (nil attribution) and ordinary zero totals.
+GS.CREDIT_UNAVAILABLE = "credit_unavailable"
+
+--- Independent per-callback work ceiling for credit projection rebuild/redrive (#459).
+-- Not derived from measured fixture cost. Ordinary small histories finish in one
+-- slice; conflict-heavy prune and multi-admit catch-up yield via C_Timer.
+-- Sized so a typical maxAttempts=32 wave of light rebuilds fits; tests may lower
+-- via GS._creditProjectionWorkBudgetOverride.
+GS.CREDIT_PROJECTION_WORK_BUDGET = 16384
+--- Max measured work a single atomic prune/baseline step may exceed the soft
+-- callback ceiling by before yielding (#459). Not an exemption for a full rebuild.
+GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT = 512
 
 --- Durable verification label. Unknown values stay on the three-witness mode.
 function GS.CanonicalVerificationMode(mode)
@@ -505,50 +528,180 @@ local function GuidCurrentNameMatches(record, guid, name)
     return false
 end
 
+-- Ephemeral name↔GUID provenance index for paced BindCharacterIdentity (#459).
+-- Built once per dependency stamp (or during credit baseline) and consulted
+-- instead of rescanning up to 10,240 rows per unresolved identity.
+local creditProvenanceIndexCache = setmetatable({}, { __mode = "k" })
+local creditProvenanceIndexActive = setmetatable({}, { __mode = "k" })
+
+local function ProvenancePairKey(name, guid)
+    return tostring(name) .. "\0" .. tostring(guid)
+end
+
+local function NoteCreditProvenancePair(map, name, guid)
+    name = NormName(name)
+    guid = ValidGuid(guid)
+    if name and guid and type(map) == "table" then
+        map[ProvenancePairKey(name, guid)] = true
+    end
+end
+
+local function NoteCreditProvenanceFromEvent(map, ev)
+    if type(ev) ~= "table" or type(map) ~= "table" then
+        return
+    end
+    -- Informational withdrawal receipts must not establish donor/attributed
+    -- name↔GUID provenance (live or archived).
+    if IsWithdrawalLedgerEvent(ev) then
+        return
+    end
+    NoteCreditProvenancePair(map, ev.actor, ev.actorGuid)
+    NoteCreditProvenancePair(map, ev.donor, ev.donorGuid or ev.actorGuid)
+    NoteCreditProvenancePair(map, ev.attributed, ev.attributedGuid)
+end
+
+local function CreditProvenanceDependencyStamp(record)
+    -- Ledger provenance depends on accounting rows, not ops generation. Including
+    -- opsGen would rebuild the index after every accepted correction and exhaust
+    -- the shared callback budget during multi-admit catch-up (#459).
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    return tostring(acctMut) .. ":" .. tostring(record and record.datasetId or "")
+end
+
+--- Shared soft-limit check for cold provenance construction under an outer
+-- callback allowance. Uses globals so this early helper can pace before the
+-- later CreditProjectionWorkNow locals are in scope (#459 G2).
+local function CreditProvenanceSharedSoftExceeded()
+    if not GS._creditProjectionAccumulating then
+        return false
+    end
+    local soft = tonumber(GS._creditProjectionCallbackLimit)
+        or (tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384)
+    local base = tonumber(GS._creditProjectionCallbackWork) or 0
+    local localNow = (tonumber(GS._creditProjectionProvenanceVisits) or 0)
+        + (tonumber(GS._creditProjectionRowVisits) or 0)
+        + (tonumber(GS._creditProjectionBucketVisits) or 0)
+        + (tonumber(GS._creditProjectionFloorVisits) or 0)
+        + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+        + (tonumber(GS._creditProjectionStructureCopyVisits) or 0)
+        + (tonumber(GS._creditProjectionTraversalVisits) or 0)
+    return (base + localNow) >= soft
+end
+
+--- Build a trusted ephemeral name↔GUID provenance index once per accounting
+-- stamp. Distinct pairs are indexed once; each row visit is charged to the
+-- shared callback counters. Under an outer allowance, construction is paced and
+-- resumable so cold Bind/Admit cannot overrun soft+atomic; when no shared
+-- budget is open the index still completes synchronously for ordinary reads
+-- (#459 G2 / discussion_r4485438881).
+-- @return map|nil, string|nil err ("work_budget" when paced incomplete)
+local function EnsureCreditProvenanceIndex(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return nil, nil
+    end
+    local active = creditProvenanceIndexActive[record]
+    if type(active) == "table" and active.complete and type(active.map) == "table" then
+        return active.map, nil
+    end
+    local stamp = CreditProvenanceDependencyStamp(record)
+    local cached = creditProvenanceIndexCache[record]
+    if type(cached) == "table" and cached.stamp == stamp and cached.complete
+        and type(cached.map) == "table" then
+        return cached.map, nil
+    end
+    local map = {}
+    local phase = "live"
+    local index = 1
+    if type(cached) == "table" and cached.stamp == stamp and cached.complete == false
+        and type(cached.map) == "table" then
+        map = cached.map
+        phase = cached.phase == "archive" and "archive" or "live"
+        index = math.max(1, tonumber(cached.index) or 1)
+    end
+    local lists = {
+        live = { record.accounting._consumableEvents, MaxLiveLedgerScan() },
+        archive = { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
+    }
+    local function persistIncomplete(nextPhase, nextIndex)
+        creditProvenanceIndexCache[record] = {
+            stamp = stamp,
+            map = map,
+            complete = false,
+            phase = nextPhase,
+            index = nextIndex,
+        }
+        -- Fold paced visits into the shared callback total before yielding so a
+        -- later Begin/Redrive cannot see orphaned provenance as "already full"
+        -- while callbackWork was reset (#459 review-5792509439 B).
+        if GS._creditProjectionAccumulating then
+            local visits = tonumber(GS._creditProjectionProvenanceVisits) or 0
+            if visits > 0 then
+                GS._creditProjectionCallbackWork =
+                    (tonumber(GS._creditProjectionCallbackWork) or 0) + visits
+            end
+            GS._creditProjectionProvenanceVisits = 0
+        end
+    end
+    local order = { "live", "archive" }
+    local startLi = (phase == "archive") and 2 or 1
+    for li = startLi, #order do
+        local key = order[li]
+        local list, maxLen = lists[key][1], lists[key][2]
+        local startAt = (li == startLi) and index or 1
+        if type(list) == "table" then
+            local limit = math.min(#list, maxLen)
+            for i = startAt, limit do
+                if CreditProvenanceSharedSoftExceeded() then
+                    persistIncomplete(key, i)
+                    return nil, "work_budget"
+                end
+                GS._creditProjectionProvenanceVisits =
+                    (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
+                NoteCreditProvenanceFromEvent(map, list[i])
+            end
+        end
+    end
+    creditProvenanceIndexCache[record] = {
+        stamp = stamp,
+        map = map,
+        complete = true,
+    }
+    -- Standalone (non-accumulating) cold builds must not leave visit counters
+    -- that poison later callback budgets after ledger revisions.
+    if not GS._creditProjectionAccumulating then
+        GS._creditProjectionProvenanceVisits = 0
+    end
+    return map, nil
+end
+
 --- True when an already-accepted local ledger row links this durable name to GUID.
 -- Authenticated history is provenance; a bare remote claim is not. Bounded scan.
+-- Prefers a paced ephemeral index so distinct unresolved identities do not each
+-- rescan the full live+archive history (#459 / discussion_r4484522633).
+-- @return boolean established, string|nil err
 local function LedgerEstablishesNameGuid(record, name, guid)
     name = NormName(name)
     guid = ValidGuid(guid)
     if not name or not guid or type(record) ~= "table" or type(record.accounting) ~= "table" then
-        return false
+        return false, nil
     end
-    local function rowLinks(ev)
-        if type(ev) ~= "table" then
-            return false
-        end
-        -- Informational withdrawal receipts must not establish donor/attributed
-        -- name↔GUID provenance (live or archived).
-        if IsWithdrawalLedgerEvent(ev) then
-            return false
-        end
-        local sideGuid = ValidGuid(ev.actorGuid) or ValidGuid(ev.donorGuid)
-        if sideGuid == guid then
-            if NormName(ev.actor) == name or NormName(ev.donor) == name then
-                return true
-            end
-        end
-        if ValidGuid(ev.attributedGuid) == guid and NormName(ev.attributed) == name then
-            return true
-        end
-        return false
+    local pair = ProvenancePairKey(name, guid)
+    local active = creditProvenanceIndexActive[record]
+    if type(active) == "table" and type(active.map) == "table" and active.complete then
+        GS._creditProjectionProvenanceVisits =
+            (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
+        return active.map[pair] == true, nil
     end
-    local lists = {
-        { record.accounting._consumableEvents, MaxLiveLedgerScan() },
-        { record.accounting._consumableEventArchive, MaxArchivedLedgerScan() },
-    }
-    for li = 1, #lists do
-        local list, maxLen = lists[li][1], lists[li][2]
-        if type(list) == "table" then
-            local limit = math.min(#list, maxLen)
-            for i = 1, limit do
-                if rowLinks(list[i]) then
-                    return true
-                end
-            end
-        end
+    local map, ensureErr = EnsureCreditProvenanceIndex(record)
+    if ensureErr == "work_budget" then
+        return false, "work_budget"
     end
-    return false
+    if type(map) == "table" then
+        GS._creditProjectionProvenanceVisits =
+            (tonumber(GS._creditProjectionProvenanceVisits) or 0) + 1
+        return map[pair] == true, nil
+    end
+    return false, nil
 end
 
 --- Bind a durable character name to an optional claimed GUID.
@@ -593,8 +746,14 @@ function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
         return name, guid, nil
     end
     -- Unresolved name: require verifiable name↔GUID provenance, not membership.
-    if GuidCurrentNameMatches(record, guid, name)
-        or LedgerEstablishesNameGuid(record, name, guid) then
+    if GuidCurrentNameMatches(record, guid, name) then
+        return name, guid, nil
+    end
+    local established, estErr = LedgerEstablishesNameGuid(record, name, guid)
+    if estErr == "work_budget" then
+        return nil, nil, "work_budget"
+    end
+    if established then
         return name, guid, nil
     end
     -- Unverifiable claimed GUID: omit rather than redirect credit.
@@ -714,6 +873,10 @@ end
 -- Used for attributed negative-adjustment floors so linked balances cannot be
 -- spent against another character and then go negative after unassign/move.
 -- GUID-first when present; exact normalized name fallback for legacy rows.
+--- Personal credited total for one actor/item (#459).
+-- When credit projection reconstruction is failed/blocked, returns
+-- nil, GS.CREDIT_UNAVAILABLE — not the ordinary number 0 (which means a
+-- legitimate empty balance) and not durable-only identities.
 function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, campaignId)
     itemId = tonumber(itemId)
     if type(record) ~= "table" or not IsItemId(itemId) then
@@ -727,6 +890,12 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
     local identityGuid = ValidGuid(actorGuid)
     if not identityName and not identityGuid then
         return 0
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return nil, GS.CREDIT_UNAVAILABLE
+        end
     end
     local generation = nil
     if record.currentCampaignId == campaignId then
@@ -782,12 +951,30 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
             return
         end
         local typ = event.type
-        if typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION" then
-            if qty > 0 and sideMatches(event.actor, event.actorGuid or event.donorGuid) then
+        local isDonation = typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION"
+        local isAdjustment = typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT"
+        if not isDonation and not isAdjustment then
+            return
+        end
+        -- #459: personal floors follow effective credited identity, not durable
+        -- donor/attributed fields alone. Projection already ensured available.
+        local creditName, creditGuid, _, status
+        if GS.ResolveEffectiveCreditIdentity then
+            creditName, creditGuid, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+            if status == GS.CREDIT_UNAVAILABLE then
+                return "unavailable"
+            end
+        elseif isDonation then
+            creditName, creditGuid = event.actor, event.actorGuid or event.donorGuid
+        else
+            creditName, creditGuid = event.attributed, event.attributedGuid
+        end
+        if isDonation then
+            if qty > 0 and sideMatches(creditName, creditGuid) then
                 total = total + qty
             end
-        elseif typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT" then
-            if event.attributed and sideMatches(event.attributed, event.attributedGuid) then
+        elseif creditName or creditGuid then
+            if sideMatches(creditName, creditGuid) then
                 total = total + qty
             end
         end
@@ -796,12 +983,16 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
     local archived = record.accounting and record.accounting._consumableEventArchive
     if type(live) == "table" then
         for i = 1, #live do
-            consider(live[i])
+            if consider(live[i]) == "unavailable" then
+                return nil, GS.CREDIT_UNAVAILABLE
+            end
         end
     end
     if type(archived) == "table" then
         for i = 1, #archived do
-            consider(archived[i])
+            if consider(archived[i]) == "unavailable" then
+                return nil, GS.CREDIT_UNAVAILABLE
+            end
         end
     end
     return total
@@ -1206,6 +1397,9 @@ local function FindRegistryByTxn(cfg, txnId)
     if not txnId then return nil end
     local list = EnsureTxnRegistry(cfg)
     for i = 1, #list do
+        -- Metric for bounded-scan regressions (#459 registry matching / alias export).
+        GS._txnRegistryRowVisits =
+            (tonumber(GS._txnRegistryRowVisits) or 0) + 1
         local row = list[i]
         if type(row) == "table" then
             if row.txnId == txnId then
@@ -1221,6 +1415,40 @@ local function FindRegistryByTxn(cfg, txnId)
         end
     end
     return nil
+end
+
+--- One-pass alias/txn → primary index over the txn registry (cold collectors).
+-- Charges GS._txnRegistryRowVisits once per examined row.
+-- @return table primaryById
+local function BuildTxnRegistryPrimaryIndex(cfg)
+    local primaryById = {}
+    local list = type(cfg) == "table" and EnsureTxnRegistry(cfg) or nil
+    if type(list) ~= "table" then
+        return primaryById
+    end
+    for i = 1, #list do
+        GS._txnRegistryRowVisits =
+            (tonumber(GS._txnRegistryRowVisits) or 0) + 1
+        local row = list[i]
+        if type(row) == "table" then
+            if row.status == "alias"
+                and type(row.txnId) == "string" and row.txnId ~= ""
+                and type(row.aliasOf) == "string" and row.aliasOf ~= "" then
+                primaryById[row.txnId] = row.aliasOf
+            elseif type(row.txnId) == "string" and row.txnId ~= "" then
+                primaryById[row.txnId] = row.txnId
+                if type(row.aliases) == "table" then
+                    for j = 1, #row.aliases do
+                        local alias = row.aliases[j]
+                        if type(alias) == "string" and alias ~= "" then
+                            primaryById[alias] = row.txnId
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return primaryById
 end
 
 local function RegistryMatchOccurrence(cfg, evidence)
@@ -1804,6 +2032,10 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
         -- when a known accepted donation is supplied.
         if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
             GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            if GS.WakePendingCorrectionsAfterAlias then
+                GS.WakePendingCorrectionsAfterAlias(
+                    record, primaryTxnId, aliasTxnId, knownEvent.itemId)
+            end
         end
         return false
     end
@@ -1812,10 +2044,20 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
     end
     for i = 1, #row.aliases do
         if row.aliases[i] == aliasTxnId then
+            -- Re-confirm durable credit alias binding (invalidates stale ops
+            -- validation cache after registry churn /reload) (#459).
+            if type(record) == "table" and GS.RememberCreditEventAlias then
+                GS.RememberCreditEventAlias(record, aliasTxnId, primaryTxnId)
+            end
             -- Alias already registered; still reconcile valuations when a known
             -- accepted donation is supplied (cold competing-ID convergence).
             if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
                 GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            end
+            -- #459: re-confirming a trusted alias must still wake pending corrections.
+            if type(record) == "table" and GS.WakePendingCorrectionsAfterAlias then
+                GS.WakePendingCorrectionsAfterAlias(
+                    record, primaryTxnId, aliasTxnId, row.itemId)
             end
             return true
         end
@@ -1842,10 +2084,31 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
         neighborsOlder = row.neighborsOlder,
         neighborsNewer = row.neighborsNewer,
     })
+    -- Durable correction/credit alias binding survives later registry eviction (#459).
+    if type(record) == "table" and GS.RememberCreditEventAlias then
+        GS.RememberCreditEventAlias(record, aliasTxnId, primaryTxnId)
+    end
     if type(record) == "table" and GS.OnDonationTxnAlias then
         GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
     end
+    -- #459: alias discovery can unblock corrections pending on either txn id.
+    if type(record) == "table" and GS.WakePendingCorrectionsAfterAlias then
+        GS.WakePendingCorrectionsAfterAlias(
+            record, primaryTxnId, aliasTxnId, row.itemId)
+    end
     return true
+end
+
+--- Test/harness: register a trusted donation txn alias and wake corrections.
+function GS._AddTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return false
+    end
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false
+    end
+    return AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
 end
 
 local function EnsureEventArchive(record)
@@ -2116,6 +2379,16 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             end
             if GS.TryAssignDonationValuation then
                 GS.TryAssignDonationValuation(record, existing, nil)
+            end
+            -- #459: late production credit can unblock pending/not_credited corrections.
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            if GS.EnsureThenRedriveCreditCorrections then
+                GS.EnsureThenRedriveCreditCorrections(record, {
+                    eventId = existing.id,
+                    itemId = existing.itemId,
+                })
             end
         end
     end
@@ -2394,7 +2667,727 @@ local function AppendArchivedLedgerEvent(record, event)
     return true
 end
 
-local function AppendLedgerEvent(record, event)
+--- Retry trusted pending correct-contributor ops through authenticated admission (#459).
+-- Skips untrusted_relay/evidence. Bounds attempted work (including failures).
+-- opts.eventId / opts.itemId wake related deps with OR matching when both set.
+-- Non-reentrant: nested accepts coalesce into one continuation with a saved cursor.
+-- Snapshot matching uses a paced id/txn/alias index so dependency lookup charges
+-- the shared callback allowance instead of rescanning live+archive per pending
+-- entry (#459 discussion_r4487530434).
+-- @return promotedCount, attemptCount
+local creditRedriveDepth = 0
+local creditRedriveContinuation = setmetatable({}, { __mode = "k" })
+
+-- #465 soft-delete pending redrive: non-reentrant, coalesced After(0) continuation
+-- with attempt budget. Nested admits must not rescan the full pending queue on
+-- the same UI callback (Codex P1 / discussion_r4516516470).
+local softDeleteRedriveDepth = 0
+local softDeleteRedriveContinuation = setmetatable({}, { __mode = "k" })
+
+--- Test seam: drop paced redrive continuation/index for a record (#459 PM).
+function GS._ClearCreditRedriveContinuationForTest(record)
+    if type(record) == "table" then
+        creditRedriveContinuation[record] = nil
+    end
+end
+
+--- Test seam: drop soft-delete redrive continuation for a record (#465).
+function GS._ClearSoftDeleteRedriveContinuationForTest(record)
+    if type(record) == "table" then
+        softDeleteRedriveContinuation[record] = nil
+    end
+end
+
+--- Resolve a credit-event id through an already-built lookup index (O(1)).
+-- Uses paced primaryByAlias + durable creditEventAliases; never FindRegistryByTxn
+-- or ledger scans (#459 discussion_r4488855210).
+local function CanonicalFromRedriveIndex(record, eventId, byId, primaryByAlias)
+    if type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    if type(byId) == "table" then
+        local hit = byId[eventId]
+        if type(hit) == "table" and type(hit.id) == "string" and hit.id ~= "" then
+            return hit.id
+        end
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    local durable = cfg and cfg.creditEventAliases
+    local current = eventId
+    for _ = 1, 8 do
+        local mapped = type(primaryByAlias) == "table" and primaryByAlias[current] or nil
+        if type(mapped) ~= "string" or mapped == "" or mapped == current then
+            mapped = type(durable) == "table" and durable[current] or nil
+        end
+        if type(mapped) == "string" and mapped ~= "" and mapped ~= current then
+            current = mapped
+        else
+            break
+        end
+    end
+    if type(byId) == "table" then
+        local hit = byId[current]
+        if type(hit) == "table" and type(hit.id) == "string" and hit.id ~= "" then
+            return hit.id
+        end
+    end
+    return current
+end
+
+local function CreditRedriveLookupEvent(byId, eventId)
+    if type(byId) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    local hit = byId[eventId]
+    if type(hit) == "table" then
+        return hit
+    end
+    return nil
+end
+
+--- Match pending body against wake filters using the paced redrive index.
+-- @param byId table complete id/txn/alias → event index
+-- @param primaryByAlias table alias/txn → primary id (includes missing primaries)
+-- @param filterCanon string|nil precomputed canonical id for opts.eventId
+local function CreditRedriveMatch(record, body, opts, byId, primaryByAlias, filterCanon)
+    local eventIdFilter = opts.eventId
+    local itemIdFilter = tonumber(opts.itemId)
+    if (type(eventIdFilter) ~= "string" or eventIdFilter == "") and not itemIdFilter then
+        return true
+    end
+    local matchEvent = false
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        if body.target == eventIdFilter then
+            matchEvent = true
+        else
+            local canonical = CanonicalFromRedriveIndex(
+                record, body.target, byId, primaryByAlias)
+            if filterCanon == nil then
+                filterCanon = CanonicalFromRedriveIndex(
+                    record, eventIdFilter, byId, primaryByAlias)
+            end
+            matchEvent = canonical ~= nil and filterCanon ~= nil and canonical == filterCanon
+        end
+    end
+    local matchItem = false
+    if itemIdFilter then
+        local bodyItem = tonumber(body.value and body.value.itemId)
+        if bodyItem and bodyItem == itemIdFilter then
+            matchItem = true
+        else
+            local ev = CreditRedriveLookupEvent(byId, body.target)
+            if not ev then
+                local canon = CanonicalFromRedriveIndex(
+                    record, body.target, byId, primaryByAlias)
+                ev = CreditRedriveLookupEvent(byId, canon)
+            end
+            if ev and tonumber(ev.itemId) == itemIdFilter then
+                matchItem = true
+            end
+        end
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" and itemIdFilter then
+        return matchEvent or matchItem
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        return matchEvent
+    end
+    return matchItem
+end
+
+--- Accounting+ops stamp for redrive lookup reuse (same inputs as projection).
+local function CreditRedriveLookupStamp(record)
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    return tostring(opsGen) .. ":" .. tostring(acctMut) .. ":" .. tostring(record.datasetId or "")
+end
+
+--- Pace-build id/txn/alias → event index for dependency matching.
+-- Charges each row visit into the shared callback work counter.
+-- @return boolean ready, table|nil byId
+local function EnsureCreditRedriveLookupIndex(record, cont)
+    local stamp = CreditRedriveLookupStamp(record)
+    if type(cont.lookupById) == "table" and cont.lookupComplete == true
+        and cont.lookupStamp == stamp then
+        return true, cont.lookupById
+    end
+    if cont.lookupStamp ~= stamp then
+        cont.lookupById = {}
+        cont.lookupPrimary = {}
+        cont.lookupPhase = "live"
+        cont.lookupIndex = 1
+        cont.lookupStamp = stamp
+        cont.lookupComplete = false
+        cont.lookupRegistryIndex = 1
+    end
+    if type(cont.lookupPrimary) ~= "table" then
+        cont.lookupPrimary = {}
+    end
+    local byId = cont.lookupById
+    local primaryByAlias = cont.lookupPrimary
+    local softLimit = tonumber(GS._creditProjectionCallbackLimit)
+        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+        or 16384
+    local function charge(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+        GS._creditRedriveLookupVisits =
+            (tonumber(GS._creditRedriveLookupVisits) or 0) + (n or 1)
+    end
+    local function overBudget()
+        return (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit
+    end
+    local function notePrimary(alias, primary)
+        if type(alias) == "string" and alias ~= ""
+            and type(primary) == "string" and primary ~= "" then
+            primaryByAlias[alias] = primary
+        end
+    end
+    local function indexEvent(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if type(event.id) == "string" and event.id ~= "" then
+            byId[event.id] = event
+            notePrimary(event.id, event.id)
+        end
+        local txnId = type(event.txnId) == "string" and event.txnId or nil
+        if txnId and txnId ~= "" then
+            byId[txnId] = event
+            notePrimary(txnId, event.id or txnId)
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if cont.lookupPhase == "live" then
+        if type(live) == "table" then
+            local limit = math.min(#live, MaxLiveLedgerScan())
+            local i = tonumber(cont.lookupIndex) or 1
+            while i <= limit do
+                if overBudget() then
+                    cont.lookupIndex = i
+                    return false, byId
+                end
+                indexEvent(live[i])
+                charge(1)
+                i = i + 1
+            end
+        end
+        cont.lookupPhase = "archive"
+        cont.lookupIndex = 1
+    end
+    if cont.lookupPhase == "archive" then
+        if type(archived) == "table" then
+            local limit = math.min(#archived, MaxArchivedLedgerScan())
+            local i = tonumber(cont.lookupIndex) or 1
+            while i <= limit do
+                if overBudget() then
+                    cont.lookupIndex = i
+                    return false, byId
+                end
+                indexEvent(archived[i])
+                charge(1)
+                i = i + 1
+            end
+        end
+        cont.lookupPhase = "registry"
+        cont.lookupIndex = 1
+        cont.lookupRegistryIndex = 1
+    end
+    if cont.lookupPhase == "registry" then
+        local cfg = record.accounting and record.accounting._consumables
+        local registry = cfg and cfg.txnRegistry
+        if type(registry) == "table" then
+            local i = tonumber(cont.lookupRegistryIndex) or 1
+            while i <= #registry do
+                if overBudget() then
+                    cont.lookupRegistryIndex = i
+                    return false, byId
+                end
+                local row = registry[i]
+                charge(1)
+                if type(row) == "table" then
+                    if type(row.txnId) == "string" and row.txnId ~= ""
+                        and type(row.aliases) == "table" then
+                        -- Bind aliases even when the primary ledger event is absent.
+                        notePrimary(row.txnId, row.txnId)
+                        local primary = byId[row.txnId]
+                        for j = 1, #row.aliases do
+                            local alias = row.aliases[j]
+                            if type(alias) == "string" and alias ~= "" then
+                                notePrimary(alias, row.txnId)
+                                charge(1)
+                                if primary then
+                                    byId[alias] = primary
+                                end
+                            end
+                        end
+                    end
+                    if row.status == "alias"
+                        and type(row.txnId) == "string" and row.txnId ~= ""
+                        and type(row.aliasOf) == "string" and row.aliasOf ~= "" then
+                        notePrimary(row.txnId, row.aliasOf)
+                        local primary = byId[row.aliasOf]
+                        if primary then
+                            byId[row.txnId] = primary
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        -- Fold durable creditEventAliases map (survives registry eviction).
+        local map = cfg and cfg.creditEventAliases
+        if type(map) == "table" then
+            for alias, canon in pairs(map) do
+                if overBudget() then
+                    -- Map fold is unordered; mark incomplete and resume next slice
+                    -- by restarting registry phase only for the alias map.
+                    cont.lookupPhase = "aliasMap"
+                    cont.lookupAliasCursor = alias
+                    return false, byId
+                end
+                if type(alias) == "string" and alias ~= ""
+                    and type(canon) == "string" and canon ~= "" then
+                    notePrimary(alias, canon)
+                    local primary = byId[canon]
+                    if primary then
+                        byId[alias] = primary
+                    end
+                    charge(1)
+                end
+            end
+        end
+        cont.lookupPhase = "done"
+        cont.lookupComplete = true
+    elseif cont.lookupPhase == "aliasMap" then
+        local cfg = record.accounting and record.accounting._consumables
+        local map = cfg and cfg.creditEventAliases
+        if type(map) == "table" then
+            local seenResume = cont.lookupAliasCursor == nil
+            for alias, canon in pairs(map) do
+                if not seenResume then
+                    if alias == cont.lookupAliasCursor then
+                        seenResume = true
+                    end
+                end
+                if seenResume then
+                    if overBudget() then
+                        cont.lookupAliasCursor = alias
+                        return false, byId
+                    end
+                    if type(alias) == "string" and alias ~= ""
+                        and type(canon) == "string" and canon ~= "" then
+                        notePrimary(alias, canon)
+                        local primary = byId[canon]
+                        if primary then
+                            byId[alias] = primary
+                        end
+                        charge(1)
+                    end
+                end
+            end
+        end
+        cont.lookupPhase = "done"
+        cont.lookupComplete = true
+        cont.lookupAliasCursor = nil
+    end
+    return cont.lookupComplete == true, byId
+end
+
+--- True when opts is an explicit full dependency wake (no item/event filter).
+-- Distinct from nil timer-resume continuation (#459 cutover `{}` wake).
+local function IsFullCreditRedriveWake(opts)
+    return type(opts) == "table" and opts.eventId == nil and opts.itemId == nil
+end
+
+--- Merge an incoming redrive wake into continuation filters (#459).
+-- nil opts = timer resume (keep filters). Explicit `{}` / unfiltered table = full
+-- wake that clears item/event filters and dominates later narrow wakes until a
+-- full snapshot drains. Broader filters clear any mid-wave snapshot.
+-- @return table cont, boolean broadened
+local function MergeCreditRedriveWake(record, opts)
+    local cont = creditRedriveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {
+            opts = opts or {},
+            scheduled = false,
+            followUpWake = false,
+            fullWake = IsFullCreditRedriveWake(opts),
+        }
+        if cont.fullWake then
+            cont.opts = {
+                maxAttempts = opts and opts.maxAttempts or nil,
+            }
+        end
+        creditRedriveContinuation[record] = cont
+        return cont, cont.fullWake
+    end
+    local prev = cont.opts or {}
+    local merged = {}
+    for k, v in pairs(prev) do
+        merged[k] = v
+    end
+    local broadened = false
+    local externalWake = type(opts) == "table"
+    if externalWake then
+        if IsFullCreditRedriveWake(opts) then
+            -- Explicit full wake dominates narrower retained filters.
+            if merged.eventId ~= nil or merged.itemId ~= nil or not cont.fullWake then
+                broadened = true
+            end
+            merged.eventId = nil
+            merged.itemId = nil
+            cont.fullWake = true
+        elseif cont.fullWake then
+            -- Outstanding full wake must not be narrowed by a later item wake.
+            merged.eventId = nil
+            merged.itemId = nil
+        else
+            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+                merged.eventId = nil
+                broadened = true
+            elseif opts.eventId and not prev.eventId and not prev.itemId then
+                merged.eventId = opts.eventId
+            elseif opts.eventId and prev.itemId and not prev.eventId then
+                merged.eventId = opts.eventId
+            end
+            if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+                merged.itemId = nil
+                merged.eventId = nil
+                broadened = true
+            elseif opts.itemId and not (prev.eventId or prev.itemId) then
+                merged.itemId = opts.itemId
+            elseif opts.itemId then
+                if prev.itemId or prev.eventId then
+                    merged.itemId = opts.itemId
+                end
+            end
+        end
+        if opts.maxAttempts then
+            merged.maxAttempts = opts.maxAttempts
+        end
+    end
+    cont.opts = merged
+    if broadened then
+        cont.snapshot = nil
+        cont.index = nil
+        cont.pendingCandidates = nil
+        cont.matchIndex = nil
+        cont.snapshotBuilding = nil
+        -- Lookup index remains valid for the same ledger stamp; keep it.
+    end
+    if externalWake and (type(cont.snapshot) == "table" or creditRedriveDepth > 0
+        or cont.scheduled or type(cont.pendingCandidates) == "table") then
+        cont.followUpWake = true
+    end
+    return cont, broadened
+end
+
+local function ScheduleCreditRedriveContinuation(record, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = MergeCreditRedriveWake(record, opts)
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = creditRedriveContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        if GS.RedrivePendingContributorCorrections then
+            -- Pass nil so Redrive merges against current cont.opts (preserves
+            -- wakes coalesced while this timer was queued) without treating
+            -- the timer itself as a new dependency wake.
+            GS.RedrivePendingContributorCorrections(record, nil)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+    else
+        run()
+    end
+end
+
+function GS.RedrivePendingContributorCorrections(record, opts)
+    if type(opts) == "string" then
+        opts = { eventId = opts }
+    end
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return 0, 0
+    end
+    if creditRedriveDepth > 0 then
+        ScheduleCreditRedriveContinuation(record, opts)
+        return 0, 0
+    end
+    local ops = record.operations
+    if type(ops.pending) ~= "table" then
+        return 0, 0
+    end
+    -- Accumulate rebuild work across nested AdmitRemoteOperation callbacks.
+    -- Nested callers (projection continuation / Ensure-then-redrive wake) share
+    -- the remaining allowance and must not reset an already-consumed counter.
+    local nested = GS._creditProjectionAccumulating == true
+    local shareBudget = nested
+        or (type(opts) == "table" and opts._shareCallbackBudget == true)
+    if not shareBudget then
+        local budget = tonumber(opts and opts.workBudget)
+            or tonumber(GS._creditProjectionWorkBudgetOverride)
+            or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+            or 16384
+        GS._creditProjectionCallbackWork = 0
+        GS._creditProjectionCallbackLimit = budget
+        local overshoot = tonumber(GS._creditProjectionAtomicOvershootOverride)
+            or tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT)
+            or 512
+        GS._creditProjectionCallbackHardLimit = budget + overshoot
+        -- Match BeginCreditProjectionCallbackBudget(false): orphaned provenance
+        -- must not make SoftExceeded trip at the first Bind of a fresh redrive.
+        GS._creditProjectionRowVisits = 0
+        GS._creditProjectionBucketVisits = 0
+        GS._creditProjectionFloorVisits = 0
+        GS._creditProjectionCandidateTrials = 0
+        GS._creditProjectionStructureCopyVisits = 0
+        GS._creditProjectionTraversalVisits = 0
+        GS._creditProjectionProvenanceVisits = 0
+        -- Keep _creditRedriveLookupVisits / _creditRedriveMatchVisits cumulative
+        -- across timer-slice re-entries so first-callback charges remain visible
+        -- to drain assertions (#459 CodeRabbit RA/CB evidence). Tests zero them
+        -- explicitly before a measured wave; soft budget uses callbackWork.
+    end
+    GS._creditProjectionAccumulating = true
+    -- Always merge the incoming wake; never overwrite cont.opts with a narrow
+    -- filter while an existing snapshot drains (A/B/C interleaving).
+    local cont = MergeCreditRedriveWake(record, opts)
+    local waveOpts = cont.opts or opts or {}
+    -- Independent callback work ceiling (not derived from measured history cost).
+    local workBudget = tonumber(waveOpts.workBudget)
+        or tonumber(GS._creditProjectionWorkBudgetOverride)
+        or tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET)
+        or 16384
+    local softLimit = tonumber(GS._creditProjectionCallbackLimit) or workBudget
+    local function overSoft()
+        return (tonumber(GS._creditProjectionCallbackWork) or 0) >= softLimit
+    end
+    local function chargeMatch(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+        GS._creditRedriveMatchVisits =
+            (tonumber(GS._creditRedriveMatchVisits) or 0) + (n or 1)
+    end
+
+    -- Deletion-safe wave: pace lookup-index + match snapshot under the shared
+    -- budget, then resume admissions by index into that snapshot.
+    local snapshot = cont.snapshot
+    local startIndex = tonumber(cont.index) or 1
+    if type(snapshot) ~= "table" then
+        -- Collect candidate pending ids cheaply (kind/reason only; no ledger scan).
+        if type(cont.pendingCandidates) ~= "table" then
+            local cands = {}
+            for id, entry in pairs(ops.pending) do
+                local body = entry and entry.body
+                if type(body) == "table" then
+                    local reason = entry.reason
+                    local isCorrection = body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                        and type(body.target) == "string"
+                    local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
+                        and reason == "work_budget"
+                    if (isCorrection or isBudgetAdj)
+                        and reason ~= "untrusted_relay" and reason ~= "evidence" then
+                        cands[#cands + 1] = id
+                    end
+                end
+            end
+            table.sort(cands)
+            cont.pendingCandidates = cands
+            cont.matchIndex = 1
+            cont.snapshotBuilding = {}
+            chargeMatch(#cands > 0 and 1 or 0)
+        end
+        -- Targeted wakes need the index for matching. Full wakes with eligible
+        -- candidates also need the complete stamp-current paced index so nested
+        -- Admit FindLedgerEventById reuses it (#459 discussion_r4498394368).
+        -- Empty wakes stay idle without indexing.
+        local cands = cont.pendingCandidates
+        local hasCandidates = type(cands) == "table" and #cands > 0
+        local needsIndex = hasCandidates and (
+            cont.fullWake == true
+            or (type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "")
+            or tonumber(waveOpts.itemId) ~= nil
+        )
+        local byId = cont.lookupById
+        local primaryByAlias = cont.lookupPrimary
+        local filterCanon = nil
+        if needsIndex then
+            local ready
+            ready, byId = EnsureCreditRedriveLookupIndex(record, cont)
+            primaryByAlias = cont.lookupPrimary
+            if not ready then
+                cont.opts = waveOpts
+                cont.scheduled = false
+                if not nested then
+                    GS._creditProjectionAccumulating = false
+                end
+                ScheduleCreditRedriveContinuation(record, nil)
+                return 0, 0, tonumber(GS._creditProjectionCallbackWork) or 0
+            end
+            -- Reuse one filter canonicalization for the whole match wave.
+            if type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "" then
+                filterCanon = CanonicalFromRedriveIndex(
+                    record, waveOpts.eventId, byId, primaryByAlias)
+            end
+        end
+        local building = cont.snapshotBuilding or {}
+        local mi = tonumber(cont.matchIndex) or 1
+        while mi <= #cands do
+            if overSoft() then
+                cont.matchIndex = mi
+                cont.snapshotBuilding = building
+                cont.opts = waveOpts
+                cont.scheduled = false
+                if not nested then
+                    GS._creditProjectionAccumulating = false
+                end
+                ScheduleCreditRedriveContinuation(record, nil)
+                return 0, 0, tonumber(GS._creditProjectionCallbackWork) or 0
+            end
+            local id = cands[mi]
+            mi = mi + 1
+            chargeMatch(1)
+            local entry = ops.pending[id]
+            local body = entry and entry.body
+            if type(body) == "table" then
+                local reason = entry.reason
+                local isBudgetAdj = body.kind == (GS.KIND and GS.KIND.ADJUST_QUANTITY)
+                    and reason == "work_budget"
+                if isBudgetAdj or CreditRedriveMatch(
+                    record, body, waveOpts, byId, primaryByAlias, filterCanon) then
+                    building[#building + 1] = id
+                end
+            end
+        end
+        snapshot = building
+        startIndex = 1
+        cont.snapshot = snapshot
+        cont.index = 1
+        cont.pendingCandidates = nil
+        cont.matchIndex = nil
+        cont.snapshotBuilding = nil
+        -- Starting a fresh snapshot consumes the follow-up request that caused it.
+        cont.followUpWake = false
+    end
+    local promoted = 0
+    local attempts = 0
+    local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
+    creditRedriveDepth = creditRedriveDepth + 1
+    local i = startIndex
+    while i <= #snapshot do
+        if attempts >= maxAttempts then
+            break
+        end
+        if overSoft() then
+            break
+        end
+        attempts = attempts + 1
+        local id = snapshot[i]
+        i = i + 1
+        local entry = ops.pending[id]
+        local body = entry and entry.body
+        if type(body) ~= "table" then
+            -- Already removed or malformed; attempt still counts toward budget.
+        elseif type(entry.sender) ~= "string" or entry.sender == "" then
+            -- leave pending until authenticated sender is known
+        else
+            local alreadyAccepted = ops.records and ops.records[id]
+            if not alreadyAccepted and GS._AcceptedCount
+                and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
+                -- Capacity full: leave pending; do not mutate credit.
+            elseif type(GS.AdmitRemoteOperation) == "function" then
+                GS._creditRedriveAdmitActive = true
+                local okAdmit, status, reason = pcall(function()
+                    return GS:AdmitRemoteOperation(body, {
+                        sender = entry.sender,
+                        offlineRecord = record,
+                        preserveAttribution = true,
+                        _creditRedrive = true,
+                    })
+                end)
+                GS._creditRedriveAdmitActive = false
+                if not okAdmit then
+                    -- Leave pending; surface via next wake rather than abort wave.
+                elseif status == "accepted" or status == "duplicate" then
+                    promoted = promoted + 1
+                elseif status == "pending" and reason == "work_budget" then
+                    -- Paced rebuild deferred mid-unit; retry this id next slice.
+                    i = i - 1
+                    break
+                end
+            end
+        end
+    end
+    GS._creditRedriveAdmitActive = false
+    creditRedriveDepth = creditRedriveDepth - 1
+    if i <= #snapshot or type(cont.pendingCandidates) == "table" then
+        cont.snapshot = snapshot
+        cont.index = i
+        cont.opts = waveOpts
+        cont.scheduled = false
+        ScheduleCreditRedriveContinuation(record, nil)
+    else
+        -- Wave complete: become idle unless a real dependency wake arrived
+        -- during this drain (followUpWake). Full-wake filter clearance sticks
+        -- so a later cutover `{}` is not required to fight stale item filters.
+        local followUp = cont.followUpWake == true
+        local wasFull = cont.fullWake == true
+        local retainedOpts = waveOpts
+        if wasFull and not followUp then
+            retainedOpts = { maxAttempts = waveOpts and waveOpts.maxAttempts or nil }
+        end
+        local retainedLookup = nil
+        if cont.lookupComplete and cont.lookupStamp == CreditRedriveLookupStamp(record) then
+            retainedLookup = {
+                lookupById = cont.lookupById,
+                lookupPrimary = cont.lookupPrimary,
+                lookupComplete = true,
+                lookupStamp = cont.lookupStamp,
+                lookupPhase = "done",
+            }
+        end
+        creditRedriveContinuation[record] = {
+            opts = retainedOpts,
+            scheduled = false,
+            followUpWake = false,
+            -- Keep fullWake through a follow-up so narrow wakes cannot re-narrow.
+            fullWake = followUp and wasFull or false,
+            lookupById = retainedLookup and retainedLookup.lookupById or nil,
+            lookupPrimary = retainedLookup and retainedLookup.lookupPrimary or nil,
+            lookupComplete = retainedLookup and true or nil,
+            lookupStamp = retainedLookup and retainedLookup.lookupStamp or nil,
+            lookupPhase = retainedLookup and retainedLookup.lookupPhase or nil,
+        }
+        if followUp then
+            ScheduleCreditRedriveContinuation(record, wasFull and {} or nil)
+        end
+    end
+    -- Only the budget owner closes the allowance; nested share leaves it open.
+    if not nested then
+        GS._creditProjectionAccumulating = false
+    end
+    return promoted, attempts, tonumber(GS._creditProjectionCallbackWork) or 0
+end
+
+local function AppendLedgerEvent(record, event, preserveProductionCredit)
     local cfg = record.accounting and record.accounting._consumables
     local curGen = tonumber(cfg and cfg.generation)
     local eventGen = type(event) == "table" and tonumber(event.generation) or nil
@@ -2403,9 +3396,29 @@ local function AppendLedgerEvent(record, event)
     if GS.AssignProductionCredit then
         GS.AssignProductionCredit(record, event)
     end
+    -- Authenticated adoption export marker is durable proof for an already-accepted
+    -- row; replay must not erase it when the historical evidence time predates the
+    -- installed live-cutover boundary (#465 async adoption).
+    if preserveProductionCredit == true and type(event) == "table" then
+        event.gsProductionCredit = true
+    end
     -- Historical rows belong in the archive list once the live generation advanced.
     if eventGen and curGen and eventGen < curGen then
-        return AppendArchivedLedgerEvent(record, event)
+        local ok, err = AppendArchivedLedgerEvent(record, event)
+        if ok and type(event) == "table" then
+            -- SoftDeleteRuntime is a later local; bind through GS (r4539041882).
+            if GS.OnSoftDeleteLedgerEvidenceArrived then
+                GS.OnSoftDeleteLedgerEvidenceArrived(record, event)
+            end
+            if GS.InvalidateCreditCorrectionProjection then
+                GS.InvalidateCreditCorrectionProjection(record)
+            end
+            GS.EnsureThenRedriveCreditCorrections(record, {
+                eventId = event.id,
+                itemId = event.itemId,
+            })
+        end
+        return ok, err
     end
     local list = record.accounting._consumableEvents
     if type(list) ~= "table" then
@@ -2426,6 +3439,23 @@ local function AppendLedgerEvent(record, event)
         cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
     end
     BumpAccountingMutation(record)
+    if type(event) == "table" then
+        -- Soft-deleted orphan facts must rederive when canonical evidence arrives
+        -- (#465 r4539041882). Targeted refresh via GS (SoftDeleteRuntime is later).
+        if GS.OnSoftDeleteLedgerEvidenceArrived then
+            GS.OnSoftDeleteLedgerEvidenceArrived(record, event)
+        end
+        -- Balance/credit changes can activate previously floor-held accepted heads
+        -- and redrive trusted pending corrections for related events/items.
+        -- One shared callback allowance across Ensure + redrive (#459).
+        if GS.InvalidateCreditCorrectionProjection then
+            GS.InvalidateCreditCorrectionProjection(record)
+        end
+        GS.EnsureThenRedriveCreditCorrections(record, {
+            eventId = event.id,
+            itemId = event.itemId,
+        })
+    end
     return true
 end
 
@@ -3755,6 +4785,16 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
 
     local isDonation = event.type == GS.LEDGER_EVENT.DONATION or event.type == "CONSUMABLE_DONATION"
     local isAdjustment = event.type == GS.LEDGER_EVENT.ADJUSTMENT or event.type == "CONSUMABLE_ADJUSTMENT"
+    -- Adoption replay restores export-attested production credit. The transport
+    -- body.cutoverMarker is emitted only for rows that already carried verified
+    -- live provenance; it is not the self-declared event.gsProductionCredit flag.
+    local adoptedProductionCredit = admissionCtx.adoptionReplay == true
+        and admissionCtx.preserveAttribution == true
+        and type(admissionCtx.sourceCutoverMarker) == "string"
+        and admissionCtx.sourceCutoverMarker ~= ""
+        and GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and record.liveCutover.cutoverMarker == admissionCtx.sourceCutoverMarker
 
     -- Adjustment idempotency uses the original operation id when present.
     local adjustmentEventId = nil
@@ -4118,7 +5158,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 and admissionCtx.sourceCutoverMarker ~= "" then
                 stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
             end
-            local appendOk, appendErr = AppendLedgerEvent(record, stored)
+            local appendOk, appendErr = AppendLedgerEvent(record, stored, adoptedProductionCredit)
             if not appendOk then
                 return "rejected", appendErr or "full"
             end
@@ -4204,9 +5244,17 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "rejected", "stale_generation"
             end
             -- Floor and stored GUID share one authenticated attributed identity.
+            -- Adoption replay may receive balancing adjustments after the matching
+            -- soft-delete already landed (same as gs-op catch-up). Honor verified
+            -- soft-delete debt floors so signed historical debt converges
+            -- (#465 assessment 6829598989 / 6771025929).
+            local floorOpts = { attributedGuid = attrGuid }
+            if admissionCtx.adoptionReplay then
+                floorOpts.respectSoftDeleteDebt = true
+            end
             local floorOk, floorErr = GS.AdjustmentFloorOk(
                 record, tonumber(event.itemId), qty, attributed, eventCampaign,
-                { attributedGuid = attrGuid })
+                floorOpts)
             if not floorOk then
                 return "pending", floorErr or "adjustment_floor"
             end
@@ -4249,7 +5297,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
             end
         end
-        local appendOk, appendErr = AppendLedgerEvent(record, stored)
+        local appendOk, appendErr = AppendLedgerEvent(record, stored, adoptedProductionCredit)
         if not appendOk then
             return "rejected", appendErr or "full"
         end
@@ -4367,6 +5415,11 @@ end
 -- @param campaignId optional; defaults to record.currentCampaignId. Callers that
 --   cannot prove historical campaign provenance should reject before calling.
 -- @param opts optional { enforceGoalCeiling = boolean }
+-- Forward-declared: defined after CreditIdentitiesEqual (#465 remote adj floors).
+local VerifiedSoftDeleteAdjustmentDebtFloors
+-- Soft-delete runtime table is assigned later; alias/remember paths bump deps.
+local SoftDeleteRuntime
+
 function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
@@ -4400,8 +5453,18 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, 
     opts = opts or {}
     local currentItem = ItemTotal(record, itemId, campaignId)
     local nextItem = currentItem + quantity
+    local itemDebtFloor, personalDebtFloor = 0, 0
+    if opts.respectSoftDeleteDebt then
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        itemDebtFloor, personalDebtFloor = VerifiedSoftDeleteAdjustmentDebtFloors(
+            record, itemId, campaignId, attributed, opts.attributedGuid)
+    end
     if nextItem < 0 then
-        return false, "item_negative"
+        if not (opts.respectSoftDeleteDebt and nextItem >= itemDebtFloor) then
+            return false, "item_negative"
+        end
     end
     -- Attributed negative floors use personal durable identity totals, not the
     -- projected main aggregate. Grouped projection remains for display/logs;
@@ -4410,11 +5473,22 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, 
     if attributed and quantity < 0 then
         local attrGuid = GS.ResolveUniqueCharacterGuid and GS.ResolveUniqueCharacterGuid(
             record, attributed, opts.attributedGuid) or nil
-        local personal = GS.PersonalContributorItemTotal
-            and GS.PersonalContributorItemTotal(record, attributed, attrGuid, itemId, campaignId)
-            or ActorItemTotal(record, attributed, itemId, campaignId)
-        if personal + quantity < 0 then
-            return false, "player_negative"
+        local personal, personalErr = nil, nil
+        if GS.PersonalContributorItemTotal then
+            personal, personalErr = GS.PersonalContributorItemTotal(
+                record, attributed, attrGuid, itemId, campaignId)
+        else
+            personal = ActorItemTotal(record, attributed, itemId, campaignId)
+        end
+        if personalErr == GS.CREDIT_UNAVAILABLE or personal == nil and personalErr then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+        personal = tonumber(personal) or 0
+        local nextPersonal = personal + quantity
+        if nextPersonal < 0 then
+            if not (opts.respectSoftDeleteDebt and nextPersonal >= personalDebtFloor) then
+                return false, "player_negative"
+            end
         end
     end
     if opts.enforceGoalCeiling and quantity > 0 then
@@ -4658,6 +5732,5233 @@ function GS.ApplyIdentityLinkMutation(record, op)
     return false, "invalid_kind"
 end
 
+---------------------------------------------------------------------------
+local function IsDonationLedgerEvent(event)
+    local typ = event and event.type
+    return typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION"
+end
+
+local function IsAdjustmentLedgerEvent(event)
+    local typ = event and event.type
+    return typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT"
+end
+
+-- Officer contributor credit corrections (#459)
+-- Durable donation actor / adjustment attributed fields stay intact. Accepted
+-- correct-contributor ops project an effective credited identity used by
+-- personal floors, progress, rankings, Logs, and history audit. Cross-entry
+-- convergence uses a deterministic active-head rebuild: LWW winner per
+-- canonical event, then greedy activation in ascending (timestamp, id) under
+-- personal nonnegative floors. Inactive accepted heads remain for audit/LWW
+-- but do not move credit until floors allow.
+
+local function CreditEventLists(record)
+    return {
+        record.accounting and record.accounting._consumableEvents,
+        record.accounting and record.accounting._consumableEventArchive,
+    }
+end
+
+local function EnsureCreditEventAliases(record)
+    local cfg = record and record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return nil
+    end
+    if type(cfg.creditEventAliases) ~= "table" then
+        cfg.creditEventAliases = {}
+    end
+    return cfg.creditEventAliases
+end
+
+local function CountCreditEventAliasKeys(map)
+    local n = 0
+    if type(map) ~= "table" then
+        return 0
+    end
+    for _ in pairs(map) do
+        n = n + 1
+        if n > (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+            return n
+        end
+    end
+    return n
+end
+
+--- Follow registry/durable alias overlays to a terminal id without ledger scans.
+-- Used by required-binding collection so body resolution cannot stop on an
+-- intermediate hop (#459 discussion_r4498359287).
+local function FollowRequiredAliasTerminal(map, primaryIndex, startId)
+    if type(startId) ~= "string" or startId == "" then
+        return nil
+    end
+    local cur = startId
+    local seen = { [startId] = true }
+    for _ = 1, 8 do
+        local nxt = type(primaryIndex) == "table" and primaryIndex[cur] or nil
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            nxt = type(map) == "table" and map[cur] or nil
+        end
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            break
+        end
+        if seen[nxt] then
+            break
+        end
+        seen[nxt] = true
+        cur = nxt
+    end
+    return ValidTxnId(cur) or cur
+end
+
+--- Collect alias→canonical bindings required by retained accepted corrections
+-- and authenticated pending corrections/soft-deletes. Prefers head keys
+-- (credit:<canon> / delete:<canon>) and registry/map-backed bodies so reclaim
+-- never drops a binding still needed after registry eviction (#459 G1 /
+-- #465 discussion_r4518383396).
+-- Head-derived terminals must not be downgraded by retained operation bodies
+-- (A→C must not become A→B); keep complete necessary edge closure (#459
+-- discussion_r4498359287 / 4498427811).
+local function CollectRequiredCreditEventAliases(record)
+    local required = {}
+    local headProtected = {}
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return required
+    end
+    local ops = record.operations
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local kindDelete = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+    local map = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    local cfg = record.accounting and record.accounting._consumables
+    -- One bounded registry pass — never FindRegistryByTxn per correction
+    -- (#459 discussion_r4488856046).
+    local primaryIndex = BuildTxnRegistryPrimaryIndex(cfg)
+    local function note(alias, canon, protect)
+        alias = ValidTxnId(alias)
+        canon = ValidTxnId(canon)
+        if not (alias and canon and alias ~= canon) then
+            return
+        end
+        local terminal = FollowRequiredAliasTerminal(map, primaryIndex, canon) or canon
+        if alias == terminal then
+            return
+        end
+        if headProtected[alias] and not protect then
+            -- Head already owns a terminal binding for this alias.
+            return
+        end
+        local existing = required[alias]
+        if type(existing) == "string" and existing ~= "" and existing ~= terminal then
+            local existingTerm = FollowRequiredAliasTerminal(map, primaryIndex, existing)
+                or existing
+            if existingTerm == terminal then
+                -- Normalize to the shared terminal; keep head protection.
+                required[alias] = terminal
+            elseif protect then
+                required[alias] = terminal
+            else
+                -- Do not replace a longer/terminal binding with an intermediate.
+                return
+            end
+        else
+            required[alias] = terminal
+        end
+        if protect then
+            headProtected[alias] = true
+        end
+    end
+    local function noteCreditTargetBody(body, kind)
+        if type(body) ~= "table" or body.kind ~= kind then
+            return
+        end
+        local tid = body.target
+        if type(tid) == "string" and tid ~= "" then
+            local primary = FollowRequiredAliasTerminal(map, primaryIndex, tid)
+            if type(primary) == "string" and primary ~= tid then
+                note(tid, primary, false)
+            end
+        end
+        local ve = body.value and body.value.eventId
+        if type(ve) == "string" and ve ~= "" then
+            local p2 = FollowRequiredAliasTerminal(map, primaryIndex, ve)
+            if type(p2) == "string" and p2 ~= ve then
+                note(ve, p2, false)
+            elseif type(tid) == "string" and tid ~= "" then
+                local primary = FollowRequiredAliasTerminal(map, primaryIndex, tid)
+                if type(primary) == "string" and ve ~= primary then
+                    note(ve, primary, false)
+                end
+            end
+        end
+    end
+    local function noteCorrectionBody(body)
+        noteCreditTargetBody(body, kindCorrect)
+    end
+    local function noteSoftDeleteBody(body)
+        noteCreditTargetBody(body, kindDelete)
+    end
+    if type(ops.heads) == "table" and type(ops.records) == "table" then
+        local prefix = "credit:"
+        local deletePrefix = "delete:"
+        for targetKey, headId in pairs(ops.heads) do
+            if type(targetKey) == "string" and type(headId) == "string" then
+                local body = ops.records[headId]
+                if type(body) == "table" and body.kind == kindCorrect then
+                    local canon = nil
+                    if targetKey:sub(1, #prefix) == prefix then
+                        canon = targetKey:sub(#prefix + 1)
+                    end
+                    if type(canon) == "string" and canon ~= "" then
+                        note(body.target, canon, true)
+                        if type(body.value) == "table" then
+                            note(body.value.eventId, canon, true)
+                        end
+                    end
+                elseif type(body) == "table" and body.kind == kindDelete then
+                    local canon = nil
+                    if targetKey:sub(1, #deletePrefix) == deletePrefix then
+                        canon = targetKey:sub(#deletePrefix + 1)
+                    end
+                    if type(canon) == "string" and canon ~= "" then
+                        note(body.target, canon, true)
+                        if type(body.value) == "table" then
+                            note(body.value.eventId, canon, true)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if type(ops.records) == "table" then
+        for _, body in pairs(ops.records) do
+            noteCorrectionBody(body)
+            noteSoftDeleteBody(body)
+        end
+    end
+    -- Authenticated pending corrections/soft-deletes also own their alias
+    -- bindings until they settle or are removed.
+    if type(ops.pending) == "table" then
+        for _, entry in pairs(ops.pending) do
+            if type(entry) == "table" then
+                local reason = entry.reason
+                if reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    noteCorrectionBody(entry.body)
+                    noteSoftDeleteBody(entry.body)
+                end
+            end
+        end
+    end
+    -- Edge closure only along paths from already-required aliases (A→B→C while
+    -- the map still carries that chain). Do not retain every unused sibling that
+    -- merely shares an owned terminal — that blocked capacity reclaim
+    -- (#459 discussion_r4498767528). Once referenced aliases compact to the
+    -- terminal (A→C), an unreferenced intermediate B may be reclaimed.
+    if type(map) == "table" then
+        local aliases = {}
+        for alias in pairs(required) do
+            aliases[#aliases + 1] = alias
+        end
+        for ai = 1, #aliases do
+            local alias = aliases[ai]
+            local terminal = required[alias]
+            if type(terminal) == "string" and terminal ~= "" then
+                local cur = alias
+                for _ = 1, 8 do
+                    local nxt = map[cur]
+                    if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+                        break
+                    end
+                    local endId = FollowRequiredAliasTerminal(map, primaryIndex, nxt) or nxt
+                    if endId ~= terminal then
+                        break
+                    end
+                    if not headProtected[cur] then
+                        if nxt == terminal then
+                            required[cur] = terminal
+                        elseif required[cur] == nil then
+                            required[cur] = nxt
+                        end
+                    end
+                    if nxt ~= terminal and required[nxt] == nil then
+                        required[nxt] = terminal
+                    end
+                    cur = nxt
+                    if cur == terminal then
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return required
+end
+
+--- Public snapshot of required alias→canonical bindings for adoption export.
+-- Bounded copy; never exports the full opportunistic alias map.
+-- @return table alias→canon
+function GS.CollectRequiredCreditEventAliases(record)
+    return CollectRequiredCreditEventAliases(record)
+end
+
+--- Collect VERIFIED soft-delete accounting facts for export/adoption (#465).
+-- Only verified entries for currently projected deletions; never raw payloads.
+-- @return table eventId -> facts, number count
+function GS.CollectSoftDeleteVerifiedFacts(record)
+    local out = {}
+    local n = 0
+    local ready = true
+    if type(record) ~= "table" then
+        return out, 0, ready
+    end
+    if GS.EnsureEventDeletionProjection then
+        local ensured = GS.EnsureEventDeletionProjection(record, nil)
+        ready = ensured == true
+    end
+    local delMap = record.eventDeletions
+    local durable = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    local seen = {}
+    local function absorb(id, entry)
+        if type(id) ~= "string" or id == "" or type(entry) ~= "table" then
+            return
+        end
+        if entry.verified ~= true then
+            return
+        end
+        local canon = entry.eventId or id
+        if type(canon) ~= "string" or canon == "" or seen[canon] then
+            return
+        end
+        seen[canon] = true
+        out[canon] = {
+            verified = true,
+            eventId = canon,
+            eventKind = entry.eventKind,
+            itemId = tonumber(entry.itemId),
+            quantity = tonumber(entry.quantity),
+            campaignId = entry.campaignId,
+            attributed = NormName(entry.attributed),
+            attributedGuid = ValidGuid(entry.attributedGuid),
+            gsProductionCredit = entry.gsProductionCredit == true,
+        }
+        n = n + 1
+    end
+    if type(delMap) == "table" then
+        for id, entry in pairs(delMap) do
+            absorb(id, entry)
+        end
+    end
+    -- Durable map may retain facts briefly ahead of projection; export only
+    -- facts that still match a projected deletion (or durable-only orphans
+    -- when the projection entry is verified via priorMap).
+    if type(durable) == "table" then
+        for id, entry in pairs(durable) do
+            if type(delMap) == "table" and type(delMap[id]) == "table" then
+                absorb(id, entry)
+            elseif type(delMap) == "table" and type(entry) == "table"
+                and type(entry.eventId) == "string" and type(delMap[entry.eventId]) == "table" then
+                absorb(entry.eventId, entry)
+            end
+        end
+    end
+    return out, n, ready
+end
+
+--- Drop durable alias bindings not required by retained accepted/pending corrections.
+-- Optional protectKeys keeps in-flight writes. Returns number of reclaimed keys.
+local function PruneUnusedCreditEventAliases(record, protectKeys)
+    local map = EnsureCreditEventAliases(record)
+    if not map then
+        return 0
+    end
+    local required = CollectRequiredCreditEventAliases(record)
+    local removed = 0
+    local victims = {}
+    for alias, canon in pairs(map) do
+        if required[alias] == nil
+            and not (type(protectKeys) == "table" and protectKeys[alias]) then
+            victims[#victims + 1] = alias
+        elseif type(required[alias]) == "string" and required[alias] ~= canon
+            and not (type(protectKeys) == "table" and protectKeys[alias]) then
+            -- Stale divergent binding for a still-required alias: refresh below.
+            victims[#victims + 1] = alias
+        end
+    end
+    for i = 1, #victims do
+        map[victims[i]] = nil
+        removed = removed + 1
+    end
+    for alias, canon in pairs(required) do
+        if map[alias] ~= canon then
+            if map[alias] ~= nil
+                or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+                map[alias] = canon
+            end
+        end
+    end
+    return removed
+end
+
+-- Public for alias-page capacity reclaim before install (#459 discussion_r4507532462).
+function GS.PruneUnusedCreditEventAliases(record, protectKeys)
+    return PruneUnusedCreditEventAliases(record, protectKeys)
+end
+
+--- Write alias→canonical into the durable map without touching ops generation.
+-- Reclaims unused bindings at capacity before failing so retained corrections
+-- keep durable alias ownership (#459 G1).
+-- @return boolean writtenOrPresent, boolean changed
+local function WriteCreditEventAlias(record, aliasId, canonicalId)
+    aliasId = ValidTxnId(aliasId)
+    canonicalId = ValidTxnId(canonicalId)
+    if not aliasId or not canonicalId or aliasId == canonicalId then
+        return false, false
+    end
+    if type(record) ~= "table" then
+        return false, false
+    end
+    local map = EnsureCreditEventAliases(record)
+    if not map then
+        return false, false
+    end
+    local prior = map[aliasId]
+    if prior == canonicalId then
+        return true, false
+    end
+    if prior == nil and CountCreditEventAliasKeys(map) >= (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+        PruneUnusedCreditEventAliases(record, { [aliasId] = true })
+        prior = map[aliasId]
+        if prior == canonicalId then
+            return true, false
+        end
+        if prior == nil and CountCreditEventAliasKeys(map) >= (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+            return false, false
+        end
+    end
+    map[aliasId] = canonicalId
+    if SoftDeleteRuntime and SoftDeleteRuntime.bumpDep then
+        SoftDeleteRuntime.bumpDep(record, "aliasGen")
+    end
+    return true, true
+end
+
+--- Ensure durable alias→canonical bindings required to retain/accept a
+-- correction that may target alias ids. Reclaims unused map entries first; if
+-- capacity is still exhausted by bindings required by already-retained
+-- corrections, refuse without mutating other retained bindings (#459 G1).
+-- @param event table resolved canonical ledger event
+-- @return boolean ok, string|nil err
+function GS.EnsureContributorCorrectionDurableAliases(record, op, event)
+    if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
+        return true
+    end
+    if type(op) ~= "table" then
+        return true
+    end
+    local function requireAlias(aliasId)
+        if type(aliasId) ~= "string" or aliasId == "" or aliasId == event.id then
+            return true
+        end
+        local wrote = WriteCreditEventAlias(record, aliasId, event.id)
+        return wrote and true or false
+    end
+    local targetId = op.target
+    if not requireAlias(targetId) then
+        return false, "full"
+    end
+    local valueEventId = op.value and op.value.eventId
+    if not requireAlias(valueEventId) then
+        return false, "full"
+    end
+    return true
+end
+
+--- Ensure durable alias→canonical bindings for soft-delete targets (#465).
+-- Same capacity/reclaim rules as contributor corrections. When `event` is nil,
+-- resolve the terminal through the existing alias overlay so a body still naming
+-- alias B keeps B→C after head migration to delete:C.
+-- @return boolean ok, string|nil err
+function GS.EnsureSoftDeleteDurableAliases(record, op, event)
+    if type(op) ~= "table" then
+        return true
+    end
+    local canon = nil
+    if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
+        canon = event.id
+    else
+        local tid = op.target or (op.value and op.value.eventId)
+        if type(tid) == "string" and tid ~= "" then
+            canon = GS.CanonicalCreditEventId and GS.CanonicalCreditEventId(record, tid) or tid
+        end
+    end
+    if type(canon) ~= "string" or canon == "" then
+        return true
+    end
+    local function requireAlias(aliasId)
+        if type(aliasId) ~= "string" or aliasId == "" or aliasId == canon then
+            return true
+        end
+        local wrote = WriteCreditEventAlias(record, aliasId, canon)
+        return wrote and true or false
+    end
+    if not requireAlias(op.target) then
+        return false, "full"
+    end
+    if not requireAlias(op.value and op.value.eventId) then
+        return false, "full"
+    end
+    return true
+end
+
+--- Persist a trusted alias→canonical credit-event binding that outlives the
+-- bounded txn registry (#459). Re-confirm clears a cached ops validation miss
+-- without requiring a manual ops-generation bump when the binding is unchanged.
+-- @return boolean changedOrPresent
+function GS.RememberCreditEventAlias(record, aliasId, canonicalId)
+    local ok, changed = WriteCreditEventAlias(record, aliasId, canonicalId)
+    if not ok then
+        return false
+    end
+    if not changed then
+        -- Binding already known: drop a stale negative ops-validation cache entry
+        -- so cold/warm re-validate can succeed after registry restore (#459).
+        if type(record.operations) == "table" and GS._ClearOpsValidationCache then
+            GS._ClearOpsValidationCache(record.operations)
+        end
+        return true
+    end
+    -- New/changed binding: advance ops generation so projection stamps and
+    -- validation caches observe the mapping change. Do not Invalidate here —
+    -- callers mid-accept still Seal; WakePending / Ensure observe the new gen.
+    if type(record.operations) == "table" and GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(record.operations)
+    end
+    -- aliasGen is bumped inside WriteCreditEventAlias on the changed path.
+    return true
+end
+
+--- Rebuild durable alias bindings from retained correction heads when the
+-- txn registry no longer carries X→Y but the canonical donation still exists.
+-- One shared bounded ledger-id pass; skip heads whose map entry already matches.
+-- Silent map writes only; does not bump ops generation mid-validation (#459 G1).
+function GS.ReconstructCreditEventAliasesFromOps(record)
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return
+    end
+    local ops = record.operations
+    if type(ops.heads) ~= "table" or type(ops.records) ~= "table" then
+        return
+    end
+    local map = EnsureCreditEventAliases(record)
+    if not map then
+        return
+    end
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    local kindDelete = GS.KIND and GS.KIND.SOFT_DELETE_EVENT
+    local needed = {}
+    local prefix = "credit:"
+    local deletePrefix = "delete:"
+    for targetKey, headId in pairs(ops.heads) do
+        if type(targetKey) == "string" and type(headId) == "string" then
+            local body = ops.records[headId]
+            if type(body) == "table"
+                and (body.kind == kindCorrect or body.kind == kindDelete)
+                and type(body.target) == "string" and body.target ~= "" then
+                local canon = nil
+                if body.kind == kindCorrect and targetKey:sub(1, #prefix) == prefix then
+                    canon = targetKey:sub(#prefix + 1)
+                elseif body.kind == kindDelete
+                    and targetKey:sub(1, #deletePrefix) == deletePrefix then
+                    canon = targetKey:sub(#deletePrefix + 1)
+                end
+                if type(canon) == "string" and canon ~= "" and canon ~= body.target then
+                    if map[body.target] ~= canon then
+                        needed[canon] = needed[canon] or {}
+                        needed[canon][#needed[canon] + 1] = body.target
+                    end
+                    local ve = body.value and body.value.eventId
+                    if type(ve) == "string" and ve ~= "" and ve ~= canon
+                        and map[ve] ~= canon then
+                        needed[canon] = needed[canon] or {}
+                        needed[canon][#needed[canon] + 1] = ve
+                    end
+                end
+            end
+        end
+    end
+    local needAny = false
+    for _ in pairs(needed) do
+        needAny = true
+        break
+    end
+    if not needAny then
+        -- Existing map entries already match heads — no ledger walk (#459 G1).
+        GS._creditEventAliasReconstructLedgerVisits = 0
+        return
+    end
+    -- Shared exact-id presence set (one live + one archive bounded pass).
+    -- Include withdrawal headroom so mixed-list donations past the donation
+    -- ceiling remain visible (#459 discussion_r4507532464).
+    local present = {}
+    local ledgerVisits = 0
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                ledgerVisits = ledgerVisits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and needed[event.id] then
+                    present[event.id] = true
+                end
+            end
+        end
+    end
+    GS._creditEventAliasReconstructLedgerVisits = ledgerVisits
+    local protect = {}
+    for canon, aliases in pairs(needed) do
+        if present[canon] then
+            for ai = 1, #aliases do
+                protect[aliases[ai]] = true
+            end
+        end
+    end
+    for canon, aliases in pairs(needed) do
+        if present[canon] then
+            for ai = 1, #aliases do
+                local alias = aliases[ai]
+                if map[alias] ~= canon then
+                    if map[alias] ~= nil
+                        or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+                        map[alias] = canon
+                    else
+                        PruneUnusedCreditEventAliases(record, protect)
+                        if map[alias] ~= nil
+                            or CountCreditEventAliasKeys(map) < (GS.MAX_CREDIT_EVENT_ALIASES or 2048) then
+                            map[alias] = canon
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+--- Resolve a correction/donation target id through the trusted txn alias registry
+-- and durable credit-event alias map (survives registry eviction) (#459).
+-- @return primaryTxnId|nil
+local function ResolveCreditTxnPrimary(record, eventId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return eventId
+    end
+    local current = eventId
+    for _ = 1, 8 do
+        local reg = type(FindRegistryByTxn) == "function" and FindRegistryByTxn(cfg, current)
+        if type(reg) == "table" then
+            if reg.status == "alias" and type(reg.aliasOf) == "string" and reg.aliasOf ~= ""
+                and reg.aliasOf ~= current then
+                current = reg.aliasOf
+            else
+                return ValidTxnId(reg.txnId) or current
+            end
+        else
+            local map = cfg.creditEventAliases
+            local mapped = type(map) == "table" and map[current]
+            if type(mapped) == "string" and mapped ~= "" and mapped ~= current then
+                current = mapped
+            else
+                return current
+            end
+        end
+    end
+    return current
+end
+
+--- Locate a durable ledger event by id across live + archive lists.
+-- Also resolves trusted donation txn aliases onto the canonical ledger row.
+-- Increments GS._ledgerEventIdLookupVisits per examined row (test/metric).
+-- When a complete, stamp-current paced redrive index exists for this record,
+-- reuse it (including authoritative misses) instead of rescanning lists
+-- (#459 pending re-admission / discussion_r4497075794).
+-- @return event|nil
+function GS.FindLedgerEventById(record, eventId)
+    if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil
+    end
+    local function chargeVisit()
+        GS._ledgerEventIdLookupVisits =
+            (tonumber(GS._ledgerEventIdLookupVisits) or 0) + 1
+    end
+    local function chargeShared(n)
+        if GS._creditProjectionAccumulating then
+            GS._creditProjectionCallbackWork =
+                (tonumber(GS._creditProjectionCallbackWork) or 0) + (n or 1)
+        end
+    end
+    -- Reuse the complete paced redrive index only during pending re-admission
+    -- nested under RedrivePendingContributorCorrections (flagged explicitly).
+    -- Ordinary Admit/Apply callbacks may share the projection allowance but must
+    -- not treat a retained index as an authoritative miss — ledger rows can land
+    -- without a stamp bump (#459 discussion_r4497075794).
+    do
+        local cont = creditRedriveContinuation[record]
+        if GS._creditRedriveAdmitActive == true
+            and type(cont) == "table" and cont.lookupComplete == true
+            and cont.lookupStamp == CreditRedriveLookupStamp(record)
+            and type(cont.lookupById) == "table" then
+            chargeVisit()
+            chargeShared(1)
+            local hit = cont.lookupById[eventId]
+            if type(hit) == "table" then
+                return hit
+            end
+            local canon = CanonicalFromRedriveIndex(
+                record, eventId, cont.lookupById, cont.lookupPrimary)
+            if type(canon) == "string" and canon ~= "" and canon ~= eventId then
+                hit = cont.lookupById[canon]
+                if type(hit) == "table" then
+                    return hit
+                end
+            end
+            return nil
+        end
+    end
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            -- Withdrawal headroom matches mixed-list ownership/reconstruction
+            -- bounds (#459 discussion_r4507532464).
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                chargeVisit()
+                local event = list[i]
+                if type(event) == "table" and event.id == eventId then
+                    return event
+                end
+            end
+        end
+    end
+    -- Exact id miss: try txnId equality, then alias → primary → ledger.
+    local byTxn = FindLedgerEventByTxnId(record, eventId)
+    if byTxn then
+        return byTxn
+    end
+    local primary = ResolveCreditTxnPrimary(record, eventId)
+    if primary and primary ~= eventId then
+        byTxn = FindLedgerEventByTxnId(record, primary)
+        if byTxn then
+            return byTxn
+        end
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                    or MaxArchivedLedgerScan())
+                for i = 1, limit do
+                    chargeVisit()
+                    local event = list[i]
+                    if type(event) == "table" and event.id == primary then
+                        return event
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--- One bounded live+archive (+ registry/durable alias) index for a validation
+-- pass. Replaces per-head FindLedgerEventById rescans during cold ops head
+-- validation (#459 discussion_r4507527088).
+-- @return table lookup { byId, primaryByAlias, visits }
+function GS.BuildCreditCanonicalLookup(record)
+    local byId = {}
+    local visits = 0
+    if type(record) ~= "table" then
+        GS._creditCanonicalLookupVisits = 0
+        return { byId = byId, primaryByAlias = {}, visits = 0 }
+    end
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                visits = visits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and event.id ~= "" then
+                    byId[event.id] = event.id
+                    if type(event.txnId) == "string" and event.txnId ~= "" then
+                        byId[event.txnId] = event.id
+                    end
+                end
+            end
+        end
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    local primaryByAlias = BuildTxnRegistryPrimaryIndex(cfg)
+    local map = cfg and cfg.creditEventAliases
+    if type(map) == "table" then
+        local scanned = 0
+        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        for alias, canon in pairs(map) do
+            scanned = scanned + 1
+            if scanned > scanCap then
+                break
+            end
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                primaryByAlias[alias] = canon
+            end
+        end
+    end
+    GS._creditCanonicalLookupVisits = visits
+    return { byId = byId, primaryByAlias = primaryByAlias, visits = visits }
+end
+
+local function CanonicalFromCreditLookup(lookup, eventId)
+    if type(lookup) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return eventId
+    end
+    local byId = lookup.byId
+    if type(byId) == "table" and type(byId[eventId]) == "string" then
+        return byId[eventId]
+    end
+    local primaryByAlias = lookup.primaryByAlias
+    local cur = eventId
+    local seen = { [eventId] = true }
+    for _ = 1, 8 do
+        local nxt = type(primaryByAlias) == "table" and primaryByAlias[cur] or nil
+        if type(nxt) ~= "string" or nxt == "" or nxt == cur then
+            break
+        end
+        if seen[nxt] then
+            break
+        end
+        seen[nxt] = true
+        cur = nxt
+        if type(byId) == "table" and type(byId[cur]) == "string" then
+            return byId[cur]
+        end
+    end
+    return cur
+end
+
+--- Canonical ledger event id for correction targets (alias-aware).
+-- Optional `lookup` from BuildCreditCanonicalLookup avoids ledger rescans.
+function GS.CanonicalCreditEventId(record, eventId, lookup)
+    if type(lookup) == "table" then
+        return CanonicalFromCreditLookup(lookup, eventId) or eventId
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
+        return event.id
+    end
+    local primary = ResolveCreditTxnPrimary(record, eventId)
+    return primary or eventId
+end
+
+--- Operation-head key for correct-contributor, bound to the canonical event id.
+-- Admission, apply, and prepare must share this key so alias-targeted ops
+-- LWW against the same head as locally prepared canonical corrections (#459).
+-- Optional `lookup` enables one pass-local index for cold validation.
+function GS.CorrectionTargetKey(record, target, lookup)
+    if type(target) ~= "string" or target == "" then
+        return nil
+    end
+    local canonical = GS.CanonicalCreditEventId(record, target, lookup) or target
+    if not GS.ComputeTargetKey then
+        return "credit:" .. canonical
+    end
+    return GS.ComputeTargetKey(
+        GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR, canonical)
+end
+
+--- Fold alias-keyed correction heads onto the canonical primary after trusted
+-- A→X discovery so obsolete/LWW classification sees one head (#459).
+-- @param resolvedPrimaryId string|nil when the caller already resolved the
+--   canonical ledger id (alias-page one-pass index), skip another ledger scan.
+function GS.MigrateCorrectionHeadsForAlias(record, primaryTxnId, aliasTxnId, resolvedPrimaryId)
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return
+    end
+    local ops = record.operations
+    if type(ops.heads) ~= "table" then
+        return
+    end
+    local primaryKey
+    if type(resolvedPrimaryId) == "string" and resolvedPrimaryId ~= "" then
+        if GS.ComputeTargetKey and GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR then
+            primaryKey = GS.ComputeTargetKey(
+                GS.KIND.CORRECT_CONTRIBUTOR, resolvedPrimaryId)
+        else
+            primaryKey = "credit:" .. resolvedPrimaryId
+        end
+    else
+        primaryKey = GS.CorrectionTargetKey
+            and GS.CorrectionTargetKey(record, primaryTxnId)
+            or ("credit:" .. tostring(primaryTxnId))
+    end
+    local aliasKey = "credit:" .. tostring(aliasTxnId)
+    if primaryKey == aliasKey then
+        return
+    end
+    local aliasHeadId = ops.heads[aliasKey]
+    if type(aliasHeadId) ~= "string" then
+        return
+    end
+    local primaryHeadId = ops.heads[primaryKey]
+    if type(primaryHeadId) ~= "string" then
+        ops.heads[primaryKey] = aliasHeadId
+        ops.heads[aliasKey] = nil
+        return
+    end
+    if primaryHeadId == aliasHeadId then
+        ops.heads[aliasKey] = nil
+        return
+    end
+    local primaryBody = ops.records and ops.records[primaryHeadId]
+    local aliasBody = ops.records and ops.records[aliasHeadId]
+    if type(aliasBody) == "table" and type(primaryBody) == "table"
+        and GS.CreditCorrectionRevisionWins
+        and GS.CreditCorrectionRevisionWins(aliasBody, primaryBody) then
+        ops.heads[primaryKey] = aliasHeadId
+    end
+    ops.heads[aliasKey] = nil
+end
+
+--- Follow the durable credit-event alias overlay (and optional ledger index) to
+-- a terminal canonical id without another full-ledger scan (#459 OD chain).
+local function ResolveAliasOverlayTerminal(record, startId, ledgerById)
+    if type(startId) ~= "string" or startId == "" then
+        return nil
+    end
+    local map = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    local cur = startId
+    local seen = { [startId] = true }
+    if type(map) == "table" then
+        for _ = 1, 8 do
+            local nextId = map[cur]
+            if type(nextId) ~= "string" or nextId == "" or nextId == cur then
+                break
+            end
+            if seen[nextId] then
+                break
+            end
+            seen[nextId] = true
+            cur = nextId
+        end
+    end
+    if type(ledgerById) == "table" then
+        local ev = ledgerById[cur]
+        if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+            return ev.id
+        end
+    end
+    return cur
+end
+
+--- After trusted alias discovery: migrate heads onto the terminal canonical,
+-- rebuild projection, redrive (#459). Also folds upstream retained heads that
+-- resolve onto the same terminal through the durable alias overlay.
+function GS.WakePendingCorrectionsAfterAlias(record, primaryTxnId, aliasTxnId, itemId)
+    if type(record) ~= "table" then
+        return
+    end
+    local terminal = ResolveAliasOverlayTerminal(record, primaryTxnId, nil)
+    if type(terminal) ~= "string" or terminal == "" then
+        terminal = primaryTxnId
+    end
+    if type(aliasTxnId) == "string" and aliasTxnId ~= "" then
+        GS.MigrateCorrectionHeadsForAlias(record, terminal, aliasTxnId, terminal)
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            GS.MigrateSoftDeleteHeadsForAlias(record, terminal, aliasTxnId, terminal)
+        end
+    end
+    local ops = record.operations
+    if type(ops) == "table" and type(ops.heads) == "table" then
+        local prefix = "credit:"
+        local pending = {}
+        local pendingDeletes = {}
+        for targetKey in pairs(ops.heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
+                local id = targetKey:sub(#prefix + 1)
+                if id ~= "" and id ~= terminal and id ~= aliasTxnId then
+                    local resolved = ResolveAliasOverlayTerminal(record, id, nil)
+                    if resolved == terminal then
+                        pending[#pending + 1] = id
+                    end
+                end
+            elseif type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                local id = targetKey:sub(8)
+                if id ~= "" and id ~= terminal and id ~= aliasTxnId then
+                    local resolved = ResolveAliasOverlayTerminal(record, id, nil)
+                    if resolved == terminal then
+                        pendingDeletes[#pendingDeletes + 1] = id
+                    end
+                end
+            end
+        end
+        for i = 1, #pending do
+            GS.MigrateCorrectionHeadsForAlias(
+                record, terminal, pending[i], terminal)
+        end
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            for i = 1, #pendingDeletes do
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, terminal, pendingDeletes[i], terminal)
+            end
+        end
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    -- One shared allowance; item filter covers primary and alias txn targets.
+    if GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {
+            itemId = itemId,
+        })
+    end
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {
+            itemId = itemId,
+            _shareCallbackBudget = true,
+        })
+    end
+end
+
+--- After a whole alias-page install: migrate every new binding onto its
+-- terminal canonical id (including upstream retained heads), then one shared
+-- projection/redrive under a single remaining allowance (#459 OD / chain).
+-- @param installed { {alias=, canon=}... } newly committed bindings
+-- @param ledgerById table|nil optional id→event index from the page's one pass
+function GS.WakePendingCorrectionsAfterAliasPage(record, installed, ledgerById)
+    if type(record) ~= "table" or type(installed) ~= "table" then
+        return
+    end
+    GS._creditAliasPageWakeCalls =
+        (tonumber(GS._creditAliasPageWakeCalls) or 0) + 1
+    local terminalsTouched = {}
+    for i = 1, #installed do
+        local row = installed[i]
+        if type(row) == "table" and type(row.alias) == "string" and row.alias ~= "" then
+            local terminal = ResolveAliasOverlayTerminal(
+                record, row.canon or row.alias, ledgerById)
+            if type(terminal) ~= "string" or terminal == "" then
+                terminal = row.canon or row.alias
+            end
+            terminalsTouched[terminal] = true
+            GS.MigrateCorrectionHeadsForAlias(
+                record, terminal, row.alias, terminal)
+            if GS.MigrateSoftDeleteHeadsForAlias then
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, terminal, row.alias, terminal)
+            end
+        end
+    end
+    -- Fold retained upstream heads (e.g. credit:A when A→B→C and B→C arrives)
+    -- onto the same terminals without per-binding ledger scans.
+    local ops = record.operations
+    if type(ops) == "table" and type(ops.heads) == "table" then
+        local prefix = "credit:"
+        local pending = {}
+        local pendingDeletes = {}
+        for targetKey in pairs(ops.heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, #prefix) == prefix then
+                local id = targetKey:sub(#prefix + 1)
+                if id ~= "" then
+                    local terminal = ResolveAliasOverlayTerminal(
+                        record, id, ledgerById)
+                    if type(terminal) == "string" and terminal ~= ""
+                        and terminalsTouched[terminal] and terminal ~= id then
+                        pending[#pending + 1] = { alias = id, terminal = terminal }
+                    end
+                end
+            elseif type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                local id = targetKey:sub(8)
+                if id ~= "" then
+                    local terminal = ResolveAliasOverlayTerminal(
+                        record, id, ledgerById)
+                    if type(terminal) == "string" and terminal ~= ""
+                        and terminalsTouched[terminal] and terminal ~= id then
+                        pendingDeletes[#pendingDeletes + 1] = {
+                            alias = id, terminal = terminal,
+                        }
+                    end
+                end
+            end
+        end
+        for i = 1, #pending do
+            GS.MigrateCorrectionHeadsForAlias(
+                record, pending[i].terminal, pending[i].alias, pending[i].terminal)
+        end
+        if GS.MigrateSoftDeleteHeadsForAlias then
+            for i = 1, #pendingDeletes do
+                GS.MigrateSoftDeleteHeadsForAlias(
+                    record, pendingDeletes[i].terminal,
+                    pendingDeletes[i].alias, pendingDeletes[i].terminal)
+            end
+        end
+    end
+    if GS.InvalidateCreditCorrectionProjection then
+        GS.InvalidateCreditCorrectionProjection(record)
+    end
+    if GS.InvalidateEventDeletionProjection then
+        GS.InvalidateEventDeletionProjection(record)
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    -- No per-binding item filter: one coalesced Ensure/Redrive covers the page.
+    if GS.EnsureThenRedriveCreditCorrections then
+        GS.EnsureThenRedriveCreditCorrections(record, {})
+    end
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {})
+    end
+end
+
+local function DurableCreditIdentity(event)
+    if IsDonationLedgerEvent(event) then
+        return NormName(event.actor), ValidGuid(event.actorGuid or event.donorGuid)
+    end
+    if IsAdjustmentLedgerEvent(event) then
+        return NormName(event.attributed), ValidGuid(event.attributedGuid)
+    end
+    return nil, nil
+end
+
+local function CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
+    local ag = ValidGuid(aGuid)
+    local bg = ValidGuid(bGuid)
+    if ag and bg then
+        return ag == bg
+    end
+    local an = NormName(aName)
+    local bn = NormName(bName)
+    if an and bn then
+        return an == bn
+    end
+    return an == nil and bn == nil and ag == nil and bg == nil
+end
+
+--- Soft-delete runtime scratch (#465 r4529162884 / r4529162895).
+-- One module local holds weak caches + helpers to stay under Lua 5.1's
+-- 200-local chunk limit. Dependency versions are mutation-owned (O(1) stamps);
+-- never rescan aliases/maps/facts to decide cache freshness.
+SoftDeleteRuntime = {
+    debtFloor = setmetatable({}, { __mode = "k" }),
+    indexes = setmetatable({}, { __mode = "k" }),
+    deps = setmetatable({}, { __mode = "k" }),
+    -- Include-deleted historical correction view (#465 assessment 6826134902):
+    -- separate cache/scratch/active map so live creditCorrections stay intact.
+    includeDeletedCache = setmetatable({}, { __mode = "k" }),
+    includeDeletedScratch = setmetatable({}, { __mode = "k" }),
+    includeDeletedValidStamp = setmetatable({}, { __mode = "k" }),
+    histEffectiveActive = setmetatable({}, { __mode = "k" }),
+    histEffectiveContinuation = setmetatable({}, { __mode = "k" }),
+}
+
+function SoftDeleteRuntime.depsFor(record)
+    local d = SoftDeleteRuntime.deps[record]
+    if type(d) ~= "table" then
+        d = {
+            delGen = 0,
+            factGen = 0,
+            scopeGen = 0,
+            aliasGen = 0,
+            histGen = 0,
+        }
+        SoftDeleteRuntime.deps[record] = d
+    end
+    return d
+end
+
+function SoftDeleteRuntime.bumpDep(record, field)
+    if type(record) ~= "table" or type(field) ~= "string" then
+        return
+    end
+    local d = SoftDeleteRuntime.depsFor(record)
+    d[field] = (tonumber(d[field]) or 0) + 1
+    SoftDeleteRuntime.debtFloor[record] = nil
+end
+
+--- Drop include-deleted historical effectiveness caches (#465 6826134902).
+function SoftDeleteRuntime.invalidateHistEffective(record)
+    if type(record) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime.includeDeletedCache[record] = nil
+    SoftDeleteRuntime.includeDeletedScratch[record] = nil
+    SoftDeleteRuntime.includeDeletedValidStamp[record] = nil
+    SoftDeleteRuntime.histEffectiveActive[record] = nil
+    SoftDeleteRuntime.histEffectiveContinuation[record] = nil
+end
+
+--- O(1) debt-floor dependency stamp — mutation-owned versions only.
+-- Includes histGen so accepted correction-history changes refresh soft-delete
+-- debt aggregates after verified deletion attribution updates.
+function SoftDeleteRuntime.debtFloorStamp(record)
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(d.delGen or 0) .. ":" .. tostring(d.factGen or 0)
+        .. ":" .. tostring(d.scopeGen or 0) .. ":" .. tostring(d.aliasGen or 0)
+        .. ":" .. tostring(d.histGen or 0)
+end
+
+local function SoftDeletePersonalKey(name, guid)
+    if type(guid) == "string" and guid ~= "" then
+        return "g:" .. guid
+    end
+    if type(name) == "string" and name ~= "" then
+        return "n:" .. name
+    end
+    return nil
+end
+
+--- Signed campaign/item/identity aggregates for soft-delete debt floors.
+-- itemFloor(query C) = unscoped + byCampaign[C] (or total when C empty).
+-- Personal keys omit Unassigned (item effect still counted).
+function SoftDeleteRuntime.buildDebtFloorAggregates(record)
+    local byItem = {}
+    local visits = 0
+    local seen = {}
+    local scope = record and record._gsSoftDeleteFactScope
+    local function bucketFor(itemId)
+        local b = byItem[itemId]
+        if type(b) ~= "table" then
+            b = {
+                total = 0,
+                unscoped = 0,
+                byCampaign = {},
+                personal = {},
+            }
+            byItem[itemId] = b
+        end
+        return b
+    end
+    local function personalBucket(b, key)
+        local p = b.personal[key]
+        if type(p) ~= "table" then
+            p = { total = 0, unscoped = 0, byCampaign = {} }
+            b.personal[key] = p
+        end
+        return p
+    end
+    local function absorb(entry, fromDurable)
+        visits = visits + 1
+        if type(entry) ~= "table" or entry.verified ~= true then
+            return
+        end
+        local canon = entry.eventId
+        if type(canon) ~= "string" or canon == "" or seen[canon] then
+            return
+        end
+        local scopedDurable = fromDurable and type(scope) == "table"
+        if scopedDurable then
+            if not scope[canon]
+                and not (type(entry.eventId) == "string" and scope[entry.eventId]) then
+                return
+            end
+        end
+        -- Descriptor facts are claims until bound to a delete op/evidence.
+        -- During adoption replay the provisional scope is that binding; outside
+        -- it, explicit unproven facts cannot fund debt floors.
+        if entry.evidenceBacked == false and not scopedDurable then
+            return
+        end
+        local itemId = tonumber(entry.itemId)
+        if not itemId then
+            return
+        end
+        local kind = entry.eventKind
+        local qty = tonumber(entry.quantity) or 0
+        if kind == "donation" then
+            if not (qty > 0) or entry.gsProductionCredit ~= true then
+                return
+            end
+        elseif kind == "adjustment" then
+            if qty == 0 or entry.gsProductionCredit ~= true then
+                return
+            end
+        else
+            return
+        end
+        seen[canon] = true
+        -- Signed removed effect (same -qty rule as ApplyVerifiedSoftDeleteDebtFloor).
+        local signed = -qty
+        local b = bucketFor(itemId)
+        b.total = b.total + signed
+        local cid = entry.campaignId
+        if type(cid) == "string" and cid ~= "" then
+            b.byCampaign[cid] = (tonumber(b.byCampaign[cid]) or 0) + signed
+        else
+            b.unscoped = b.unscoped + signed
+        end
+        local creditName = NormName(entry.attributed)
+        local creditGuid = ValidGuid(entry.attributedGuid)
+        local pKey = SoftDeletePersonalKey(creditName, creditGuid)
+        if pKey then
+            -- Compatible name-only + GUID representations share one bucket
+            -- (CreditIdentitiesEqual). Merge an earlier name-only bucket into the
+            -- GUID bucket instead of overwriting n:name and orphaning signed debt
+            -- (r4538978983). Never merge two known different GUIDs.
+            local function mergePersonal(dst, src)
+                if type(dst) ~= "table" or type(src) ~= "table" or dst == src then
+                    return
+                end
+                dst.total = (tonumber(dst.total) or 0) + (tonumber(src.total) or 0)
+                dst.unscoped = (tonumber(dst.unscoped) or 0)
+                    + (tonumber(src.unscoped) or 0)
+                if type(src.byCampaign) == "table" then
+                    dst.byCampaign = dst.byCampaign or {}
+                    for cKey, cVal in pairs(src.byCampaign) do
+                        dst.byCampaign[cKey] =
+                            (tonumber(dst.byCampaign[cKey]) or 0) + (tonumber(cVal) or 0)
+                    end
+                end
+            end
+            local function guidOwnsBucket(bucket, exceptGuidKey)
+                if type(bucket) ~= "table" then
+                    return false
+                end
+                for k, v in pairs(b.personal) do
+                    if v == bucket and type(k) == "string" and k:sub(1, 2) == "g:"
+                        and k ~= exceptGuidKey then
+                        return true
+                    end
+                end
+                return false
+            end
+            local p
+            if creditGuid and creditName then
+                local guidKey = "g:" .. creditGuid
+                local nameKey = "n:" .. creditName
+                p = personalBucket(b, guidKey)
+                local nameBucket = b.personal[nameKey]
+                if type(nameBucket) == "table" and nameBucket ~= p
+                    and not guidOwnsBucket(nameBucket, guidKey) then
+                    mergePersonal(p, nameBucket)
+                end
+                b.personal[guidKey] = p
+                -- Only claim the name alias when it is not owned by another GUID.
+                if type(nameBucket) ~= "table" or nameBucket == p
+                    or not guidOwnsBucket(nameBucket, guidKey) then
+                    b.personal[nameKey] = p
+                end
+            else
+                p = personalBucket(b, pKey)
+            end
+            p.total = p.total + signed
+            if type(cid) == "string" and cid ~= "" then
+                p.byCampaign[cid] = (tonumber(p.byCampaign[cid]) or 0) + signed
+            else
+                p.unscoped = p.unscoped + signed
+            end
+        end
+    end
+    local delMap = record and record.eventDeletions
+    if type(delMap) == "table" then
+        for _, entry in pairs(delMap) do
+            absorb(entry, false)
+        end
+    end
+    local durable = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    if type(durable) == "table" then
+        for _, entry in pairs(durable) do
+            absorb(entry, true)
+        end
+    end
+    return byItem, visits
+end
+
+function SoftDeleteRuntime.ensureDebtFloorAggregates(record)
+    if type(record) ~= "table" then
+        return nil, 0
+    end
+    local stamp = SoftDeleteRuntime.debtFloorStamp(record)
+    local scratch = SoftDeleteRuntime.debtFloor[record]
+    if type(scratch) == "table" and scratch.stamp == stamp
+        and type(scratch.byItem) == "table" then
+        GS._softDeleteDebtFloorIndexReuse = true
+        GS._softDeleteDebtFloorStampVisits = 0
+        return scratch.byItem, 0
+    end
+    local byItem, visits = SoftDeleteRuntime.buildDebtFloorAggregates(record)
+    SoftDeleteRuntime.debtFloor[record] = {
+        stamp = stamp,
+        byItem = byItem,
+        visits = visits,
+    }
+    GS._softDeleteDebtFloorIndexReuse = false
+    GS._softDeleteDebtFloorIndexVisits = visits
+    GS._softDeleteDebtFloorStampVisits = 0
+    return byItem, visits
+end
+
+local function SoftDeleteSignedFloorFromAgg(bucket, campaignId)
+    if type(bucket) ~= "table" then
+        return 0
+    end
+    if type(campaignId) == "string" and campaignId ~= "" then
+        return (tonumber(bucket.unscoped) or 0)
+            + (tonumber(bucket.byCampaign and bucket.byCampaign[campaignId]) or 0)
+    end
+    return tonumber(bucket.total) or 0
+end
+
+--- Verified soft-delete debt floors for remote/adoption adjustment floors (#465).
+-- Returns itemFloor and personalFloor as permitted negative allowances (≤ 0).
+-- Aligns with ApplyVerifiedSoftDeleteDebtFloor: each verified deletion contributes
+-- the signed removed effect (-quantity) once per canonical id + campaign.
+-- Positive adjustments (including Unassigned) lower the item floor; deleting a
+-- negative adjustment raises the aggregate and must not invent a negative
+-- allowance. Personal floors follow effective attribution only — Unassigned
+-- supplies none.
+-- Mutation-owned dependency versions + signed campaign/item/identity aggregates
+-- keep stamp+query O(1) across unchanged deletion facts (r4529162884).
+VerifiedSoftDeleteAdjustmentDebtFloors = function(
+    record, itemId, campaignId, attributed, attributedGuid)
+    local itemFloor, personalFloor = 0, 0
+    if type(record) ~= "table" then
+        return itemFloor, personalFloor
+    end
+    itemId = tonumber(itemId)
+    if not itemId then
+        return itemFloor, personalFloor
+    end
+    local attrName = NormName(attributed)
+    local attrGuid = ValidGuid(attributedGuid)
+    local byItem, buildVisits = SoftDeleteRuntime.ensureDebtFloorAggregates(record)
+    local bucket = type(byItem) == "table" and byItem[itemId] or nil
+    itemFloor = SoftDeleteSignedFloorFromAgg(bucket, campaignId)
+    local pKey = SoftDeletePersonalKey(attrName, attrGuid)
+    if pKey and type(bucket) == "table" and type(bucket.personal) == "table" then
+        personalFloor = SoftDeleteSignedFloorFromAgg(bucket.personal[pKey], campaignId)
+    end
+    GS._softDeleteDebtFloorQueryVisits = 1
+    GS._softDeleteDebtFloorBuildVisits = tonumber(buildVisits) or 0
+    if itemFloor > 0 then
+        itemFloor = 0
+    end
+    if personalFloor > 0 then
+        personalFloor = 0
+    end
+    return itemFloor, personalFloor
+end
+
+--- Install provisional soft-delete fact scope for adoption replay floors (#465).
+function GS.NoteSoftDeleteFactScope(record, scope)
+    if type(record) ~= "table" then
+        return
+    end
+    record._gsSoftDeleteFactScope = scope
+    SoftDeleteRuntime.bumpDep(record, "scopeGen")
+end
+
+function GS.ClearSoftDeleteFactScope(record)
+    if type(record) ~= "table" then
+        return
+    end
+    if record._gsSoftDeleteFactScope ~= nil then
+        record._gsSoftDeleteFactScope = nil
+        SoftDeleteRuntime.bumpDep(record, "scopeGen")
+    end
+end
+
+--- Public identity equality for prepare/UI unchanged checks (#459).
+function GS.CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
+    return CreditIdentitiesEqual(aName, aGuid, bName, bGuid)
+end
+
+--- True when the credit correction projection is verified for ordinary reads.
+-- Distinct from Ensure's rebuild details; false means credit_unavailable.
+function GS.IsCreditCorrectionProjectionAvailable(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    if not GS.EnsureCreditCorrectionProjection then
+        return true
+    end
+    return GS.EnsureCreditCorrectionProjection(record, nil) ~= false
+end
+
+--- Correction head for a known ledger event without scanning the ledger.
+-- Heads are keyed by durable event.id. Alias-shaped ids consult the durable
+-- creditEventAliases hash only — never FindLedgerEventById / registry scans
+-- (those are quadratic when Resolve runs once per campaign row).
+-- @return head|nil
+local function CorrectionHeadForKnownEvent(record, map, event)
+    if type(map) ~= "table" or type(event) ~= "table" then
+        return nil
+    end
+    local id = event.id
+    if type(id) ~= "string" or id == "" then
+        return nil
+    end
+    local head = map[id]
+    if type(head) == "table" then
+        return head
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    local aliases = cfg and cfg.creditEventAliases
+    if type(aliases) ~= "table" then
+        return nil
+    end
+    local current = id
+    for _ = 1, 8 do
+        local mapped = aliases[current]
+        if type(mapped) ~= "string" or mapped == "" or mapped == current then
+            break
+        end
+        current = mapped
+        head = map[current]
+        if type(head) == "table" then
+            return head
+        end
+    end
+    return nil
+end
+
+--- Effective credited identity for one ledger event (#459).
+-- When projection reconstruction is failed/blocked, returns
+-- nil, nil, nil, GS.CREDIT_UNAVAILABLE — never durable fallback.
+-- Legitimate Unassigned adjustments still return nil, nil, nil, nil while
+-- the projection is available.
+-- Caller already holds the event row: do not re-canonicalize via
+-- FindLedgerEventById (#459 discussion_r4488489365).
+-- @return name|nil, guid|nil, correctionHead|nil, status|nil
+function GS.ResolveEffectiveCreditIdentity(record, event)
+    if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
+        return nil, nil, nil, nil
+    end
+    if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return nil, nil, nil, GS.CREDIT_UNAVAILABLE
+        end
+    end
+    local map = type(record) == "table" and record.creditCorrections or nil
+    local head = CorrectionHeadForKnownEvent(record, map, event)
+    if type(head) == "table" then
+        return NormName(head.attributed), ValidGuid(head.attributedGuid), head, nil
+    end
+    local name, guid = DurableCreditIdentity(event)
+    return name, guid, nil, nil
+end
+
+--- Count retained correction projection heads (capacity guard).
+local function CountCreditCorrections(record)
+    local map = record and record.creditCorrections
+    if type(map) ~= "table" then
+        return 0
+    end
+    local n = 0
+    for _ in pairs(map) do
+        n = n + 1
+    end
+    return n
+end
+
+--- Personal total using an override map of active correction heads (by event.id).
+-- Does not read record.creditCorrections so rebuild stays self-contained.
+local function PersonalTotalWithActive(record, actorName, actorGuid, itemId, campaignId, activeMap)
+    itemId = tonumber(itemId)
+    if type(record) ~= "table" or not IsItemId(itemId) then
+        return 0
+    end
+    campaignId = campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return 0
+    end
+    local identityName = NormName(actorName)
+    local identityGuid = ValidGuid(actorGuid)
+    if not identityName and not identityGuid then
+        return 0
+    end
+    local generation = nil
+    if record.currentCampaignId == campaignId then
+        local cfg = record.accounting and record.accounting._consumables
+        generation = cfg and tonumber(cfg.generation)
+    end
+    if not generation then
+        local archive = record.campaignArchives and record.campaignArchives[campaignId]
+        generation = archive and tonumber(archive.generation)
+    end
+    if not generation or generation < 1 then
+        return 0
+    end
+    local function sideMatches(sideName, sideGuid)
+        local g = ValidGuid(sideGuid)
+        if identityGuid and g then
+            return g == identityGuid
+        end
+        local side = NormName(sideName)
+        if identityGuid and not g then
+            if side and identityName and side == identityName then
+                return true
+            end
+            if side then
+                local resolved = GS.ResolveUniqueCharacterGuid(record, side, nil)
+                if resolved and resolved == identityGuid then
+                    return true
+                end
+            end
+            return false
+        end
+        return side ~= nil and identityName ~= nil and side == identityName
+    end
+    local total = 0
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if tonumber(event.generation) ~= generation then
+            return
+        end
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        if tonumber(event.itemId) ~= itemId then
+            return
+        end
+        local qty = tonumber(event.quantity) or 0
+        if qty == 0 then
+            return
+        end
+        local typ = event.type
+        local isDonation = typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION"
+        local isAdjustment = typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT"
+        if not isDonation and not isAdjustment then
+            return
+        end
+        local creditName, creditGuid
+        local override = type(activeMap) == "table" and type(event.id) == "string"
+            and activeMap[event.id] or nil
+        if type(override) == "table" then
+            creditName, creditGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
+        else
+            creditName, creditGuid = DurableCreditIdentity(event)
+        end
+        if isDonation then
+            if qty > 0 and sideMatches(creditName, creditGuid) then
+                total = total + qty
+            end
+        elseif creditName or creditGuid then
+            if sideMatches(creditName, creditGuid) then
+                total = total + qty
+            end
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        for i = 1, #live do
+            consider(live[i])
+        end
+    end
+    if type(archived) == "table" then
+        for i = 1, #archived do
+            consider(archived[i])
+        end
+    end
+    return total
+end
+
+local function FloorOkWithActive(record, event, newName, newGuid, activeMap)
+    if type(record) ~= "table" or type(event) ~= "table" then
+        return false, "invalid_event"
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity)
+    if not IsItemId(itemId) or not qty or qty ~= qty or qty ~= math.floor(qty) or qty == 0 then
+        return false, "invalid_event"
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return false, "no_campaign"
+    end
+    local curName, curGuid
+    local override = type(activeMap) == "table" and activeMap[event.id]
+    if type(override) == "table" then
+        curName, curGuid = NormName(override.attributed), ValidGuid(override.attributedGuid)
+    else
+        curName, curGuid = DurableCreditIdentity(event)
+    end
+    newName = NormName(newName)
+    newGuid = ValidGuid(newGuid)
+    if CreditIdentitiesEqual(curName, curGuid, newName, newGuid) then
+        return true
+    end
+    if curName or curGuid then
+        local personal = PersonalTotalWithActive(
+            record, curName, curGuid, itemId, campaignId, activeMap)
+        if personal - qty < 0 then
+            return false, "player_negative"
+        end
+    end
+    if newName or newGuid then
+        local personal = PersonalTotalWithActive(
+            record, newName, newGuid, itemId, campaignId, activeMap)
+        if personal + qty < 0 then
+            return false, "player_negative"
+        end
+    end
+    return true
+end
+
+--- Personal floor check against the live effective projection (#459).
+function GS.ContributorCorrectionFloorOk(record, event, newName, newGuid)
+    if type(record) == "table" and GS.EnsureCreditCorrectionProjection then
+        local ok = GS.EnsureCreditCorrectionProjection(record, nil)
+        if ok == false then
+            return false, GS.CREDIT_UNAVAILABLE
+        end
+    end
+    -- Use current creditCorrections as the active map.
+    local activeMap = nil
+    if type(record) == "table" and type(record.creditCorrections) == "table" then
+        activeMap = record.creditCorrections
+    end
+    return FloorOkWithActive(record, event, newName, newGuid, activeMap)
+end
+
+local function CorrectionHeadFromOp(op, event, newName, newGuid, prior)
+    local durableName, durableGuid = DurableCreditIdentity(event)
+    local originalName = (type(prior) == "table" and (prior.originalAttributed or prior.originalName))
+        or durableName
+    local originalGuid = (type(prior) == "table" and (prior.originalAttributedGuid or prior.originalGuid))
+        or durableGuid
+    -- Authored previous credit (durable on the op). Never derive from receiver
+    -- projection so reversed delivery preserves audit.
+    local previousName = NormName(op.value and op.value.baseAttributed)
+    local previousGuid = ValidGuid(op.value and op.value.baseAttributedGuid)
+    local isDonation = IsDonationLedgerEvent(event)
+    return {
+        attributed = newName,
+        attributedGuid = newGuid,
+        revisionId = op.id,
+        correctedAt = tonumber(op.timestamp) or Now(),
+        actorName = NormName(op.actorName),
+        actorGuid = ValidGuid(op.actorGuid),
+        originalAttributed = originalName,
+        originalAttributedGuid = originalGuid,
+        previousAttributed = previousName,
+        previousAttributedGuid = previousGuid,
+        eventKind = isDonation and "donation" or "adjustment",
+    }
+end
+
+local function BindCorrectionNewIdentity(record, event, attributed, attributedGuid)
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if not isDonation and not isAdjustment then
+        return nil, nil, "invalid_event"
+    end
+    local newName = NormName(attributed)
+    local newGuid = ValidGuid(attributedGuid)
+    if isDonation then
+        if not newName then
+            return nil, nil, "invalid_attribution"
+        end
+        local boundName, boundGuid, bindErr = GS.ResolveAttributedIdentity(
+            record, newName, newGuid)
+        if bindErr then
+            return nil, nil, bindErr
+        end
+        return boundName, boundGuid, nil
+    end
+    if newName then
+        local boundName, boundGuid, bindErr = GS.ResolveAttributedIdentity(
+            record, newName, newGuid)
+        if bindErr then
+            return nil, nil, bindErr
+        end
+        return boundName, boundGuid, nil
+    end
+    return nil, nil, nil
+end
+
+local function IdentityBucketKey(name, guid, itemId, campaignId)
+    local g = ValidGuid(guid)
+    local n = NormName(name)
+    if not g and not n then
+        return nil
+    end
+    itemId = tonumber(itemId)
+    if not itemId then
+        return nil
+    end
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return nil
+    end
+    if g then
+        return "g:" .. g .. "\0" .. tostring(itemId) .. "\0" .. campaignId
+    end
+    return "n:" .. n .. "\0" .. tostring(itemId) .. "\0" .. campaignId
+end
+
+--- Identity bucket for correction floor aggregates (#459).
+-- GUID-first when Guild Info relationships are ready; when they are not,
+-- BindCharacterIdentity may strip claimed GUIDs from correction heads while
+-- durable adjustments still carry GUIDs — prefer name keys in that state.
+-- resolveCache: optional per-rebuild name→guid memo so readiness is not
+-- revalidated once per ledger row.
+local function CreditFloorBucketKey(record, name, guid, itemId, campaignId, relationshipsReady, resolveCache)
+    local g = ValidGuid(guid)
+    local n = NormName(name)
+    -- Name-only buckets when relationships are not ready — skip unique-GUID
+    -- resolve so projection/readiness stays O(1) in relationship checks.
+    if n and not relationshipsReady then
+        return IdentityBucketKey(n, nil, itemId, campaignId)
+    end
+    if not g and n and GS.ResolveUniqueCharacterGuid then
+        if type(resolveCache) == "table" and resolveCache[n] ~= nil then
+            g = ValidGuid(resolveCache[n])
+        else
+            g = ValidGuid(GS.ResolveUniqueCharacterGuid(record, n, nil))
+            if type(resolveCache) == "table" then
+                resolveCache[n] = g or false
+            end
+        end
+    end
+    return IdentityBucketKey(n, g, itemId, campaignId)
+end
+
+local function NegContribution(value)
+    value = tonumber(value) or 0
+    if value < 0 then
+        return value
+    end
+    return 0
+end
+
+--- Add qty to a floor bucket. Optional scoreBox={score} updates TotalsNegScore in O(1).
+local function TotalsAdd(totals, key, qty, scoreBox)
+    if not key or not qty or qty == 0 then
+        return
+    end
+    local old = totals[key] or 0
+    local new = old + qty
+    totals[key] = new
+    if type(scoreBox) == "table" then
+        scoreBox[1] = (tonumber(scoreBox[1]) or 0)
+            + (NegContribution(new) - NegContribution(old))
+        GS._creditProjectionBucketVisits =
+            (tonumber(GS._creditProjectionBucketVisits) or 0) + 1
+    end
+end
+
+local function TotalsAllNonNegative(totals)
+    for _, total in pairs(totals) do
+        GS._creditProjectionFloorVisits =
+            (tonumber(GS._creditProjectionFloorVisits) or 0) + 1
+        if total < 0 then
+            return false
+        end
+    end
+    return true
+end
+
+--- True when every negative bucket is no worse than approved soft-delete debt (#465).
+-- `debtFloors[key]` is the permitted negative floor from actual soft-deleted
+-- signed quantities (0 / absent ⇒ must be nonnegative). A raw negative baseline
+-- alone is not permission — ordinary invalid accounting still fails closed.
+local function TotalsRespectDeletionDebt(totals, debtFloors)
+    debtFloors = debtFloors or {}
+    for key, total in pairs(totals or {}) do
+        GS._creditProjectionFloorVisits =
+            (tonumber(GS._creditProjectionFloorVisits) or 0) + 1
+        if total < 0 then
+            local floor = tonumber(debtFloors[key]) or 0
+            if total < floor then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+--- Sum of negative totals (0 when all nonnegative). Higher is better when pruning.
+-- Prefer maintaining score via TotalsAdd(..., scoreBox) during conflict trials.
+local function TotalsNegScore(totals)
+    local score = 0
+    for _, total in pairs(totals) do
+        GS._creditProjectionBucketVisits =
+            (tonumber(GS._creditProjectionBucketVisits) or 0) + 1
+        if total < 0 then
+            score = score + total
+        end
+    end
+    return score
+end
+
+--- Item ids whose active totals are worse than approved soft-delete debt floors.
+-- Keys are "g:guid\0itemId\0campaign" or "n:name\0itemId\0campaign".
+-- Lua 5.1 patterns cannot match embedded NULs — use plain find/sub.
+local function ItemIdsWorseThanDeletionDebt(totals, debtFloors)
+    debtFloors = debtFloors or {}
+    local bad = {}
+    for key, total in pairs(totals or {}) do
+        if total < 0 and type(key) == "string" then
+            local floor = tonumber(debtFloors[key]) or 0
+            if total < floor then
+                local first = key:find("\0", 1, true)
+                if first then
+                    local second = key:find("\0", first + 1, true)
+                    if second then
+                        local itemId = tonumber(key:sub(first + 1, second - 1))
+                        if itemId then
+                            bad[itemId] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bad
+end
+
+--- Apply one verified soft-delete debt floor contribution (#465).
+-- Quantity/item/campaign/credited identity must already be VERIFIED — never
+-- arbitrary soft-delete payload snapshots (discussion_r4518378042).
+local function ApplyVerifiedSoftDeleteDebtFloor(
+    debtFloors, record, facts, relationshipsReady, resolveCache)
+    if type(debtFloors) ~= "table" or type(facts) ~= "table" or facts.verified ~= true
+        or facts.evidenceBacked == false then
+        return
+    end
+    local eventKind = facts.eventKind
+    if eventKind ~= "donation" and eventKind ~= "adjustment" then
+        return
+    end
+    if facts.gsProductionCredit ~= true then
+        return
+    end
+    local itemId = tonumber(facts.itemId)
+    local qty = tonumber(facts.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    if eventKind == "donation" and not (qty > 0) then
+        return
+    end
+    local creditName = facts.attributed
+    local creditGuid = facts.attributedGuid
+    if eventKind == "adjustment" and not (creditName or creditGuid) then
+        return
+    end
+    if eventKind == "donation" and not creditName then
+        return
+    end
+    local campaignId = facts.campaignId or record.currentCampaignId
+    local key = CreditFloorBucketKey(
+        record, creditName, creditGuid, itemId, campaignId,
+        relationshipsReady, resolveCache)
+    TotalsAdd(debtFloors, key, -qty)
+end
+
+--- Accumulate soft-delete signed-quantity debt floors for one ledger event.
+-- Prefer VERIFIED deletion-head facts when present; otherwise use durable ledger
+-- identity/quantity only — never unvalidated payload attribution/qty.
+local function NoteSoftDeleteDebtFloor(debtFloors, record, event, relationshipsReady, resolveCache)
+    if type(debtFloors) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    -- Include-deleted historical view treats soft-deleted rows as credit, not debt.
+    if GS._creditProjectionIncludeSoftDeleted then
+        return
+    end
+    if not (GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event)) then
+        return
+    end
+    local delMap = record.eventDeletions
+    local delEntry = nil
+    if type(delMap) == "table" then
+        if type(event.id) == "string" then
+            delEntry = delMap[event.id]
+        end
+        if type(delEntry) ~= "table" and type(event.txnId) == "string" then
+            delEntry = delMap[event.txnId]
+        end
+    end
+    if type(delEntry) == "table" and delEntry.verified == true
+        and delEntry.evidenceBacked ~= false then
+        ApplyVerifiedSoftDeleteDebtFloor(
+            debtFloors, record, delEntry, relationshipsReady, resolveCache)
+        return
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    if event.gsProductionCredit ~= true then
+        return
+    end
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if not isDonation and not isAdjustment then
+        return
+    end
+    if isDonation and not (qty > 0) then
+        return
+    end
+    local creditName, creditGuid = DurableCreditIdentity(event)
+    if isAdjustment and not (creditName or creditGuid) then
+        return
+    end
+    if isDonation and not creditName then
+        return
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    local key = CreditFloorBucketKey(
+        record, creditName, creditGuid, itemId, campaignId,
+        relationshipsReady, resolveCache)
+    TotalsAdd(debtFloors, key, -qty)
+end
+
+--- Reconstruct verified deletion debt after ledger evidence eviction (#465).
+-- Counts each canonical verified deletion once; skips ids still present in byId
+-- (those floors were already noted from the retained ledger row).
+local function NoteVerifiedOrphanSoftDeleteDebtFloors(
+    debtFloors, record, byId, relationshipsReady, resolveCache)
+    if GS._creditProjectionIncludeSoftDeleted then
+        return
+    end
+    local map = record and record.eventDeletions
+    if type(map) ~= "table" or type(debtFloors) ~= "table" then
+        return
+    end
+    local seen = {}
+    for id, entry in pairs(map) do
+        if type(entry) == "table" and entry.verified == true then
+            local canon = entry.eventId or id
+            if type(canon) == "string" and canon ~= "" and not seen[canon] then
+                seen[canon] = true
+                local present = type(byId) == "table"
+                    and (byId[canon] ~= nil or byId[id] ~= nil)
+                if not present then
+                    ApplyVerifiedSoftDeleteDebtFloor(
+                        debtFloors, record, entry, relationshipsReady, resolveCache)
+                end
+            end
+        end
+    end
+end
+
+local function NormalizeSoftDeleteDebtFloors(debtFloors)
+    if type(debtFloors) ~= "table" then
+        return {}
+    end
+    local out = {}
+    for key, total in pairs(debtFloors) do
+        local n = tonumber(total)
+        if n and n < 0 then
+            out[key] = n
+        end
+    end
+    return out
+end
+
+--- Index a ledger event under id and txnId only (#459).
+-- Trusted aliases are folded in one separate registry pass — never call
+-- FindRegistryByTxn per ledger row (that is O(ledger×registry)).
+local function IndexCreditEventKeys(byId, event)
+    if type(byId) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    if type(event.id) == "string" and event.id ~= "" then
+        byId[event.id] = event
+    end
+    local txnId = type(event.txnId) == "string" and event.txnId or nil
+    if txnId and txnId ~= "" then
+        byId[txnId] = event
+    end
+end
+
+--- Fold durable creditEventAliases (survives registry eviction) into byId.
+-- Resolves short alias chains against the map, then binds when the terminal
+-- ledger event is already indexed. Charges one visit per map entry.
+-- Optional shouldYield(visits) aborts mid-fold with the current alias cursor.
+-- @return boolean complete, string|nil resumeAlias, number visits
+local function FoldDurableCreditEventAliasesIntoById(
+    record, byId, visits, shouldYield, resumeAlias)
+    local cfg = record and record.accounting and record.accounting._consumables
+    local map = cfg and cfg.creditEventAliases
+    if type(map) ~= "table" or type(byId) ~= "table" then
+        return true, nil, visits or 0
+    end
+    visits = tonumber(visits) or 0
+    local seenResume = resumeAlias == nil
+    for alias, canon in pairs(map) do
+        if not seenResume then
+            if alias == resumeAlias then
+                seenResume = true
+            end
+        end
+        if seenResume then
+            if shouldYield and shouldYield(visits) then
+                return false, alias, visits
+            end
+            visits = visits + 1
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                local cur = canon
+                for _ = 1, 8 do
+                    local nextId = map[cur]
+                    if type(nextId) == "string" and nextId ~= "" and nextId ~= cur then
+                        cur = nextId
+                    else
+                        break
+                    end
+                end
+                local primary = byId[cur]
+                if type(primary) == "table" then
+                    byId[alias] = primary
+                end
+            end
+        end
+    end
+    return true, nil, visits
+end
+
+--- Scan live+archive once into durable baseline totals and an id/alias index.
+-- Returns totals, byId, rowVisits, relationshipsReady. Callers apply correction
+-- deltas in O(1). Alias mapping is one linear registry pass plus durable map.
+local function BuildDurableCreditFloorBaseline(record)
+    local relationshipsReady = GS.WitnessRelationshipsReady
+        and select(1, GS.WitnessRelationshipsReady(record))
+    local totals = {}
+    local debtFloors = {}
+    local byId = {}
+    local visits = 0
+    local resolveCache = {}
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        visits = visits + 1
+        IndexCreditEventKeys(byId, event)
+        -- Soft-deleted rows leave signed debt floors but never baseline credit.
+        NoteSoftDeleteDebtFloor(
+            debtFloors, record, event, relationshipsReady, resolveCache)
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        local itemId = tonumber(event.itemId)
+        local qty = tonumber(event.quantity) or 0
+        if not itemId or qty == 0 then
+            return
+        end
+        local campaignId = event.campaignId or record.currentCampaignId
+        local creditName, creditGuid = DurableCreditIdentity(event)
+        local isDonation = IsDonationLedgerEvent(event)
+        local isAdjustment = IsAdjustmentLedgerEvent(event)
+        if isDonation then
+            if qty > 0 then
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
+            end
+        elseif isAdjustment then
+            if creditName or creditGuid then
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
+            end
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        for i = 1, #live do
+            consider(live[i])
+        end
+    end
+    if type(archived) == "table" then
+        for i = 1, #archived do
+            consider(archived[i])
+        end
+    end
+    -- One linear registry pass: map verified primary aliases + alias pointers.
+    local cfg = record.accounting and record.accounting._consumables
+    local registry = cfg and cfg.txnRegistry
+    if type(registry) == "table" then
+        for i = 1, #registry do
+            local row = registry[i]
+            visits = visits + 1
+            if type(row) == "table" then
+                if type(row.txnId) == "string" and row.txnId ~= ""
+                    and type(row.aliases) == "table" then
+                    local primary = byId[row.txnId]
+                    if primary then
+                        for j = 1, #row.aliases do
+                            local alias = row.aliases[j]
+                            if type(alias) == "string" and alias ~= "" then
+                                byId[alias] = primary
+                                visits = visits + 1
+                            end
+                        end
+                    end
+                end
+                if row.status == "alias"
+                    and type(row.txnId) == "string" and type(row.aliasOf) == "string" then
+                    local primary = byId[row.aliasOf]
+                    if primary then
+                        byId[row.txnId] = primary
+                    end
+                end
+            end
+        end
+    end
+    -- Durable bindings survive registry eviction (#459 discussion_r4497121466).
+    local foldOk
+    foldOk, _, visits = FoldDurableCreditEventAliasesIntoById(
+        record, byId, visits, nil, nil)
+    if not foldOk then
+        -- Synchronous builder never yields; treat as complete.
+    end
+    -- Verified soft-delete debt survives ledger eviction (#465).
+    NoteVerifiedOrphanSoftDeleteDebtFloors(
+        debtFloors, record, byId, relationshipsReady, resolveCache)
+    return totals, byId, visits, relationshipsReady, NormalizeSoftDeleteDebtFloors(debtFloors)
+end
+
+--- Paced durable baseline: retain partial totals/byId across slices when the
+-- shared callback allowance is exhausted mid-ledger / mid-registry / mid-alias-map.
+-- scratch fields: baselineReady, baselinePhase ("live"|"archive"|"registry"|"aliasMap"),
+-- baselineIndex, baselineTotals, baselineById, baselineVisits,
+-- baselineRelationshipsReady, baselineResolveCache, baselineAliasCursor.
+local function ContinueDurableCreditFloorBaseline(record, scratch, shouldYieldFn)
+    local relationshipsReady = scratch and scratch.baselineRelationshipsReady
+    if relationshipsReady == nil then
+        relationshipsReady = GS.WitnessRelationshipsReady
+            and select(1, GS.WitnessRelationshipsReady(record))
+    end
+    local totals = scratch and scratch.baselineTotals or {}
+    local debtFloors = scratch and scratch.baselineDebtFloors or {}
+    local byId = scratch and scratch.baselineById or {}
+    local provenance = scratch and scratch.baselineProvenance or {}
+    local visits = tonumber(scratch and scratch.baselineVisits) or 0
+    local resolveCache = scratch and scratch.baselineResolveCache or {}
+    local phase = (scratch and scratch.baselinePhase) or "live"
+    local index = tonumber(scratch and scratch.baselineIndex) or 1
+
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        visits = visits + 1
+        IndexCreditEventKeys(byId, event)
+        -- Index name↔GUID provenance once during the paced baseline so activation
+        -- BindCharacterIdentity does not rescan the ledger per head (#459).
+        NoteCreditProvenanceFromEvent(provenance, event)
+        -- Soft-deleted rows leave signed debt floors but never baseline credit.
+        NoteSoftDeleteDebtFloor(
+            debtFloors, record, event, relationshipsReady, resolveCache)
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        local itemId = tonumber(event.itemId)
+        local qty = tonumber(event.quantity) or 0
+        if not itemId or qty == 0 then
+            return
+        end
+        local campaignId = event.campaignId or record.currentCampaignId
+        local creditName, creditGuid = DurableCreditIdentity(event)
+        local isDonation = IsDonationLedgerEvent(event)
+        local isAdjustment = IsAdjustmentLedgerEvent(event)
+        if isDonation then
+            if qty > 0 then
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
+            end
+        elseif isAdjustment then
+            if creditName or creditGuid then
+                TotalsAdd(totals, CreditFloorBucketKey(
+                    record, creditName, creditGuid, itemId, campaignId,
+                    relationshipsReady, resolveCache), qty)
+            end
+        end
+    end
+
+    local function snapshot(nextPhase, nextIndex, aliasCursor)
+        return {
+            baselineReady = false,
+            baselinePhase = nextPhase,
+            baselineIndex = nextIndex,
+            baselineTotals = totals,
+            baselineDebtFloors = debtFloors,
+            baselineById = byId,
+            baselineProvenance = provenance,
+            baselineVisits = visits,
+            baselineRelationshipsReady = relationshipsReady,
+            baselineResolveCache = resolveCache,
+            baselineAliasCursor = aliasCursor,
+        }, visits
+    end
+
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if phase == "live" and type(live) == "table" then
+        while index <= #live do
+            consider(live[index])
+            index = index + 1
+            if shouldYieldFn and shouldYieldFn(visits) then
+                return false, snapshot("live", index)
+            end
+        end
+        phase = "archive"
+        index = 1
+    elseif phase == "live" then
+        phase = "archive"
+        index = 1
+    end
+    if phase == "archive" and type(archived) == "table" then
+        while index <= #archived do
+            consider(archived[index])
+            index = index + 1
+            if shouldYieldFn and shouldYieldFn(visits) then
+                return false, snapshot("archive", index)
+            end
+        end
+        phase = "registry"
+        index = 1
+    elseif phase == "archive" then
+        phase = "registry"
+        index = 1
+    end
+    if phase == "registry" then
+        local cfg = record.accounting and record.accounting._consumables
+        local registry = cfg and cfg.txnRegistry
+        if type(registry) == "table" then
+            while index <= #registry do
+                local row = registry[index]
+                visits = visits + 1
+                index = index + 1
+                if type(row) == "table" then
+                    if type(row.txnId) == "string" and row.txnId ~= ""
+                        and type(row.aliases) == "table" then
+                        local primary = byId[row.txnId]
+                        if primary then
+                            for j = 1, #row.aliases do
+                                local alias = row.aliases[j]
+                                if type(alias) == "string" and alias ~= "" then
+                                    byId[alias] = primary
+                                    visits = visits + 1
+                                end
+                            end
+                        end
+                    end
+                    if row.status == "alias"
+                        and type(row.txnId) == "string" and type(row.aliasOf) == "string" then
+                        local primary = byId[row.aliasOf]
+                        if primary then
+                            byId[row.txnId] = primary
+                        end
+                    end
+                end
+                if shouldYieldFn and shouldYieldFn(visits) then
+                    return false, snapshot("registry", index)
+                end
+            end
+        end
+        phase = "aliasMap"
+        index = 1
+    end
+    if phase == "aliasMap" then
+        local foldOk, resumeAlias
+        foldOk, resumeAlias, visits = FoldDurableCreditEventAliasesIntoById(
+            record, byId, visits, shouldYieldFn,
+            scratch and scratch.baselineAliasCursor)
+        if not foldOk then
+            return false, snapshot("aliasMap", 1, resumeAlias)
+        end
+    end
+    -- Verified soft-delete debt survives ledger eviction (#465).
+    NoteVerifiedOrphanSoftDeleteDebtFloors(
+        debtFloors, record, byId, relationshipsReady, resolveCache)
+    return true, {
+        baselineReady = true,
+        baselineTotals = totals,
+        baselineDebtFloors = NormalizeSoftDeleteDebtFloors(debtFloors),
+        baselineById = byId,
+        baselineProvenance = provenance,
+        baselineVisits = visits,
+        baselineRelationshipsReady = relationshipsReady,
+    }, visits
+end
+
+--- Apply or reverse one donation/adjustment correction delta on floor totals.
+-- Optional scoreBox={score} keeps TotalsNegScore in O(1) per touched bucket.
+local function ApplyCorrectionFloorDelta(record, totals, event, newName, newGuid, relationshipsReady, sign, scoreBox)
+    sign = sign or 1
+    if type(event) ~= "table" then
+        return
+    end
+    if GS.EventCountsTowardLiveProgress
+        and not GS.EventCountsTowardLiveProgress(record, event) then
+        return
+    end
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity) or 0
+    if not itemId or qty == 0 then
+        return
+    end
+    local campaignId = event.campaignId or record.currentCampaignId
+    local oldName, oldGuid = DurableCreditIdentity(event)
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if isDonation and qty > 0 then
+        TotalsAdd(totals, CreditFloorBucketKey(
+            record, oldName, oldGuid, itemId, campaignId, relationshipsReady),
+            -sign * qty, scoreBox)
+        TotalsAdd(totals, CreditFloorBucketKey(
+            record, newName, newGuid, itemId, campaignId, relationshipsReady),
+            sign * qty, scoreBox)
+    elseif isAdjustment and (oldName or oldGuid or newName or newGuid) then
+        if oldName or oldGuid then
+            TotalsAdd(totals, CreditFloorBucketKey(
+                record, oldName, oldGuid, itemId, campaignId, relationshipsReady),
+                -sign * qty, scoreBox)
+        end
+        if newName or newGuid then
+            TotalsAdd(totals, CreditFloorBucketKey(
+                record, newName, newGuid, itemId, campaignId, relationshipsReady),
+                sign * qty, scoreBox)
+        end
+    end
+end
+
+--- True when every personal total is nonnegative under activeMap (#459).
+-- Prefer BuildDurableCreditFloorBaseline + ApplyCorrectionFloorDelta for rebuilds.
+local function AllPersonalNonNegative(record, activeMap)
+    if type(record) ~= "table" then
+        return false
+    end
+    local totals, _, _, relationshipsReady = BuildDurableCreditFloorBaseline(record)
+    if type(activeMap) == "table" then
+        for eventId, head in pairs(activeMap) do
+            if type(head) == "table" and type(eventId) == "string" then
+                local event = GS.FindLedgerEventById(record, eventId)
+                if event then
+                    ApplyCorrectionFloorDelta(
+                        record, totals, event,
+                        NormName(head.attributed), ValidGuid(head.attributedGuid),
+                        relationshipsReady, 1)
+                end
+            end
+        end
+    end
+    return TotalsAllNonNegative(totals)
+end
+
+local creditProjectionCache = setmetatable({}, { __mode = "k" })
+local creditProjectionContinuation = setmetatable({}, { __mode = "k" })
+
+local function CreditProjectionDependencyStamp(record)
+    -- Include-deleted historical effectiveness ignores soft-delete map mutations
+    -- (assessment 6826134902): only correction history + ledger evidence matter.
+    if GS._creditProjectionIncludeSoftDeleted
+        and SoftDeleteRuntime.histIndexStamp
+        and SoftDeleteRuntime.ledgerIndexStamp then
+        local acctMut = GS.GetAccountingMutationSeq
+            and GS.GetAccountingMutationSeq(record) or 0
+        return SoftDeleteRuntime.histIndexStamp(record) .. ":"
+            .. SoftDeleteRuntime.ledgerIndexStamp(record) .. ":"
+            .. tostring(acctMut) .. ":"
+            .. tostring(record.datasetId or "")
+    end
+    local opsGen = 0
+    if GS.GetOpsValidationGen then
+        opsGen = GS.GetOpsValidationGen(record.operations) or 0
+    end
+    local acctMut = GS.GetAccountingMutationSeq and GS.GetAccountingMutationSeq(record) or 0
+    return tostring(opsGen) .. ":" .. tostring(acctMut) .. ":" .. tostring(record.datasetId or "")
+end
+
+--- Effective per-callback work ceiling (#459). Override is test-only.
+local function CreditProjectionSliceBudget()
+    local override = tonumber(GS._creditProjectionWorkBudgetOverride)
+    if override and override > 0 then
+        return override
+    end
+    return tonumber(GS.CREDIT_PROJECTION_WORK_BUDGET) or 16384
+end
+
+local function CreditProjectionAtomicOvershoot()
+    local override = tonumber(GS._creditProjectionAtomicOvershootOverride)
+    if override and override >= 0 then
+        return override
+    end
+    return tonumber(GS.CREDIT_PROJECTION_ATOMIC_OVERSHOOT) or 512
+end
+
+local function CreditProjectionWorkNow(rowVisits)
+    return (tonumber(rowVisits) or 0)
+        + (tonumber(GS._creditProjectionBucketVisits) or 0)
+        + (tonumber(GS._creditProjectionFloorVisits) or 0)
+        + (tonumber(GS._creditProjectionCandidateTrials) or 0)
+        + (tonumber(GS._creditProjectionStructureCopyVisits) or 0)
+        + (tonumber(GS._creditProjectionTraversalVisits) or 0)
+        + (tonumber(GS._creditProjectionProvenanceVisits) or 0)
+end
+
+--- Clear orphaned local visit counters that are not owned by an open allowance.
+-- Used when opening a fresh callback so prior standalone provenance / slice
+-- work cannot reject a new valid admit as work_budget (#459 B).
+local function ClearCreditProjectionLocalVisitCounters()
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
+    GS._creditProjectionTraversalVisits = 0
+    GS._creditProjectionProvenanceVisits = 0
+end
+
+--- Begin a fresh callback budget, or keep nesting under the parent allowance.
+local function BeginCreditProjectionCallbackBudget(share)
+    if not share then
+        local budget = CreditProjectionSliceBudget()
+        GS._creditProjectionCallbackWork = 0
+        GS._creditProjectionCallbackLimit = budget
+        GS._creditProjectionCallbackHardLimit = budget + CreditProjectionAtomicOvershoot()
+        -- Fresh outer boundary owns a clean slice; do not carry stale provenance
+        -- from prior callbacks / ledger revisions into SoftExceeded checks.
+        ClearCreditProjectionLocalVisitCounters()
+    end
+    GS._creditProjectionAccumulating = true
+end
+
+local function EndCreditProjectionCallbackBudget()
+    GS._creditProjectionAccumulating = false
+    -- Drop any unfolder leftovers so the next outer Begin starts clean.
+    ClearCreditProjectionLocalVisitCounters()
+end
+
+--- Open an outer callback allowance when none is active (#459).
+-- @return boolean owned true when this caller must EndOuter later
+function GS.BeginOuterCreditProjectionCallbackBudget()
+    if GS._creditProjectionAccumulating then
+        return false
+    end
+    BeginCreditProjectionCallbackBudget(false)
+    return true
+end
+
+--- Close an outer allowance only when BeginOuter returned owned=true.
+function GS.EndOuterCreditProjectionCallbackBudget(owned)
+    if owned then
+        EndCreditProjectionCallbackBudget()
+    end
+end
+
+--- One outer callback allowance for accepted-history Ensure then pending redrive.
+-- Production wakes must not open a second full slice after Ensure returns.
+-- Nested callers share the caller's already-consumed allowance; only this
+-- boundary closes a budget it opened. Exhausted soft limit merges/schedules
+-- remaining redrive work rather than resetting the counter.
+-- @param record table
+-- @param redriveOpts table|nil filters for RedrivePendingContributorCorrections
+function GS.EnsureThenRedriveCreditCorrections(record, redriveOpts)
+    if type(record) ~= "table" then
+        return
+    end
+    local owned = false
+    if not GS._creditProjectionAccumulating then
+        BeginCreditProjectionCallbackBudget(false)
+        owned = true
+    end
+    if GS.EnsureCreditCorrectionProjection then
+        GS.EnsureCreditCorrectionProjection(record, nil)
+    end
+    local opts = type(redriveOpts) == "table" and redriveOpts or {}
+    if opts._shareCallbackBudget ~= true then
+        local shared = {}
+        for k, v in pairs(opts) do
+            shared[k] = v
+        end
+        shared._shareCallbackBudget = true
+        opts = shared
+    end
+    if GS.RedrivePendingContributorCorrections then
+        GS.RedrivePendingContributorCorrections(record, opts)
+    end
+    -- #465: ledger/credit wakes also promote pending soft-deletes.
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, opts)
+    end
+    if owned then
+        EndCreditProjectionCallbackBudget()
+    end
+end
+
+--- Work already charged this callback plus in-progress local rebuild units.
+local function CreditProjectionCallbackWorkTotal(localWork)
+    local base = 0
+    if GS._creditProjectionAccumulating then
+        base = tonumber(GS._creditProjectionCallbackWork) or 0
+    end
+    return base + (tonumber(localWork) or 0)
+end
+
+local function CreditProjectionSoftLimit()
+    return tonumber(GS._creditProjectionCallbackLimit) or CreditProjectionSliceBudget()
+end
+
+local function CreditProjectionHardLimit()
+    return tonumber(GS._creditProjectionCallbackHardLimit)
+        or (CreditProjectionSoftLimit() + CreditProjectionAtomicOvershoot())
+end
+
+local function AccumulateCreditProjectionCallbackWork(workUnits)
+    if not GS._creditProjectionAccumulating then
+        return
+    end
+    GS._creditProjectionCallbackWork =
+        (tonumber(GS._creditProjectionCallbackWork) or 0) + (tonumber(workUnits) or 0)
+end
+
+--- Fold a finished rebuild slice into the shared callback total and clear local
+-- visit counters so a later fold/observe cannot double-count (#459 G2).
+local function AccumulateCreditProjectionSliceWork(workUnits)
+    AccumulateCreditProjectionCallbackWork(workUnits)
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
+    GS._creditProjectionTraversalVisits = 0
+    GS._creditProjectionProvenanceVisits = 0
+end
+
+-- Ephemeral paced-rebuild scratch (not durable / not another ledger authority).
+-- Scratch is ownership-keyed: accepted-history and each speculative extraOp
+-- keep private paused state so admission previews cannot clobber a pause.
+local creditProjectionScratchAccepted = setmetatable({}, { __mode = "k" })
+local creditProjectionScratchSpeculative = setmetatable({}, { __mode = "k" })
+-- Accepted published map validity for the current dependency stamp. Distinct
+-- from "creditCorrections is a table": Invalidate / incomplete accepted rebuild
+-- clear this so speculative pauses cannot resurrect stale readable credit (#459).
+local acceptedCreditValidStamp = setmetatable({}, { __mode = "k" })
+
+local function MarkAcceptedCreditInvalid(record)
+    if type(record) ~= "table" then
+        return
+    end
+    acceptedCreditValidStamp[record] = nil
+    record.creditCorrections = nil
+end
+
+local function MarkAcceptedCreditValid(record, stamp)
+    if type(record) ~= "table" then
+        return
+    end
+    acceptedCreditValidStamp[record] = stamp or CreditProjectionDependencyStamp(record)
+end
+
+local function IsSpeculativeCreditProjectionOp(ops, extraOp)
+    return type(extraOp) == "table"
+        and not (type(ops) == "table" and type(ops.records) == "table"
+            and ops.records[extraOp.id])
+end
+
+local function ReadCreditProjectionScratch(record, speculative, extraOp)
+    if type(record) ~= "table" then
+        return nil
+    end
+    if speculative and type(extraOp) == "table" and type(extraOp.id) == "string" then
+        local bag = creditProjectionScratchSpeculative[record]
+        if type(bag) == "table" then
+            return bag[extraOp.id]
+        end
+        return nil
+    end
+    return creditProjectionScratchAccepted[record]
+end
+
+local function WriteCreditProjectionScratch(record, speculative, extraOp, value)
+    if type(record) ~= "table" then
+        return
+    end
+    if speculative and type(extraOp) == "table" and type(extraOp.id) == "string" then
+        local bag = creditProjectionScratchSpeculative[record]
+        if type(bag) ~= "table" then
+            bag = {}
+            creditProjectionScratchSpeculative[record] = bag
+        end
+        bag[extraOp.id] = value
+        return
+    end
+    creditProjectionScratchAccepted[record] = value
+end
+
+local function ClearCreditProjectionScratch(record)
+    if type(record) == "table" then
+        creditProjectionScratchAccepted[record] = nil
+        creditProjectionScratchSpeculative[record] = nil
+    end
+end
+
+local function ClearSpeculativeCreditProjectionScratch(record, op)
+    if type(record) ~= "table" then
+        return
+    end
+    local bag = creditProjectionScratchSpeculative[record]
+    if type(bag) ~= "table" then
+        return
+    end
+    local opId = type(op) == "table" and op.id or nil
+    if type(opId) == "string" then
+        bag[opId] = nil
+    else
+        creditProjectionScratchSpeculative[record] = nil
+    end
+end
+
+local function CloneCreditProjectionTotals(totals)
+    local copy = {}
+    if type(totals) ~= "table" then
+        return copy
+    end
+    local n = 0
+    for k, v in pairs(totals) do
+        copy[k] = v
+        n = n + 1
+    end
+    if n > 0 then
+        GS._creditProjectionStructureCopyVisits =
+            (tonumber(GS._creditProjectionStructureCopyVisits) or 0) + n
+    end
+    return copy
+end
+
+--- Drop a speculative preview resume so timers cannot publish a rejected edit.
+local function DiscardSpeculativeCreditProjectionResume(record, op)
+    if type(record) ~= "table" then
+        return
+    end
+    local cached = creditProjectionCache[record]
+    if type(cached) == "table" and type(cached.resume) == "table" then
+        local resume = cached.resume
+        if resume.speculative then
+            local opId = type(op) == "table" and op.id or nil
+            if not (type(resume.extraOpId) == "string"
+                and type(opId) == "string"
+                and resume.extraOpId ~= opId) then
+                creditProjectionCache[record] = nil
+                local cont = creditProjectionContinuation[record]
+                if type(cont) == "table" then
+                    cont.scheduled = false
+                end
+            end
+        end
+    end
+    -- Never clear accepted-history scratch when discarding a speculative preview.
+    ClearSpeculativeCreditProjectionScratch(record, op)
+end
+
+local ScheduleCreditProjectionContinuation
+
+ScheduleCreditProjectionContinuation = function(record)
+    if type(record) ~= "table" then
+        return
+    end
+    -- Include-deleted historical rebuild owns its own continuation (#465).
+    if GS._creditProjectionIncludeSoftDeleted
+        and SoftDeleteRuntime.scheduleHistEffectiveContinuation then
+        SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
+        return
+    end
+    -- Without a timer, finish inline on the next Rebuild caller instead of
+    -- recursively draining here (keeps one unit of work per callback).
+    if not (C_Timer and C_Timer.After) then
+        return
+    end
+    -- Never background-resume a speculative preview op; only accepted history.
+    local cached = creditProjectionCache[record]
+    if type(cached) == "table" and type(cached.resume) == "table"
+        and cached.resume.speculative then
+        return
+    end
+    -- Scheduling accepted-history continuation means reconstruction is incomplete:
+    -- clear published validity so Ensure cannot serve a stale map (#459 B3).
+    MarkAcceptedCreditInvalid(record)
+    local cont = creditProjectionContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {}
+        creditProjectionContinuation[record] = cont
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = creditProjectionContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        local prior = creditProjectionCache[record]
+        local fromAcceptedBudget = type(prior) == "table"
+            and prior.err == "work_budget"
+            and not (type(prior.resume) == "table" and prior.resume.speculative)
+        BeginCreditProjectionCallbackBudget(false)
+        local ok, err = false, nil
+        if GS.RebuildCreditCorrectionProjection then
+            -- Accepted-history only — never pass resume.extraOp here.
+            ok, err = GS.RebuildCreditCorrectionProjection(record, nil)
+        end
+        if (ok or err ~= "work_budget")
+            and GS.RedrivePendingContributorCorrections then
+            -- Share remaining callback allowance with nested redrive.
+            GS.RedrivePendingContributorCorrections(record, {
+                _shareCallbackBudget = true,
+            })
+        end
+        EndCreditProjectionCallbackBudget()
+        -- One coalesced UI-only notify for accepted-history work_budget→terminal
+        -- after publication/budget cleanup (#459 / discussion_r4480421491).
+        -- No per-slice notifies; do not invalidate the just-completed projection.
+        if fromAcceptedBudget and (ok or err ~= "work_budget") then
+            if GS.NotifyUI then
+                GS.NotifyUI("credit-projection-ready")
+            end
+        end
+    end
+    C_Timer.After(0, run)
+end
+
+--- Swap live credit-projection ownership for include-deleted historical rebuild.
+-- Defined after creditProjection* locals so Lua 5.1 binds the correct upvalues.
+-- Live creditCorrections / accepted validity remain untouched for callers.
+function SoftDeleteRuntime.enterIncludeDeletedProjection(record)
+    SoftDeleteRuntime._includeDeletedDepth =
+        (tonumber(SoftDeleteRuntime._includeDeletedDepth) or 0) + 1
+    if SoftDeleteRuntime._includeDeletedDepth > 1 then
+        return
+    end
+    SoftDeleteRuntime._savedLiveProjection = {
+        corrections = record.creditCorrections,
+        cache = creditProjectionCache[record],
+        scratch = creditProjectionScratchAccepted[record],
+        valid = acceptedCreditValidStamp[record],
+        cont = creditProjectionContinuation[record],
+    }
+    record.creditCorrections = SoftDeleteRuntime.histEffectiveActive[record]
+    creditProjectionCache[record] = SoftDeleteRuntime.includeDeletedCache[record]
+    creditProjectionScratchAccepted[record] = SoftDeleteRuntime.includeDeletedScratch[record]
+    acceptedCreditValidStamp[record] = SoftDeleteRuntime.includeDeletedValidStamp[record]
+    creditProjectionContinuation[record] = SoftDeleteRuntime.histEffectiveContinuation[record]
+    GS._creditProjectionIncludeSoftDeleted = true
+end
+
+function SoftDeleteRuntime.leaveIncludeDeletedProjection(record)
+    local depth = tonumber(SoftDeleteRuntime._includeDeletedDepth) or 0
+    if depth <= 0 then
+        return
+    end
+    SoftDeleteRuntime._includeDeletedDepth = depth - 1
+    if SoftDeleteRuntime._includeDeletedDepth > 0 then
+        return
+    end
+    SoftDeleteRuntime.histEffectiveActive[record] = record.creditCorrections
+    SoftDeleteRuntime.includeDeletedCache[record] = creditProjectionCache[record]
+    SoftDeleteRuntime.includeDeletedScratch[record] = creditProjectionScratchAccepted[record]
+    SoftDeleteRuntime.includeDeletedValidStamp[record] = acceptedCreditValidStamp[record]
+    SoftDeleteRuntime.histEffectiveContinuation[record] = creditProjectionContinuation[record]
+    local saved = SoftDeleteRuntime._savedLiveProjection
+    SoftDeleteRuntime._savedLiveProjection = nil
+    GS._creditProjectionIncludeSoftDeleted = false
+    if type(saved) == "table" then
+        record.creditCorrections = saved.corrections
+        creditProjectionCache[record] = saved.cache
+        creditProjectionScratchAccepted[record] = saved.scratch
+        acceptedCreditValidStamp[record] = saved.valid
+        creditProjectionContinuation[record] = saved.cont
+    end
+end
+
+--- Drain sync-drain hist-effective continuations after rebuild releases busy.
+-- Adoption tests set GS._adoptionReplaySyncDrain and never flush C_Timer; paced
+-- hist-effective must still make progress without disabling C_Timer.After.
+function SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    local q = SoftDeleteRuntime._histEffectiveSyncDrain
+    SoftDeleteRuntime._histEffectiveSyncDrain = nil
+    if type(q) ~= "table" or #q == 0 then
+        return
+    end
+    local depth = tonumber(SoftDeleteRuntime._histEffectiveSyncDrainDepth) or 0
+    if depth >= 8 then
+        -- Bound nested sync slices. Clear scheduled so a later Ensure can resume.
+        -- Do not re-queue After(0) — test flushTimers would loop forever.
+        for i = 1, #q do
+            local item = q[i]
+            local rec = item and item.record
+            local cont = type(rec) == "table"
+                and SoftDeleteRuntime.histEffectiveContinuation[rec]
+            if type(cont) == "table" then
+                cont.scheduled = false
+            end
+        end
+        return
+    end
+    SoftDeleteRuntime._histEffectiveSyncDrainDepth = depth + 1
+    for i = 1, #q do
+        local item = q[i]
+        if type(item) == "table" and type(item.run) == "function" then
+            item.run()
+        elseif type(item) == "function" then
+            item()
+        end
+    end
+    SoftDeleteRuntime._histEffectiveSyncDrainDepth = depth
+end
+
+--- Resume paced include-deleted historical rebuild, then publish pending facts.
+function SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = SoftDeleteRuntime.histEffectiveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {}
+        SoftDeleteRuntime.histEffectiveContinuation[record] = cont
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = SoftDeleteRuntime.histEffectiveContinuation[record]
+        if type(state) == "table" then
+            state.scheduled = false
+        end
+        SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
+    end
+    -- Sync-drain adoption never flushes After(0); queue until rebuild leaves busy.
+    if GS._adoptionReplaySyncDrain == true then
+        SoftDeleteRuntime._histEffectiveSyncDrain =
+            SoftDeleteRuntime._histEffectiveSyncDrain or {}
+        SoftDeleteRuntime._histEffectiveSyncDrain[
+            #SoftDeleteRuntime._histEffectiveSyncDrain + 1] = {
+            record = record,
+            run = run,
+        }
+        return
+    end
+    if not (C_Timer and C_Timer.After) then
+        cont.scheduled = false
+        return
+    end
+    C_Timer.After(0, run)
+end
+
+--- Finish include-deleted rebuild then coherently refresh deletion facts (#465).
+function SoftDeleteRuntime.continueHistEffectiveAndFacts(record)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    local owned = false
+    if GS.BeginOuterCreditProjectionCallbackBudget then
+        owned = GS.BeginOuterCreditProjectionCallbackBudget()
+    end
+    local ok, err = SoftDeleteRuntime.rebuildHistEffectiveActive(record)
+    if ok == false then
+        if GS.EndOuterCreditProjectionCallbackBudget then
+            GS.EndOuterCreditProjectionCallbackBudget(owned)
+        end
+        -- work_budget already scheduled via ScheduleCreditProjectionContinuation.
+        return false, err or "engine_error"
+    end
+    local pending = SoftDeleteRuntime._pendingFactRefresh
+        and SoftDeleteRuntime._pendingFactRefresh[record]
+    if SoftDeleteRuntime._pendingFactRefresh then
+        SoftDeleteRuntime._pendingFactRefresh[record] = nil
+    end
+    -- Hist-effective just settled: any published deletion map may have been
+    -- sealed under incomplete effectiveness. Force a coherent fact refresh when
+    -- deletions exist even if notePendingFactRefresh was not set (async adopt).
+    if type(pending) ~= "table" then
+        local hasDeletes = false
+        if type(record.eventDeletions) == "table" and next(record.eventDeletions) ~= nil then
+            hasDeletes = true
+        else
+            local heads = record.operations and record.operations.heads
+            if type(heads) == "table" then
+                for targetKey in pairs(heads) do
+                    if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                        hasDeletes = true
+                        break
+                    end
+                end
+            end
+        end
+        if hasDeletes then
+            pending = { fullRebuild = true }
+        end
+    end
+    local factOk, factErr = true, nil
+    if type(pending) == "table" then
+        if pending.fullRebuild == true and GS.RebuildEventDeletionProjection then
+            -- Hist-effective stamp is part of EventDeletionDependencyStamp, so a
+            -- prior completed deletion cache cannot match after this settle.
+            if GS.InvalidateEventDeletionProjection then
+                GS.InvalidateEventDeletionProjection(record)
+            end
+            factOk, factErr = GS.RebuildEventDeletionProjection(record, nil)
+            if not factOk then
+                factErr = factErr or "work_budget"
+            end
+        elseif pending.correctionBody ~= nil then
+            factOk = SoftDeleteRuntime.refreshDeletionAttributionForTarget(
+                record, pending.correctionBody)
+            if not factOk then
+                factErr = "work_budget"
+            end
+        end
+    end
+    if GS.EndOuterCreditProjectionCallbackBudget then
+        GS.EndOuterCreditProjectionCallbackBudget(owned)
+    end
+    if factOk == false then
+        return false, factErr or "work_budget"
+    end
+    -- Wake retained soft-deletes once hist-effective + facts settle (#465
+    -- assessment 6834988628). Continuation rebuild does not carry the op body;
+    -- admission/local pending + redrive re-applies the authenticated delete.
+    if GS.RedrivePendingSoftDeletes then
+        GS.RedrivePendingSoftDeletes(record, {
+            _shareCallbackBudget = true,
+        })
+    end
+    if GS._NotifyLocalDurableChange and GS.GetCurrentRecord
+        and not GS._adoptionReplaySyncDrain then
+        local current = GS.GetCurrentRecord(GS)
+        if current == record then
+            GS._NotifyLocalDurableChange("ledger")
+        end
+    end
+    return ok, err
+end
+
+function SoftDeleteRuntime.notePendingFactRefresh(record, pending)
+    if type(record) ~= "table" or type(pending) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime._pendingFactRefresh = SoftDeleteRuntime._pendingFactRefresh
+        or setmetatable({}, { __mode = "k" })
+    SoftDeleteRuntime._pendingFactRefresh[record] = pending
+    SoftDeleteRuntime.scheduleHistEffectiveContinuation(record)
+    -- Outside an in-flight rebuild, sync-drain queues must run immediately.
+    if GS._adoptionReplaySyncDrain == true
+        and not SoftDeleteRuntime._rebuildingHistEffective then
+        SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    end
+end
+
+--- Dependency stamp for include-deleted historical effectiveness (#465).
+-- Soft-delete admits do not bump histGen / ledger row counts, so multi-delete
+-- slices reuse the cached active map instead of rebuilding per deletion.
+function SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+    local acctMut = GS.GetAccountingMutationSeq
+        and GS.GetAccountingMutationSeq(record) or 0
+    return SoftDeleteRuntime.histIndexStamp(record) .. ":"
+        .. SoftDeleteRuntime.ledgerIndexStamp(record) .. ":"
+        .. tostring(acctMut) .. ":"
+        .. tostring(record.datasetId or "")
+end
+
+--- Rebuild include-deleted active correction map via the live engine (#465).
+-- Shares activate/prune/tie/bind semantics and the parent callback allowance;
+-- publishes to histEffectiveActive only. Never disables C_Timer.After.
+function SoftDeleteRuntime.rebuildHistEffectiveActive(record)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    if SoftDeleteRuntime._rebuildingHistEffective then
+        local nested = SoftDeleteRuntime.includeDeletedCache[record]
+        if type(nested) == "table" and nested.ok == true then
+            return true
+        end
+        return false, nested and nested.err or "busy"
+    end
+    local stamp = SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+    local cached = SoftDeleteRuntime.includeDeletedCache[record]
+    if type(cached) == "table" and cached.stamp == stamp and cached.ok == true
+        and type(SoftDeleteRuntime.histEffectiveActive[record]) == "table" then
+        return true, nil, { rowVisits = 0, cached = true }
+    end
+    SoftDeleteRuntime._rebuildingHistEffective = true
+    local savedVisits = {
+        row = GS._creditProjectionRowVisits,
+        bucket = GS._creditProjectionBucketVisits,
+        floor = GS._creditProjectionFloorVisits,
+        trials = GS._creditProjectionCandidateTrials,
+        structure = GS._creditProjectionStructureCopyVisits,
+        traversal = GS._creditProjectionTraversalVisits,
+        provenance = GS._creditProjectionProvenanceVisits,
+        deactivations = GS._creditProjectionDeactivations,
+        lookup = GS._creditProjectionLookupMisses,
+    }
+    local entered = false
+    local callOk, retOk, retErr, retDetails = pcall(function()
+        SoftDeleteRuntime.enterIncludeDeletedProjection(record)
+        entered = true
+        if GS._ForceHistEffectiveEngineErrorForTest then
+            error("forced hist-effective engine failure")
+        end
+        return GS.RebuildCreditCorrectionProjection(record, nil)
+    end)
+    if entered then
+        SoftDeleteRuntime.leaveIncludeDeletedProjection(record)
+    else
+        -- enter failed before swapping ownership; clear include-deleted gate.
+        GS._creditProjectionIncludeSoftDeleted = false
+        SoftDeleteRuntime._includeDeletedDepth = 0
+        SoftDeleteRuntime._savedLiveProjection = nil
+    end
+    local rowVisits = 0
+    local workUnits = 0
+    if callOk then
+        if type(retDetails) ~= "table" and type(retErr) == "table" then
+            retDetails = retErr
+            retErr = nil
+        end
+        rowVisits = retDetails and tonumber(retDetails.rowVisits)
+            or tonumber(GS._creditProjectionRowVisits) or 0
+        workUnits = retDetails and tonumber(retDetails.workUnits) or rowVisits
+    end
+    GS._softDeleteHistEffectivenessRowVisits = rowVisits
+    GS._softDeleteHistEffectivenessWorkUnits = workUnits
+    GS._softDeleteCumulativeHistEffectivenessRowVisits =
+        (tonumber(GS._softDeleteCumulativeHistEffectivenessRowVisits) or 0) + rowVisits
+    GS._creditProjectionRowVisits = savedVisits.row
+    GS._creditProjectionBucketVisits = savedVisits.bucket
+    GS._creditProjectionFloorVisits = savedVisits.floor
+    GS._creditProjectionCandidateTrials = savedVisits.trials
+    GS._creditProjectionStructureCopyVisits = savedVisits.structure
+    GS._creditProjectionTraversalVisits = savedVisits.traversal
+    GS._creditProjectionProvenanceVisits = savedVisits.provenance
+    GS._creditProjectionDeactivations = savedVisits.deactivations
+    GS._creditProjectionLookupMisses = savedVisits.lookup
+    SoftDeleteRuntime._rebuildingHistEffective = false
+    if not callOk then
+        SoftDeleteRuntime.includeDeletedCache[record] = {
+            stamp = SoftDeleteRuntime.histEffectiveDependencyStamp(record),
+            ok = false,
+            err = "engine_error",
+        }
+        SoftDeleteRuntime.histEffectiveActive[record] = nil
+        if geterrorhandler then
+            pcall(geterrorhandler(), retOk)
+        end
+        if SF and SF.Debug and SF.Debug.Error then
+            SF.Debug:Error("GUILD_SUPPLIES",
+                "hist-effective engine error: %s", tostring(retOk))
+        end
+        SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+        return false, "engine_error"
+    end
+    if type(retDetails) ~= "table" then
+        retDetails = {}
+    end
+    retDetails.rowVisits = rowVisits
+    retDetails.workUnits = workUnits
+    SoftDeleteRuntime.drainHistEffectiveSyncContinuations()
+    return retOk, retErr, retDetails
+end
+
+---------------------------------------------------------------------------
+-- Authorized local correction save resume (#459 / discussion_r4480434323)
+--
+-- Owner: one private pending entry per record (immutable op body + captured
+--        recipient/head/context). Never ops.pending / AdmitRemote.
+-- Lifetime: first local work_budget → accept | cancel | context invalidation.
+-- Cancellation: ClearEditSession / OpenEdit replacement / GI invalidation /
+--               Continue detecting stale authority, guild, dataset, campaign,
+--               expected head, or captured recipient. No later mutation.
+-- Preserve approved accounting/floor policy; complete via LOCAL commit path.
+---------------------------------------------------------------------------
+local localCorrectionSavePending = setmetatable({}, { __mode = "k" })
+local localCorrectionSaveContinuation = setmetatable({}, { __mode = "k" })
+
+local ScheduleLocalContributorCorrectionSaveContinuation
+
+function GS.CancelLocalContributorCorrectionSave(record, reason, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local entry = localCorrectionSavePending[record]
+    localCorrectionSavePending[record] = nil
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+    if type(entry) == "table" and type(entry.op) == "table" then
+        DiscardSpeculativeCreditProjectionResume(record, entry.op)
+    end
+    -- Timer-driven terminal cancel only: publish one coalesced UI-only notify so
+    -- Logs can clear pendingLocal and report cancellation (#459 / discussion_r4484516439).
+    -- Skip invalidate/session_cleared/recipient_changed to avoid notify loops.
+    opts = opts or {}
+    if type(entry) == "table" and (opts.notifyUI == true) and GS.NotifyUI then
+        GS.NotifyUI("local-correction-cancelled")
+    end
+    reason = reason -- keep reason available for callers/diagnostics
+end
+
+--- Drop the retain slot after a successful local accept without discarding the
+-- speculative scratch that Seal/StoreAccepted is about to promote.
+function GS._ClearLocalContributorCorrectionSaveRetain(record)
+    if type(record) ~= "table" then
+        return
+    end
+    localCorrectionSavePending[record] = nil
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+end
+
+function GS.GetLocalContributorCorrectionSave(record)
+    local entry = type(record) == "table" and localCorrectionSavePending[record]
+    if type(entry) ~= "table" or type(entry.op) ~= "table" then
+        return nil
+    end
+    return entry
+end
+
+local function RetainLocalContributorCorrectionSave(record, op, meta)
+    if type(record) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
+        return false
+    end
+    local prior = localCorrectionSavePending[record]
+    if type(prior) == "table" and type(prior.op) == "table" and prior.op.id ~= op.id then
+        DiscardSpeculativeCreditProjectionResume(record, prior.op)
+    end
+    localCorrectionSavePending[record] = {
+        op = op,
+        guildKey = meta and meta.guildKey or op.guildKey,
+        datasetId = meta and meta.datasetId or op.datasetId,
+        campaignId = meta and meta.campaignId or op.campaignId,
+        eventId = op.target,
+        baseTargetRevision = op.baseTargetRevision,
+        baseAttributed = op.value and op.value.baseAttributed,
+        baseAttributedGuid = op.value and op.value.baseAttributedGuid,
+        attributed = op.value and op.value.attributed,
+        attributedGuid = op.value and op.value.attributedGuid,
+    }
+    return true
+end
+
+local function LocalContributorCorrectionSaveStillValid(record, entry)
+    if type(record) ~= "table" or type(entry) ~= "table" or type(entry.op) ~= "table" then
+        return false, "invalid_operation"
+    end
+    local op = entry.op
+    local caps = GS.GetCapabilities and GS:GetCapabilities() or nil
+    if not (caps and caps.canEdit) then
+        return false, (caps and caps.reason) or "unauthorized"
+    end
+    local ctx = GS.GetCurrentContext and GS:GetCurrentContext() or nil
+    if type(ctx) ~= "table" or ctx.guildKey ~= entry.guildKey then
+        return false, "stale_guild"
+    end
+    local live, liveReason = GS.GetCurrentRecord and GS:GetCurrentRecord() or nil, nil
+    if live ~= record then
+        return false, liveReason or "not_configured"
+    end
+    if record.datasetId ~= entry.datasetId then
+        return false, "dataset_mismatch"
+    end
+    if record.currentCampaignId ~= entry.campaignId then
+        return false, "stale_campaign"
+    end
+    if op.datasetId ~= record.datasetId or op.campaignId ~= record.currentCampaignId then
+        return false, "stale_campaign"
+    end
+    local event = GS.FindLedgerEventById and GS.FindLedgerEventById(record, entry.eventId)
+    if not event then
+        return false, "missing_event"
+    end
+    local curName, curGuid, _, creditStatus = nil, nil, nil, nil
+    if GS.ResolveEffectiveCreditIdentity then
+        curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    end
+    if creditStatus == GS.CREDIT_UNAVAILABLE then
+        return false, GS.CREDIT_UNAVAILABLE
+    end
+    if GS.CreditIdentities and GS.CreditIdentities.equal then
+        if not GS.CreditIdentities.equal(
+            curName, curGuid, entry.baseAttributed, entry.baseAttributedGuid) then
+            return false, "stale_credit"
+        end
+    end
+    local tKey = GS.CorrectionTargetKey and GS.CorrectionTargetKey(record, entry.eventId)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(
+            GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR, entry.eventId))
+    local headId = tKey and record.operations and record.operations.heads
+        and record.operations.heads[tKey]
+    local expected = entry.baseTargetRevision
+    local noPriorHead = expected == nil or expected == record.datasetId
+    if noPriorHead then
+        if headId ~= nil then
+            return false, "stale_credit"
+        end
+    elseif expected ~= headId then
+        return false, "stale_credit"
+    end
+    return true, nil, op
+end
+
+function GS.ContinueLocalContributorCorrectionSave(record)
+    local entry = type(record) == "table" and localCorrectionSavePending[record]
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+    if type(entry) ~= "table" then
+        return false, "missing"
+    end
+    local okValid, validErr, op = LocalContributorCorrectionSaveStillValid(record, entry)
+    if not okValid then
+        GS.CancelLocalContributorCorrectionSave(record, validErr or "stale_credit", {
+            notifyUI = true,
+        })
+        return false, validErr or "stale_credit"
+    end
+    if type(GS.ApplyStagedConfigOperation) ~= "function" then
+        GS.CancelLocalContributorCorrectionSave(record, "unsupported_kind", {
+            notifyUI = true,
+        })
+        return false, "unsupported_kind"
+    end
+    local status, reason = GS:ApplyStagedConfigOperation(op)
+    if status == "pending" and reason == "work_budget" then
+        ScheduleLocalContributorCorrectionSaveContinuation(record)
+        return false, "work_budget"
+    end
+    if status == "accepted" or status == "duplicate" then
+        localCorrectionSavePending[record] = nil
+        return true, status
+    end
+    GS.CancelLocalContributorCorrectionSave(record, reason or status or "rejected", {
+        notifyUI = true,
+    })
+    return false, reason or status or "rejected"
+end
+
+ScheduleLocalContributorCorrectionSaveContinuation = function(record)
+    if type(record) ~= "table" then
+        return
+    end
+    if not (C_Timer and C_Timer.After) then
+        return
+    end
+    if type(localCorrectionSavePending[record]) ~= "table" then
+        return
+    end
+    local cont = localCorrectionSaveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {}
+        localCorrectionSaveContinuation[record] = cont
+    end
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    C_Timer.After(0, function()
+        local state = localCorrectionSaveContinuation[record]
+        if type(state) ~= "table" or state.scheduled ~= true then
+            -- Cancelled while queued.
+            if type(state) == "table" then
+                state.scheduled = false
+            end
+            return
+        end
+        state.scheduled = false
+        if GS.ContinueLocalContributorCorrectionSave then
+            GS.ContinueLocalContributorCorrectionSave(record)
+        end
+    end)
+end
+
+function GS.RetainLocalContributorCorrectionSave(record, op, meta)
+    return RetainLocalContributorCorrectionSave(record, op, meta)
+end
+
+function GS.ScheduleLocalContributorCorrectionSaveContinuation(record)
+    return ScheduleLocalContributorCorrectionSaveContinuation(record)
+end
+
+--- Invalidate cached credit projection after dependency mutations (#459).
+function GS.InvalidateCreditCorrectionProjection(record)
+    if type(record) == "table" then
+        -- Drop in-flight authorized local save with the projection it depends on.
+        if GS.CancelLocalContributorCorrectionSave then
+            GS.CancelLocalContributorCorrectionSave(record, "invalidate")
+        end
+        creditProjectionCache[record] = nil
+        ClearCreditProjectionScratch(record)
+        -- Clear published accepted credit so Invalidate cannot leave a readable
+        -- stale map for Ensure's speculative shortcut or Resolve (#459 B3).
+        MarkAcceptedCreditInvalid(record)
+        local cont = creditProjectionContinuation[record]
+        if type(cont) == "table" then
+            cont.scheduled = false
+        end
+    end
+end
+
+--- Rebuild creditCorrections from accepted correct-contributor ops (#459).
+-- Deterministic active-head policy:
+--   1) LWW winner per canonical event
+--   2) Activate *all* production-credited winners that bind
+--   3) While floors fail, deactivate the head whose removal maximizes
+--      TotalsNegScore (O(1) bucket deltas); ties drop older.
+--   4) If prune stalls, empty only item groups that still have negative
+--      floors — independent items keep deduction-supporting heads.
+--   5) Never leave a stale active map; never mark a negative projection ok.
+--      Failed reconstructions cache under the stamp; Resolve returns nil
+--      (unavailable) rather than durable fallback.
+-- Conflict prune yields when projection work reaches CREDIT_PROJECTION_WORK_BUDGET
+-- (independent of fixture cost); resume continues via C_Timer.After(0).
+-- Floor checks use one durable ledger baseline plus O(1) deltas per head.
+-- Alias targets resolve through the baseline id/txn + one linear registry pass.
+-- @param extraOp table|nil op not yet in ops.records (apply-time preview)
+-- @return boolean ok, string|nil err, table|nil details
+function GS.RebuildCreditCorrectionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    -- Soft-delete debt floors need a current eventDeletions map before baseline.
+    -- Include-deleted historical rebuild must not re-enter Ensure/annotate (#465).
+    if GS.EnsureEventDeletionProjection and not GS._creditProjectionIncludeSoftDeleted then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    local ops = record.operations
+    local stampEarly = CreditProjectionDependencyStamp(record)
+    local priorCache = creditProjectionCache[record]
+    -- Fresh entry (not a work_budget resume): fold cold Bind/Ensure provenance
+    -- into the shared callback total before resetting counters. Resume paths
+    -- already Accumulated their slice — folding again would double-count (#459 G2).
+    local resumingBudget = type(priorCache) == "table" and priorCache.stamp == stampEarly
+        and priorCache.err == "work_budget" and type(priorCache.resume) == "table"
+    if not resumingBudget and GS._creditProjectionAccumulating then
+        local priorProv = tonumber(GS._creditProjectionProvenanceVisits) or 0
+        if priorProv > 0 then
+            AccumulateCreditProjectionCallbackWork(priorProv)
+        end
+    end
+    GS._creditProjectionRowVisits = 0
+    GS._creditProjectionLookupMisses = 0
+    GS._creditProjectionDeactivations = 0
+    GS._creditProjectionBucketVisits = 0
+    GS._creditProjectionFloorVisits = 0
+    GS._creditProjectionCandidateTrials = 0
+    GS._creditProjectionStructureCopyVisits = 0
+    GS._creditProjectionTraversalVisits = 0
+    GS._creditProjectionProvenanceVisits = 0
+    -- Drop a prior active provenance view; baseline republishes when ready (#459).
+    creditProvenanceIndexActive[record] = nil
+    local resumeDeactivated = nil
+    local resumePhase = nil
+    local resumeScan = nil
+    -- Resume an interrupted paced rebuild (same dependency stamp).
+    -- Speculative extraOp resumes only when the caller re-supplies that exact op
+    -- (Apply/Admit). Accepted-history Rebuild(nil) never adopts a preview op.
+    if type(priorCache) == "table" and priorCache.stamp == stampEarly
+        and priorCache.err == "work_budget"
+        and type(priorCache.resume) == "table" then
+        local resume = priorCache.resume
+        resumePhase = resume.phase
+        if type(extraOp) == "table" and resume.speculative
+            and type(resume.extraOp) == "table"
+            and resume.extraOp.id == extraOp.id then
+            resumeDeactivated = resume.deactivatedEventIds
+            resumeScan = resume.scan
+        elseif type(extraOp) ~= "table" and not resume.speculative then
+            resumeDeactivated = resume.deactivatedEventIds
+            resumeScan = resume.scan
+        elseif type(extraOp) ~= "table" and resume.speculative then
+            -- Stale speculative pause must not affect accepted-history rebuild.
+            resumeDeactivated = nil
+            resumePhase = nil
+            resumeScan = nil
+        end
+    end
+    -- Top-level Rebuild/Ensure opens a callback budget when not nested.
+    if not GS._creditProjectionAccumulating then
+        BeginCreditProjectionCallbackBudget(false)
+        GS._creditProjectionOwnedCallbackBudget = true
+    else
+        GS._creditProjectionOwnedCallbackBudget = false
+    end
+    local speculative = IsSpeculativeCreditProjectionOp(ops, extraOp)
+    local function readScratch()
+        return ReadCreditProjectionScratch(record, speculative, extraOp)
+    end
+    local function writeScratch(value)
+        WriteCreditProjectionScratch(record, speculative, extraOp, value)
+    end
+    local scratch = readScratch()
+    -- Dependency generation gate: never reuse candidates/cursors/phase from a
+    -- prior stamp (Seal/admission can advance the generation while owner scratch
+    -- and timers still linger).
+    if type(scratch) == "table" and scratch.stamp ~= stampEarly then
+        writeScratch(nil)
+        scratch = nil
+    end
+    -- Speculative callers must not adopt or mutate accepted-history pauses.
+    if type(scratch) == "table" and scratch.stamp == stampEarly then
+        if speculative and scratch.ownerSpeculative ~= true then
+            scratch = nil
+        elseif (not speculative) and scratch.ownerSpeculative == true then
+            scratch = nil
+        end
+    end
+    local skipToPrune = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.pruneReady == true
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
+    local skipToActivate = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.activateReady == true
+        and type(scratch.ordered) == "table"
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
+    local skipToRestore = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.restoreReady == true
+        and type(scratch.ordered) == "table"
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
+    local skipToFallback = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.fallbackReady == true
+        and type(scratch.ordered) == "table"
+        and type(scratch.pruneTotals) == "table"
+        and type(scratch.pruneBound) == "table"
+        and type(scratch.pruneActiveMap) == "table"
+        and type(scratch.pruneActiveIds) == "table"
+    local skipToBaseline = type(scratch) == "table" and scratch.stamp == stampEarly
+        and scratch.baselineReady == false
+        and type(scratch.baselineTotals) == "table"
+        and type(scratch.baselineById) == "table"
+    local haveOrderedScratch = type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.ordered) == "table"
+        and type(scratch.baselineTotals) == "table"
+    local skipToCollect = type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.candidates) == "table"
+        and tonumber(scratch.collectIndex) ~= nil
+        and not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline
+            or haveOrderedScratch)
+    -- Owner-keyed prune comparison progress (cursor / best-so-far).
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.pruneScan) == "table" then
+        resumeScan = scratch.pruneScan
+    end
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.deactivatedEventIds) == "table" then
+        resumeDeactivated = scratch.deactivatedEventIds
+    end
+    -- Skip ops.records walks when ordered/working state is already retained.
+    -- Candidates only from current-stamp scratch (stamp gate above).
+    local candidates = scratch and scratch.candidates or nil
+    if type(candidates) ~= "table" then
+        candidates = {}
+    end
+    local function considerOp(op)
+        GS._creditProjectionTraversalVisits =
+            (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+        if type(op) ~= "table" or op.kind ~= (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR) then
+            return
+        end
+        if type(op.id) ~= "string" or op.id == "" then
+            return
+        end
+        if type(op.target) ~= "string" or op.target == "" then
+            return
+        end
+        if type(op.value) ~= "table" then
+            return
+        end
+        candidates[#candidates + 1] = op
+    end
+    local function deferCandidates(collectIndex, collectIds, collectOrderIndex, collectIdsReady)
+        writeScratch({
+            stamp = stampEarly,
+            candidates = candidates,
+            collectIndex = collectIndex,
+            collectIds = collectIds,
+            collectOrderIndex = collectOrderIndex,
+            collectIdsReady = collectIdsReady and true or false,
+            ownerSpeculative = speculative and true or false,
+            ownerOpId = speculative and extraOp.id or nil,
+        })
+        creditProjectionCache[record] = {
+            stamp = stampEarly,
+            ok = false,
+            err = "work_budget",
+            resume = {
+                deactivatedEventIds = {},
+                phase = "collect",
+                speculative = speculative and true or false,
+                extraOp = speculative and extraOp or nil,
+                extraOpId = speculative and extraOp.id or nil,
+            },
+        }
+        -- Incomplete accepted reconstruction is not readable (#459 B3).
+        if not speculative then
+            MarkAcceptedCreditInvalid(record)
+        end
+        local workUnits = CreditProjectionWorkNow(0)
+        AccumulateCreditProjectionSliceWork(workUnits)
+        if not speculative then
+            ScheduleCreditProjectionContinuation(record)
+        end
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
+        return false, "work_budget", {
+            traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+            workUnits = workUnits,
+            deferred = true,
+            phase = "collect",
+            speculative = speculative and true or false,
+            callbackWork = CreditProjectionCallbackWorkTotal(0),
+        }
+    end
+    if not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline
+        or haveOrderedScratch or (#candidates > 0 and not skipToCollect)) then
+        candidates = {}
+        local softLimitEarly = CreditProjectionSoftLimit()
+        local hardLimitEarly = CreditProjectionHardLimit()
+        local allowDeferEarly = (C_Timer and C_Timer.After) and true or false
+        -- Stable paced collection via ops.order when present; else id snapshot.
+        local collectIds = scratch and scratch.collectIds or nil
+        local collectIndex = 1
+        local collectOrderIndex = 1
+        local collectIdsReady = false
+        if skipToCollect then
+            collectIds = scratch.collectIds
+            collectIndex = tonumber(scratch.collectIndex) or 1
+            collectOrderIndex = tonumber(scratch.collectOrderIndex) or 1
+            collectIdsReady = scratch.collectIdsReady == true
+            candidates = scratch.candidates or {}
+        end
+        if type(collectIds) ~= "table" then
+            collectIds = {}
+        end
+        if not collectIdsReady then
+            if type(ops) == "table" and type(ops.order) == "table" then
+                for oi = collectOrderIndex, #ops.order do
+                    GS._creditProjectionTraversalVisits =
+                        (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                    collectIds[#collectIds + 1] = ops.order[oi]
+                    local now = CreditProjectionWorkNow(0)
+                    if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                        or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                        return deferCandidates(1, collectIds, oi + 1, false)
+                    end
+                end
+                collectIdsReady = true
+            elseif type(ops) == "table" and type(ops.records) == "table" then
+                -- Unordered snapshot: finish id list without mid-pairs yield
+                -- (pairs order is not stable); pace considerOp via collectIndex.
+                if #collectIds == 0 then
+                    for id, _ in pairs(ops.records) do
+                        GS._creditProjectionTraversalVisits =
+                            (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                        collectIds[#collectIds + 1] = id
+                    end
+                end
+                collectIdsReady = true
+            else
+                collectIdsReady = true
+            end
+        end
+        local records = type(ops) == "table" and ops.records or nil
+        for ci = collectIndex, #collectIds do
+            local id = collectIds[ci]
+            local op = type(records) == "table" and records[id] or nil
+            considerOp(op)
+            local now = CreditProjectionWorkNow(0)
+            if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                return deferCandidates(ci + 1, collectIds, collectOrderIndex, true)
+            end
+        end
+        if type(extraOp) == "table" then
+            -- Pace dedup under the shared remainder; a full unpaced scan of
+            -- thousands of candidates can exceed soft+atomic in one step.
+            local seen = scratch and scratch.extraOpSeen == true
+            local extraScanIndex = 1
+            if skipToCollect and tonumber(scratch and scratch.extraScanIndex) then
+                extraScanIndex = tonumber(scratch.extraScanIndex)
+                seen = scratch.extraOpSeen == true
+            end
+            if not seen then
+                for i = extraScanIndex, #candidates do
+                    GS._creditProjectionTraversalVisits =
+                        (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                    if candidates[i].id == extraOp.id then
+                        seen = true
+                        break
+                    end
+                    local now = CreditProjectionWorkNow(0)
+                    if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                        or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                        writeScratch({
+                            stamp = stampEarly,
+                            candidates = candidates,
+                            collectIndex = #collectIds + 1,
+                            collectIds = collectIds,
+                            collectOrderIndex = collectOrderIndex,
+                            collectIdsReady = true,
+                            extraScanIndex = i + 1,
+                            extraOpSeen = false,
+                            ownerSpeculative = speculative and true or false,
+                            ownerOpId = speculative and extraOp.id or nil,
+                        })
+                        creditProjectionCache[record] = {
+                            stamp = stampEarly,
+                            ok = false,
+                            err = "work_budget",
+                            resume = {
+                                deactivatedEventIds = {},
+                                phase = "collect",
+                                speculative = speculative and true or false,
+                                extraOp = speculative and extraOp or nil,
+                                extraOpId = speculative and extraOp.id or nil,
+                            },
+                        }
+                        local workUnits = CreditProjectionWorkNow(0)
+                        AccumulateCreditProjectionSliceWork(workUnits)
+                        if not speculative then
+                            ScheduleCreditProjectionContinuation(record)
+                        end
+                        if GS._creditProjectionOwnedCallbackBudget then
+                            EndCreditProjectionCallbackBudget()
+                            GS._creditProjectionOwnedCallbackBudget = false
+                        end
+                        return false, "work_budget", {
+                            traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                            workUnits = workUnits,
+                            deferred = true,
+                            phase = "collect",
+                            speculative = speculative and true or false,
+                            callbackWork = CreditProjectionCallbackWorkTotal(0),
+                        }
+                    end
+                end
+            end
+            if not seen then
+                considerOp(extraOp)
+            end
+            local now = CreditProjectionWorkNow(0)
+            if allowDeferEarly and (CreditProjectionCallbackWorkTotal(now) >= softLimitEarly
+                or CreditProjectionCallbackWorkTotal(now) >= hardLimitEarly) then
+                return deferCandidates(#collectIds + 1, collectIds, collectOrderIndex, true)
+            end
+        end
+    elseif type(extraOp) == "table" and not (skipToPrune or skipToActivate)
+        and haveOrderedScratch then
+        -- Ordered already built; extraOp speculative path uses ordered+extra separately.
+    end
+    -- No correction ops: publish empty active set without scanning the ledger
+    -- (keeps ordinary progress projection readiness-bounded — #427 / #459).
+    if not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline or haveOrderedScratch) and #candidates == 0 then
+        local emptyStamp = CreditProjectionDependencyStamp(record)
+        record.creditCorrections = {}
+        creditProjectionCache[record] = {
+            stamp = emptyStamp,
+            ok = true,
+        }
+        MarkAcceptedCreditValid(record, emptyStamp)
+        writeScratch(nil)
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
+        return true, nil, {
+            activeIds = {},
+            rowVisits = 0,
+            bucketVisits = 0,
+            deactivations = 0,
+            lookupMisses = 0,
+        }
+    end
+    -- Soft yield after charged candidate collection when allowance already spent.
+    do
+        local softLimit = CreditProjectionSoftLimit()
+        local allowDefer = (C_Timer and C_Timer.After) and true or false
+        if allowDefer and not (skipToPrune or skipToActivate or skipToRestore or skipToFallback or skipToBaseline or haveOrderedScratch)
+            and CreditProjectionCallbackWorkTotal(CreditProjectionWorkNow(0)) >= softLimit then
+            writeScratch({
+                stamp = stampEarly,
+                candidates = candidates,
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp.id or nil,
+            })
+            creditProjectionCache[record] = {
+                stamp = stampEarly,
+                ok = false,
+                err = "work_budget",
+                resume = {
+                    deactivatedEventIds = {},
+                    phase = "post_candidates",
+                    speculative = speculative and true or false,
+                    extraOp = speculative and extraOp or nil,
+                    extraOpId = speculative and extraOp.id or nil,
+                },
+            }
+            local workUnits = CreditProjectionWorkNow(0)
+            AccumulateCreditProjectionSliceWork(workUnits)
+            if not speculative then
+                ScheduleCreditProjectionContinuation(record)
+            end
+            if GS._creditProjectionOwnedCallbackBudget then
+                EndCreditProjectionCallbackBudget()
+                GS._creditProjectionOwnedCallbackBudget = false
+            end
+            return false, "work_budget", {
+                traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                workUnits = workUnits,
+                deferred = true,
+                phase = "post_candidates",
+                speculative = speculative and true or false,
+            }
+        end
+    end
+    -- Reuse scratch baseline/ordered when resuming the same dependency stamp.
+    -- When prune/activate working tables are retained, skip baseline cloning.
+    local totals, byId, rowVisits, relationshipsReady, ordered, lookupMisses
+    local baselineTotals
+    local deletionDebtFloors = {}
+    local resumeActivateIndex = nil
+    local resumeRestoreIndex = nil
+    if skipToPrune then
+        -- Adopt retained private working state below; keep metadata from scratch.
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        GS._creditProjectionRowVisits = 0
+    elseif skipToActivate then
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        resumeActivateIndex = tonumber(scratch.activateIndex) or 1
+        GS._creditProjectionRowVisits = 0
+    elseif skipToRestore then
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        resumeRestoreIndex = tonumber(scratch.restoreIndex) or 1
+        GS._creditProjectionRowVisits = 0
+    elseif skipToFallback then
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        totals = scratch.pruneTotals
+        GS._creditProjectionRowVisits = 0
+    elseif haveOrderedScratch then
+        -- Resume after post_baseline: one charged working clone from baseline.
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        totals = CloneCreditProjectionTotals(scratch.baselineTotals)
+        byId = scratch.byId
+        rowVisits = 0
+        relationshipsReady = scratch.relationshipsReady
+        ordered = scratch.ordered
+        lookupMisses = scratch.lookupMisses or 0
+        GS._creditProjectionRowVisits = 0
+    elseif type(scratch) == "table" and scratch.stamp == stampEarly
+        and type(scratch.winners) == "table"
+        and tonumber(scratch.winnersIndex)
+        and type(scratch.baselineTotals) == "table"
+        and type(scratch.ordered) ~= "table" then
+        -- Resume paced winner indexing; keep baseline immutable.
+        baselineTotals = scratch.baselineTotals
+        deletionDebtFloors = scratch.deletionDebtFloors or {}
+        totals = CloneCreditProjectionTotals(baselineTotals)
+        byId = scratch.byId
+        rowVisits = tonumber(scratch.rowVisits) or 0
+        relationshipsReady = scratch.relationshipsReady
+        lookupMisses = scratch.lookupMisses or 0
+        if type(scratch.candidates) == "table" then
+            candidates = scratch.candidates
+        end
+        GS._creditProjectionRowVisits = rowVisits
+        -- ordered remains nil → winners loop below runs.
+    else
+        -- Paced durable baseline (fresh or mid-baseline resume).
+        local softLimitEarly = CreditProjectionSoftLimit()
+        local allowDeferEarly = (C_Timer and C_Timer.After) and true or false
+        local function baselineShouldYield(visits)
+            if not allowDeferEarly then
+                return false
+            end
+            return CreditProjectionCallbackWorkTotal(
+                CreditProjectionWorkNow(visits or 0)) >= softLimitEarly
+        end
+        local baselineIn = nil
+        if skipToBaseline then
+            baselineIn = scratch
+        end
+        local baselineDone, baselineSnap, baselineVisits =
+            ContinueDurableCreditFloorBaseline(record, baselineIn, baselineShouldYield)
+        if not baselineDone then
+            -- snapshot() returns snap, visits — capture both.
+            if type(baselineSnap) ~= "table" then
+                baselineSnap = {}
+            end
+            writeScratch({
+                stamp = stampEarly,
+                candidates = scratch and scratch.candidates or candidates,
+                baselineReady = false,
+                baselinePhase = baselineSnap.baselinePhase,
+                baselineIndex = baselineSnap.baselineIndex,
+                baselineTotals = baselineSnap.baselineTotals,
+                baselineDebtFloors = baselineSnap.baselineDebtFloors,
+                deletionDebtFloors = NormalizeSoftDeleteDebtFloors(
+                    baselineSnap.baselineDebtFloors),
+                baselineById = baselineSnap.baselineById,
+                baselineProvenance = baselineSnap.baselineProvenance,
+                baselineVisits = baselineSnap.baselineVisits,
+                baselineRelationshipsReady = baselineSnap.baselineRelationshipsReady,
+                baselineResolveCache = baselineSnap.baselineResolveCache,
+                baselineAliasCursor = baselineSnap.baselineAliasCursor,
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
+            creditProjectionCache[record] = {
+                stamp = stampEarly,
+                ok = false,
+                err = "work_budget",
+                resume = {
+                    deactivatedEventIds = {},
+                    phase = "baseline",
+                    speculative = speculative and true or false,
+                    extraOp = speculative and extraOp or nil,
+                    extraOpId = speculative and extraOp.id or nil,
+                },
+            }
+            rowVisits = tonumber(baselineSnap.baselineVisits) or tonumber(baselineVisits) or 0
+            GS._creditProjectionRowVisits = rowVisits
+            local workUnits = CreditProjectionWorkNow(rowVisits)
+            AccumulateCreditProjectionSliceWork(workUnits)
+            if not speculative then
+                ScheduleCreditProjectionContinuation(record)
+            end
+            if GS._creditProjectionOwnedCallbackBudget then
+                EndCreditProjectionCallbackBudget()
+                GS._creditProjectionOwnedCallbackBudget = false
+            end
+            return false, "work_budget", {
+                rowVisits = rowVisits,
+                traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+                workUnits = workUnits,
+                deferred = true,
+                phase = "baseline",
+                speculative = speculative and true or false,
+            }
+        end
+        -- Keep baseline immutable; working totals are a charged clone.
+        baselineTotals = baselineSnap.baselineTotals
+        deletionDebtFloors = NormalizeSoftDeleteDebtFloors(
+            baselineSnap.baselineDebtFloors)
+        totals = CloneCreditProjectionTotals(baselineTotals)
+        byId = baselineSnap.baselineById
+        local baselineProvenance = baselineSnap.baselineProvenance
+        rowVisits = tonumber(baselineSnap.baselineVisits) or tonumber(baselineVisits) or 0
+        relationshipsReady = baselineSnap.baselineRelationshipsReady
+        GS._creditProjectionRowVisits = rowVisits
+        -- Publish paced provenance index for activation / BindCharacterIdentity (#459).
+        if type(baselineProvenance) == "table" then
+            creditProvenanceIndexActive[record] = {
+                map = baselineProvenance,
+                complete = true,
+            }
+            creditProvenanceIndexCache[record] = {
+                stamp = CreditProvenanceDependencyStamp(record),
+                map = baselineProvenance,
+                complete = true,
+            }
+        end
+        -- Yield after baseline before winner indexing when allowance spent.
+        do
+            local softLimit = CreditProjectionSoftLimit()
+            local allowDefer = (C_Timer and C_Timer.After) and true or false
+            if allowDefer and CreditProjectionCallbackWorkTotal(
+                CreditProjectionWorkNow(rowVisits or 0)) >= softLimit then
+                writeScratch({
+                    stamp = stampEarly,
+                    candidates = scratch and scratch.candidates or candidates,
+                    baselineTotals = baselineTotals,
+                deletionDebtFloors = deletionDebtFloors,
+                    baselineProvenance = baselineProvenance,
+                    byId = byId,
+                    rowVisits = rowVisits,
+                    relationshipsReady = relationshipsReady,
+                    -- ordered filled after winners; mark baseline-only resume
+                    ordered = scratch and scratch.ordered or nil,
+                    lookupMisses = scratch and scratch.lookupMisses or 0,
+                    winnersIndex = 1,
+                    winners = {},
+                    ownerSpeculative = speculative and true or false,
+                    ownerOpId = speculative and extraOp and extraOp.id or nil,
+                })
+                -- If ordered already absent, resume via winnersIndex path below.
+                creditProjectionCache[record] = {
+                    stamp = stampEarly,
+                    ok = false,
+                    err = "work_budget",
+                    resume = {
+                        deactivatedEventIds = {},
+                        phase = "post_baseline",
+                        speculative = speculative and true or false,
+                        extraOp = speculative and extraOp or nil,
+                        extraOpId = speculative and extraOp.id or nil,
+                    },
+                }
+                local workUnits = CreditProjectionWorkNow(rowVisits or 0)
+                AccumulateCreditProjectionSliceWork(workUnits)
+                if not speculative then
+                    ScheduleCreditProjectionContinuation(record)
+                end
+                if GS._creditProjectionOwnedCallbackBudget then
+                    EndCreditProjectionCallbackBudget()
+                    GS._creditProjectionOwnedCallbackBudget = false
+                end
+                return false, "work_budget", {
+                    rowVisits = rowVisits,
+                    traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                    structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+                    workUnits = workUnits,
+                    deferred = true,
+                    phase = "post_baseline",
+                    speculative = speculative and true or false,
+                }
+            end
+        end
+    end -- baseline build / prune-activate resume branches
+
+    -- Winner indexing (fresh after baseline, or winners-resume). Skipped when
+    -- ordered was retained from a later phase.
+    if ordered == nil then
+    -- Group by canonical event id; keep LWW winner. Resolve via baseline index
+    -- (id + txnId + trusted aliases). Fall back to FindLedgerEventById only on
+    -- true miss, caching both canonical and the immutable alias target.
+    local winners = (type(scratch) == "table" and type(scratch.winners) == "table"
+        and scratch.stamp == stampEarly) and scratch.winners or {}
+    lookupMisses = (type(scratch) == "table" and scratch.stamp == stampEarly
+        and tonumber(scratch.lookupMisses)) or 0
+    local winnersStart = 1
+    if type(scratch) == "table" and scratch.stamp == stampEarly
+        and tonumber(scratch.winnersIndex) then
+        winnersStart = tonumber(scratch.winnersIndex)
+    end
+    for i = winnersStart, #candidates do
+        GS._creditProjectionTraversalVisits =
+            (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+        local op = candidates[i]
+        local event = byId[op.target]
+        if event == false then
+            event = nil
+        elseif not event then
+            -- True miss: trusted index lacked the target. Count the miss and the
+            -- full-list scan cost so production measurements include alias gaps.
+            lookupMisses = lookupMisses + 1
+            local lists = CreditEventLists(record)
+            for li = 1, #lists do
+                local list = lists[li]
+                if type(list) == "table" then
+                    rowVisits = rowVisits + #list
+                end
+            end
+            GS._creditProjectionRowVisits = rowVisits
+            event = GS.FindLedgerEventById(record, op.target)
+            if event then
+                IndexCreditEventKeys(byId, event)
+                byId[op.target] = event
+            else
+                byId[op.target] = false
+            end
+        end
+        if event then
+            local canonical = event.id
+            local cur = winners[canonical]
+            if not cur then
+                winners[canonical] = { op = op, event = event }
+            elseif GS.CreditCorrectionRevisionWins
+                and GS.CreditCorrectionRevisionWins(op, cur.op) then
+                winners[canonical] = { op = op, event = event }
+            elseif not GS.CreditCorrectionRevisionWins
+                and (tonumber(op.timestamp) or 0) >= (tonumber(cur.op.timestamp) or 0)
+                and tostring(op.id) > tostring(cur.op.id) then
+                winners[canonical] = { op = op, event = event }
+            end
+        end
+        -- Pace after each candidate so shared remainder is respected.
+        local softLimit = CreditProjectionSoftLimit()
+        local hardLimit = CreditProjectionHardLimit()
+        local allowDefer = (C_Timer and C_Timer.After) and true or false
+        local now = CreditProjectionWorkNow(rowVisits or 0)
+        if allowDefer and (CreditProjectionCallbackWorkTotal(now) >= softLimit
+            or CreditProjectionCallbackWorkTotal(now) >= hardLimit) then
+            writeScratch({
+                stamp = stampEarly,
+                candidates = candidates,
+                baselineTotals = baselineTotals or totals,
+                deletionDebtFloors = deletionDebtFloors,
+                byId = byId,
+                rowVisits = rowVisits,
+                relationshipsReady = relationshipsReady,
+                winners = winners,
+                winnersIndex = i + 1,
+                lookupMisses = lookupMisses,
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
+            creditProjectionCache[record] = {
+                stamp = stampEarly,
+                ok = false,
+                err = "work_budget",
+                resume = {
+                    deactivatedEventIds = {},
+                    phase = "winners",
+                    speculative = speculative and true or false,
+                    extraOp = speculative and extraOp or nil,
+                    extraOpId = speculative and extraOp.id or nil,
+                },
+            }
+            local workUnits = now
+            AccumulateCreditProjectionSliceWork(workUnits)
+            if not speculative then
+                ScheduleCreditProjectionContinuation(record)
+            end
+            if GS._creditProjectionOwnedCallbackBudget then
+                EndCreditProjectionCallbackBudget()
+                GS._creditProjectionOwnedCallbackBudget = false
+            end
+            return false, "work_budget", {
+                rowVisits = rowVisits,
+                traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+                structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+                workUnits = workUnits,
+                deferred = true,
+                phase = "winners",
+                speculative = speculative and true or false,
+            }
+        end
+    end
+    GS._creditProjectionLookupMisses = lookupMisses
+    ordered = {}
+    for canonical, entry in pairs(winners) do
+        ordered[#ordered + 1] = {
+            canonical = canonical,
+            op = entry.op,
+            event = entry.event,
+        }
+    end
+    table.sort(ordered, function(a, b)
+        local ta = tonumber(a.op.timestamp) or 0
+        local tb = tonumber(b.op.timestamp) or 0
+        if ta ~= tb then
+            return ta < tb
+        end
+        return tostring(a.op.id) < tostring(b.op.id)
+    end)
+    end -- winner indexing built ordered
+    if not baselineTotals then
+        -- Freeze immutable baseline; working totals are a charged clone.
+        baselineTotals = totals
+        totals = CloneCreditProjectionTotals(baselineTotals)
+    end
+    -- Soft yield after baseline/indexing before activation when allowance spent.
+    -- Never run this when resuming activate/prune — it would wipe working state.
+    do
+        local softLimit = CreditProjectionSoftLimit()
+        local allowDefer = (C_Timer and C_Timer.After) and true or false
+        if allowDefer
+            and not (skipToActivate or skipToPrune or skipToRestore or skipToFallback)
+            and CreditProjectionCallbackWorkTotal(
+            CreditProjectionWorkNow(rowVisits or 0)) >= softLimit then
+            writeScratch({
+                stamp = stampEarly,
+                baselineTotals = baselineTotals,
+                deletionDebtFloors = deletionDebtFloors,
+                byId = byId,
+                rowVisits = rowVisits,
+                relationshipsReady = relationshipsReady,
+                ordered = ordered,
+                lookupMisses = lookupMisses,
+                ownerSpeculative = speculative and true or false,
+                ownerOpId = speculative and extraOp and extraOp.id or nil,
+            })
+            creditProjectionCache[record] = {
+                stamp = stampEarly,
+                ok = false,
+                err = "work_budget",
+                resume = {
+                    deactivatedEventIds = {},
+                    phase = "post_baseline",
+                    speculative = speculative and true or false,
+                    extraOp = speculative and extraOp or nil,
+                    extraOpId = speculative and extraOp.id or nil,
+                },
+            }
+            local workUnits = CreditProjectionWorkNow(rowVisits or 0)
+            AccumulateCreditProjectionSliceWork(workUnits)
+            if not speculative then
+                ScheduleCreditProjectionContinuation(record)
+            end
+            if GS._creditProjectionOwnedCallbackBudget then
+                EndCreditProjectionCallbackBudget()
+                GS._creditProjectionOwnedCallbackBudget = false
+            end
+            return false, "work_budget", {
+                rowVisits = rowVisits,
+                structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+                workUnits = workUnits,
+                deferred = true,
+                phase = "post_baseline",
+                speculative = speculative and true or false,
+            }
+        end
+    end
+    local activeMap = {}
+    local activeIds = {}
+    local bound = {}
+    local scoreBox
+    -- Private working tables are retained by reference across slices (O(1)
+    -- save/resume). Do not history-copy bound/map/ids/totals on each yield.
+    local deactivatedEventIds = resumeDeactivated
+    if type(deactivatedEventIds) ~= "table" then
+        deactivatedEventIds = {}
+    end
+    local stamp = stampEarly
+    local softLimit = CreditProjectionSoftLimit()
+    local hardLimit = CreditProjectionHardLimit()
+    local allowDefer = (C_Timer and C_Timer.After) and true or false
+    -- `speculative` was resolved at rebuild entry for scratch ownership.
+    local function finishOwnedBudget()
+        if GS._creditProjectionOwnedCallbackBudget then
+            EndCreditProjectionCallbackBudget()
+            GS._creditProjectionOwnedCallbackBudget = false
+        end
+    end
+    local scanState = nil
+    if type(resumeScan) == "table" then
+        scanState = {
+            index = tonumber(resumeScan.index) or 1,
+            bestEventId = resumeScan.bestEventId,
+            bestIdx = resumeScan.bestIdx,
+            bestScore = resumeScan.bestScore,
+            bestTs = resumeScan.bestTs,
+            bestId = resumeScan.bestId,
+            currentScore = resumeScan.currentScore,
+        }
+    end
+    local function savePruneScratch(opts)
+        opts = opts or {}
+        local priorScratch = readScratch()
+        local baseSnap = baselineTotals
+        if type(priorScratch) == "table" and type(priorScratch.baselineTotals) == "table" then
+            baseSnap = priorScratch.baselineTotals
+        end
+        local activateIdx = opts.activateIndex
+        local restoreIdx = opts.restoreIndex
+        local fallbackIdx = opts.fallbackIndex
+        local activating = activateIdx ~= nil
+        local restoring = restoreIdx ~= nil
+        local fallingBack = fallbackIdx ~= nil
+        -- O(1) retain owned private working state; no history-sized copies.
+        writeScratch({
+            stamp = stamp,
+            baselineTotals = baseSnap,
+                deletionDebtFloors = deletionDebtFloors,
+            byId = byId,
+            rowVisits = rowVisits,
+            relationshipsReady = relationshipsReady,
+            ordered = ordered,
+            lookupMisses = lookupMisses,
+            candidates = priorScratch and priorScratch.candidates or nil,
+            pruneReady = not activating and not restoring and not fallingBack,
+            activateReady = activating and true or false,
+            activateIndex = activateIdx,
+            restoreReady = restoring and true or false,
+            restoreIndex = restoreIdx,
+            fallbackReady = fallingBack and true or false,
+            fallbackIndex = fallbackIdx,
+            fallbackBadItems = opts.fallbackBadItems,
+            pruneTotals = totals,
+            pruneBound = bound,
+            pruneActiveMap = activeMap,
+            pruneActiveIds = activeIds,
+            pruneScoreBox = scoreBox,
+            deactivatedEventIds = deactivatedEventIds,
+            pruneScan = scanState,
+            ownerSpeculative = speculative and true or false,
+            ownerOpId = speculative and extraOp and extraOp.id or nil,
+        })
+    end
+    local function deferProjection(phase, activateIndex, restoreIndex, fallbackIndex, fallbackBadItems)
+        -- Retain working state first (O(1)), then charge this callback's work
+        -- including anything performed after the yield decision.
+        if activateIndex ~= nil or restoreIndex ~= nil or fallbackIndex ~= nil then
+            savePruneScratch({
+                activateIndex = activateIndex,
+                restoreIndex = restoreIndex,
+                fallbackIndex = fallbackIndex,
+                fallbackBadItems = fallbackBadItems,
+            })
+        else
+            savePruneScratch()
+        end
+        local workUnits = CreditProjectionWorkNow(rowVisits)
+        AccumulateCreditProjectionSliceWork(workUnits)
+        -- Do not publish a partial prune. Accepted-history pauses clear published
+        -- validity so unfinished reconstruction cannot be read as current (#459 B3).
+        -- Speculative pauses keep any independently valid accepted map intact.
+        creditProjectionCache[record] = {
+            stamp = stamp,
+            ok = false,
+            err = "work_budget",
+            resume = {
+                deactivatedEventIds = deactivatedEventIds,
+                phase = phase,
+                scan = scanState,
+                speculative = speculative and true or false,
+                extraOp = speculative and extraOp or nil,
+                extraOpId = speculative and extraOp.id or nil,
+            },
+        }
+        if not speculative then
+            MarkAcceptedCreditInvalid(record)
+        end
+        -- Accepted-history always owns its successor timer while unfinished.
+        if not speculative then
+            ScheduleCreditProjectionContinuation(record)
+        end
+        finishOwnedBudget()
+        return false, "work_budget", {
+            activeIds = activeIds,
+            rowVisits = rowVisits,
+            bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0,
+            floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0,
+            candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0,
+            structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0,
+            traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0,
+            workUnits = workUnits,
+            callbackWork = CreditProjectionCallbackWorkTotal(0),
+            deactivations = GS._creditProjectionDeactivations,
+            lookupMisses = lookupMisses,
+            deferred = true,
+            phase = phase,
+            speculative = speculative and true or false,
+        }
+    end
+    local function shouldYield(localWork)
+        return allowDefer
+            and CreditProjectionCallbackWorkTotal(localWork) >= softLimit
+    end
+    -- Adopt retained private working tables (no copy) when stamp matches.
+    local reusedPrune = false
+    local reusedActivate = false
+    local reusedRestore = false
+    local reusedFallback = false
+    if skipToPrune then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
+        else
+            scoreBox = { tonumber(scratch.pruneScore) or TotalsNegScore(totals) }
+        end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedPrune = true
+    elseif skipToActivate then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
+        else
+            scoreBox = { TotalsNegScore(totals) }
+        end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedActivate = true
+    elseif skipToRestore then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
+        else
+            scoreBox = { TotalsNegScore(totals) }
+        end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedRestore = true
+    elseif skipToFallback then
+        totals = scratch.pruneTotals
+        bound = scratch.pruneBound
+        activeMap = scratch.pruneActiveMap
+        activeIds = scratch.pruneActiveIds
+        if type(scratch.pruneScoreBox) == "table" then
+            scoreBox = scratch.pruneScoreBox
+        else
+            scoreBox = { TotalsNegScore(totals) }
+        end
+        if type(scratch.deactivatedEventIds) == "table" then
+            deactivatedEventIds = scratch.deactivatedEventIds
+        end
+        reusedFallback = true
+    end
+    if not reusedPrune and not reusedFallback then
+        if not reusedActivate and not reusedRestore then
+            scoreBox = { TotalsNegScore(totals) }
+        end
+        if not reusedRestore then
+            -- Activate every bindable production-credited winner, paced under the
+            -- remaining shared callback allowance (including partially consumed).
+            local activateStart = 1
+            if reusedActivate and resumeActivateIndex then
+                activateStart = resumeActivateIndex
+            end
+            -- Prefer baseline-built provenance; fall back to scratch / Ensure (#459).
+            if not (type(creditProvenanceIndexActive[record]) == "table"
+                and creditProvenanceIndexActive[record].complete)
+                and type(scratch) == "table" and type(scratch.baselineProvenance) == "table" then
+                creditProvenanceIndexActive[record] = {
+                    map = scratch.baselineProvenance,
+                    complete = true,
+                }
+            end
+            for i = activateStart, #ordered do
+                GS._creditProjectionTraversalVisits =
+                    (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                local entry = ordered[i]
+                local op = entry.op
+                local event = entry.event
+                -- Soft-deleted events keep accepted correction history but must
+                -- not activate live credit heads or floor deltas (#465).
+                -- Include-deleted historical effectiveness activates them so the
+                -- shared prune/tie engine can mark hist.effective (#465 6826134902).
+                if event.gsProductionCredit == true
+                    and (GS._creditProjectionIncludeSoftDeleted
+                        or not (GS.IsEventSoftDeleted
+                            and GS.IsEventSoftDeleted(record, event))) then
+                    local newName, newGuid, bindErr = BindCorrectionNewIdentity(
+                        record, event, op.value.attributed, op.value.attributedGuid)
+                    if bindErr == "work_budget" then
+                        -- Cold paced provenance incomplete: pause activation and
+                        -- resume via the shared continuation (#459 G2).
+                        return deferProjection("activate", i)
+                    end
+                    if not bindErr then
+                        local head = CorrectionHeadFromOp(op, event, newName, newGuid, nil)
+                        activeMap[event.id] = head
+                        activeIds[op.id] = true
+                        bound[#bound + 1] = {
+                            event = event,
+                            op = op,
+                            newName = newName,
+                            newGuid = newGuid,
+                        }
+                        ApplyCorrectionFloorDelta(
+                            record, totals, event, newName, newGuid, relationshipsReady, 1, scoreBox)
+                    end
+                end
+                local now = CreditProjectionWorkNow(rowVisits)
+                if shouldYield(now)
+                    or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                    return deferProjection("activate", i + 1)
+                end
+            end
+        end
+        -- Legacy safety: resume.deactivated without retained prune scratch.
+        -- Normal paced path keeps removals in retained working tables.
+        if (not reusedActivate or reusedRestore) and #deactivatedEventIds > 0 then
+            local boundByEventId = {}
+            for i = 1, #bound do
+                GS._creditProjectionTraversalVisits =
+                    (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                if bound[i] then
+                    boundByEventId[bound[i].event.id] = i
+                end
+            end
+            local restoreStart = 1
+            if reusedRestore and resumeRestoreIndex then
+                restoreStart = resumeRestoreIndex
+            end
+            for ri = restoreStart, #deactivatedEventIds do
+                GS._creditProjectionTraversalVisits =
+                    (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+                local eid = deactivatedEventIds[ri]
+                local bi = boundByEventId[eid]
+                local entry = bi and bound[bi]
+                if entry and activeMap[eid] then
+                    ApplyCorrectionFloorDelta(
+                        record, totals, entry.event, entry.newName, entry.newGuid,
+                        relationshipsReady, -1, scoreBox)
+                    activeMap[eid] = nil
+                    activeIds[entry.op.id] = nil
+                    local last = #bound
+                    bound[bi] = bound[last]
+                    bound[last] = nil
+                    if bound[bi] then
+                        boundByEventId[bound[bi].event.id] = bi
+                    end
+                    boundByEventId[eid] = nil
+                    GS._creditProjectionDeactivations =
+                        (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+                end
+                local now = CreditProjectionWorkNow(rowVisits)
+                if shouldYield(now)
+                    or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                    return deferProjection("activate_restore", nil, ri + 1)
+                end
+            end
+        end
+    end
+    -- Soft yield before prune when baseline/activate already spent the allowance.
+    -- Soft-delete baseline debt alone does not require prune (#465).
+    if (not reusedFallback) and shouldYield(CreditProjectionWorkNow(rowVisits))
+        and not TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
+        return deferProjection("pre_prune")
+    end
+    -- Conflict rule: drop the head whose removal most improves personal floors.
+    -- Score updates are O(touched buckets) via scoreBox — not a full rescan.
+    -- A yield mid-scan preserves scan progress; never commit a prefix winner.
+    -- Compare against soft-delete baseline debt so surviving corrections are not
+    -- pruned merely because another deletion left a negative bucket (#465).
+    while (not reusedFallback)
+        and not TotalsRespectDeletionDebt(totals, deletionDebtFloors) do
+        if not scanState then
+            if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                return deferProjection("prune")
+            end
+            scanState = {
+                index = 1,
+                bestEventId = nil,
+                bestIdx = nil,
+                bestScore = nil,
+                bestTs = nil,
+                bestId = nil,
+                currentScore = scoreBox[1],
+            }
+        end
+        local currentScore = tonumber(scanState.currentScore) or scoreBox[1]
+        local bestEventId = scanState.bestEventId
+        local bestIdx = scanState.bestIdx
+        local bestScore = scanState.bestScore
+        local bestTs = scanState.bestTs
+        local bestId = scanState.bestId
+        local i = tonumber(scanState.index) or 1
+        local yieldedMidScan = false
+        while i <= #bound do
+            local entry = bound[i]
+            local entryIdx = i
+            i = i + 1
+            if entry and activeMap[entry.event.id] then
+                if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+                    -- Preserve scan cursor before this untried candidate.
+                    scanState = {
+                        index = entryIdx,
+                        bestEventId = bestEventId,
+                        bestIdx = bestIdx,
+                        bestScore = bestScore,
+                        bestTs = bestTs,
+                        bestId = bestId,
+                        currentScore = currentScore,
+                    }
+                    yieldedMidScan = true
+                    break
+                end
+                GS._creditProjectionCandidateTrials =
+                    (tonumber(GS._creditProjectionCandidateTrials) or 0) + 1
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, -1, scoreBox)
+                local score = scoreBox[1]
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, 1, scoreBox)
+                if score > currentScore then
+                    local ts = tonumber(entry.op.timestamp) or 0
+                    local id = tostring(entry.op.id)
+                    local take = false
+                    if not bestEventId then
+                        take = true
+                    elseif score > bestScore then
+                        take = true
+                    elseif score == bestScore then
+                        if ts < bestTs or (ts == bestTs and id < bestId) then
+                            take = true
+                        end
+                    end
+                    if take then
+                        bestEventId, bestScore, bestTs, bestId =
+                            entry.event.id, score, ts, id
+                        bestIdx = entryIdx
+                    end
+                end
+                if CreditProjectionCallbackWorkTotal(CreditProjectionWorkNow(rowVisits))
+                    >= hardLimit then
+                    -- Atomic trial finished; yield before the next candidate.
+                    scanState = {
+                        index = i,
+                        bestEventId = bestEventId,
+                        bestIdx = bestIdx,
+                        bestScore = bestScore,
+                        bestTs = bestTs,
+                        bestId = bestId,
+                        currentScore = currentScore,
+                    }
+                    yieldedMidScan = true
+                    break
+                end
+            end
+        end
+        if yieldedMidScan then
+            return deferProjection("prune_scan")
+        end
+        -- Full comparison complete for this pass.
+        scanState = nil
+        if not bestEventId or not bestIdx or not bound[bestIdx] then
+            break
+        end
+        local entry = bound[bestIdx]
+        if entry.event.id ~= bestEventId then
+            -- Index invalidated (should not happen with dense swap-remove); abort pass.
+            break
+        end
+        ApplyCorrectionFloorDelta(
+            record, totals, entry.event, entry.newName, entry.newGuid,
+            relationshipsReady, -1, scoreBox)
+        activeMap[entry.event.id] = nil
+        activeIds[entry.op.id] = nil
+        -- O(1) dense removal — no history-sized compaction copy.
+        local last = #bound
+        bound[bestIdx] = bound[last]
+        bound[last] = nil
+        deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
+        GS._creditProjectionDeactivations =
+            (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+        GS._creditProjectionTraversalVisits =
+            (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+        if shouldYield(CreditProjectionWorkNow(rowVisits)) then
+            return deferProjection("prune")
+        end
+    end
+    -- Local empty-set fallback: when single-head prune stalls, drop remaining
+    -- heads only for item groups whose active totals are worse than the
+    -- soft-delete baseline. Permitted baseline debt alone must not deactivate
+    -- surviving same-item corrections (#465). Independent deduction-supporting
+    -- corrections on other items remain preserved.
+    if not TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
+        local badItems = ItemIdsWorseThanDeletionDebt(totals, deletionDebtFloors)
+        if type(scratch) == "table" and scratch.fallbackReady == true
+            and type(scratch.fallbackBadItems) == "table" then
+            badItems = scratch.fallbackBadItems
+        end
+        local i = 1
+        if type(scratch) == "table" and scratch.fallbackReady == true
+            and tonumber(scratch.fallbackIndex) then
+            i = tonumber(scratch.fallbackIndex)
+        elseif resumePhase == "empty_fallback" and type(scratch) == "table"
+            and tonumber(scratch.fallbackIndex) then
+            i = tonumber(scratch.fallbackIndex)
+        end
+        while i <= #bound do
+            GS._creditProjectionTraversalVisits =
+                (tonumber(GS._creditProjectionTraversalVisits) or 0) + 1
+            local now = CreditProjectionWorkNow(rowVisits)
+            -- Check every traversed entry (including non-removals).
+            if shouldYield(now) or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                return deferProjection("empty_fallback", nil, nil, i, badItems)
+            end
+            local entry = bound[i]
+            if entry and activeMap[entry.event.id] then
+                local itemId = tonumber(entry.event.itemId)
+                if itemId and badItems[itemId] then
+                    ApplyCorrectionFloorDelta(
+                        record, totals, entry.event, entry.newName, entry.newGuid,
+                        relationshipsReady, -1, scoreBox)
+                    activeMap[entry.event.id] = nil
+                    activeIds[entry.op.id] = nil
+                    local last = #bound
+                    bound[i] = bound[last]
+                    bound[last] = nil
+                    deactivatedEventIds[#deactivatedEventIds + 1] = entry.event.id
+                    GS._creditProjectionDeactivations =
+                        (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+                    -- Do not advance i: swapped-in entry must be considered.
+                    now = CreditProjectionWorkNow(rowVisits)
+                    if shouldYield(now) or CreditProjectionCallbackWorkTotal(now) >= hardLimit then
+                        return deferProjection("empty_fallback", nil, nil, i, badItems)
+                    end
+                else
+                    i = i + 1
+                end
+            else
+                i = i + 1
+            end
+        end
+    end
+    local bucketVisits = tonumber(GS._creditProjectionBucketVisits) or 0
+    local floorVisits = tonumber(GS._creditProjectionFloorVisits) or 0
+    local candidateTrials = tonumber(GS._creditProjectionCandidateTrials) or 0
+    local traversalVisits = tonumber(GS._creditProjectionTraversalVisits) or 0
+    local structureCopyVisits = tonumber(GS._creditProjectionStructureCopyVisits) or 0
+    local workUnits = CreditProjectionWorkNow(rowVisits)
+    AccumulateCreditProjectionSliceWork(workUnits)
+    writeScratch(nil)
+    finishOwnedBudget()
+    -- Final invariant: never leave a stale active map. Correction-created
+    -- negatives still fail closed as CREDIT_UNAVAILABLE (#459). Soft-delete
+    -- debt floors are scoped to actual deleted signed quantities (#465): a raw
+    -- negative baseline alone is not permission. Publish residual active maps
+    -- only when they respect those deletion floors.
+    if not TotalsAllNonNegative(totals) then
+        if TotalsRespectDeletionDebt(totals, deletionDebtFloors) then
+            -- Permitted soft-delete debt with surviving corrections intact.
+        elseif type(baselineTotals) == "table"
+            and TotalsRespectDeletionDebt(baselineTotals, deletionDebtFloors) then
+            -- Active heads made floors worse than permitted deletion debt —
+            -- prefer the durable soft-delete baseline (do not reinstate credit).
+            activeMap = {}
+            activeIds = {}
+            totals = CloneCreditProjectionTotals(baselineTotals)
+        else
+            MarkAcceptedCreditInvalid(record)
+            record.creditCorrections = {}
+            creditProjectionCache[record] = {
+                stamp = stamp,
+                ok = false,
+                err = "player_negative",
+            }
+            return false, "player_negative", {
+                activeIds = {},
+                rowVisits = rowVisits,
+                bucketVisits = bucketVisits,
+                floorVisits = floorVisits,
+                candidateTrials = candidateTrials,
+                traversalVisits = traversalVisits,
+                structureCopyVisits = structureCopyVisits,
+                workUnits = workUnits,
+                deactivations = GS._creditProjectionDeactivations,
+                lookupMisses = lookupMisses,
+            }
+        end
+    end
+    local nActive = 0
+    for _ in pairs(activeMap) do
+        nActive = nActive + 1
+    end
+    if nActive > (GS.MAX_LEDGER_EVENTS or 4096) then
+        return false, "full"
+    end
+    record.creditCorrections = activeMap
+    creditProjectionCache[record] = {
+        stamp = stamp,
+        ok = true,
+    }
+    MarkAcceptedCreditValid(record, stamp)
+    return true, nil, {
+        activeIds = activeIds,
+        rowVisits = rowVisits,
+        bucketVisits = bucketVisits,
+        floorVisits = floorVisits,
+        candidateTrials = candidateTrials,
+        traversalVisits = traversalVisits,
+        structureCopyVisits = structureCopyVisits,
+        workUnits = workUnits,
+        deactivations = GS._creditProjectionDeactivations,
+        lookupMisses = lookupMisses,
+    }
+end
+
+--- After Apply already published a coherent projection (e.g. extraOp preview)
+-- and the matching op was stored, adopt the current dependency stamp without a
+-- second full rebuild (#459 redrive callback budget).
+-- Only call after a completed coherent publication — never to certify an
+-- unfinished accepted reconstruction (e.g. local ADJUST_QUANTITY).
+function GS.SealCreditCorrectionProjection(record, ok)
+    if type(record) ~= "table" then
+        return
+    end
+    local stamp = CreditProjectionDependencyStamp(record)
+    creditProjectionCache[record] = {
+        stamp = stamp,
+        ok = ok ~= false,
+        err = (ok == false) and "player_negative" or nil,
+    }
+    -- Sealed generation must not leave prior-stamp owner pauses/candidates that
+    -- a queued accepted-history timer could certify as current.
+    ClearCreditProjectionScratch(record)
+    if ok ~= false and type(record.creditCorrections) == "table" then
+        MarkAcceptedCreditValid(record, stamp)
+    else
+        MarkAcceptedCreditInvalid(record)
+        if ok == false then
+            record.creditCorrections = {}
+        end
+    end
+    local cont = creditProjectionContinuation[record]
+    if type(cont) == "table" then
+        cont.scheduled = false
+    end
+end
+
+--- Ensure the credit projection matches current ops/ledger dependency stamps.
+-- Unchanged reads reuse the last verified *or failed* stamp (#459) so a
+-- failed reconstruction does not rebuild on every ResolveEffectiveCreditIdentity.
+-- Incomplete paced rebuilds (work_budget) stay unavailable and resume via timer.
+function GS.EnsureCreditCorrectionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    if extraOp ~= nil then
+        return GS.RebuildCreditCorrectionProjection(record, extraOp)
+    end
+    local stamp = CreditProjectionDependencyStamp(record)
+    local cached = creditProjectionCache[record]
+    if cached and cached.stamp == stamp then
+        if cached.ok then
+            -- Published ok must still have independent accepted validity.
+            if acceptedCreditValidStamp[record] == stamp
+                and type(record.creditCorrections) == "table" then
+                return true
+            end
+            -- Stale ok without a valid map: rebuild.
+            return GS.RebuildCreditCorrectionProjection(record, nil)
+        end
+        if cached.err == "work_budget" then
+            -- Speculative local/remote preview pauses must not Schedule an
+            -- accepted-history continuation that would wipe private scratch.
+            -- Serve accepted credit only when it still has current-stamp validity
+            -- (#459 B3) — never merely because creditCorrections is a table.
+            if type(cached.resume) == "table" and cached.resume.speculative then
+                if acceptedCreditValidStamp[record] == stamp
+                    and type(record.creditCorrections) == "table" then
+                    return true
+                end
+                return false, "work_budget"
+            end
+            ScheduleCreditProjectionContinuation(record)
+            return false, "work_budget"
+        end
+        return false, cached.err or "player_negative"
+    end
+    return GS.RebuildCreditCorrectionProjection(record, nil)
+end
+
+--- Event-kind and production-credit eligibility shared by winner apply and
+-- LWW-loser retention. Does not enforce local freshness or current-campaign
+-- authoring (#459 review-5792509439 C).
+-- @return boolean ok, string|nil err
+function GS.ValidateContributorCorrectionEventEligibility(record, op, event)
+    if type(op) ~= "table" or type(op.value) ~= "table" then
+        return false, "invalid_value"
+    end
+    -- Orphaned accepted correction: eligibility from authored eventKind only.
+    if event == nil then
+        local kind = op.value.eventKind
+        if kind == "donation" or kind == "adjustment" then
+            return true
+        end
+        return false, "invalid_event"
+    end
+    if type(event) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventKind = op.value.eventKind
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if eventKind == "donation" and not isDonation then
+        return false, "invalid_event"
+    end
+    if eventKind == "adjustment" and not isAdjustment then
+        return false, "invalid_event"
+    end
+    if not isDonation and not isAdjustment then
+        return false, "invalid_event"
+    end
+    if event.gsProductionCredit ~= true then
+        return false, "not_credited"
+    end
+    return true
+end
+
+--- Shared acceptance-boundary checks before any path retains a correction as
+-- accepted history (ordinary apply, LWW-loser retention, adoption) (#459 G3/G4).
+-- Does not require local editor freshness, floors, or activation.
+-- opts.allowMissingEvent / opts.remoteAdmit: missing target → pending_event.
+-- @return boolean ok, string|nil err, table|nil event
+function GS.ValidateContributorCorrectionScope(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or (op.value and op.value.eventId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return false, "invalid_target"
+    end
+    -- Acceptance wall-clock skew: reject implausibly future timestamps before
+    -- durable retention/head changes. Not part of saved-body shape validation.
+    do
+        local skew = tonumber(GS.CORRECT_CONTRIBUTOR_TIMESTAMP_SKEW) or 600
+        local now = (GetServerTime and GetServerTime()) or nil
+        local ts = tonumber(op.timestamp)
+        if now and ts and ts == ts and ts >= 0 and skew >= 0 then
+            if ts > now + skew then
+                return false, "invalid_timestamp"
+            end
+        end
+    end
+    local authoredCampaign = op.campaignId
+    local authoredBase = op.baseCampaignId
+    if type(authoredCampaign) ~= "string" or authoredCampaign == ""
+        or type(authoredBase) ~= "string" or authoredBase == "" then
+        return false, "stale_campaign"
+    end
+    if authoredCampaign ~= authoredBase then
+        return false, "stale_campaign"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        -- #465: source-accepted correction whose target evidence aged out of
+        -- retention can still be retained as inactive history when a verified
+        -- soft-delete accounts for the same event (adoption/orphan transfer).
+        if opts.allowOrphanedAcceptedCorrection then
+            return true, nil, nil
+        end
+        if opts.allowMissingEvent or opts.remoteAdmit then
+            return false, "pending_event"
+        end
+        return false, "missing_event"
+    end
+    if type(event.campaignId) ~= "string" or event.campaignId == ""
+        or authoredCampaign ~= event.campaignId then
+        return false, "stale_campaign"
+    end
+    return true, nil, event
+end
+
+-- opts.localPrepare: require current campaign + production credit + expected match.
+-- opts.skipExpected: remote LWW apply (still checks floors against current→new).
+-- opts.allowMissingEvent: return pending_event instead of missing_event.
+-- opts.skipFloor: remote apply defers floors to RebuildCreditCorrectionProjection.
+-- @return boolean ok, string|nil err, table|nil details
+function GS.ValidateContributorCorrectionPrepare(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" or type(op.value) ~= "table" then
+        return false, "invalid_value"
+    end
+    local scopeOk, scopeErr, event = GS.ValidateContributorCorrectionScope(record, op, opts)
+    if not scopeOk then
+        return false, scopeErr or "invalid_value"
+    end
+    local eligOk, eligErr = GS.ValidateContributorCorrectionEventEligibility(record, op, event)
+    if not eligOk then
+        return false, eligErr or "invalid_event"
+    end
+    -- #465: deletion wins over new local contributor editing. Remote/adoption
+    -- replay of a prior accepted correction must retain inactive history when
+    -- the delete already landed (delete-first delivery); do not reactivate credit.
+    if opts.localPrepare then
+        if GS.EnsureEventDeletionProjection then
+            GS.EnsureEventDeletionProjection(record, nil)
+        end
+        if event and GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+            return false, "already_deleted"
+        end
+    end
+    -- Orphaned accepted correction (evidence evicted): retain inactive history
+    -- without floors/identity resolution against a missing ledger row.
+    if event == nil then
+        local kind = op.value.eventKind
+        if kind ~= "donation" and kind ~= "adjustment" then
+            return false, "invalid_event"
+        end
+        return true, nil, {
+            event = nil,
+            eventKind = kind,
+            currentName = nil,
+            currentGuid = nil,
+            newName = NormName(op.value.attributed),
+            newGuid = ValidGuid(op.value.attributedGuid),
+            orphanedAccepted = true,
+        }
+    end
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    -- Local authoring/commit is current-campaign-only; remote historical replay
+    -- uses Scope event-campaign match without this guard (#459 G4).
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return false, "stale_campaign"
+        end
+    end
+    local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    -- Remote/skipFloor apply rebuilds projection itself; do not reject while a
+    -- paced work_budget slice has left credit temporarily unavailable (#459).
+    if creditStatus == GS.CREDIT_UNAVAILABLE and not opts.skipFloor then
+        return false, GS.CREDIT_UNAVAILABLE
+    end
+    if opts.localPrepare and not opts.skipExpected then
+        local baseName = NormName(op.value.baseAttributed)
+        local baseGuid = ValidGuid(op.value.baseAttributedGuid)
+        if not CreditIdentitiesEqual(curName, curGuid, baseName, baseGuid) then
+            return false, "stale_credit"
+        end
+        -- Open-time head freshness. CurrentTargetRevision falls back to
+        -- datasetId when no correction head exists yet — treat that as "no head".
+        do
+            local tKey = GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, event.id) or nil
+            local headId = tKey and record.operations and record.operations.heads
+                and record.operations.heads[tKey]
+            local expected = op.baseTargetRevision
+            local noPriorHead = expected == nil or expected == record.datasetId
+            if noPriorHead then
+                if headId ~= nil then
+                    return false, "stale_credit"
+                end
+            elseif expected ~= headId then
+                return false, "stale_credit"
+            end
+        end
+    end
+    local newName, newGuid, bindErr = BindCorrectionNewIdentity(
+        record, event, op.value.attributed, op.value.attributedGuid)
+    if bindErr then
+        return false, bindErr
+    end
+    if not opts.skipFloor then
+        local floorOk, floorErr = GS.ContributorCorrectionFloorOk(
+            record, event, newName, newGuid)
+        if not floorOk then
+            return false, floorErr or "player_negative"
+        end
+    end
+    return true, nil, {
+        event = event,
+        eventKind = isDonation and "donation" or "adjustment",
+        currentName = curName,
+        currentGuid = curGuid,
+        newName = newName,
+        newGuid = newGuid,
+    }
+end
+
+--- Build the public op value for a local correction prepare.
+-- @return value|nil, err|nil
+function GS.BuildContributorCorrectionValue(record, eventId, attributed, attributedGuid, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil, "invalid_target"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        return nil, "missing_event"
+    end
+    local isDonation = IsDonationLedgerEvent(event)
+    local isAdjustment = IsAdjustmentLedgerEvent(event)
+    if not isDonation and not isAdjustment then
+        return nil, "invalid_event"
+    end
+    if event.gsProductionCredit ~= true then
+        return nil, "not_credited"
+    end
+    -- #465: deletion wins over contributor editing.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+        return nil, "already_deleted"
+    end
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return nil, "stale_campaign"
+        end
+    end
+    local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
+    if creditStatus == GS.CREDIT_UNAVAILABLE then
+        return nil, GS.CREDIT_UNAVAILABLE
+    end
+    local newName, newGuid, bindErr = BindCorrectionNewIdentity(
+        record, event, attributed, attributedGuid)
+    if bindErr then
+        return nil, bindErr
+    end
+    local floorOk, floorErr = GS.ContributorCorrectionFloorOk(
+        record, event, newName, newGuid)
+    if not floorOk then
+        return nil, floorErr or "player_negative"
+    end
+    local value = {
+        eventId = event.id,
+        eventKind = isDonation and "donation" or "adjustment",
+        attributed = newName,
+        attributedGuid = newGuid,
+        baseAttributed = curName,
+        baseAttributedGuid = curGuid,
+        itemId = tonumber(event.itemId),
+    }
+    return value
+end
+
+--- Apply an accepted correct-contributor mutation (#459).
+-- Leaves ledger evidence intact; rebuilds the active creditCorrections projection.
+function GS.ApplyContributorCorrectionMutation(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or (op.value and op.value.eventId)
+    local canonical = GS.CanonicalCreditEventId(record, eventId)
+    local tKey = GS.CorrectionTargetKey and GS.CorrectionTargetKey(record, eventId)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId))
+    -- Also accept heads keyed by the raw target string for pre-migration peers.
+    local ops = record.operations
+    local headId = ops and ops.heads and tKey and ops.heads[tKey]
+    if not headId and type(eventId) == "string" and GS.ComputeTargetKey then
+        local rawKey = GS.ComputeTargetKey(op.kind, eventId)
+        headId = rawKey and ops and ops.heads and ops.heads[rawKey]
+    end
+    if not headId and type(canonical) == "string" and canonical ~= eventId
+        and GS.ComputeTargetKey then
+        local canonRaw = GS.ComputeTargetKey(op.kind, canonical)
+        headId = canonRaw and ops and ops.heads and ops.heads[canonRaw]
+    end
+    local headBody = headId and ops.records and ops.records[headId]
+    if type(headBody) == "table" and headBody.id ~= op.id
+        and GS.CreditCorrectionRevisionWins
+        and not GS.CreditCorrectionRevisionWins(op, headBody) then
+        return false, "stale_credit"
+    end
+    local isLocal = opts.localProductionAuthority or opts.localWrite or false
+    local ok, err, details = GS.ValidateContributorCorrectionPrepare(record, op, {
+        localPrepare = isLocal,
+        -- Remote/adoption: expected base is local editor freshness only.
+        -- Floors are enforced by the deterministic rebuild (active heads).
+        skipExpected = not isLocal,
+        skipFloor = not isLocal,
+        remoteAdmit = not isLocal,
+        allowMissingEvent = not isLocal,
+        allowOrphanedAcceptedCorrection = opts.allowOrphanedAcceptedCorrection == true,
+    })
+    if not ok then
+        return false, err or "invalid_value"
+    end
+    local event = details and details.event
+    -- Preview rebuild including this op; local prepare must activate.
+    local rebuilt, rebuildErr, rebuildDetails = GS.RebuildCreditCorrectionProjection(record, op)
+    if not rebuilt then
+        -- Local work_budget keeps private speculative scratch for the authorized
+        -- resumable local save path (#459 / discussion_r4480434323). Other local
+        -- failures still discard so timers cannot publish an unaccepted preview.
+        -- Remote redrive keeps speculative resume so the next Admit can continue.
+        if rebuildErr == "work_budget" and isLocal then
+            return false, "work_budget"
+        end
+        if isLocal then
+            DiscardSpeculativeCreditProjectionResume(record, op)
+        end
+        return false, rebuildErr or "invalid_value"
+    end
+    if isLocal then
+        local activeIds = rebuildDetails and rebuildDetails.activeIds
+        if type(activeIds) ~= "table" or not activeIds[op.id] then
+            DiscardSpeculativeCreditProjectionResume(record, op)
+            -- Roll back projection without this op.
+            GS.RebuildCreditCorrectionProjection(record, nil)
+            return false, "player_negative"
+        end
+    end
+    -- Capacity guard for brand-new projection keys is inside rebuild.
+    if CountCreditCorrections(record) > (GS.MAX_LEDGER_EVENTS or 4096) then
+        return false, "full"
+    end
+    -- Durable alias binding required for alias-targeted acceptance; refuse when
+    -- the binding cannot be retained under the bounded map (#459 G1).
+    local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(record, op, event)
+    if not aliasOk then
+        if isLocal then
+            DiscardSpeculativeCreditProjectionResume(record, op)
+        end
+        GS.RebuildCreditCorrectionProjection(record, nil)
+        return false, aliasErr or "full"
+    end
+    -- histGen / deletion-fact refresh runs AFTER StoreAccepted (winning +
+    -- stale_credit retention paths) so Rebuild sees the stored history body.
+    return true, "accepted"
+end
+
 function GS.ApplyAdjustmentMutation(record, op, opts)
     opts = opts or {}
     local itemId = tonumber(op.value and op.value.itemId) or tonumber(op.target and op.target.itemId)
@@ -4712,6 +11013,12 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
     local floorOpts = { attributedGuid = attrGuid }
     if isLocalCommit then
         floorOpts.enforceGoalCeiling = true
+    else
+        -- Remote/adoption catch-up may replay balancing adjustments after the
+        -- matching soft-delete already landed. Honor verified soft-delete debt
+        -- floors so historical signed debt converges without inventing new
+        -- authority (#465 assessment 6771025929).
+        floorOpts.respectSoftDeleteDebt = true
     end
     local floorOk, floorErr = GS.AdjustmentFloorOk(
         record, itemId, quantity, normAttr, record.currentCampaignId, floorOpts)
@@ -4758,6 +11065,2146 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
         return false, err or "full"
     end
     return true, "accepted"
+end
+
+---------------------------------------------------------------------------
+-- Soft-delete projection (#465)
+-- Authority: accepted soft-delete-event ops. Ledger evidence stays intact.
+-- Guarantee: deleted rows leave Logs/progress/rankings; deletion wins over
+-- contributor corrections. Authorized deletions are honored even when they
+-- create signed negative balances; officers repair debt with explicit
+-- adjustments. Missing-event dependencies stay pending; floors do not.
+---------------------------------------------------------------------------
+
+GS.SOFT_DELETE_TIMESTAMP_SKEW = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
+
+local eventDeletionCache = setmetatable({}, { __mode = "k" })
+
+--- O(1) deletion-projection dependency stamp (#465).
+-- Mutation-owned soft-delete/alias/hist gens plus the fresh include-deleted
+-- dependency stamp. Ordinary ledger/balance repairs advance the accounting
+-- mutation token, so a warm deletion map cannot keep pre-repair attribution.
+local function EventDeletionDependencyStamp(record)
+    local d = SoftDeleteRuntime.depsFor(record)
+    -- Include include-deleted hist-effective readiness so Ensure cannot serve a
+    -- deletion map sealed before async hist-effective settles (#465 r4555245945).
+    local histEff = SoftDeleteRuntime.includeDeletedCache[record]
+    local histEffPart = "none"
+    if type(histEff) == "table" then
+        if histEff.ok == true then
+            histEffPart = SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+        elseif histEff.err == "work_budget" then
+            histEffPart = "pending"
+        else
+            histEffPart = tostring(histEff.err or "err")
+        end
+    end
+    local cont = SoftDeleteRuntime.histEffectiveContinuation
+        and SoftDeleteRuntime.histEffectiveContinuation[record]
+    if type(cont) == "table" and cont.scheduled == true then
+        histEffPart = histEffPart .. ":sched"
+    end
+    return tostring(d.delGen or 0) .. ":" .. tostring(d.aliasGen or 0)
+        .. ":" .. tostring(d.histGen or 0) .. ":" .. histEffPart
+end
+
+--- Ledger/alias stamp for reusable soft-delete event indexes (#465 r4529162895).
+-- O(1): list lengths + mutation-owned alias gen. Omits ops.generation and
+-- accounting mut so soft-delete admits (and later adjustments) reuse lookup +
+-- event-object indexes while retained evidence cardinality is unchanged.
+function SoftDeleteRuntime.ledgerIndexStamp(record)
+    local ledgerN = 0
+    local live = record and record.accounting and record.accounting._consumableEvents
+    if type(live) == "table" then
+        ledgerN = #live
+    end
+    local archiveN = 0
+    local archive = record and record.accounting
+        and record.accounting._consumableEventArchive
+    if type(archive) == "table" then
+        archiveN = #archive
+    end
+    local wdN = 0
+    local wd = record and record.accounting and record.accounting._withdrawalEvents
+    if type(wd) == "table" then
+        wdN = #wd
+    end
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(ledgerN) .. ":" .. tostring(archiveN) .. ":" .. tostring(wdN)
+        .. ":" .. tostring(d.aliasGen or 0)
+end
+
+--- Correction-history stamp for hist attribution index (#465).
+-- O(1) mutation-owned histGen — soft-delete admits do not bump it, so hist
+-- stays warm across a multi-delete slice without rescanning ops.records.
+function SoftDeleteRuntime.histIndexStamp(record)
+    local d = SoftDeleteRuntime.depsFor(record)
+    return tostring(d.histGen or 0) .. ":" .. tostring(d.aliasGen or 0)
+end
+
+--- Operation-head key for soft-delete-event, bound to the canonical event id.
+function GS.SoftDeleteTargetKey(record, target, lookup)
+    if type(target) ~= "string" or target == "" then
+        return nil
+    end
+    local canonical = GS.CanonicalCreditEventId(record, target, lookup) or target
+    if not GS.ComputeTargetKey then
+        return "delete:" .. canonical
+    end
+    return GS.ComputeTargetKey(
+        GS.KIND and GS.KIND.SOFT_DELETE_EVENT, canonical)
+end
+
+--- Soft-delete LWW ordering (same as rename/credit corrections).
+function GS.SoftDeleteRevisionWins(incoming, incumbent)
+    return GS.RenameRevisionWins and GS.RenameRevisionWins(incoming, incumbent)
+end
+
+local function SoftDeleteEventKind(event)
+    if IsWithdrawalLedgerEvent(event) then
+        return "withdrawal"
+    end
+    if IsAdjustmentLedgerEvent(event) then
+        return "adjustment"
+    end
+    if IsDonationLedgerEvent(event) then
+        return "donation"
+    end
+    return nil
+end
+
+--- Durable VERIFIED soft-delete accounting facts (#465). Survives ledger
+-- evidence eviction and projection rebuilds; never invented from raw payload.
+local function EnsureSoftDeleteVerifiedFactsMap(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return nil
+    end
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        cfg = {}
+        record.accounting._consumables = cfg
+    end
+    if type(cfg.softDeleteVerifiedFacts) ~= "table" then
+        cfg.softDeleteVerifiedFacts = {}
+    end
+    return cfg.softDeleteVerifiedFacts
+end
+
+local function RememberSoftDeleteVerifiedFacts(record, facts)
+    if type(facts) ~= "table" or facts.verified ~= true then
+        return
+    end
+    local canon = facts.eventId
+    if type(canon) ~= "string" or canon == "" then
+        return
+    end
+    local map = EnsureSoftDeleteVerifiedFactsMap(record)
+    if not map then
+        return
+    end
+    -- Prefer sizing transfer capacity to legal deletions; never reclaim an
+    -- already-retained canon. Reject only brand-new keys past the shared max.
+    if type(map[canon]) ~= "table" then
+        local maxN = GS.MAX_SOFT_DELETE_VERIFIED_FACTS or 4096
+        local n = 0
+        for _ in pairs(map) do
+            n = n + 1
+            if n >= maxN then
+                return
+            end
+        end
+    end
+    local prior = map[canon]
+    local nextFacts = {
+        verified = true,
+        eventId = canon,
+        eventKind = facts.eventKind,
+        itemId = tonumber(facts.itemId),
+        quantity = tonumber(facts.quantity),
+        campaignId = facts.campaignId,
+        attributed = NormName(facts.attributed),
+        attributedGuid = ValidGuid(facts.attributedGuid),
+        gsProductionCredit = facts.gsProductionCredit == true,
+        evidenceBacked = facts.evidenceBacked,
+    }
+    map[canon] = nextFacts
+    -- Bump only when content changes so rebuild remember-passes are not O(n)
+    -- factGen storms for unchanged facts.
+    if type(prior) ~= "table"
+        or prior.quantity ~= nextFacts.quantity
+        or prior.itemId ~= nextFacts.itemId
+        or prior.eventKind ~= nextFacts.eventKind
+        or prior.campaignId ~= nextFacts.campaignId
+        or prior.attributed ~= nextFacts.attributed
+        or prior.attributedGuid ~= nextFacts.attributedGuid
+        or (prior.gsProductionCredit == true) ~= (nextFacts.gsProductionCredit == true)
+        or prior.evidenceBacked ~= nextFacts.evidenceBacked then
+        SoftDeleteRuntime.bumpDep(record, "factGen")
+    end
+end
+
+local function LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    local map = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    if type(map) ~= "table" then
+        return nil
+    end
+    local prior = nil
+    if type(canon) == "string" and canon ~= "" then
+        prior = map[canon]
+    end
+    if type(prior) ~= "table" and type(eventId) == "string" and eventId ~= "" then
+        prior = map[eventId]
+    end
+    if type(prior) == "table" and prior.verified == true then
+        return prior
+    end
+    return nil
+end
+
+--- LWW attribution from retained accepted correct-contributor history (#465).
+-- Does NOT read record.creditCorrections (active projection excludes deleted
+-- events). One bounded records pass; heads win via CreditCorrectionRevisionWins.
+-- @return table canonId -> { attributed=, attributedGuid= }, number visits
+local function BuildHistoricalCorrectionAttributionIndex(record, lookup)
+    local byCanon = {}
+    local visits = 0
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return byCanon, 0
+    end
+    local ops = record.operations
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    if type(ops.records) ~= "table" or not kindCorrect then
+        return byCanon, 0
+    end
+    local function noteBody(body)
+        if type(body) ~= "table" or body.kind ~= kindCorrect then
+            return
+        end
+        visits = visits + 1
+        local tid = body.target or (body.value and body.value.eventId)
+        if type(tid) ~= "string" or tid == "" then
+            return
+        end
+        local canon = GS.CanonicalCreditEventId
+            and GS.CanonicalCreditEventId(record, tid, lookup) or tid
+        if type(canon) ~= "string" or canon == "" then
+            return
+        end
+        -- Explicit Unassigned clears both fields to nil; still mark present so
+        -- soft-delete derivation does not fall back to the original donor (#465).
+        local attr = NormName(body.value and body.value.attributed)
+        local attrGuid = ValidGuid(body.value and body.value.attributedGuid)
+        local cur = byCanon[canon]
+        local entry = {
+            attributed = attr,
+            attributedGuid = attrGuid,
+            present = true,
+            op = body,
+        }
+        if type(cur) ~= "table" then
+            byCanon[canon] = entry
+            return
+        end
+        if GS.CreditCorrectionRevisionWins
+            and GS.CreditCorrectionRevisionWins(body, cur.op) then
+            byCanon[canon] = entry
+        elseif not GS.CreditCorrectionRevisionWins
+            and (tonumber(body.timestamp) or 0) >= (tonumber(cur.op.timestamp) or 0)
+            and tostring(body.id) > tostring(cur.op.id) then
+            byCanon[canon] = entry
+        end
+    end
+    for _, body in pairs(ops.records) do
+        noteBody(body)
+    end
+    return byCanon, visits
+end
+
+--- Bounded event-object index for soft-delete rebuild (#465).
+-- Distinct from BuildCreditCanonicalLookup (which stores canonical-ID strings).
+-- Definitive misses are false; never falls back to FindLedgerEventById per head.
+-- @return table { byObj=, aliasesByCanon=, visits= }
+local function BuildSoftDeleteEventObjectIndex(record, lookup)
+    local byObj = {}
+    local aliasesByCanon = {}
+    local visits = 0
+    if type(record) ~= "table" then
+        return { byObj = byObj, aliasesByCanon = aliasesByCanon, visits = 0 }
+    end
+    local function noteAlias(terminal, alias)
+        if type(terminal) ~= "string" or terminal == ""
+            or type(alias) ~= "string" or alias == "" then
+            return
+        end
+        local list = aliasesByCanon[terminal]
+        if type(list) ~= "table" then
+            list = {}
+            aliasesByCanon[terminal] = list
+        end
+        list[#list + 1] = alias
+    end
+    local lists = CreditEventLists(record)
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            local limit = math.min(#list, (li == 1 and MaxLiveLedgerScan())
+                or MaxArchivedLedgerScan())
+            for i = 1, limit do
+                visits = visits + 1
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string"
+                    and event.id ~= "" then
+                    byObj[event.id] = event
+                    if type(event.txnId) == "string" and event.txnId ~= "" then
+                        byObj[event.txnId] = event
+                        if event.txnId ~= event.id then
+                            noteAlias(event.id, event.txnId)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Fold durable aliases onto already-indexed terminals (no new ledger scans).
+    local cfg = record.accounting and record.accounting._consumables
+    local map = cfg and cfg.creditEventAliases
+    if type(map) == "table" then
+        local scanned = 0
+        local scanCap = GS.MAX_CREDIT_EVENT_ALIASES or 2048
+        for alias, canon in pairs(map) do
+            scanned = scanned + 1
+            if scanned > scanCap then
+                break
+            end
+            if type(alias) == "string" and alias ~= ""
+                and type(canon) == "string" and canon ~= "" then
+                local terminal = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, canon, lookup) or canon
+                local ev = byObj[terminal] or byObj[canon]
+                if type(ev) == "table" then
+                    byObj[alias] = ev
+                    noteAlias(terminal, alias)
+                    if terminal ~= canon then
+                        noteAlias(canon, alias)
+                    end
+                elseif byObj[terminal] == false or byObj[canon] == false then
+                    byObj[alias] = false
+                end
+            end
+        end
+    end
+    return { byObj = byObj, aliasesByCanon = aliasesByCanon, visits = visits }
+end
+
+-- Adoption completeness / tests: shared event-object index builder (#465 r4539832738).
+GS.BuildSoftDeleteEventObjectIndex = BuildSoftDeleteEventObjectIndex
+
+--- Mark hist LWW winners that survive the shared include-deleted correction
+-- engine (activate-all then prune; equal-impact ties drop older timestamp/op-id).
+-- Floor-suppressed corrections keep present=true for audit but effective=false
+-- so soft-delete facts do not grant their recipients debt allowance
+-- (#465 assessment 6826134902 / 6804075343 / Devin 5860609021 / 5866811007).
+-- Removes the prior greedy personalTotalIncludingSoftDeleted calculator.
+function SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+    if type(histIndex) ~= "table" then
+        return 0
+    end
+    local visits = 0
+    local anyPresent = false
+    for _, hist in pairs(histIndex) do
+        visits = visits + 1
+        if type(hist) == "table" then
+            hist.effective = false
+            if hist.present == true and type(hist.op) == "table" then
+                anyPresent = true
+            end
+        end
+    end
+    if not anyPresent then
+        SoftDeleteRuntime.histEffectiveActive[record] = SoftDeleteRuntime.histEffectiveActive[record] or {}
+        GS._softDeleteHistEffectivenessVisits = visits
+        return visits
+    end
+    -- No soft-delete work: skip include-deleted credit rebuild so ordinary #459
+    -- correction Ensure/Rebuild paths keep their callback budgets intact.
+    local hasDeleteWork = false
+    if type(record.eventDeletions) == "table" and next(record.eventDeletions) ~= nil then
+        hasDeleteWork = true
+    else
+        local heads = record.operations and record.operations.heads
+        if type(heads) == "table" then
+            for targetKey in pairs(heads) do
+                if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:" then
+                    hasDeleteWork = true
+                    break
+                end
+            end
+        end
+    end
+    if not hasDeleteWork then
+        GS._softDeleteHistEffectivenessVisits = visits
+        return visits, true
+    end
+    -- Production pacing: keep C_Timer.After and share parent callback budgets.
+    -- Incomplete rebuilds leave hist.effective=false and return work_budget so
+    -- callers do not publish partial affected facts (assessment 6829598989).
+    local ok, err, details = SoftDeleteRuntime.rebuildHistEffectiveActive(record)
+    local nested = (details and tonumber(details.workUnits))
+        or (tonumber(GS._softDeleteHistEffectivenessWorkUnits) or 0)
+    if ok == false then
+        GS._softDeleteHistEffectivenessVisits = visits + nested
+        return visits, false, err or "engine_error"
+    end
+    local active = SoftDeleteRuntime.histEffectiveActive[record]
+    if type(active) ~= "table" then
+        GS._softDeleteHistEffectivenessVisits = visits + nested
+        return visits, true
+    end
+    for canon, hist in pairs(histIndex) do
+        visits = visits + 1
+        if type(hist) == "table" and hist.present == true and type(hist.op) == "table" then
+            local head = active[canon]
+            if type(head) ~= "table" then
+                local tid = hist.op.target
+                    or (hist.op.value and hist.op.value.eventId)
+                if type(tid) == "string" and tid ~= "" then
+                    head = active[tid]
+                end
+            end
+            if type(head) == "table" then
+                if type(head.revisionId) == "string" and type(hist.op.id) == "string" then
+                    hist.effective = (head.revisionId == hist.op.id)
+                else
+                    hist.effective = CreditIdentitiesEqual(
+                        head.attributed, head.attributedGuid,
+                        hist.attributed, hist.attributedGuid)
+                end
+            end
+        end
+    end
+    GS._softDeleteHistEffectivenessVisits = visits + nested
+    return visits, true
+end
+
+--- Pure verified soft-delete facts from evidence + hist (no durable write).
+-- Kept on SoftDeleteRuntime to stay under Lua 5.1's 200-local chunk limit.
+function SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex)
+    if type(event) == "table" then
+        local eventKind = SoftDeleteEventKind(event)
+        if not eventKind then
+            return { verified = false }
+        end
+        local creditName, creditGuid = nil, nil
+        if eventKind == "withdrawal" then
+            creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
+        else
+            -- Prefer live effective identity while the row is not yet soft-deleted
+            -- (first apply): floor-suppressed corrections must not receive debt
+            -- allowance (#465 / Devin 5860609021). Soft-deleted rebuild/refresh
+            -- keeps accepted-history catch-up via hist.present, but only when
+            -- hist.effective ~= false (annotated with include-deleted floors).
+            local softDeleted = GS.IsEventSoftDeleted
+                and GS.IsEventSoftDeleted(record, event)
+            local usedEffective = false
+            if not softDeleted and GS.ResolveEffectiveCreditIdentity then
+                local n, g, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+                if status ~= GS.CREDIT_UNAVAILABLE then
+                    creditName, creditGuid = n, g
+                    usedEffective = true
+                end
+            end
+            if not usedEffective then
+                local hist = type(histIndex) == "table" and histIndex[event.id] or nil
+                if type(hist) ~= "table" and type(histIndex) == "table"
+                    and type(event.txnId) == "string" and event.txnId ~= "" then
+                    hist = histIndex[event.txnId]
+                end
+                if type(hist) == "table" and hist.present == true then
+                    if hist.effective ~= false then
+                        creditName, creditGuid = hist.attributed, hist.attributedGuid
+                    else
+                        -- Explicitly ineffective. Once include-deleted
+                        -- effectiveness has completed for the current
+                        -- dependencies, an empty active map is a real prune
+                        -- result: use durable donor identity. While
+                        -- reconstruction is still pending, keep prior verified
+                        -- facts rather than collapsing to durable donor Alice
+                        -- (async adopt Ensure; 6834988628 / 5895068773).
+                        local histEffCache = SoftDeleteRuntime.includeDeletedCache[record]
+                        local histEffComplete = type(histEffCache) == "table"
+                            and histEffCache.ok == true
+                            and histEffCache.stamp
+                                == SoftDeleteRuntime.histEffectiveDependencyStamp(record)
+                        if histEffComplete then
+                            creditName, creditGuid = DurableCreditIdentity(event)
+                        elseif type(priorEntry) == "table"
+                            and priorEntry.verified == true then
+                            creditName, creditGuid =
+                                priorEntry.attributed, priorEntry.attributedGuid
+                        else
+                            creditName, creditGuid = DurableCreditIdentity(event)
+                        end
+                    end
+                elseif type(priorEntry) == "table" and priorEntry.verified == true then
+                    -- Soft-deleted rebuild with no hist row yet: keep previously
+                    -- verified attribution so Ensure does not invent donor Alice.
+                    creditName, creditGuid =
+                        priorEntry.attributed, priorEntry.attributedGuid
+                else
+                    creditName, creditGuid = DurableCreditIdentity(event)
+                end
+            end
+        end
+        return {
+            verified = true,
+            eventId = event.id,
+            eventKind = eventKind,
+            itemId = tonumber(event.itemId),
+            quantity = tonumber(event.quantity),
+            campaignId = event.campaignId,
+            attributed = creditName,
+            attributedGuid = creditGuid,
+            gsProductionCredit = event.gsProductionCredit == true,
+            evidenceBacked = true,
+        }
+    end
+    -- Orphaned: retain previously verified facts only — never invent from payload.
+    if type(priorEntry) == "table" and priorEntry.verified == true then
+        local evidenceBacked = priorEntry.evidenceBacked
+        if evidenceBacked == false and type(op) == "table"
+            and op.kind == GS.KIND.SOFT_DELETE_EVENT then
+            local target = op.target
+            if type(target) ~= "string" or target == "" then
+                local value = type(op.value) == "table" and op.value or nil
+                target = value and value.eventId or nil
+            end
+            if type(target) == "string" and target ~= "" then
+                local canonTarget = target
+                if GS.CanonicalCreditEventId then
+                    canonTarget = GS.CanonicalCreditEventId(record, target) or target
+                end
+                if canonTarget == priorEntry.eventId then
+                    evidenceBacked = true
+                end
+            end
+        end
+        return {
+            verified = true,
+            eventId = priorEntry.eventId,
+            eventKind = priorEntry.eventKind,
+            itemId = priorEntry.itemId,
+            quantity = priorEntry.quantity,
+            campaignId = priorEntry.campaignId,
+            attributed = priorEntry.attributed,
+            attributedGuid = priorEntry.attributedGuid,
+            gsProductionCredit = priorEntry.gsProductionCredit == true,
+            evidenceBacked = evidenceBacked,
+        }
+    end
+    local value = type(op) == "table" and op.value or nil
+    local eventKind = type(value) == "table" and value.eventKind or nil
+    if eventKind ~= "donation" and eventKind ~= "adjustment" and eventKind ~= "withdrawal" then
+        eventKind = nil
+    end
+    return {
+        verified = false,
+        eventKind = eventKind,
+    }
+end
+
+function SoftDeleteRuntime.factsContentEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    return a.verified == true and b.verified == true
+        and a.eventId == b.eventId
+        and a.eventKind == b.eventKind
+        and tonumber(a.itemId) == tonumber(b.itemId)
+        and tonumber(a.quantity) == tonumber(b.quantity)
+        and a.campaignId == b.campaignId
+        and a.attributed == b.attributed
+        and a.attributedGuid == b.attributedGuid
+        and (a.gsProductionCredit == true) == (b.gsProductionCredit == true)
+        and a.evidenceBacked == b.evidenceBacked
+end
+
+function SoftDeleteRuntime.headEntry(op, facts)
+    facts = type(facts) == "table" and facts or {}
+    local eventKind = facts.eventKind or "donation"
+    if eventKind ~= "donation" and eventKind ~= "adjustment" and eventKind ~= "withdrawal" then
+        eventKind = "donation"
+    end
+    local entry = {
+        revisionId = op and op.id,
+        deletedAt = tonumber(op and op.timestamp) or Now(),
+        actorName = NormName(op and op.actorName),
+        actorGuid = ValidGuid(op and op.actorGuid),
+        eventKind = eventKind,
+        verified = facts.verified == true,
+    }
+    if facts.verified == true then
+        entry.eventId = facts.eventId
+        entry.itemId = tonumber(facts.itemId)
+        entry.quantity = tonumber(facts.quantity)
+        entry.campaignId = facts.campaignId
+        entry.attributed = NormName(facts.attributed)
+        entry.attributedGuid = ValidGuid(facts.attributedGuid)
+        entry.gsProductionCredit = facts.gsProductionCredit == true
+        entry.evidenceBacked = facts.evidenceBacked
+    end
+    return entry
+end
+
+--- Bind soft-delete accounting facts to canonical evidence + accepted correction
+-- history. Raw confirmation payload quantity/attribution is never floor authority
+-- (#465 discussion_r4518378042 / r4518383410).
+-- histIndex: optional BuildHistoricalCorrectionAttributionIndex result.
+local function DeriveVerifiedSoftDeleteFacts(record, op, event, priorEntry, histIndex)
+    local facts = SoftDeleteRuntime.computeFacts(record, op, event, priorEntry, histIndex)
+    if facts.verified == true and type(event) == "table" then
+        RememberSoftDeleteVerifiedFacts(record, facts)
+    end
+    return facts
+end
+
+function SoftDeleteRuntime.forgetFact(record, canon)
+    if type(record) ~= "table" or type(canon) ~= "string" or canon == "" then
+        return false
+    end
+    local map = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.softDeleteVerifiedFacts
+    if type(map) ~= "table" or type(map[canon]) ~= "table" then
+        return false
+    end
+    map[canon] = nil
+    SoftDeleteRuntime.bumpDep(record, "factGen")
+    SoftDeleteRuntime.debtFloor[record] = nil
+    return true
+end
+
+GS.ForgetSoftDeleteVerifiedFact = SoftDeleteRuntime.forgetFact
+
+--- Logical soft-deletion count (shared entry tables), not alias map keys.
+function SoftDeleteRuntime.countCanonical(map)
+    local seen, n = {}, 0
+    if type(map) ~= "table" then
+        return 0
+    end
+    for _, entry in pairs(map) do
+        if type(entry) == "table" and not seen[entry] then
+            seen[entry] = true
+            n = n + 1
+        end
+    end
+    return n
+end
+
+GS.CountCanonicalSoftDeletions = SoftDeleteRuntime.countCanonical
+
+--- LWW-apply one accepted correction body into a hist attribution index.
+function SoftDeleteRuntime.applyHistCorrection(byCanon, record, body, lookup)
+    if type(byCanon) ~= "table" or type(body) ~= "table" then
+        return false
+    end
+    local kindCorrect = GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR
+    if not kindCorrect or body.kind ~= kindCorrect then
+        return false
+    end
+    local tid = body.target or (body.value and body.value.eventId)
+    if type(tid) ~= "string" or tid == "" then
+        return false
+    end
+    local canon = GS.CanonicalCreditEventId
+        and GS.CanonicalCreditEventId(record, tid, lookup) or tid
+    if type(canon) ~= "string" or canon == "" then
+        return false
+    end
+    local attr = NormName(body.value and body.value.attributed)
+    local attrGuid = ValidGuid(body.value and body.value.attributedGuid)
+    local cur = byCanon[canon]
+    local entry = {
+        attributed = attr,
+        attributedGuid = attrGuid,
+        present = true,
+        op = body,
+    }
+    if type(cur) ~= "table" then
+        byCanon[canon] = entry
+        return true
+    end
+    if GS.CreditCorrectionRevisionWins
+        and GS.CreditCorrectionRevisionWins(body, cur.op) then
+        byCanon[canon] = entry
+        return true
+    elseif not GS.CreditCorrectionRevisionWins
+        and (tonumber(body.timestamp) or 0) >= (tonumber(cur.op.timestamp) or 0)
+        and tostring(body.id) > tostring(cur.op.id) then
+        byCanon[canon] = entry
+        return true
+    end
+    return true
+end
+
+--- Affected deletion-fact refresh after accepted correction history (#465).
+-- Reuses shared include-deleted effectiveness, then rewrites every deletion
+-- whose effective attribution changed — including when the correction target
+-- itself is not soft-deleted (assessment 6826134902 / r4538978963).
+function SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, correctionBody)
+    if type(record) ~= "table" then
+        return false
+    end
+    local map = record.eventDeletions
+    if type(map) ~= "table" or next(map) == nil then
+        return false
+    end
+    local eventId = nil
+    if type(correctionBody) == "table" then
+        eventId = correctionBody.target
+            or (correctionBody.value and correctionBody.value.eventId)
+    elseif type(correctionBody) == "string" then
+        eventId = correctionBody
+    end
+    if type(eventId) ~= "string" or eventId == "" then
+        return false
+    end
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) ~= "table" then
+        scratch = {}
+        SoftDeleteRuntime.indexes[record] = scratch
+    end
+    local d = SoftDeleteRuntime.depsFor(record)
+    local lookup = scratch.lookup
+    if SoftDeleteRuntime.ledgerIndexStamp(record) ~= scratch.ledgerStamp
+        or type(lookup) ~= "table" or type(scratch.eventIndex) ~= "table" then
+        lookup = GS.BuildCreditCanonicalLookup and GS.BuildCreditCanonicalLookup(record) or nil
+        scratch.lookup = lookup
+        scratch.ledgerStamp = SoftDeleteRuntime.ledgerIndexStamp(record)
+        scratch.eventIndex = BuildSoftDeleteEventObjectIndex(record, lookup)
+        GS._softDeleteEventIndexVisits = tonumber(scratch.eventIndex and scratch.eventIndex.visits) or 0
+        GS._softDeleteCumulativeEventVisits =
+            (tonumber(GS._softDeleteCumulativeEventVisits) or 0)
+            + (tonumber(GS._softDeleteEventIndexVisits) or 0)
+        GS._softDeleteColdLedgerBuilds =
+            (tonumber(GS._softDeleteColdLedgerBuilds) or 0) + 1
+    else
+        GS._softDeleteEventIndexVisits = 0
+        GS._softDeleteIndexReuse = true
+    end
+    local needFullHist = type(scratch.histIndex) ~= "table"
+        or scratch.histAliasGen ~= (d.aliasGen or 0)
+    local annotOk, annotErr = true, nil
+    if needFullHist then
+        local histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
+        scratch.histIndex = histIndex
+        scratch.histVisits = histVisits
+        scratch.histAliasGen = d.aliasGen or 0
+        scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
+        GS._softDeleteHistCorrectionVisits = tonumber(histVisits) or 0
+        GS._softDeleteCumulativeHistVisits =
+            (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
+            + (tonumber(histVisits) or 0)
+    else
+        local histTouch = 0
+        if type(correctionBody) == "table" then
+            SoftDeleteRuntime.applyHistCorrection(
+                scratch.histIndex, record, correctionBody, lookup)
+            histTouch = 1
+        end
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, scratch.histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
+        scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
+        scratch.histAliasGen = d.aliasGen or 0
+        GS._softDeleteHistCorrectionVisits = histTouch
+        if histTouch > 0 then
+            GS._softDeleteCumulativeHistVisits =
+                (tonumber(GS._softDeleteCumulativeHistVisits) or 0) + histTouch
+        end
+    end
+    if not annotOk then
+        -- Keep prior deletion facts coherent; resume via shared scheduling.
+        SoftDeleteRuntime.notePendingFactRefresh(record, {
+            correctionBody = correctionBody,
+        })
+        eventDeletionCache[record] = {
+            stamp = EventDeletionDependencyStamp(record),
+            ok = false,
+            err = annotErr or "work_budget",
+        }
+        return false
+    end
+    local ops = record.operations
+    local byObj = scratch.eventIndex and scratch.eventIndex.byObj
+    local aliasesByCanon = scratch.eventIndex and scratch.eventIndex.aliasesByCanon
+    local histIndex = scratch.histIndex
+    local seen = {}
+    local unique = {}
+    -- Unique shared entry tables only — never charge alias-inflated pairs scans
+    -- as deletion-map rewrite cost (#465 r4538978963 / r4539832738).
+    for _, entry in pairs(map) do
+        if type(entry) == "table" and not seen[entry] then
+            seen[entry] = true
+            unique[#unique + 1] = entry
+        end
+    end
+    local mapVisits = 0
+    local headVisits = 0
+    local affected = 0
+    for i = 1, #unique do
+        local priorEntry = unique[i]
+        local entryEventId = priorEntry.eventId
+        if type(entryEventId) ~= "string" or entryEventId == "" then
+            entryEventId = eventId
+        end
+        local canon = GS.CanonicalCreditEventId
+            and GS.CanonicalCreditEventId(record, entryEventId, lookup)
+            or entryEventId
+        local headBody = nil
+        if type(priorEntry.revisionId) == "string" and type(ops) == "table"
+            and type(ops.records) == "table" then
+            headBody = ops.records[priorEntry.revisionId]
+        end
+        if type(headBody) ~= "table" and entryEventId == eventId
+            and type(correctionBody) == "table" then
+            headBody = correctionBody
+        end
+        if type(headBody) ~= "table" then
+            -- Preserve deletion-head audit fields when only attribution changes.
+            headBody = {
+                id = priorEntry.revisionId,
+                timestamp = priorEntry.deletedAt,
+                actorName = priorEntry.actorName,
+                actorGuid = priorEntry.actorGuid,
+            }
+        end
+        local resolved = nil
+        if type(byObj) == "table" then
+            resolved = byObj[canon] or byObj[entryEventId]
+            if resolved == false then
+                resolved = nil
+            end
+        end
+        if type(resolved) ~= "table" and GS.FindLedgerEventById then
+            resolved = GS.FindLedgerEventById(record, canon)
+                or GS.FindLedgerEventById(record, entryEventId)
+        end
+        local facts = SoftDeleteRuntime.computeFacts(
+            record, headBody, resolved, priorEntry, histIndex)
+        if not SoftDeleteRuntime.factsContentEqual(priorEntry, facts) then
+            if facts.verified == true and type(resolved) == "table" then
+                RememberSoftDeleteVerifiedFacts(record, facts)
+            end
+            local newEntry = SoftDeleteRuntime.headEntry(headBody, facts)
+            for k in pairs(priorEntry) do
+                priorEntry[k] = nil
+                mapVisits = mapVisits + 1
+            end
+            for k, v in pairs(newEntry) do
+                priorEntry[k] = v
+                mapVisits = mapVisits + 1
+            end
+            map[canon] = priorEntry
+            map[entryEventId] = priorEntry
+            mapVisits = mapVisits + 2
+            local aliasList = type(aliasesByCanon) == "table"
+                and (aliasesByCanon[canon]
+                    or (type(resolved) == "table" and aliasesByCanon[resolved.id]))
+            if type(aliasList) == "table" then
+                for ai = 1, #aliasList do
+                    local alias = aliasList[ai]
+                    if type(alias) == "string" and alias ~= "" then
+                        map[alias] = priorEntry
+                        mapVisits = mapVisits + 1
+                    end
+                end
+            end
+            affected = affected + 1
+            headVisits = headVisits + 1
+        end
+    end
+    if affected > 0 then
+        SoftDeleteRuntime.bumpDep(record, "delGen")
+    end
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = true,
+    }
+    GS._softDeleteDeletionMapVisits = mapVisits
+    GS._softDeleteHeadVisits = headVisits
+    GS._softDeleteCumulativeHeadVisits =
+        (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + headVisits
+    -- One coherent refresh invocation (may rewrite multiple dependent facts).
+    GS._softDeleteAffectedAttributionRefreshes =
+        (tonumber(GS._softDeleteAffectedAttributionRefreshes) or 0) + 1
+    GS._softDeleteAffectedFactRewrites =
+        (tonumber(GS._softDeleteAffectedFactRewrites) or 0) + affected
+    return true
+end
+
+--- Late ledger evidence for a soft-deleted id must rederive facts (#465 r4539041882).
+-- Conflicting orphan/transferred facts mark adoption fail-closed; matching evidence
+-- refreshes the projection without a full unrelated rebuild.
+function SoftDeleteRuntime.onLedgerEvidenceArrived(record, event)
+    if type(record) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    local eventId = event.id
+    if type(eventId) ~= "string" or eventId == "" then
+        return
+    end
+    if not GS.IsEventSoftDeleted or not GS.IsEventSoftDeleted(record, event) then
+        if type(event.txnId) == "string" and event.txnId ~= ""
+            and GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event.txnId) then
+            -- fall through with txn alias
+        else
+            return
+        end
+    end
+    -- Patch the warm event index in place — do not drop reusable ledger indexes
+    -- (adoption multi-delete would otherwise cold-rebuild per late row).
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) ~= "table" then
+        scratch = {}
+        SoftDeleteRuntime.indexes[record] = scratch
+    end
+    if type(scratch.eventIndex) == "table" and type(scratch.eventIndex.byObj) == "table" then
+        scratch.eventIndex.byObj[eventId] = event
+        if type(event.txnId) == "string" and event.txnId ~= "" then
+            scratch.eventIndex.byObj[event.txnId] = event
+        end
+        scratch.ledgerStamp = SoftDeleteRuntime.ledgerIndexStamp(record)
+    end
+    local lookup = scratch.lookup
+    local histIndex = scratch.histIndex
+    if type(histIndex) ~= "table"
+        or SoftDeleteRuntime.histIndexStamp(record) ~= scratch.histStamp then
+        histIndex = select(1, BuildHistoricalCorrectionAttributionIndex(record, lookup))
+        scratch.histIndex = histIndex
+        scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
+        local d = SoftDeleteRuntime.depsFor(record)
+        scratch.histAliasGen = d.aliasGen or 0
+    end
+    local expected = SoftDeleteRuntime.computeFacts(
+        record, nil, event, nil, histIndex)
+    if expected.verified ~= true then
+        return
+    end
+    local prior = LookupSoftDeleteVerifiedFacts(record, eventId, expected.eventId)
+    -- Security surface is forged item/quantity allowances (r4539041882). Do not
+    -- treat campaign remapping / equivalent attribution reshaping as conflict.
+    if type(prior) == "table" and prior.verified == true then
+        if tonumber(prior.itemId) ~= tonumber(expected.itemId)
+            or tonumber(prior.quantity) ~= tonumber(expected.quantity) then
+            record._gsSoftDeleteFactEvidenceConflict = true
+        end
+    end
+    RememberSoftDeleteVerifiedFacts(record, expected)
+    SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, eventId)
+end
+
+-- Late-bound for AppendLedgerEvent (defined before SoftDeleteRuntime local).
+GS.OnSoftDeleteLedgerEvidenceArrived = SoftDeleteRuntime.onLedgerEvidenceArrived
+
+local SoftDeleteHeadEntry = SoftDeleteRuntime.headEntry
+
+--- Fold alias-keyed soft-delete heads onto the terminal canonical (#465).
+-- Mirrors MigrateCorrectionHeadsForAlias: one LWW head per logical event.
+function GS.MigrateSoftDeleteHeadsForAlias(record, primaryTxnId, aliasTxnId, resolvedPrimaryId)
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return
+    end
+    local ops = record.operations
+    if type(ops.heads) ~= "table" then
+        return
+    end
+    local primaryKey
+    if type(resolvedPrimaryId) == "string" and resolvedPrimaryId ~= "" then
+        if GS.ComputeTargetKey and GS.KIND and GS.KIND.SOFT_DELETE_EVENT then
+            primaryKey = GS.ComputeTargetKey(
+                GS.KIND.SOFT_DELETE_EVENT, resolvedPrimaryId)
+        else
+            primaryKey = "delete:" .. resolvedPrimaryId
+        end
+    else
+        primaryKey = GS.SoftDeleteTargetKey
+            and GS.SoftDeleteTargetKey(record, primaryTxnId)
+            or ("delete:" .. tostring(primaryTxnId))
+    end
+    local aliasKey = "delete:" .. tostring(aliasTxnId)
+    if primaryKey == aliasKey then
+        return
+    end
+    local aliasHeadId = ops.heads[aliasKey]
+    if type(aliasHeadId) ~= "string" then
+        return
+    end
+    local primaryHeadId = ops.heads[primaryKey]
+    if type(primaryHeadId) ~= "string" then
+        ops.heads[primaryKey] = aliasHeadId
+        ops.heads[aliasKey] = nil
+        return
+    end
+    if primaryHeadId == aliasHeadId then
+        ops.heads[aliasKey] = nil
+        return
+    end
+    local primaryBody = ops.records and ops.records[primaryHeadId]
+    local aliasBody = ops.records and ops.records[aliasHeadId]
+    if type(aliasBody) == "table" and type(primaryBody) == "table"
+        and GS.SoftDeleteRevisionWins
+        and GS.SoftDeleteRevisionWins(aliasBody, primaryBody) then
+        ops.heads[primaryKey] = aliasHeadId
+    end
+    -- Losing revision stays in records; only the head key is cleared.
+    ops.heads[aliasKey] = nil
+end
+
+--- Rebuild eventDeletions from accepted soft-delete heads (#465).
+-- Resolves every retained delete target through a shared canonical lookup so
+-- late alias bindings unify onto one LWW head without per-head ledger scans.
+-- Reuses ledger/event/hist indexes across rebuilds when SoftDeleteLedgerIndexStamp
+-- is unchanged so multi-delete admission slices do not rescan the ledger per
+-- head (r4529162895).
+-- @return boolean ok
+function GS.RebuildEventDeletionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    local map = {}
+    local ops = record.operations
+    local heads = ops and ops.heads
+    local records = ops and ops.records
+    local priorMap = type(record.eventDeletions) == "table" and record.eventDeletions or nil
+    local ledgerStamp = SoftDeleteRuntime.ledgerIndexStamp(record)
+    local histStamp = SoftDeleteRuntime.histIndexStamp(record)
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) ~= "table" then
+        scratch = {}
+        SoftDeleteRuntime.indexes[record] = scratch
+    end
+    local lookup, eventIndex, histIndex, histVisits
+    local reusedLedger = false
+    if scratch.ledgerStamp == ledgerStamp
+        and type(scratch.lookup) == "table"
+        and type(scratch.eventIndex) == "table" then
+        lookup = scratch.lookup
+        eventIndex = scratch.eventIndex
+        reusedLedger = true
+        GS._softDeleteEventIndexVisits = 0
+    else
+        lookup = GS.BuildCreditCanonicalLookup and GS.BuildCreditCanonicalLookup(record) or nil
+        -- Shared event-object index (one cold ledger pass). Do not use
+        -- lookup.byId as event tables — it stores canonical IDs.
+        eventIndex = BuildSoftDeleteEventObjectIndex(record, lookup)
+        scratch.ledgerStamp = ledgerStamp
+        scratch.lookup = lookup
+        scratch.eventIndex = eventIndex
+        GS._softDeleteEventIndexVisits = tonumber(eventIndex and eventIndex.visits) or 0
+        GS._softDeleteCumulativeEventVisits =
+            (tonumber(GS._softDeleteCumulativeEventVisits) or 0)
+            + (tonumber(GS._softDeleteEventIndexVisits) or 0)
+        GS._softDeleteColdLedgerBuilds =
+            (tonumber(GS._softDeleteColdLedgerBuilds) or 0) + 1
+    end
+    local annotOk, annotErr = true, nil
+    if scratch.histStamp == histStamp and type(scratch.histIndex) == "table" then
+        histIndex = scratch.histIndex
+        histVisits = tonumber(scratch.histVisits) or 0
+        GS._softDeleteHistCorrectionVisits = 0
+        -- Re-annotate: floor context may have changed since the cached hist build.
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
+    else
+        histIndex, histVisits = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk, annotErr = okAnnot ~= false, errAnnot
+        scratch.histStamp = histStamp
+        scratch.histIndex = histIndex
+        scratch.histVisits = histVisits
+        GS._softDeleteHistCorrectionVisits = tonumber(histVisits) or 0
+        GS._softDeleteCumulativeHistVisits =
+            (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
+            + (tonumber(histVisits) or 0)
+    end
+    do
+        local dHist = SoftDeleteRuntime.depsFor(record)
+        scratch.histAliasGen = dHist.aliasGen or 0
+    end
+    if not annotOk then
+        -- Do not publish a partial deletion map; resume via shared scheduling.
+        SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+        local rebuildErr = annotErr or "work_budget"
+        eventDeletionCache[record] = {
+            stamp = EventDeletionDependencyStamp(record),
+            ok = false,
+            err = rebuildErr,
+        }
+        return false, rebuildErr
+    end
+    GS._softDeleteIndexReuse = reusedLedger
+    GS._softDeleteRebuildFindLedgerCalls = 0
+    local function resolveDeleteEvent(eventId, canon)
+        local byObj = eventIndex and eventIndex.byObj
+        if type(byObj) ~= "table" then
+            return nil
+        end
+        local function probe(id)
+            if type(id) ~= "string" or id == "" then
+                return nil
+            end
+            local ev = byObj[id]
+            if ev == false then
+                return nil
+            end
+            if type(ev) == "table" then
+                return ev
+            end
+            -- Definitive miss for this rebuild: index already scanned bounded lists.
+            byObj[id] = false
+            return nil
+        end
+        return probe(canon) or probe(eventId)
+    end
+    local function priorFactsFor(canon, eventId)
+        if type(priorMap) == "table" then
+            local prior = priorMap[canon] or priorMap[eventId]
+            if type(prior) == "table" and prior.verified == true then
+                return prior
+            end
+        end
+        return LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    end
+    local function entryFor(body, eventId, canon)
+        local event = resolveDeleteEvent(eventId, canon)
+        local facts = DeriveVerifiedSoftDeleteFacts(
+            record, body, event, priorFactsFor(canon, eventId), histIndex)
+        if facts.verified == true then
+            RememberSoftDeleteVerifiedFacts(record, facts)
+        end
+        return SoftDeleteHeadEntry(body, facts)
+    end
+    -- Collect head bodies keyed by terminal canonical id; LWW within each group.
+    local winners = {} -- canon -> { body=, entry=, ids={} }
+    local headVisits = 0
+    if type(heads) == "table" and type(records) == "table" then
+        for targetKey, headId in pairs(heads) do
+            if type(targetKey) == "string" and targetKey:sub(1, 7) == "delete:"
+                and type(headId) == "string" then
+                headVisits = headVisits + 1
+                local body = records[headId]
+                if type(body) == "table"
+                    and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+                    local eventId = body.target or (body.value and body.value.eventId)
+                        or targetKey:sub(8)
+                    if type(eventId) == "string" and eventId ~= "" then
+                        local canon = GS.CanonicalCreditEventId
+                            and GS.CanonicalCreditEventId(record, eventId, lookup)
+                            or eventId
+                        local cur = winners[canon]
+                        if type(cur) ~= "table" then
+                            winners[canon] = {
+                                body = body,
+                                entry = entryFor(body, eventId, canon),
+                                ids = { eventId, targetKey:sub(8) },
+                            }
+                        else
+                            cur.ids[#cur.ids + 1] = eventId
+                            cur.ids[#cur.ids + 1] = targetKey:sub(8)
+                            if GS.SoftDeleteRevisionWins
+                                and GS.SoftDeleteRevisionWins(body, cur.body) then
+                                cur.body = body
+                                cur.entry = entryFor(body, eventId, canon)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    GS._softDeleteHeadVisits = headVisits
+    GS._softDeleteCumulativeHeadVisits =
+        (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + headVisits
+    -- Speculative local prepare preview: include extraOp before StoreAccepted.
+    if type(extraOp) == "table"
+        and extraOp.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+        local eventId = extraOp.target or (extraOp.value and extraOp.value.eventId)
+        if type(eventId) == "string" and eventId ~= "" then
+            local canon = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, eventId, lookup)
+                or eventId
+            local cur = winners[canon]
+            local wins = true
+            if type(cur) == "table" and type(cur.body) == "table"
+                and cur.body.id ~= extraOp.id and GS.SoftDeleteRevisionWins then
+                wins = GS.SoftDeleteRevisionWins(extraOp, cur.body)
+            end
+            if wins then
+                winners[canon] = {
+                    body = extraOp,
+                    entry = entryFor(extraOp, eventId, canon),
+                    ids = (cur and cur.ids) or { eventId },
+                }
+                local ids = winners[canon].ids
+                ids[#ids + 1] = eventId
+            end
+        end
+    end
+    -- Publish map at canonical + every known alias / retained id for pure reads.
+    for canon, cur in pairs(winners) do
+        if type(canon) == "string" and canon ~= "" and type(cur.entry) == "table" then
+            map[canon] = cur.entry
+            if type(cur.ids) == "table" then
+                for i = 1, #cur.ids do
+                    local id = cur.ids[i]
+                    if type(id) == "string" and id ~= "" then
+                        map[id] = cur.entry
+                    end
+                end
+            end
+        end
+    end
+    local aliases = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.creditEventAliases
+    if type(aliases) == "table" then
+        for alias, canon in pairs(aliases) do
+            if type(alias) == "string" and alias ~= "" then
+                local terminal = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, alias, lookup)
+                    or canon
+                if type(terminal) == "string" and type(map[terminal]) == "table" then
+                    map[alias] = map[terminal]
+                    if type(canon) == "string" and canon ~= "" then
+                        map[canon] = map[terminal]
+                    end
+                end
+            end
+        end
+    end
+    -- Migrate ops.heads onto terminal keys so future LWW shares one head.
+    if type(heads) == "table" then
+        for canon, cur in pairs(winners) do
+            if type(canon) == "string" and type(cur.ids) == "table" then
+                for i = 1, #cur.ids do
+                    local id = cur.ids[i]
+                    if type(id) == "string" and id ~= "" and id ~= canon then
+                        GS.MigrateSoftDeleteHeadsForAlias(record, canon, id, canon)
+                    end
+                end
+            end
+        end
+    end
+    record.eventDeletions = map
+    SoftDeleteRuntime.bumpDep(record, "delGen")
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = true,
+    }
+    return true
+end
+
+--- Incremental soft-delete head apply when ledger/hist indexes are warm (#465).
+-- Avoids folding every retained delete head on each new admission.
+function SoftDeleteRuntime.tryIncrementalDelete(record, op, event)
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false
+    end
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) ~= "table" or type(scratch.eventIndex) ~= "table"
+        or type(scratch.lookup) ~= "table" then
+        return false
+    end
+    if SoftDeleteRuntime.ledgerIndexStamp(record) ~= scratch.ledgerStamp then
+        return false
+    end
+    local lookup = scratch.lookup
+    local eventIndex = scratch.eventIndex
+    local histIndex = scratch.histIndex
+    local annotOk = true
+    if SoftDeleteRuntime.histIndexStamp(record) ~= scratch.histStamp
+        or type(histIndex) ~= "table" then
+        local hv
+        histIndex, hv = BuildHistoricalCorrectionAttributionIndex(record, lookup)
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk = okAnnot ~= false
+        if not annotOk then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local incrErr = errAnnot or "work_budget"
+            eventDeletionCache[record] = {
+                stamp = EventDeletionDependencyStamp(record),
+                ok = false,
+                err = incrErr,
+            }
+            return false, incrErr
+        end
+        scratch.histStamp = SoftDeleteRuntime.histIndexStamp(record)
+        scratch.histIndex = histIndex
+        scratch.histVisits = hv
+        GS._softDeleteHistCorrectionVisits = tonumber(hv) or 0
+        GS._softDeleteCumulativeHistVisits =
+            (tonumber(GS._softDeleteCumulativeHistVisits) or 0)
+            + (tonumber(hv) or 0)
+    else
+        local _, okAnnot, errAnnot =
+            SoftDeleteRuntime.annotateHistEffectiveness(record, histIndex, lookup)
+        annotOk = okAnnot ~= false
+        if not annotOk then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local incrErr = errAnnot or "work_budget"
+            eventDeletionCache[record] = {
+                stamp = EventDeletionDependencyStamp(record),
+                ok = false,
+                err = incrErr,
+            }
+            return false, incrErr
+        end
+        GS._softDeleteHistCorrectionVisits = 0
+    end
+    do
+        local dHist = SoftDeleteRuntime.depsFor(record)
+        scratch.histAliasGen = dHist.aliasGen or 0
+    end
+    GS._softDeleteEventIndexVisits = 0
+    GS._softDeleteIndexReuse = true
+    GS._softDeleteHeadVisits = 1
+    GS._softDeleteCumulativeHeadVisits =
+        (tonumber(GS._softDeleteCumulativeHeadVisits) or 0) + 1
+    GS._softDeleteIncrementalApplies =
+        (tonumber(GS._softDeleteIncrementalApplies) or 0) + 1
+    GS._softDeleteRebuildFindLedgerCalls = 0
+    local eventId = op.target or (op.value and op.value.eventId)
+    if type(eventId) ~= "string" or eventId == "" then
+        return false
+    end
+    local canon = GS.CanonicalCreditEventId
+        and GS.CanonicalCreditEventId(record, eventId, lookup) or eventId
+    local byObj = eventIndex.byObj
+    local resolved = event
+    if type(resolved) ~= "table" and type(byObj) == "table" then
+        resolved = byObj[canon] or byObj[eventId]
+        if resolved == false then
+            resolved = nil
+        end
+    end
+    local priorMap = type(record.eventDeletions) == "table" and record.eventDeletions or nil
+    local prior = nil
+    if type(priorMap) == "table" then
+        prior = priorMap[canon] or priorMap[eventId]
+        if type(prior) ~= "table" or prior.verified ~= true then
+            prior = LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+        end
+    else
+        prior = LookupSoftDeleteVerifiedFacts(record, eventId, canon)
+    end
+    local facts = DeriveVerifiedSoftDeleteFacts(
+        record, op, resolved, prior, histIndex)
+    if facts.verified == true then
+        RememberSoftDeleteVerifiedFacts(record, facts)
+    end
+    local entry = SoftDeleteHeadEntry(op, facts)
+    local map = type(record.eventDeletions) == "table" and record.eventDeletions or {}
+    map[canon] = entry
+    map[eventId] = entry
+    if type(resolved) == "table" then
+        if type(resolved.id) == "string" and resolved.id ~= "" then
+            map[resolved.id] = entry
+        end
+        if type(resolved.txnId) == "string" and resolved.txnId ~= "" then
+            map[resolved.txnId] = entry
+        end
+    end
+    -- Local prepare canonicalizes op.target; publish warm alias keys for this
+    -- canon so IsEventSoftDeleted(alias) matches a full Rebuild fold without
+    -- rescanning the whole durable alias map on every incremental delete.
+    local aliasList = eventIndex.aliasesByCanon and (
+        eventIndex.aliasesByCanon[canon]
+        or (type(resolved) == "table" and eventIndex.aliasesByCanon[resolved.id])
+    )
+    if type(aliasList) == "table" then
+        for i = 1, #aliasList do
+            local alias = aliasList[i]
+            if type(alias) == "string" and alias ~= "" then
+                map[alias] = entry
+            end
+        end
+    end
+    record.eventDeletions = map
+    SoftDeleteRuntime.bumpDep(record, "delGen")
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = true,
+    }
+    return true
+end
+
+function GS.InvalidateEventDeletionProjection(record)
+    if type(record) ~= "table" then
+        return
+    end
+    eventDeletionCache[record] = nil
+    SoftDeleteRuntime.debtFloor[record] = nil
+    SoftDeleteRuntime.bumpDep(record, "delGen")
+    -- Keep SoftDeleteRuntime.indexes: ledger/alias stamp still gates reuse.
+    -- Clearing it here would force a full ledger rescan on every Ensure after
+    -- Invalidate.
+end
+
+--- Accepted correction-history mutation notification (#465 r4529162895 / r4538978963).
+-- Call AFTER the correction body is stored in ops.records (winning apply,
+-- stale_credit loser retention, or equivalent adoption paths). Bumps O(1)
+-- histGen so deletion/floor stamps observe the change. When deletions are
+-- already projected, refreshes the affected target incrementally (or Ensure as
+-- fallback) so intervening debt-floor consumers never read stale allowances and
+-- correction-heavy replay does not rebuild history/heads per admission.
+-- @param correctionBody table|nil accepted correct-contributor body (preferred)
+function GS.NoteAcceptedCorrectionHistoryMutation(record, correctionBody, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime.bumpDep(record, "histGen")
+    if type(record.eventDeletions) ~= "table" or next(record.eventDeletions) == nil then
+        return
+    end
+    opts = opts or {}
+    -- Adoption correction replay: invalidate and coalesce; one Ensure after the
+    -- replay settles publishes all affected facts coherently (#465).
+    if opts.deferRefresh == true then
+        eventDeletionCache[record] = nil
+        SoftDeleteRuntime.invalidateHistEffective(record)
+        return
+    end
+    local body = correctionBody
+    if type(body) == "table" and type(body.op) == "table" and body.target == nil then
+        body = body.op
+    end
+    if type(body) == "table"
+        and SoftDeleteRuntime.refreshDeletionAttributionForTarget(record, body) then
+        return
+    end
+    -- Paced hist-effective work owns the refresh via shared continuation.
+    local pending = SoftDeleteRuntime._pendingFactRefresh
+        and SoftDeleteRuntime._pendingFactRefresh[record]
+    if type(pending) == "table" then
+        return
+    end
+    -- Unknown target: full Ensure preserves ordinary immediate correctness.
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+end
+
+--- Test seam: include-deleted historical effectiveness rebuild (#465).
+-- Always uses production pacing (never disables C_Timer.After).
+function GS._RebuildHistEffectiveActiveForTest(record, opts)
+    opts = opts or {}
+    return SoftDeleteRuntime.rebuildHistEffectiveActive(record)
+end
+
+--- Test/repair seam: drop reusable soft-delete ledger indexes (#465).
+function GS.InvalidateSoftDeleteLedgerIndexes(record)
+    if type(record) ~= "table" then
+        return
+    end
+    SoftDeleteRuntime.indexes[record] = nil
+    SoftDeleteRuntime.debtFloor[record] = nil
+    SoftDeleteRuntime.invalidateHistEffective(record)
+    SoftDeleteRuntime.deps[record] = nil
+    eventDeletionCache[record] = nil
+end
+
+function GS.SealEventDeletionProjection(record, ok)
+    if type(record) ~= "table" then
+        return
+    end
+    eventDeletionCache[record] = {
+        stamp = EventDeletionDependencyStamp(record),
+        ok = ok and true or false,
+    }
+end
+
+function GS.EnsureEventDeletionProjection(record, extraOp)
+    if type(record) ~= "table" then
+        return false, "invalid_value"
+    end
+    -- Never treat deletion facts as complete while include-deleted hist-effective
+    -- work is still paced/scheduled (#465 assessment 6834988628).
+    do
+        local histEff = SoftDeleteRuntime.includeDeletedCache[record]
+        local cont = SoftDeleteRuntime.histEffectiveContinuation
+            and SoftDeleteRuntime.histEffectiveContinuation[record]
+        local histPending = (type(histEff) == "table" and histEff.ok == false
+            and histEff.err == "work_budget")
+            or (type(cont) == "table" and cont.scheduled == true)
+        if histPending and type(extraOp) ~= "table" then
+            SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+            local after = eventDeletionCache[record]
+            local stampNow = EventDeletionDependencyStamp(record)
+            if type(after) == "table" and after.stamp == stampNow and after.ok == true
+                and type(record.eventDeletions) == "table" then
+                return true
+            end
+            return false, "work_budget"
+        end
+    end
+    local stamp = EventDeletionDependencyStamp(record)
+    local cache = eventDeletionCache[record]
+    if type(cache) == "table" and cache.stamp == stamp and cache.ok == true
+        and type(extraOp) ~= "table"
+        and type(record.eventDeletions) == "table" then
+        return true
+    end
+    -- Incomplete paced hist-effective work resumes via shared scheduling;
+    -- do not treat pending effectiveness as a completed deletion map (#465).
+    if type(cache) == "table" and cache.stamp == stamp and cache.ok == false
+        and cache.err == "work_budget" and type(extraOp) ~= "table" then
+        SoftDeleteRuntime.notePendingFactRefresh(record, { fullRebuild = true })
+        local after = eventDeletionCache[record]
+        local stampNow = EventDeletionDependencyStamp(record)
+        if type(after) == "table" and after.stamp == stampNow and after.ok == true
+            and type(record.eventDeletions) == "table" then
+            return true
+        end
+        local pendingErr = (type(after) == "table" and after.err) or "work_budget"
+        return false, pendingErr
+    end
+    local rebuilt, rebuildErr = GS.RebuildEventDeletionProjection(record, extraOp)
+    if rebuilt then
+        return true
+    end
+    return false, rebuildErr or "work_budget"
+end
+
+--- True when the canonical event is soft-deleted (#465).
+-- Pure map read — do not Ensure/FindLedger here. EventCountsTowardLiveProgress
+-- and credit-floor baselines call this on every row; nested Ensure would charge
+-- the credit-projection work budget and stall paced rebuilds (#459 work_budget).
+-- Callers that need a fresh map (history/rankings/progress entry, apply/admit)
+-- must EnsureEventDeletionProjection first.
+function GS.IsEventSoftDeleted(record, eventOrId)
+    if type(record) ~= "table" then
+        return false
+    end
+    local map = record.eventDeletions
+    if type(map) ~= "table" then
+        return false
+    end
+    if type(eventOrId) == "table" then
+        local eventId = eventOrId.id
+        if type(eventId) == "string" and eventId ~= "" and type(map[eventId]) == "table" then
+            return true
+        end
+        local txnId = eventOrId.txnId
+        if type(txnId) == "string" and txnId ~= "" and txnId ~= eventId
+            and type(map[txnId]) == "table" then
+            return true
+        end
+        return false
+    end
+    if type(eventOrId) ~= "string" or eventOrId == "" then
+        return false
+    end
+    -- Avoid CanonicalCreditEventId/FindLedgerEventById on this hot path.
+    return type(map[eventOrId]) == "table"
+end
+
+--- Scope/eligibility for soft-delete prepare/apply (#465).
+function GS.ValidateSoftDeleteScope(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" or type(op.value) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or op.value.eventId
+    if type(eventId) ~= "string" or eventId == "" then
+        return false, "invalid_target"
+    end
+    if type(op.campaignId) ~= "string" or op.campaignId == "" then
+        return false, "invalid_campaign"
+    end
+    if type(op.baseCampaignId) ~= "string" or op.baseCampaignId == "" then
+        return false, "invalid_base_campaign"
+    end
+    if op.campaignId ~= op.baseCampaignId then
+        return false, "invalid_campaign"
+    end
+    local skew = GS.SOFT_DELETE_TIMESTAMP_SKEW or 600
+    local ts = tonumber(op.timestamp)
+    local now = Now()
+    if not ts or ts ~= ts or ts < 0 then
+        return false, "invalid_value"
+    end
+    if ts > now + skew then
+        return false, "invalid_value"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        -- Source-accepted deletion whose base evidence aged out of retention:
+        -- keep the authenticated deletion as durable history without credit (#465).
+        if opts.allowOrphanedAcceptedDelete then
+            return true, nil, nil
+        end
+        if opts.allowMissingEvent or opts.remoteAdmit then
+            return false, "pending_event"
+        end
+        return false, "missing_event"
+    end
+    -- Authored campaign must match the event's campaign (historical remote OK).
+    if type(event.campaignId) == "string" and event.campaignId ~= ""
+        and event.campaignId ~= op.campaignId then
+        return false, "stale_campaign"
+    end
+    return true, nil, event
+end
+
+function GS.ValidateSoftDeleteEventEligibility(record, op, event)
+    if event == nil then
+        -- Orphaned accepted deletion: eligibility comes from the op value shape.
+        if type(op) == "table" and type(op.value) == "table"
+            and type(op.value.eventKind) == "string" then
+            local kind = op.value.eventKind
+            if kind == "donation" or kind == "adjustment" or kind == "withdrawal" then
+                return true, nil, kind
+            end
+        end
+        return false, "invalid_event"
+    end
+    if type(event) ~= "table" then
+        return false, "invalid_event"
+    end
+    local kind = SoftDeleteEventKind(event)
+    if not kind then
+        return false, "invalid_event"
+    end
+    if type(op.value) == "table" and type(op.value.eventKind) == "string"
+        and op.value.eventKind ~= kind then
+        return false, "invalid_value"
+    end
+    -- Donations/adjustments require production credit; withdrawals are informational.
+    if kind ~= "withdrawal" and event.gsProductionCredit ~= true then
+        return false, "not_credited"
+    end
+    return true, nil, kind
+end
+
+function GS.ValidateSoftDeletePrepare(record, op, opts)
+    opts = opts or {}
+    local scopeOk, scopeErr, event = GS.ValidateSoftDeleteScope(record, op, opts)
+    if not scopeOk then
+        return false, scopeErr or "invalid_value"
+    end
+    local eligOk, eligErr, eventKind = GS.ValidateSoftDeleteEventEligibility(record, op, event)
+    if not eligOk then
+        return false, eligErr or "invalid_event"
+    end
+    if opts.localPrepare then
+        if type(event) ~= "table" then
+            return false, "missing_event"
+        end
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return false, "stale_campaign"
+        end
+    end
+    -- #465: authorized deletions are honored even when they create signed
+    -- negative item/personal balances. Floors are not deletion eligibility.
+    return true, nil, {
+        event = event,
+        eventKind = eventKind,
+        orphaned = event == nil and true or nil,
+    }
+end
+
+--- Build the public op value for a local soft-delete prepare.
+function GS.BuildSoftDeleteValue(record, eventId, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return nil, "invalid_target"
+    end
+    local event = GS.FindLedgerEventById(record, eventId)
+    if not event then
+        return nil, "missing_event"
+    end
+    local eventKind = SoftDeleteEventKind(event)
+    if not eventKind then
+        return nil, "invalid_event"
+    end
+    if eventKind ~= "withdrawal" and event.gsProductionCredit ~= true then
+        return nil, "not_credited"
+    end
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return nil, "stale_campaign"
+        end
+    end
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
+    if GS.IsEventSoftDeleted(record, event) then
+        return nil, "already_deleted"
+    end
+    local creditName, creditGuid = nil, nil
+    if eventKind ~= "withdrawal" and GS.ResolveEffectiveCreditIdentity then
+        local status
+        creditName, creditGuid, _, status = GS.ResolveEffectiveCreditIdentity(record, event)
+        -- Deletion metadata must not fail closed on temporary credit reconstruction;
+        -- fall back to durable identity for the confirmation snapshot.
+        if status == GS.CREDIT_UNAVAILABLE or (not creditName and not creditGuid) then
+            creditName, creditGuid = DurableCreditIdentity(event)
+        end
+    elseif eventKind == "withdrawal" then
+        creditName, creditGuid = NormName(event.actor), ValidGuid(event.actorGuid)
+    else
+        creditName, creditGuid = DurableCreditIdentity(event)
+    end
+    return {
+        eventId = event.id,
+        eventKind = eventKind,
+        itemId = tonumber(event.itemId),
+        quantity = tonumber(event.quantity),
+        attributed = creditName,
+        attributedGuid = creditGuid,
+    }
+end
+
+--- Apply an accepted soft-delete mutation (#465). Ledger evidence is untouched.
+-- Prefer incremental head apply when replay indexes are warm so multi-delete
+-- slices do not re-fold every retained head (r4529162895). Deliberately skips a
+-- leading Ensure→full Rebuild; heads + Rebuild/incremental keep coherence.
+function GS.ApplySoftDeleteMutation(record, op, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false, "invalid_value"
+    end
+    local eventId = op.target or (op.value and op.value.eventId)
+    local lookup = nil
+    local scratch = SoftDeleteRuntime.indexes[record]
+    if type(scratch) == "table" and type(scratch.lookup) == "table"
+        and SoftDeleteRuntime.ledgerIndexStamp(record) == scratch.ledgerStamp then
+        lookup = scratch.lookup
+    end
+    local canonical = GS.CanonicalCreditEventId(record, eventId, lookup) or eventId
+    local tKey = GS.SoftDeleteTargetKey and GS.SoftDeleteTargetKey(record, eventId, lookup)
+        or (GS.ComputeTargetKey and GS.ComputeTargetKey(op.kind, canonical or eventId))
+    local ops = record.operations
+    local headId = ops and ops.heads and tKey and ops.heads[tKey]
+    if not headId and type(eventId) == "string" and GS.ComputeTargetKey then
+        local rawKey = GS.ComputeTargetKey(op.kind, eventId)
+        headId = rawKey and ops and ops.heads and ops.heads[rawKey]
+    end
+    local headBody = headId and ops.records and ops.records[headId]
+    if type(headBody) == "table" and headBody.id == op.id then
+        -- Exact retained body: idempotent duplicate (already soft-deleted).
+        return true, "duplicate"
+    end
+    if type(headBody) == "table" and headBody.id ~= op.id then
+        if GS.SoftDeleteRevisionWins
+            and not GS.SoftDeleteRevisionWins(op, headBody) then
+            -- Older concurrent delete: retain as obsolete; credit already removed once.
+            return false, "stale_delete"
+        end
+        -- Newer delete replaces head metadata only; accounting already excluded.
+        local event = GS.FindLedgerEventById and GS.FindLedgerEventById(record, eventId)
+        if GS.EnsureSoftDeleteDurableAliases then
+            local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(record, op, event)
+            if not aliasOk then
+                return false, aliasErr or "full"
+            end
+        end
+        if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
+            return true, "accepted"
+        end
+        local rebuiltReplace, rebuildReplaceErr =
+            GS.RebuildEventDeletionProjection(record, op)
+        if not rebuiltReplace then
+            -- Paced yield is pending work_budget, not invalid_value (#465
+            -- assessment 6834988628 / r4538978963). Terminal engine_error aborts.
+            local errReplace = rebuildReplaceErr or "work_budget"
+            if errReplace == "engine_error" then
+                return false, "engine_error"
+            end
+            return false, (errReplace == "work_budget") and "work_budget" or errReplace
+        end
+        return true, "accepted"
+    end
+    if GS.IsEventSoftDeleted(record, eventId) or GS.IsEventSoftDeleted(record, canonical) then
+        -- Map says deleted but head missing (adoption edge): treat as duplicate.
+        return true, "duplicate"
+    end
+
+    local isLocal = opts.localProductionAuthority or opts.localWrite or false
+    local orphanedAccepted = opts.allowOrphanedAcceptedDelete == true
+        or (opts.adoptionReplay == true and opts.sourceAcceptedDelete == true)
+    local ok, err, meta = GS.ValidateSoftDeletePrepare(record, op, {
+        localPrepare = isLocal,
+        remoteAdmit = not isLocal,
+        allowMissingEvent = not isLocal,
+        allowOrphanedAcceptedDelete = orphanedAccepted,
+    })
+    if not ok then
+        return false, err or "invalid_value"
+    end
+    local event = meta and meta.event or nil
+    if GS.EnsureSoftDeleteDurableAliases then
+        local aliasOk, aliasErr = GS.EnsureSoftDeleteDurableAliases(record, op, event)
+        if not aliasOk then
+            return false, aliasErr or "full"
+        end
+    end
+    -- Snapshot whether this canon already had durable verified facts so a
+    -- rejected/full path can roll back speculative Remember writes (r4538978993).
+    local priorFact = LookupSoftDeleteVerifiedFacts(record, eventId, canonical)
+    local hadPriorFact = type(priorFact) == "table" and priorFact.verified == true
+    -- Warm indexes once via Rebuild when incremental cannot run yet.
+    if SoftDeleteRuntime.tryIncrementalDelete(record, op, event) then
+        -- ok
+    else
+        local rebuilt, rebuildErr = GS.RebuildEventDeletionProjection(record, op)
+        if not rebuilt then
+            -- Carry completed/pending/terminal through mutation paths; do not
+            -- map a yielded projection rebuild to invalid_value (r4538978963).
+            local errRebuild = rebuildErr or "work_budget"
+            if errRebuild == "engine_error" then
+                return false, "engine_error"
+            end
+            return false, (errRebuild == "work_budget") and "work_budget" or errRebuild
+        end
+    end
+    -- Capacity counts logical deletions (shared entry tables), not alias keys.
+    local count = SoftDeleteRuntime.countCanonical(record.eventDeletions)
+    local maxN = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+    -- Test seam: force reject/full after preview Remember (r4538978993).
+    if count > maxN or GS._softDeleteForceCapacityReject == true then
+        GS._softDeleteForceCapacityReject = nil
+        if not hadPriorFact then
+            SoftDeleteRuntime.forgetFact(record, canonical)
+            if type(eventId) == "string" and eventId ~= canonical then
+                SoftDeleteRuntime.forgetFact(record, eventId)
+            end
+        end
+        GS.RebuildEventDeletionProjection(record, nil)
+        SoftDeleteRuntime.debtFloor[record] = nil
+        return false, "full"
+    end
+    return true, "accepted"
+end
+
+local function IsFullSoftDeleteRedriveWake(opts)
+    return type(opts) == "table" and opts.eventId == nil and opts.itemId == nil
+end
+
+--- Match pending soft-delete body using a shared canonical lookup (#465).
+-- Never calls FindLedgerEventById per pending entry.
+local function SoftDeleteRedriveMatch(record, body, waveOpts, lookup, filterCanon)
+    if type(body) ~= "table"
+        or body.kind ~= (GS.KIND and GS.KIND.SOFT_DELETE_EVENT) then
+        return false
+    end
+    local eventIdFilter = waveOpts and waveOpts.eventId
+    local itemIdFilter = waveOpts and tonumber(waveOpts.itemId)
+    local matchEvent = true
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        local target = body.target or (body.value and body.value.eventId)
+        if target == eventIdFilter then
+            matchEvent = true
+        else
+            local canonTarget = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, target, lookup)
+                or target
+            if filterCanon == nil then
+                filterCanon = GS.CanonicalCreditEventId
+                    and GS.CanonicalCreditEventId(record, eventIdFilter, lookup)
+                    or eventIdFilter
+            end
+            matchEvent = canonTarget ~= nil and filterCanon ~= nil
+                and canonTarget == filterCanon
+        end
+    end
+    local matchItem = true
+    if itemIdFilter then
+        local itemId = body.value and tonumber(body.value.itemId)
+        matchItem = itemId == nil or itemId == itemIdFilter
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" and itemIdFilter then
+        return matchEvent or matchItem
+    end
+    if type(eventIdFilter) == "string" and eventIdFilter ~= "" then
+        return matchEvent
+    end
+    if itemIdFilter then
+        return matchItem
+    end
+    return true
+end
+
+local function MergeSoftDeleteRedriveWake(record, opts)
+    local cont = softDeleteRedriveContinuation[record]
+    if type(cont) ~= "table" then
+        cont = {
+            opts = opts or {},
+            scheduled = false,
+            followUpWake = false,
+            fullWake = IsFullSoftDeleteRedriveWake(opts),
+        }
+        if cont.fullWake then
+            cont.opts = {
+                maxAttempts = opts and opts.maxAttempts or nil,
+            }
+        end
+        softDeleteRedriveContinuation[record] = cont
+        return cont, cont.fullWake
+    end
+    local prev = cont.opts or {}
+    local merged = {}
+    for k, v in pairs(prev) do
+        merged[k] = v
+    end
+    local broadened = false
+    local externalWake = type(opts) == "table"
+    if externalWake then
+        if IsFullSoftDeleteRedriveWake(opts) then
+            if merged.eventId ~= nil or merged.itemId ~= nil or not cont.fullWake then
+                broadened = true
+            end
+            merged.eventId = nil
+            merged.itemId = nil
+            cont.fullWake = true
+        elseif cont.fullWake then
+            merged.eventId = nil
+            merged.itemId = nil
+        else
+            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+                merged.eventId = nil
+                broadened = true
+            elseif opts.eventId and not prev.eventId then
+                merged.eventId = opts.eventId
+            end
+            if opts.itemId and prev.itemId
+                and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+                merged.itemId = nil
+                merged.eventId = nil
+                broadened = true
+            elseif opts.itemId and not (prev.eventId or prev.itemId) then
+                merged.itemId = opts.itemId
+            elseif opts.itemId then
+                merged.itemId = opts.itemId
+            end
+        end
+        if opts.maxAttempts then
+            merged.maxAttempts = opts.maxAttempts
+        end
+    end
+    cont.opts = merged
+    if broadened then
+        cont.snapshot = nil
+        cont.index = nil
+    end
+    if externalWake and (type(cont.snapshot) == "table" or softDeleteRedriveDepth > 0
+        or cont.scheduled) then
+        cont.followUpWake = true
+    end
+    return cont, broadened
+end
+
+local function ScheduleSoftDeleteRedriveContinuation(record, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = MergeSoftDeleteRedriveWake(record, opts)
+    if cont.scheduled then
+        return
+    end
+    cont.scheduled = true
+    local function run()
+        local state = softDeleteRedriveContinuation[record]
+        if type(state) ~= "table" then
+            return
+        end
+        state.scheduled = false
+        if GS.RedrivePendingSoftDeletes then
+            GS.RedrivePendingSoftDeletes(record, nil)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+    else
+        run()
+    end
+end
+
+--- Redrive pending soft-delete ops after ledger/dependency changes (#465).
+-- Non-reentrant: nested admits coalesce into a bounded After(0) continuation
+-- with attempt budget. Retained senders are reauthenticated through ordinary
+-- AdmitRemoteOperation. Missing-event/not-credited entries stay pending; floors
+-- are not deletion dependencies. A no-progress drain becomes idle; promotions
+-- or external wakes schedule one more paced pass.
+-- @return promotedCount, attemptCount
+function GS.RedrivePendingSoftDeletes(record, opts)
+    if type(opts) == "string" then
+        opts = { eventId = opts }
+    end
+    if type(record) ~= "table" or type(record.operations) ~= "table" then
+        return 0, 0
+    end
+    if softDeleteRedriveDepth > 0 then
+        ScheduleSoftDeleteRedriveContinuation(record, opts)
+        return 0, 0
+    end
+    local ops = record.operations
+    local pending = ops.pending
+    if type(pending) ~= "table" then
+        return 0, 0
+    end
+    local cont = MergeSoftDeleteRedriveWake(record, opts)
+    local waveOpts = cont.opts or opts or {}
+    local snapshot = cont.snapshot
+    local startIndex = tonumber(cont.index) or 1
+    if type(snapshot) ~= "table" then
+        -- One shared canonical index for the whole filter pass (#465): never
+        -- FindLedgerEventById per pending body before the attempt budget.
+        local lookup = GS.BuildCreditCanonicalLookup
+            and GS.BuildCreditCanonicalLookup(record) or nil
+        GS._softDeleteRedriveLookupVisits =
+            (tonumber(GS._softDeleteRedriveLookupVisits) or 0)
+            + (lookup and tonumber(lookup.visits) or 0)
+        local filterCanon = nil
+        if type(waveOpts.eventId) == "string" and waveOpts.eventId ~= "" then
+            filterCanon = GS.CanonicalCreditEventId
+                and GS.CanonicalCreditEventId(record, waveOpts.eventId, lookup)
+                or waveOpts.eventId
+        end
+        local ids = {}
+        local filterVisits = 0
+        local filterBudget = tonumber(waveOpts.maxFilterVisits)
+            or tonumber(GS.SOFT_DELETE_REDRIVE_FILTER_BUDGET)
+            or 256
+        for id, entry in pairs(pending) do
+            filterVisits = filterVisits + 1
+            if filterVisits > filterBudget then
+                -- Bound snapshot construction; remaining entries wait for the
+                -- next paced wake rather than scanning unbounded pending.
+                cont.followUpWake = true
+                break
+            end
+            local body = entry and entry.body
+            if SoftDeleteRedriveMatch(record, body, waveOpts, lookup, filterCanon) then
+                local reason = entry.reason
+                if reason ~= "untrusted_relay" and reason ~= "evidence" then
+                    ids[#ids + 1] = id
+                end
+            end
+        end
+        table.sort(ids)
+        snapshot = ids
+        startIndex = 1
+        cont.snapshot = snapshot
+        cont.index = 1
+        cont.lookup = lookup
+        cont.filterCanon = filterCanon
+        if not cont.followUpWake then
+            cont.followUpWake = false
+        end
+    end
+    local promoted = 0
+    local attempts = 0
+    local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
+    softDeleteRedriveDepth = softDeleteRedriveDepth + 1
+    GS._softDeleteRedriveAdmitActive = true
+    local i = startIndex
+    local admitErr = nil
+    local waveOk, waveErr = pcall(function()
+        while i <= #snapshot do
+            if attempts >= maxAttempts then
+                break
+            end
+            attempts = attempts + 1
+            local id = snapshot[i]
+            i = i + 1
+            local entry = pending[id]
+            local body = entry and entry.body
+            if type(body) ~= "table" then
+                -- Already removed or malformed; attempt still counts.
+            elseif type(entry.sender) ~= "string" or entry.sender == "" then
+                -- Leave pending until an authenticated sender is known.
+            else
+                local alreadyAccepted = ops.records and ops.records[id]
+                if not alreadyAccepted and GS._AcceptedCount
+                    and GS._AcceptedCount(ops) >= (GS.MAX_ACCEPTED_OPERATIONS or 0) then
+                    -- Capacity full: leave pending.
+                elseif type(GS.AdmitRemoteOperation) == "function" then
+                    local okAdmit, statusOrErr = pcall(function()
+                        return GS:AdmitRemoteOperation(body, {
+                            sender = entry.sender,
+                            offlineRecord = waveOpts.offlineRecord
+                                or opts and opts.offlineRecord,
+                            preserveAttribution = true,
+                            _softDeleteRedrive = true,
+                        })
+                    end)
+                    if not okAdmit then
+                        -- Leave pending; report after re-entry guards clear.
+                        admitErr = statusOrErr
+                    elseif statusOrErr == "accepted" or statusOrErr == "duplicate" then
+                        promoted = promoted + 1
+                    end
+                    -- Missing-event pending stays in ops.pending via Admit; wave
+                    -- continues and becomes idle after a no-progress drain.
+                end
+            end
+        end
+    end)
+    -- Always clear re-entry guards before any fallible reporting so a logger
+    -- mistake cannot strand depth>0 scheduling (#465 P1).
+    GS._softDeleteRedriveAdmitActive = false
+    softDeleteRedriveDepth = softDeleteRedriveDepth - 1
+    if not waveOk then
+        admitErr = admitErr or waveErr
+    end
+    if admitErr then
+        -- Normal clients with debug disabled still need BugGrabber visibility.
+        if geterrorhandler then
+            pcall(geterrorhandler(), admitErr)
+        end
+        if SF.Debug and SF.Debug.Error then
+            SF.Debug:Error("GUILD_SUPPLIES",
+                "soft-delete redrive admit error: %s",
+                tostring(admitErr))
+        end
+    end
+    if i <= #snapshot then
+        cont.snapshot = snapshot
+        cont.index = i
+        cont.opts = waveOpts
+        cont.scheduled = false
+        ScheduleSoftDeleteRedriveContinuation(record, nil)
+    else
+        local followUp = cont.followUpWake == true
+        -- Actual promotions can justify one more paced pass for dependency
+        -- siblings; a no-progress blocked pass becomes idle (#465).
+        if promoted > 0 then
+            followUp = true
+        end
+        local wasFull = cont.fullWake == true
+        local retainedOpts = waveOpts
+        if wasFull and not followUp then
+            retainedOpts = { maxAttempts = waveOpts and waveOpts.maxAttempts or nil }
+        end
+        softDeleteRedriveContinuation[record] = {
+            opts = retainedOpts,
+            scheduled = false,
+            followUpWake = false,
+            fullWake = followUp and wasFull or false,
+        }
+        if followUp then
+            ScheduleSoftDeleteRedriveContinuation(record, wasFull and {} or nil)
+        end
+    end
+    return promoted, attempts
 end
 
 -- Test helper: inject a direct observation without bank scanning (#388 staged only).

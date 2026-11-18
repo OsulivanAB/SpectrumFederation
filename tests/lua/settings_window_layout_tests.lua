@@ -93,6 +93,14 @@ local function makeRegion(kind, name, parent)
 
     function region:Hide()
         self.shown = false
+        local hook = self.scripts["hook:OnHide"]
+        if hook then
+            hook(self)
+        end
+        local script = self.scripts.OnHide
+        if script then
+            script(self)
+        end
     end
 
     function region:IsShown()
@@ -136,10 +144,28 @@ local function makeRegion(kind, name, parent)
     end
 
     function region:HookScript(event, fn)
-        self.scripts["hook:" .. event] = fn
+        local key = "hook:" .. event
+        local prev = self.scripts[key]
+        if prev then
+            self.scripts[key] = function(...)
+                prev(...)
+                fn(...)
+            end
+        else
+            self.scripts[key] = fn
+        end
     end
 
-    function region:SetFrameStrata()
+    function region:SetFrameStrata(strata)
+        self.frameStrata = strata
+    end
+
+    function region:GetFrameStrata()
+        return self.frameStrata
+    end
+
+    function region:Raise()
+        self.raiseCount = (self.raiseCount or 0) + 1
     end
 
     function region:SetBackdrop()
@@ -220,12 +246,18 @@ local function resetWindow()
     SettingsWindow.pagePanels = {}
     SettingsWindow.currentCategoryId = nil
     SettingsWindow.currentPageId = nil
+    SettingsWindow._elevatedAboveBankChrome = nil
     SF.LootHelperImpersonation = nil
 end
 
 resetWindow()
 SettingsWindow:CreateWindow()
 
+assertEq(
+    SettingsWindow.frame.frameStrata,
+    "DIALOG",
+    "CreateWindow uses DIALOG strata by default"
+)
 assertTrue(SettingsWindow.contentHeader ~= nil, "CreateWindow creates contentHeader")
 assertTrue(SettingsWindow.contentHost ~= nil, "CreateWindow creates contentHost")
 assertTrue(SettingsWindow.impersonationBanner ~= nil, "CreateWindow creates impersonationBanner")
@@ -288,6 +320,61 @@ assertTrue(
 assertTrue(
     isAnchoredTo(SettingsWindow.contentHost, SettingsWindow.contentHeader),
     "contentHost remains anchored to contentHeader after banner toggle"
+)
+
+-- #466: Rankings-from-bank elevates Settings above bank chrome, then restores.
+SettingsWindow:ElevateAboveBankChrome()
+assertEq(
+    SettingsWindow.frame.frameStrata,
+    "FULLSCREEN_DIALOG",
+    "ElevateAboveBankChrome moves Settings above DIALOG bank/review chrome"
+)
+assertTrue(
+    SettingsWindow._elevatedAboveBankChrome == true,
+    "elevation flag is set while Rankings overlays bank chrome"
+)
+assertTrue(
+    (SettingsWindow.frame.raiseCount or 0) >= 1,
+    "elevation also Raises within the elevated strata"
+)
+
+-- Normal ShowPage must not clear an active bank-overlay elevation mid-session.
+SettingsWindow.RefreshEnablementIfNeeded = function() end
+SettingsWindow.ApplySelection = function() end
+local modelStub = {
+    ResolveShowPage = function()
+        return { categoryId = "guildSupplies", pageId = "guildSuppliesRankings" }
+    end,
+}
+SF.SettingsNavigationModel = modelStub
+SF.SettingsUI = SF.SettingsUI or {}
+SF.SettingsUI.Registry = {}
+SettingsWindow:ShowPage("guildSuppliesRankings")
+assertEq(
+    SettingsWindow.frame.frameStrata,
+    "FULLSCREEN_DIALOG",
+    "ShowPage keeps elevated strata while Rankings stays open over the bank"
+)
+
+SettingsWindow:Hide()
+assertEq(
+    SettingsWindow.frame.frameStrata,
+    "DIALOG",
+    "Hide restores normal DIALOG strata after bank-overlay Rankings"
+)
+assertTrue(
+    SettingsWindow._elevatedAboveBankChrome ~= true,
+    "elevation flag clears on Hide so later opens are not stale"
+)
+
+-- Second elevate → hide cycle must converge (no sticky FULLSCREEN_DIALOG).
+SettingsWindow:ElevateAboveBankChrome()
+assertEq(SettingsWindow.frame.frameStrata, "FULLSCREEN_DIALOG", "re-elevate after restore works")
+SettingsWindow.frame:Hide()
+assertEq(
+    SettingsWindow.frame.frameStrata,
+    "DIALOG",
+    "OnHide hook restores DIALOG without an explicit SettingsWindow:Hide call"
 )
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
