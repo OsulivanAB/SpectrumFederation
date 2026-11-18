@@ -664,12 +664,12 @@ local function LayoutPicker(host, draft, opts)
 	ReleaseHostChildren(host)
 
 	local x = 0
-	local function place(btn)
+	local function place(btn, width)
 		btn:SetParent(host)
 		btn:ClearAllPoints()
 		btn:SetPoint("LEFT", host, "LEFT", x, 0)
 		btn:Show()
-		x = x + ICON + ICON_GAP
+		x = x + (width or ICON) + ICON_GAP
 	end
 
 	local phase = draft.phase or "class"
@@ -688,26 +688,59 @@ local function LayoutPicker(host, draft, opts)
 			place(btn)
 		end
 	else
-		local selected = MakeIconButton(host, ICON)
-		selected:Enable()
+		local function WireChangeClassControl(control)
+			control.tooltipText = Loc("RAID_SIGNUP_TIP_CHANGE_CLASS",
+				"Click to choose a different class.")
+			control:SetScript("OnClick", function()
+				if opts.onResetClass then
+					opts.onResetClass()
+				end
+			end)
+		end
+
 		if draft.specId then
+			-- Collapsed selection: only the chosen spec icon.
+			local selected = MakeIconButton(host, ICON)
+			selected:Enable()
 			SetIconVisual(selected, TextureForSpec(draft.specId), true, false)
 			selected.tooltipTitle = SpecName(draft.specId)
+			WireChangeClassControl(selected)
+			place(selected)
 		else
-			SetIconVisual(selected, TextureForClass(draft.classFile), true, false)
-			selected.tooltipTitle = ClassName(draft.classFile)
-		end
-		selected.tooltipText = Loc("RAID_SIGNUP_TIP_CHANGE_CLASS",
-			"Click to choose a different class.")
-		-- Spec phase: return to class picking without discarding nickname/notes.
-		selected:SetScript("OnClick", function()
-			if opts.onResetClass then
-				opts.onResetClass()
-			end
-		end)
-		place(selected)
+			-- Spec phase: only spec icons; a back button returns to class picking
+			-- so the chosen class icon does not linger among them.
+			local back = AcquirePooled(textButtonPool, function()
+				local b = TrackCreate(CreateFrame("Button", nil, host, "UIPanelButtonTemplate"))
+				b.__sfRaidSignupOwned = true
+				b.__sfPoolKind = "text"
+				return b
+			end)
+			back.__sfRaidSignupOwned = true
+			back.__sfPoolKind = "text"
+			back:SetParent(host)
+			SafeClearScript(back, "OnClick")
+			back:SetSize(56, 20)
+			back:SetText(Loc("RAID_SIGNUP_PICKER_BACK", "Back"))
+			back.tooltipTitle = ClassName(draft.classFile)
+			back:SetScript("OnEnter", function(self)
+				if self.tooltipTitle or self.tooltipText then
+					GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+					if self.tooltipTitle then
+						GameTooltip:SetText(self.tooltipTitle, 1, 1, 1)
+					end
+					if self.tooltipText then
+						GameTooltip:AddLine(self.tooltipText, 0.9, 0.9, 0.9, true)
+					end
+					GameTooltip:Show()
+				end
+			end)
+			back:SetScript("OnLeave", function()
+				GameTooltip:Hide()
+			end)
+			WireChangeClassControl(back)
+			back:Show()
+			place(back, 56)
 
-		if not draft.specId then
 			local specs = SpecsFor(draft.classFile)
 			for i = 1, #specs do
 				local specId = specs[i]
@@ -1586,6 +1619,8 @@ PaintEntries = function(host, planId, planOpen, caps)
 					end)
 					btn.__sfRaidSignupOwned = true
 					btn.__sfPoolKind = "text"
+					btn.tooltipTitle = nil
+					btn.tooltipText = nil
 					btn:SetParent(row)
 					SafeClearScript(btn, "OnClick")
 					btn:Show()
