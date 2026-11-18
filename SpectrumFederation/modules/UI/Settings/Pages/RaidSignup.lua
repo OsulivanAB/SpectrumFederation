@@ -649,6 +649,62 @@ local function AcquireFontString(parent, layer, template)
 	return fs
 end
 
+local function ClassColor(classFile)
+	local key = type(classFile) == "string" and string.upper(classFile) or nil
+	local data = key and SF.WOW_CLASSES and SF.WOW_CLASSES[key]
+	local c = data and data.colorCode
+	if c then
+		return c.r or 1, c.g or 1, c.b or 1
+	end
+	return 1, 1, 1
+end
+
+-- Display-only clip for collapsed rows: nicknames/notes are byte-capped but can
+-- still overflow the fixed row width; cut at a UTF-8 character boundary.
+local function ClipDisplay(text, maxChars)
+	if type(text) ~= "string" or text == "" then
+		return ""
+	end
+	local chars = {}
+	-- Lua 5.1 patterns reject a literal NUL byte in a set, so the ASCII range
+	-- starts at byte 1 (NUL cannot appear in nicknames/notes anyway).
+	for ch in text:gmatch("[\1-\127\194-\244][\128-\191]*") do
+		chars[#chars + 1] = ch
+		if #chars > maxChars then
+			break
+		end
+	end
+	if #chars > maxChars then
+		return table.concat(chars, "", 1, maxChars) .. "…"
+	end
+	return text
+end
+
+local function AcquireFieldLabel(parent, text)
+	local fs = AcquireFontString(parent, "OVERLAY", "GameFontHighlight")
+	fs:ClearAllPoints()
+	fs:SetText(text or "")
+	fs:SetTextColor(0.75, 0.75, 0.75)
+	return fs
+end
+
+local function AcquireTextButton(parent)
+	local btn = AcquirePooled(textButtonPool, function()
+		local b = TrackCreate(CreateFrame("Button", nil, parent, "UIPanelButtonTemplate"))
+		b.__sfRaidSignupOwned = true
+		b.__sfPoolKind = "text"
+		return b
+	end)
+	btn.__sfRaidSignupOwned = true
+	btn.__sfPoolKind = "text"
+	btn.tooltipTitle = nil
+	btn.tooltipText = nil
+	btn:SetParent(parent)
+	SafeClearScript(btn, "OnClick")
+	btn:Show()
+	return btn
+end
+
 local function SafeSetEditText(edit, text)
 	if not edit then
 		return
@@ -1352,11 +1408,13 @@ PaintEntries = function(host, planId, planOpen, caps)
 	end
 
 	if session.draft and planOpen and session.draft.planId == planId then
-		placeRow(56, function(row)
+		placeRow(86, function(row)
+			local nameLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NAME", "Name"))
+			nameLabel:SetPoint("LEFT", row, "LEFT", 4, -13)
 			local nick = AcquireEditBox(row)
 			nick.__sfRaidSignupField = "nickname"
-			nick:SetSize(140, 22)
-			nick:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -4)
+			nick:SetSize(170, 22)
+			nick:SetPoint("LEFT", nameLabel, "RIGHT", 6, 0)
 			nick:SetMaxLetters(RS().MAX_NICKNAME or 48)
 			nick:Enable()
 			SafeSetEditText(nick, session.draft.nickname or "")
@@ -1390,19 +1448,34 @@ PaintEntries = function(host, planId, planOpen, caps)
 				self:ClearFocus()
 			end)
 
-			local anchor = nick
-			if session.draft.specId then
-				local mainBtn = MakeIconButton(row, ICON)
-				mainBtn:SetPoint("LEFT", nick, "RIGHT", 8, 0)
-				SetIconVisual(mainBtn, TextureForSpec(session.draft.specId), true, false)
-				mainBtn.tooltipTitle = SpecName(session.draft.specId)
-				anchor = mainBtn
-			end
+			local classLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
+			classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
+			local picker = AcquireFrame(row)
+			picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
+			picker:SetSize(500, ICON + 2)
+			LayoutPicker(picker, session.draft, {
+				onClass = function(classFile)
+					RS().UpdateDraftField(session.draft, "classFile", classFile)
+					TryPersistDraft()
+					QueueRefresh({ force = true })
+				end,
+				onSpec = function(specId)
+					RS().UpdateDraftField(session.draft, "specId", specId)
+					TryPersistDraft()
+					QueueRefresh({ force = true })
+				end,
+				onResetClass = function()
+					RS().UpdateDraftField(session.draft, "classFile", nil)
+					QueueRefresh({ force = true })
+				end,
+			})
 
+			local notesLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NOTES", "Notes"))
+			notesLabel:SetPoint("LEFT", row, "LEFT", 4, -69)
 			local notes = AcquireEditBox(row)
 			notes.__sfRaidSignupField = "notes"
-			notes:SetSize(160, 22)
-			notes:SetPoint("LEFT", anchor, "RIGHT", 12, 0)
+			notes:SetSize(240, 22)
+			notes:SetPoint("LEFT", notesLabel, "RIGHT", 6, 0)
 			notes:SetMaxLetters(RS().MAX_NOTES or 160)
 			notes:Enable()
 			SafeSetEditText(notes, session.draft.notes or "")
@@ -1434,26 +1507,6 @@ PaintEntries = function(host, planId, planOpen, caps)
 				end
 				self:ClearFocus()
 			end)
-
-			local picker = AcquireFrame(row)
-			picker:SetPoint("TOPLEFT", nick, "BOTTOMLEFT", 0, -4)
-			picker:SetSize(500, ICON + 2)
-			LayoutPicker(picker, session.draft, {
-				onClass = function(classFile)
-					RS().UpdateDraftField(session.draft, "classFile", classFile)
-					TryPersistDraft()
-					QueueRefresh({ force = true })
-				end,
-				onSpec = function(specId)
-					RS().UpdateDraftField(session.draft, "specId", specId)
-					TryPersistDraft()
-					QueueRefresh({ force = true })
-				end,
-				onResetClass = function()
-					RS().UpdateDraftField(session.draft, "classFile", nil)
-					QueueRefresh({ force = true })
-				end,
-			})
 		end)
 	end
 
@@ -1461,61 +1514,181 @@ PaintEntries = function(host, planId, planOpen, caps)
 		local entry = entries[i]
 		local editingThis = session.editing and session.editing.entryId == entry.entryId
 		local altThis = session.altDraft and session.altDraft.entryId == entry.entryId
-		local rowH = (editingThis or altThis) and 78 or 34
-		placeRow(rowH, function(row)
+		local expanded = editingThis or altThis
+		placeRow(expanded and 86 or 26, function(row)
 			local canEdit = planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry)
-			local nickBox = AcquireEditBox(row)
-			nickBox.__sfRaidSignupField = "nickname"
-			nickBox:SetSize(120, 20)
-			if editingThis or altThis then
-				-- Expanded rows reserve the band below the controls for the
-				-- class/spec picker; keep the control cluster out of its way.
-				nickBox:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -4)
-			else
-				nickBox:SetPoint("LEFT", row, "LEFT", 4, 0)
-			end
-			nickBox:SetMaxLetters(RS().MAX_NICKNAME or 48)
-			SafeSetEditText(nickBox, entry.nickname or "")
-			if nickBox.Instructions then
-				nickBox.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
-			end
-			if canEdit then
-				nickBox:Enable()
-			else
-				nickBox:Disable()
-			end
-			local function commitSavedNick(self)
-				if not canEdit then
-					return
+			if expanded then
+				-- Editing: labeled fields stacked Name / Class + Spec / Notes, with a
+				-- Done button that leaves edit mode without changing class/spec.
+				local nameLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NAME", "Name"))
+				nameLabel:SetPoint("LEFT", row, "LEFT", 4, -13)
+				local nickBox = AcquireEditBox(row)
+				nickBox.__sfRaidSignupField = "nickname"
+				nickBox:SetSize(170, 20)
+				nickBox:SetPoint("LEFT", nameLabel, "RIGHT", 6, 0)
+				nickBox:SetMaxLetters(RS().MAX_NICKNAME or 48)
+				SafeSetEditText(nickBox, entry.nickname or "")
+				if nickBox.Instructions then
+					nickBox.Instructions:SetText(Loc("RAID_SIGNUP_NICK_HINT", "Nickname"))
 				end
-				local text = self:GetText() or ""
-				local status, reason = RS():UpsertEntry({
-					entryId = entry.entryId,
-					planId = entry.planId,
-					nickname = text,
-					mainClass = entry.mainClass,
-					mainSpec = entry.mainSpec,
-					notes = entry.notes,
-					altClass = entry.altClass,
-					altSpec = entry.altSpec,
-				}, { expectedVer = entry.ver })
-				Report(status, reason)
-			end
-			BindTypingFocus(nickBox, function()
-				-- Only commit nickname edits explicitly via Enter; Escape reverts.
-			end)
-			nickBox:SetScript("OnEnterPressed", function(self)
-				commitSavedNick(self)
-				self:ClearFocus()
-			end)
-			nickBox:SetScript("OnEscapePressed", function(self)
-				self:SetText(entry.nickname or "")
-				self:ClearFocus()
-			end)
+				if canEdit then
+					nickBox:Enable()
+				else
+					nickBox:Disable()
+				end
+				local function commitSavedNick(self)
+					if not canEdit then
+						return
+					end
+					local text = self:GetText() or ""
+					local status, reason = RS():UpsertEntry({
+						entryId = entry.entryId,
+						planId = entry.planId,
+						nickname = text,
+						mainClass = entry.mainClass,
+						mainSpec = entry.mainSpec,
+						notes = entry.notes,
+						altClass = entry.altClass,
+						altSpec = entry.altSpec,
+					}, { expectedVer = entry.ver })
+					Report(status, reason)
+				end
+				BindTypingFocus(nickBox, function()
+					-- Only commit nickname edits explicitly via Enter; Escape reverts.
+				end)
+				nickBox:SetScript("OnEnterPressed", function(self)
+					commitSavedNick(self)
+					self:ClearFocus()
+				end)
+				nickBox:SetScript("OnEscapePressed", function(self)
+					self:SetText(entry.nickname or "")
+					self:ClearFocus()
+				end)
 
+				local classLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
+				classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
+				local picker = AcquireFrame(row)
+				picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
+				picker:SetSize(520, ICON + 2)
+				if editingThis then
+					local draft = session.editing.draft
+					LayoutPicker(picker, draft, {
+						disableSpec = function(specId)
+							return session.editing.slot == "alt"
+								and RS().IsAltSpecDisabled(draft, specId)
+						end,
+						onClass = function(classFile)
+							if session.editing.slot == "main" then
+								RS().UpdateDraftField(draft, "classFile", classFile)
+							else
+								RS().UpdateAltDraftField(draft, "classFile", classFile)
+							end
+							TryPersistEdit()
+							QueueRefresh({ force = true })
+						end,
+						onSpec = function(specId)
+							if session.editing.slot == "main" then
+								RS().UpdateDraftField(draft, "specId", specId)
+							else
+								RS().UpdateAltDraftField(draft, "specId", specId)
+							end
+							TryPersistEdit()
+							QueueRefresh({ force = true })
+						end,
+						onResetClass = function()
+							if session.editing.slot == "main" then
+								RS().UpdateDraftField(draft, "classFile", nil)
+							else
+								RS().UpdateAltDraftField(draft, "classFile", nil)
+							end
+							QueueRefresh({ force = true })
+						end,
+					})
+				else
+					local draft = session.altDraft.draft
+					LayoutPicker(picker, draft, {
+						disableSpec = function(specId)
+							return RS().IsAltSpecDisabled(draft, specId)
+						end,
+						onClass = function(classFile)
+							RS().UpdateAltDraftField(draft, "classFile", classFile)
+							TryPersistAltDraft()
+							QueueRefresh({ force = true })
+						end,
+						onSpec = function(specId)
+							RS().UpdateAltDraftField(draft, "specId", specId)
+							TryPersistAltDraft()
+							QueueRefresh({ force = true })
+						end,
+						onResetClass = function()
+							RS().UpdateAltDraftField(draft, "classFile", nil)
+							QueueRefresh({ force = true })
+						end,
+					})
+				end
+
+				local notesLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NOTES", "Notes"))
+				notesLabel:SetPoint("LEFT", row, "LEFT", 4, -69)
+				local notesBox = AcquireEditBox(row)
+				notesBox.__sfRaidSignupField = "notes"
+				notesBox:SetSize(240, 20)
+				notesBox:SetPoint("LEFT", notesLabel, "RIGHT", 6, 0)
+				notesBox:SetMaxLetters(RS().MAX_NOTES or 160)
+				SafeSetEditText(notesBox, entry.notes or "")
+				if notesBox.Instructions then
+					notesBox.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
+				end
+				if canEdit then
+					notesBox:Enable()
+				else
+					notesBox:Disable()
+				end
+				BindTypingFocus(notesBox)
+				notesBox:SetScript("OnEnterPressed", function(self)
+					if not canEdit then
+						return
+					end
+					local status, reason = RS():UpsertEntry({
+						entryId = entry.entryId,
+						planId = entry.planId,
+						nickname = entry.nickname,
+						mainClass = entry.mainClass,
+						mainSpec = entry.mainSpec,
+						notes = self:GetText() or "",
+						altClass = entry.altClass,
+						altSpec = entry.altSpec,
+					}, { expectedVer = entry.ver })
+					Report(status, reason)
+					self:ClearFocus()
+				end)
+				notesBox:SetScript("OnEscapePressed", function(self)
+					self:SetText(entry.notes or "")
+					self:ClearFocus()
+				end)
+
+				local done = AcquireTextButton(row)
+				done:SetSize(60, 20)
+				done:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4, -4)
+				done:SetText(Loc("RAID_SIGNUP_DONE", "Done"))
+				done:SetScript("OnClick", function()
+					if editingThis then
+						session.editing = nil
+					else
+						session.altDraft = nil
+					end
+					QueueRefresh({ force = true })
+				end)
+				return
+			end
+
+			-- Collapsed: one line — class-colored name, spec icon(s), alt spec
+			-- name + icon, then notes. Clicking an icon opens the editor.
+			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 24))
+			nameFs:SetPoint("LEFT", row, "LEFT", 4, 0)
+			nameFs:SetTextColor(ClassColor(entry.mainClass))
 			local mainBtn = MakeIconButton(row, ICON)
 			mainBtn.__sfRaidSignupSpecSlot = "main"
-			mainBtn:SetPoint("LEFT", nickBox, "RIGHT", 8, 0)
+			mainBtn:SetPoint("LEFT", nameFs, "RIGHT", 6, 0)
 			-- Enabled presentation follows canEdit (plan open + edit eligibility).
 			-- Informative hover tooltips stay assigned even when the button is disabled.
 			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), canEdit, false)
@@ -1540,12 +1713,14 @@ PaintEntries = function(host, planId, planOpen, caps)
 				}
 				QueueRefresh({ force = true })
 			end)
-
 			local anchor = mainBtn
-			if entry.altClass and entry.altSpec and not (editingThis and session.editing.slot == "alt") then
+			if entry.altClass and entry.altSpec then
+				local altNameFs = AcquireFieldLabel(row, SpecName(entry.altSpec))
+				altNameFs:SetPoint("LEFT", anchor, "RIGHT", 6, 0)
+				altNameFs:SetTextColor(0.85, 0.85, 0.85)
 				local altBtn = MakeIconButton(row, ICON)
 				altBtn.__sfRaidSignupSpecSlot = "alt"
-				altBtn:SetPoint("LEFT", mainBtn, "RIGHT", 6, 0)
+				altBtn:SetPoint("LEFT", altNameFs, "RIGHT", 4, 0)
 				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), canEdit, false)
 				altBtn.tooltipTitle = SpecName(entry.altSpec)
 				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
@@ -1571,93 +1746,17 @@ PaintEntries = function(host, planId, planOpen, caps)
 				end)
 				anchor = altBtn
 			end
-
-			local notesBox = AcquireEditBox(row)
-			notesBox:SetSize(120, 20)
-			notesBox:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
-			notesBox:SetMaxLetters(RS().MAX_NOTES or 160)
-			SafeSetEditText(notesBox, entry.notes or "")
-			if notesBox.Instructions then
-				notesBox.Instructions:SetText(Loc("RAID_SIGNUP_NOTES_HINT", "Notes (optional)"))
+			local notesText = entry.notes or ""
+			if notesText ~= "" then
+				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, 40))
+				notesFs:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
+				notesFs:SetTextColor(0.6, 0.6, 0.6)
+				anchor = notesFs
 			end
-			if canEdit then
-				notesBox:Enable()
-			else
-				notesBox:Disable()
-			end
-			BindTypingFocus(notesBox)
-			notesBox:SetScript("OnEnterPressed", function(self)
-				if not canEdit then
-					return
-				end
-				local status, reason = RS():UpsertEntry({
-					entryId = entry.entryId,
-					planId = entry.planId,
-					nickname = entry.nickname,
-					mainClass = entry.mainClass,
-					mainSpec = entry.mainSpec,
-					notes = self:GetText() or "",
-					altClass = entry.altClass,
-					altSpec = entry.altSpec,
-				}, { expectedVer = entry.ver })
-				Report(status, reason)
-				self:ClearFocus()
-			end)
-			notesBox:SetScript("OnEscapePressed", function(self)
-				self:SetText(entry.notes or "")
-				self:ClearFocus()
-			end)
-			anchor = notesBox
-
 			if planOpen and canEdit then
-				local function AcquireTextButton()
-					local btn = AcquirePooled(textButtonPool, function()
-						local b = TrackCreate(CreateFrame("Button", nil, row, "UIPanelButtonTemplate"))
-						b.__sfRaidSignupOwned = true
-						b.__sfPoolKind = "text"
-						return b
-					end)
-					btn.__sfRaidSignupOwned = true
-					btn.__sfPoolKind = "text"
-					btn.tooltipTitle = nil
-					btn.tooltipText = nil
-					btn:SetParent(row)
-					SafeClearScript(btn, "OnClick")
-					btn:Show()
-					return btn
-				end
-				if not entry.altClass and not altThis and not editingThis then
-					local addAlt = AcquireTextButton()
-					addAlt:SetSize(90, 20)
-					addAlt:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
-					addAlt:SetText(Loc("RAID_SIGNUP_ADD_ALT", "Add an Alt?"))
-					addAlt:SetScript("OnClick", function()
-						session.draft = nil
-						session.editing = nil
-						session.altDraft = {
-							entryId = entry.entryId,
-							draft = RS().MakeAltDraft(entry),
-						}
-						QueueRefresh({ force = true })
-					end)
-					anchor = addAlt
-				elseif entry.altClass then
-					local remAlt = AcquireTextButton()
-					remAlt:SetSize(90, 20)
-					remAlt:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
-					remAlt:SetText(Loc("RAID_SIGNUP_REMOVE_ALT", "Remove Alt"))
-					remAlt:SetScript("OnClick", function()
-						local status, reason = RS():RemoveAlternative(entry.entryId, {
-							expectedVer = entry.ver,
-						})
-						Report(status, reason)
-					end)
-					anchor = remAlt
-				end
-
-				local del = AcquireTextButton()
+				local del = AcquireTextButton(row)
 				del:SetSize(70, 20)
-				del:SetPoint("LEFT", anchor, "RIGHT", 8, 0)
+				del:SetPoint("RIGHT", row, "RIGHT", -4, 0)
 				del:SetText(Loc("RAID_SIGNUP_DELETE", "Delete"))
 				del:SetScript("OnClick", function()
 					local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
@@ -1675,69 +1774,29 @@ PaintEntries = function(host, planId, planOpen, caps)
 						commit()
 					end
 				end)
-			end
-
-			if editingThis then
-				local picker = AcquireFrame(row)
-				picker:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -28)
-				picker:SetSize(520, ICON + 2)
-				local draft = session.editing.draft
-				LayoutPicker(picker, draft, {
-					disableSpec = function(specId)
-						return session.editing.slot == "alt"
-							and RS().IsAltSpecDisabled(draft, specId)
-					end,
-					onClass = function(classFile)
-						if session.editing.slot == "main" then
-							RS().UpdateDraftField(draft, "classFile", classFile)
-						else
-							RS().UpdateAltDraftField(draft, "classFile", classFile)
-						end
-						TryPersistEdit()
+				local altAction = AcquireTextButton(row)
+				altAction:SetSize(90, 20)
+				altAction:SetPoint("RIGHT", del, "LEFT", -8, 0)
+				if not entry.altClass then
+					altAction:SetText(Loc("RAID_SIGNUP_ADD_ALT", "Add an Alt?"))
+					altAction:SetScript("OnClick", function()
+						session.draft = nil
+						session.editing = nil
+						session.altDraft = {
+							entryId = entry.entryId,
+							draft = RS().MakeAltDraft(entry),
+						}
 						QueueRefresh({ force = true })
-					end,
-					onSpec = function(specId)
-						if session.editing.slot == "main" then
-							RS().UpdateDraftField(draft, "specId", specId)
-						else
-							RS().UpdateAltDraftField(draft, "specId", specId)
-						end
-						TryPersistEdit()
-						QueueRefresh({ force = true })
-					end,
-					onResetClass = function()
-						if session.editing.slot == "main" then
-							RS().UpdateDraftField(draft, "classFile", nil)
-						else
-							RS().UpdateAltDraftField(draft, "classFile", nil)
-						end
-						QueueRefresh({ force = true })
-					end,
-				})
-			elseif altThis then
-				local picker = AcquireFrame(row)
-				picker:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -28)
-				picker:SetSize(520, ICON + 2)
-				local draft = session.altDraft.draft
-				LayoutPicker(picker, draft, {
-					disableSpec = function(specId)
-						return RS().IsAltSpecDisabled(draft, specId)
-					end,
-					onClass = function(classFile)
-						RS().UpdateAltDraftField(draft, "classFile", classFile)
-						TryPersistAltDraft()
-						QueueRefresh({ force = true })
-					end,
-					onSpec = function(specId)
-						RS().UpdateAltDraftField(draft, "specId", specId)
-						TryPersistAltDraft()
-						QueueRefresh({ force = true })
-					end,
-					onResetClass = function()
-						RS().UpdateAltDraftField(draft, "classFile", nil)
-						QueueRefresh({ force = true })
-					end,
-				})
+					end)
+				else
+					altAction:SetText(Loc("RAID_SIGNUP_REMOVE_ALT", "Remove Alt"))
+					altAction:SetScript("OnClick", function()
+						local status, reason = RS():RemoveAlternative(entry.entryId, {
+							expectedVer = entry.ver,
+						})
+						Report(status, reason)
+					end)
+				end
 			end
 		end)
 	end
@@ -1748,6 +1807,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 			fs:ClearAllPoints()
 			fs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			fs:SetText(Loc("RAID_SIGNUP_EMPTY", "No signups in this plan yet."))
+			fs:SetTextColor(1, 1, 1)
 		end)
 	end
 
@@ -2034,6 +2094,10 @@ end
 
 function Page._GetEditingForTests()
 	return session.editing
+end
+
+function Page._SetEditingForTests(editing)
+	session.editing = editing
 end
 
 function Page._GetAltDraftForTests()

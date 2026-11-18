@@ -163,19 +163,19 @@ SF.Debug = {
 }
 
 SF.WOW_CLASSES = {
-    WARRIOR = { textureFile = "Interface\\Icons\\ClassIcon_Warrior" },
-    PALADIN = { textureFile = "Interface\\Icons\\ClassIcon_Paladin" },
-    HUNTER = { textureFile = "Interface\\Icons\\ClassIcon_Hunter" },
-    ROGUE = { textureFile = "Interface\\Icons\\ClassIcon_Rogue" },
-    PRIEST = { textureFile = "Interface\\Icons\\ClassIcon_Priest" },
-    DEATHKNIGHT = { textureFile = "Interface\\Icons\\ClassIcon_DeathKnight" },
-    SHAMAN = { textureFile = "Interface\\Icons\\ClassIcon_Shaman" },
-    MAGE = { textureFile = "Interface\\Icons\\ClassIcon_Mage" },
-    WARLOCK = { textureFile = "Interface\\Icons\\ClassIcon_Warlock" },
-    MONK = { textureFile = "Interface\\Icons\\ClassIcon_Monk" },
-    DRUID = { textureFile = "Interface\\Icons\\ClassIcon_Druid" },
-    DEMONHUNTER = { textureFile = "Interface\\Icons\\ClassIcon_DemonHunter" },
-    EVOKER = { textureFile = "Interface\\Icons\\ClassIcon_Evoker" },
+    WARRIOR = { colorCode = { r = 0.78, g = 0.61, b = 0.43 }, textureFile = "Interface\\Icons\\ClassIcon_Warrior" },
+    PALADIN = { colorCode = { r = 0.96, g = 0.55, b = 0.73 }, textureFile = "Interface\\Icons\\ClassIcon_Paladin" },
+    HUNTER = { colorCode = { r = 0.67, g = 0.83, b = 0.45 }, textureFile = "Interface\\Icons\\ClassIcon_Hunter" },
+    ROGUE = { colorCode = { r = 1.00, g = 0.96, b = 0.41 }, textureFile = "Interface\\Icons\\ClassIcon_Rogue" },
+    PRIEST = { colorCode = { r = 1.00, g = 1.00, b = 1.00 }, textureFile = "Interface\\Icons\\ClassIcon_Priest" },
+    DEATHKNIGHT = { colorCode = { r = 0.77, g = 0.12, b = 0.23 }, textureFile = "Interface\\Icons\\ClassIcon_DeathKnight" },
+    SHAMAN = { colorCode = { r = 0.00, g = 0.44, b = 0.87 }, textureFile = "Interface\\Icons\\ClassIcon_Shaman" },
+    MAGE = { colorCode = { r = 0.25, g = 0.78, b = 0.92 }, textureFile = "Interface\\Icons\\ClassIcon_Mage" },
+    WARLOCK = { colorCode = { r = 0.53, g = 0.53, b = 0.93 }, textureFile = "Interface\\Icons\\ClassIcon_Warlock" },
+    MONK = { colorCode = { r = 0.00, g = 1.00, b = 0.59 }, textureFile = "Interface\\Icons\\ClassIcon_Monk" },
+    DRUID = { colorCode = { r = 1.00, g = 0.49, b = 0.04 }, textureFile = "Interface\\Icons\\ClassIcon_Druid" },
+    DEMONHUNTER = { colorCode = { r = 0.64, g = 0.19, b = 0.79 }, textureFile = "Interface\\Icons\\ClassIcon_DemonHunter" },
+    EVOKER = { colorCode = { r = 0.20, g = 0.58, b = 0.50 }, textureFile = "Interface\\Icons\\ClassIcon_Evoker" },
 }
 
 SF.LootHelperImpersonation = {
@@ -1081,7 +1081,7 @@ local function makeRegion(objectType)
         end
     end
     function r:SetAlpha(a) self._alpha = a end
-    function r:SetTextColor() end
+    function r:SetTextColor(cr, cg, cb) self._textColor = { cr, cg, cb } end
     function r:SetCursorPosition(p) self._cursor = p end
     function r:GetCursorPosition() return self._cursor or 0 end
     function r:SetFrameLevel(l) self._frameLevel = l end
@@ -1386,15 +1386,30 @@ local staleStatus = select(1, RS:UpsertEntry({
 }, { expectedVer = { n = 0, w = "000000000000000000000000" } }))
 assertEq(staleStatus, "rejected", "stale nickname edit rejected")
 
--- Focus deferral via a page-bound edit box
+-- Focus deferral via a page-bound edit box (expanded edit row)
+UIPage:Refresh(panel, { force = true })
+local focusEntries = RS:GetSortedEntries(plan3)
+assertTrue(#focusEntries >= 1, "saved entry available for focus-deferral check")
+UIPage._SetEditingForTests({
+    entryId = focusEntries[1].entryId,
+    slot = "main",
+    draft = {
+        nickname = focusEntries[1].nickname,
+        nicknameCommitted = true,
+        classFile = nil,
+        specId = nil,
+        phase = "class",
+    },
+})
 UIPage:Refresh(panel, { force = true })
 boxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
-assertTrue(#boxes >= 1, "edit boxes after persist refresh")
+assertTrue(#boxes >= 1, "expanded edit row nickname box present")
 boxes[1]:SetFocus()
 refreshBefore = UIPage._GetLifecycleCounters().refreshCount
 UIPage:Refresh(panel)
 assertEq(UIPage._GetLifecycleCounters().refreshCount, refreshBefore, "refresh deferred while page edit focused")
 boxes[1]:ClearFocus()
+UIPage._SetEditingForTests(nil)
 UIPage:Refresh(panel, { force = true })
 assertTrue(UIPage._GetLifecycleCounters().refreshCount > refreshBefore, "forced refresh runs")
 
@@ -1567,14 +1582,30 @@ do
         notes = "seed",
     })), "accepted", "seed owned entry for readonly view")
     assertEq(select(1, RS:SetPlanArchived(planRO, true)), "accepted", "archive plan to force Disable on boxes")
+    -- Collapsed rows are text-only; an expanded edit row still has edit boxes,
+    -- which must be disabled while the plan is archived.
+    local roEntries = RS:GetSortedEntries(planRO)
+    assertTrue(#roEntries >= 1, "archived plan entry available")
+    UIPage._SetEditingForTests({
+        entryId = roEntries[1].entryId,
+        slot = "main",
+        draft = {
+            nickname = roEntries[1].nickname,
+            nicknameCommitted = true,
+            classFile = nil,
+            specId = nil,
+            phase = "class",
+        },
+    })
     UIPage:Refresh(panel, { force = true })
     local roBoxes = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
-    assertTrue(#roBoxes >= 1, "archived nickname box present")
+    assertTrue(#roBoxes >= 1, "archived expanded nickname box present")
     assertTrue(not roBoxes[1]:IsEnabled(), "archived nickname is disabled")
     local beforeText = roBoxes[1]:GetText()
     roBoxes[1]:SetText("ShouldNotType", true)
     assertTrue(roBoxes[1]._lastUserEditRejected, "disabled box rejects user typing")
     assertEq(roBoxes[1]:GetText(), beforeText, "disabled box text unchanged by user SetText")
+    UIPage._SetEditingForTests(nil)
 
     -- Reopen + Add Row: pooled edit boxes must be enabled for draft typing.
     assertEq(select(1, RS:SetPlanArchived(planRO, false)), "accepted", "reopen for Add Row")
@@ -1607,7 +1638,8 @@ do
     end
     assertTrue(foundFresh, "completed signup from enabled draft boxes")
 
-    -- Ordinary member: others' rows disabled; own Add Row enabled.
+    -- Ordinary member: others' collapsed rows are text-only with disabled spec
+    -- icons; own Add Row stays enabled.
     ActAs("Alice-Garona", "Player-1-Alice")
     local stMem, _, planMem = RS:CreatePlan("Member Own Entry")
     assertEq(stMem, "accepted", "member plan created")
@@ -1620,9 +1652,11 @@ do
     })), "accepted", "officer seeds other-owned row")
     ActAs("Carol-Garona", "Player-1-Carol")
     UIPage:Refresh(panel, { force = true })
-    local others = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
-    assertTrue(#others >= 1, "other member nickname visible")
-    assertTrue(not others[1]:IsEnabled(), "non-owned nickname disabled for member")
+    assertEq(#UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname"), 0,
+        "collapsed rows expose no nickname edit boxes")
+    local othersIcons = UIPage._FindSpecButtonsForTests(panel.__sfRaidSignupEntriesHost, "main")
+    assertTrue(#othersIcons >= 1, "other member spec icon visible")
+    assertTrue(not othersIcons[1]:IsEnabled(), "other member spec icon disabled for member")
     local memberDraft = RS.MakeDraft(planMem)
     RS.UpdateDraftField(memberDraft, "classFile", "PRIEST")
     RS.UpdateDraftField(memberDraft, "specId", 256)
@@ -1652,20 +1686,33 @@ do
     assertTrue(carolFound, "member completed own signup via enabled draft")
 
     -- Reverse: editable → archived read-only again (pooled controls Disable).
+    -- Collapsed rows are text-only, so exercise the boxes via an expanded edit
+    -- session; archiving clears it, so re-arm after each transition.
     ActAs("Alice-Garona", "Player-1-Alice")
     RS:SelectPlan(planRO)
     UIPage:Refresh(panel, { force = true })
-    local editableAgain = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
-    assertTrue(#editableAgain >= 1, "editable nicknames before re-archive")
-    local anyEnabled = false
-    for i = 1, #editableAgain do
-        if editableAgain[i]:IsEnabled() then
-            anyEnabled = true
-        end
+    local revEntries = RS:GetSortedEntries(planRO)
+    assertTrue(#revEntries >= 1, "planRO entry available for reverse check")
+    local function ArmEditSession()
+        UIPage._SetEditingForTests({
+            entryId = revEntries[1].entryId,
+            slot = "main",
+            draft = {
+                nickname = revEntries[1].nickname,
+                nicknameCommitted = true,
+                classFile = nil,
+                specId = nil,
+                phase = "class",
+            },
+        })
+        UIPage:Refresh(panel, { force = true })
     end
-    assertTrue(anyEnabled, "open plan has enabled nickname for owner")
+    ArmEditSession()
+    local editableAgain = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
+    assertTrue(#editableAgain >= 1, "expanded nickname box before re-archive")
+    assertTrue(editableAgain[1]:IsEnabled(), "open plan nickname enabled for owner")
     assertEq(select(1, RS:SetPlanArchived(planRO, true)), "accepted", "re-archive for reverse transition")
-    UIPage:Refresh(panel, { force = true })
+    ArmEditSession()
     local againRO = UIPage._FindEditBoxesForTests(panel.__sfRaidSignupEntriesHost, "nickname")
     assertTrue(#againRO >= 1, "nickname boxes after re-archive")
     for i = 1, #againRO do
@@ -1675,6 +1722,7 @@ do
         assertTrue(againRO[i]._lastUserEditRejected, "re-archived rejects user typing")
         assertEq(againRO[i]:GetText(), prior, "re-archived text unchanged")
     end
+    UIPage._SetEditingForTests(nil)
     assertEq(select(1, RS:SetPlanArchived(planRO, false)), "accepted", "cleanup reopen planRO")
     UIPage._SetDraftForTests(nil)
     RS:SelectPlan(plan3)
@@ -3002,7 +3050,7 @@ do
             return n
         end
         for _, child in ipairs({ host:GetChildren() }) do
-            if child._h == 56 and child.IsShown and child:IsShown() then
+            if child._h == 86 and child.IsShown and child:IsShown() then
                 n = n + 1
             end
         end
@@ -3054,7 +3102,78 @@ do
         walk(root)
         return found
     end
-    -- Expanded alt row: control cluster stays above the picker band.
+    do
+    -- Rows expose fontstrings as regions, so walks must cover both children
+    -- and regions to find labels and collapsed-row text.
+    local function FindFontStringByText(root, text)
+        local found = nil
+        local function walk(f)
+            if found or not f then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "FontString"
+                and f.GetText and f:GetText() == text then
+                found = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+            if f.GetRegions then
+                for _, r in ipairs({ f:GetRegions() }) do
+                    walk(r)
+                end
+            end
+        end
+        walk(root)
+        return found
+    end
+    local function AnchorTarget(widget, pointType)
+        for _, pt in ipairs(widget._points or {}) do
+            if pt[1] == pointType then
+                return pt[2]
+            end
+        end
+        return nil
+    end
+
+    do
+    -- Collapsed rows render one text line: class-colored name, spec icons,
+    -- alt spec name + icon, notes — with no inline edit boxes.
+    local collapsedEntries = RS:GetSortedEntries(tabPlanId)
+    assertTrue(#collapsedEntries >= 1, "entry available for collapsed row check")
+    local collapsedTarget = collapsedEntries[1]
+    assertEq(#UIPage._FindEditBoxesForTests(entryHost, "nickname"), 0,
+        "collapsed rows have no nickname edit box")
+    local collapsedName = FindFontStringByText(entryHost, collapsedTarget.nickname)
+    assertTrue(collapsedName ~= nil, "collapsed row shows nickname as text")
+    local classColor = SF.WOW_CLASSES[collapsedTarget.mainClass]
+        and SF.WOW_CLASSES[collapsedTarget.mainClass].colorCode
+    assertTrue(classColor ~= nil, "class color available for entry class")
+    local nameColor = collapsedName._textColor
+    assertTrue(nameColor ~= nil, "collapsed name has a text color")
+    assertTrue(math.abs(nameColor[1] - classColor.r) < 0.001
+        and math.abs(nameColor[2] - classColor.g) < 0.001
+        and math.abs(nameColor[3] - classColor.b) < 0.001,
+        "collapsed name uses class color")
+    if collapsedTarget.notes and collapsedTarget.notes ~= "" then
+        assertTrue(FindFontStringByText(entryHost, collapsedTarget.notes) ~= nil,
+            "collapsed row shows notes text")
+    end
+    if collapsedTarget.altClass and collapsedTarget.altSpec then
+        local altSpecName = RS.SpecDisplayName and RS.SpecDisplayName(collapsedTarget.altSpec)
+        if altSpecName then
+            assertTrue(FindFontStringByText(entryHost, altSpecName) ~= nil,
+                "collapsed row shows alt spec name")
+        end
+    end
+    end
+
+    do
+    -- Expanded alt row: labeled fields stacked Name / Class / Spec / Notes,
+    -- each control anchored right of its label.
     local entriesForAlt = RS:GetSortedEntries(tabPlanId)
     assertTrue(#entriesForAlt >= 1, "entry available for alt row check")
     UIPage._SetAltDraftForTests({
@@ -3066,24 +3185,60 @@ do
     local nickBoxes = UIPage._FindEditBoxesForTests(entryHost, "nickname")
     assertEq(#nickBoxes, 1, "exactly one entry nickname box in alt row check")
     local nickBox = nickBoxes[1]
-    local nickTopY = nil
-    for _, pt in ipairs(nickBox._points or {}) do
-        if pt[1] == "TOPLEFT" then
-            nickTopY = pt[5]
-        end
-    end
-    assertEq(nickTopY, -4, "expanded row nickname anchored to top band")
+    local nameLabel = FindFontStringByText(entryHost, "Name")
+    assertTrue(nameLabel ~= nil, "Name label present in expanded row")
+    assertTrue(AnchorTarget(nickBox, "LEFT") == nameLabel,
+        "nickname box sits right of the Name label")
+    local classLabel = FindFontStringByText(entryHost, "Class / Spec")
+    assertTrue(classLabel ~= nil, "Class / Spec label present in expanded row")
     local altPicker = FindBySize(entryHost, 520, 24)
     assertTrue(altPicker ~= nil, "alt class picker painted")
-    local pickerTopY = nil
-    for _, pt in ipairs(altPicker._points or {}) do
-        if pt[1] == "TOPLEFT" then
-            pickerTopY = pt[5]
+    assertTrue(AnchorTarget(altPicker, "LEFT") == classLabel,
+        "class picker sits right of the Class / Spec label")
+    local notesLabel = FindFontStringByText(entryHost, "Notes")
+    assertTrue(notesLabel ~= nil, "Notes label present in expanded row")
+    local notesBoxes = UIPage._FindEditBoxesForTests(entryHost, "notes")
+    assertEq(#notesBoxes, 1, "notes box present in expanded row")
+    assertTrue(AnchorTarget(notesBoxes[1], "LEFT") == notesLabel,
+        "notes box sits right of the Notes label")
+    local doneBtn = nil
+    local function FindDoneButton(root)
+        local function walk(f)
+            if doneBtn or not f then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "Button"
+                and f.GetText and f:GetText() == "Done" then
+                doneBtn = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
         end
+        walk(root)
     end
-    assertEq(pickerTopY, -28, "alt picker anchored below control band")
-    assertTrue(pickerTopY <= nickTopY - (nickBox._h or 20) - 2,
-        "nickname cluster clears the picker band")
+    FindDoneButton(entryHost)
+    assertTrue(doneBtn ~= nil, "Done button present in expanded row")
+    -- Done leaves edit mode without touching the entry.
+    local nickBeforeDone = entriesForAlt[1].nickname
+    local notesBeforeDone = entriesForAlt[1].notes
+    doneBtn:GetScript("OnClick")(doneBtn)
+    assertTrue(UIPage._GetAltDraftForTests() == nil, "Done clears the alt draft")
+    UIPage:Refresh(memberPanel, { force = true })
+    local afterDone = RS:GetSortedEntries(tabPlanId)[1]
+    assertEq(afterDone.nickname, nickBeforeDone, "Done does not rename the entry")
+    assertEq(afterDone.notes or "", notesBeforeDone or "", "Done does not change notes")
+    -- Re-arm the alt picker for the localized class-name checks below.
+    UIPage._SetAltDraftForTests({
+        entryId = entriesForAlt[1].entryId,
+        draft = RS.MakeAltDraft(entriesForAlt[1]),
+    })
+    UIPage:Refresh(memberPanel, { force = true })
+    end
+    end
 
     -- The class picker itself shows localized class names.
     local classPickerBtn = nil
