@@ -512,29 +512,40 @@ end
 --- Export VERIFIED soft-delete accounting facts for adoption (#465).
 -- Mirrors credit-alias packing: inline when under wire budget; otherwise page
 -- as gs-soft-delete-facts-page. Never exports unverified/raw payload snapshots.
--- @return pages, factCount, pageCount
+-- @return pages, factCount, pageCount, state
 local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody)
     local facts, factCount, ready = {}, 0, true
     if GS.CollectSoftDeleteVerifiedFacts then
         facts, factCount, ready = GS.CollectSoftDeleteVerifiedFacts(record)
     end
+    local state
     if ready == false then
         local cache = exportState.softDeleteFactExport
-        if type(cache) == "table"
+        local cacheMatches = type(cache) == "table"
             and cache.datasetId == descBody.datasetId
             and cache.guildKey == descBody.guildKey
             and cache.epoch == (tonumber(GS._adoptionEpoch) or 0)
-            and cache.localGuid == exportState.localGuid then
-            descBody.softDeleteVerifiedFactCount = cache.factCount
-            descBody.softDeleteVerifiedFactPageCount = cache.pageCount
-            descBody.softDeleteVerifiedFacts =
-                (cache.pageCount == 0 and cache.facts) or {}
-            return cache.pages or {}, cache.factCount, cache.pageCount, "cached"
+            and cache.localGuid == exportState.localGuid
+        local cachedCount = cacheMatches and (tonumber(cache.factCount) or 0) or 0
+        local cachedPages = cacheMatches and (tonumber(cache.pageCount) or 0) or 0
+        if cacheMatches and cachedPages > 0 then
+            descBody.softDeleteVerifiedFactCount = cachedCount
+            descBody.softDeleteVerifiedFactPageCount = cachedPages
+            descBody.softDeleteVerifiedFacts = {}
+            return cache.pages or {}, cachedCount, cachedPages, "cached"
         end
-        descBody.softDeleteVerifiedFacts = nil
-        descBody.softDeleteVerifiedFactCount = nil
-        descBody.softDeleteVerifiedFactPageCount = nil
-        return {}, 0, 0, "deferred"
+        if cacheMatches and type(cache.facts) == "table" then
+            -- Reuse the coherent fact set, but repack it against the current
+            -- descriptor: alias/descriptor growth can move inline facts to pages.
+            state = "cached"
+            facts = cache.facts
+            factCount = cachedCount
+        else
+            descBody.softDeleteVerifiedFacts = nil
+            descBody.softDeleteVerifiedFactCount = nil
+            descBody.softDeleteVerifiedFactPageCount = nil
+            return {}, 0, 0, "deferred"
+        end
     end
     factCount = tonumber(factCount) or 0
     descBody.softDeleteVerifiedFactCount = factCount
@@ -542,11 +553,11 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
     descBody.softDeleteVerifiedFactPageCount = 0
     if factCount < 1 then
         descBody.softDeleteVerifiedFacts = {}
-        return {}, 0, 0
+        return {}, 0, 0, state
     end
     local budget = WireBudget()
     if EstimateWireRecordBytes(descId, descBody) <= budget then
-        return {}, factCount, 0
+        return {}, factCount, 0, state
     end
     descBody.softDeleteVerifiedFacts = {}
     local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
@@ -596,7 +607,7 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
             if not flushSlice() then
                 descBody.softDeleteVerifiedFactCount = factCount
                 descBody.softDeleteVerifiedFactPageCount = factCount
-                return {}, factCount, factCount
+                return {}, factCount, factCount, state
             end
             trial, trialCount = { [eventId] = entry }, 1
             pageIdx = #pageSlices + 1
@@ -609,7 +620,7 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
         if overBudget and sliceCount < 1 then
             descBody.softDeleteVerifiedFactCount = factCount
             descBody.softDeleteVerifiedFactPageCount = factCount
-            return {}, factCount, factCount
+            return {}, factCount, factCount, state
         end
         slice = trial
         sliceCount = trialCount
@@ -617,7 +628,7 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
     if not flushSlice() then
         descBody.softDeleteVerifiedFactCount = factCount
         descBody.softDeleteVerifiedFactPageCount = factCount
-        return {}, factCount, factCount
+        return {}, factCount, factCount, state
     end
     local pageCount = #pageSlices
     descBody.softDeleteVerifiedFactPageCount = pageCount
@@ -634,16 +645,16 @@ local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody
         if EstimateWireRecordBytes(pageId, body) > budget then
             descBody.softDeleteVerifiedFactCount = factCount
             descBody.softDeleteVerifiedFactPageCount = factCount
-            return {}, factCount, factCount
+            return {}, factCount, factCount, state
         end
         pages[#pages + 1] = { id = pageId, body = body }
     end
     if EstimateWireRecordBytes(descId, descBody) > budget then
         descBody.softDeleteVerifiedFactCount = factCount
         descBody.softDeleteVerifiedFactPageCount = pageCount
-        return {}, factCount, pageCount
+        return {}, factCount, pageCount, state
     end
-    return pages, factCount, pageCount
+    return pages, factCount, pageCount, state
 end
 
 local function SyncSoftDeleteVerifiedFactsExportPages(record, descId, descBody, upsertFn)

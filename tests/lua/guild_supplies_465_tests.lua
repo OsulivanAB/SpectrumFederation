@@ -7336,6 +7336,123 @@ do
         "465-fact-cache: deferred export omitted stale manifest")
 end
 
+-- #475 Devin Review: cached inline soft-delete facts must be repacked when
+-- descriptor growth (credit aliases) makes the previous inline fit stale.
+do
+    local itemId = 9413
+    local record = seedLiveCampaignWithItem(itemId, 50)
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    local guildKey = select(1, GS:GetCurrentContext()).guildKey
+    local datasetId = "465-fact-cache-size"
+    local descId = "gs:desc:" .. datasetId
+    local fakeFacts = {
+        ["465-size-don"] = {
+            verified = true,
+            eventId = "465-size-don",
+            eventKind = "donation",
+            itemId = itemId,
+            quantity = 1,
+            campaignId = record.currentCampaignId,
+            attributed = "Alice-Garona",
+            attributedGuid = "Player-1-Alice",
+            gsProductionCredit = true,
+        },
+    }
+    local aliasCount = 16
+    local aliases = {}
+    for i = 1, aliasCount do
+        aliases[string.format("465-size-alias-%02d-%s", i, string.rep("a", 30))] =
+            string.format("canon-%02d-%s", i, string.rep("b", 16))
+    end
+    local function freshDesc()
+        return {
+            kind = "dataset-desc",
+            schemaVersion = GS.PROVIDER_SCHEMA,
+            guildKey = guildKey,
+            datasetId = datasetId,
+            softDeleteVerifiedFacts = {},
+            softDeleteVerifiedFactCount = 0,
+            softDeleteVerifiedFactPageCount = 0,
+            creditEventAliases = {},
+            creditEventAliasCount = 0,
+            creditEventAliasPageCount = 0,
+            acceptedOpCount = 0,
+            transferOpCount = 0,
+            campaignCount = 0,
+            archiveCount = 0,
+            acceptedLedgerCount = 0,
+            donationEvidenceCount = 0,
+            valuationCount = 0,
+            hasBankTab = true,
+        }
+    end
+    local function sizedDesc(mode)
+        local desc = freshDesc()
+        desc.creditEventAliases = aliases
+        desc.creditEventAliasCount = aliasCount
+        desc.creditEventAliasPageCount = 0
+        desc.softDeleteVerifiedFactCount = 1
+        desc.softDeleteVerifiedFactPageCount = (mode == "paged") and 1 or 0
+        desc.softDeleteVerifiedFacts = (mode == "inline") and fakeFacts or {}
+        return desc
+    end
+    local inlineBytes = GS._EstimateWireRecordBytesForTest(descId, sizedDesc("inline"))
+    local pagedBytes = GS._EstimateWireRecordBytesForTest(descId, sizedDesc("paged"))
+    assertTrue(inlineBytes > pagedBytes,
+        "465-fact-cache-size: fixture sizes ordered inline=" .. tostring(inlineBytes)
+            .. " paged=" .. tostring(pagedBytes))
+    assertTrue(pagedBytes <= 2048,
+        "465-fact-cache-size: paged fixture within real budget bytes=" .. tostring(pagedBytes))
+
+    local realCollect = GS.CollectSoftDeleteVerifiedFacts
+    local savedBudget = GS.MAX_WIRE_RECORD_BYTES
+    GS.MAX_WIRE_RECORD_BYTES = pagedBytes
+    GS.CollectSoftDeleteVerifiedFacts = function()
+        return fakeFacts, 1, true
+    end
+    local readyDesc = freshDesc()
+    local _, readyCount, readyPages = GS._SyncSoftDeleteVerifiedFactsExportPagesForTest(
+        record, descId, readyDesc, function() end)
+    assertEq(readyCount, 1, "465-fact-cache-size: ready export count")
+    assertEq(readyPages, 0, "465-fact-cache-size: ready export inline")
+    assertTrue(readyDesc.softDeleteVerifiedFacts["465-size-don"] ~= nil,
+        "465-fact-cache-size: ready export carried fact")
+
+    GS.CollectSoftDeleteVerifiedFacts = function()
+        return {}, 0, false
+    end
+    local upserted = {}
+    local grownDesc = freshDesc()
+    grownDesc.creditEventAliases = aliases
+    grownDesc.creditEventAliasCount = aliasCount
+    local _, pendingCount, pendingPages, pendingState =
+        GS._SyncSoftDeleteVerifiedFactsExportPagesForTest(
+            record, descId, grownDesc, function(id, body)
+                upserted[#upserted + 1] = { id = id, body = body }
+            end)
+    GS.CollectSoftDeleteVerifiedFacts = realCollect
+    GS.MAX_WIRE_RECORD_BYTES = savedBudget
+
+    assertEq(pendingState, "cached", "465-fact-cache-size: pending reused coherent facts")
+    assertEq(pendingCount, 1, "465-fact-cache-size: pending kept fact count")
+    assertEq(pendingPages, 1, "465-fact-cache-size: pending repacked to pages")
+    assertEq(tonumber(grownDesc.softDeleteVerifiedFactPageCount), 1,
+        "465-fact-cache-size: desc advertises one fact page")
+    local inlineN = 0
+    for _ in pairs(grownDesc.softDeleteVerifiedFacts or {}) do inlineN = inlineN + 1 end
+    assertEq(inlineN, 0, "465-fact-cache-size: paged desc strips inline map")
+    assertTrue(GS._EstimateWireRecordBytesForTest(descId, grownDesc) <= pagedBytes,
+        "465-fact-cache-size: grown desc fits budget bytes="
+            .. tostring(GS._EstimateWireRecordBytesForTest(descId, grownDesc)))
+    assertEq(#upserted, 1, "465-fact-cache-size: one fact page upserted")
+    assertEq(upserted[1].id, "gs:sdf:" .. datasetId .. ":p1",
+        "465-fact-cache-size: fact page id")
+    assertTrue(upserted[1].body.facts["465-size-don"] ~= nil,
+        "465-fact-cache-size: fact page carried fact")
+end
+
 io.stdout:write(string.format("\nguild_supplies_465_tests: %d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
