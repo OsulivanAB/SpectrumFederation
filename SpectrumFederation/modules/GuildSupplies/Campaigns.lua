@@ -937,6 +937,9 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
     local contributions = {}
     -- Item totals stay quantity-based even when credit attribution is blocked.
     local creditUnavailable = false
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
     if GS.EnsureCreditCorrectionProjection
         and GS.EnsureCreditCorrectionProjection(record, nil) == false then
         creditUnavailable = true
@@ -946,6 +949,7 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
         and GS.BeginContributorProjectionContext(record) or nil
     ForEachCampaignLedgerEvent(record, generation, function(event)
         -- Active datasets exclude pre-activation staged accounting from live totals.
+        -- Soft-deleted rows are also excluded via EventCountsTowardLiveProgress (#465).
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
             return
@@ -1112,6 +1116,9 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
     end
 
     local creditUnavailable = false
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
     if GS.EnsureCreditCorrectionProjection
         and GS.EnsureCreditCorrectionProjection(record, nil) == false then
         creditUnavailable = true
@@ -1135,6 +1142,10 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
         and GS.BeginContributorProjectionContext(record) or nil
 
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        -- #465: soft-deleted rows leave Rankings (and monetary effect).
+        if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+            return
+        end
         -- Rankings require durable production credit. Do not reuse
         -- EventCountsTowardLiveProgress: that predicate deliberately includes
         -- all accepted staged rows for preparation UI (#447).
@@ -1620,7 +1631,14 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
 
     local ordered = {}
     local seen = {}
+    if GS.EnsureEventDeletionProjection then
+        GS.EnsureEventDeletionProjection(record, nil)
+    end
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        -- #465: soft-deleted rows are hidden from normal Logs.
+        if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event) then
+            return
+        end
         local isWithdrawal = IsWithdrawalEvent(event)
         local credited = true
         if not isWithdrawal and GS.EventCountsTowardLiveProgress then
@@ -1944,6 +1962,10 @@ function GS.FormatReasonText(reason)
             "a newer campaign name revision already applied"),
         stale_credit = Loc("GUILD_SUPPLIES_REASON_STALE_CREDIT",
             "that contribution was corrected by another officer — refresh and try again"),
+        stale_delete = Loc("GUILD_SUPPLIES_REASON_STALE_DELETE",
+            "that log entry was already deleted by another officer"),
+        already_deleted = Loc("GUILD_SUPPLIES_REASON_ALREADY_DELETED",
+            "that log entry is already deleted"),
         stale_guild = Loc("GUILD_SUPPLIES_REASON_STALE_GUILD",
             "the guild context changed — reopen Edit and try again"),
         ambiguous_character = Loc("GUILD_SUPPLIES_REASON_AMBIGUOUS_CHARACTER",

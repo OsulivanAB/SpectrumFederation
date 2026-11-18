@@ -12,7 +12,7 @@ GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
 -- Wire schema for sf.guildsupplies.config. Schema 4 (#447) carries attributed
 -- adjustment unitCopper on ledger events; schema-3 peers drop that field.
 -- Guild Gossip matches by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 6
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 7
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -67,6 +67,8 @@ local exportState = {
     ledgerArchiveWarmPos = 0,
     donationEvidenceBuildNeeded = false,
     donationEvidenceBuildCursor = nil,
+    -- Last coherent soft-delete fact export while paced projection is pending.
+    softDeleteFactExport = nil,
     -- #397 paced cold construction for accepted donation valuations.
     valuationBuildNeeded = false,
     valuationBuildCursor = nil,
@@ -505,6 +507,196 @@ local function ApplyCreditAliasExportToDesc(record, descId, descBody)
         return {}, aliasCount, pageCount
     end
     return pages, aliasCount, pageCount
+end
+
+--- Export VERIFIED soft-delete accounting facts for adoption (#465).
+-- Mirrors credit-alias packing: inline when under wire budget; otherwise page
+-- as gs-soft-delete-facts-page. Never exports unverified/raw payload snapshots.
+-- @return pages, factCount, pageCount, state
+local function ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody)
+    local facts, factCount, ready = {}, 0, true
+    if GS.CollectSoftDeleteVerifiedFacts then
+        facts, factCount, ready = GS.CollectSoftDeleteVerifiedFacts(record)
+    end
+    local state
+    if ready == false then
+        local cache = exportState.softDeleteFactExport
+        local cacheMatches = type(cache) == "table"
+            and cache.datasetId == descBody.datasetId
+            and cache.guildKey == descBody.guildKey
+            and cache.epoch == (tonumber(GS._adoptionEpoch) or 0)
+            and cache.localGuid == exportState.localGuid
+        local cachedCount = cacheMatches and (tonumber(cache.factCount) or 0) or 0
+        local cachedPages = cacheMatches and (tonumber(cache.pageCount) or 0) or 0
+        if cacheMatches and cachedPages > 0 then
+            descBody.softDeleteVerifiedFactCount = cachedCount
+            descBody.softDeleteVerifiedFactPageCount = cachedPages
+            descBody.softDeleteVerifiedFacts = {}
+            return cache.pages or {}, cachedCount, cachedPages, "cached"
+        end
+        if cacheMatches and type(cache.facts) == "table" then
+            -- Reuse the coherent fact set, but repack it against the current
+            -- descriptor: alias/descriptor growth can move inline facts to pages.
+            state = "cached"
+            facts = cache.facts
+            factCount = cachedCount
+        else
+            descBody.softDeleteVerifiedFacts = nil
+            descBody.softDeleteVerifiedFactCount = nil
+            descBody.softDeleteVerifiedFactPageCount = nil
+            return {}, 0, 0, "deferred"
+        end
+    end
+    factCount = tonumber(factCount) or 0
+    descBody.softDeleteVerifiedFactCount = factCount
+    descBody.softDeleteVerifiedFacts = facts
+    descBody.softDeleteVerifiedFactPageCount = 0
+    if factCount < 1 then
+        descBody.softDeleteVerifiedFacts = {}
+        return {}, 0, 0, state
+    end
+    local budget = WireBudget()
+    if EstimateWireRecordBytes(descId, descBody) <= budget then
+        return {}, factCount, 0, state
+    end
+    descBody.softDeleteVerifiedFacts = {}
+    local maxPages = GS.MAX_SOFT_DELETE_FACT_PAGE_COUNT or 4096
+    local datasetId = descBody.datasetId or (record and record.datasetId)
+    local pairsList = {}
+    for eventId, entry in pairs(facts) do
+        if type(eventId) == "string" and eventId ~= "" and type(entry) == "table" then
+            pairsList[#pairsList + 1] = { id = eventId, entry = entry }
+        end
+    end
+    table.sort(pairsList, function(a, b)
+        return tostring(a.id) < tostring(b.id)
+    end)
+    local pageSlices = {}
+    local slice, sliceCount = {}, 0
+    local function flushSlice()
+        if sliceCount < 1 then
+            return true
+        end
+        if #pageSlices >= maxPages then
+            return false
+        end
+        pageSlices[#pageSlices + 1] = slice
+        slice, sliceCount = {}, 0
+        return true
+    end
+    for i = 1, #pairsList do
+        local eventId = pairsList[i].id
+        local entry = pairsList[i].entry
+        local trial = {}
+        for k, v in pairs(slice) do
+            trial[k] = v
+        end
+        trial[eventId] = entry
+        local trialCount = sliceCount + 1
+        local pageIdx = #pageSlices + 1
+        local trialBody = {
+            kind = "gs-soft-delete-facts-page",
+            datasetId = datasetId,
+            page = pageIdx,
+            pageCount = maxPages,
+            facts = trial,
+        }
+        local trialId = "gs:sdf:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
+        local overBudget = EstimateWireRecordBytes(trialId, trialBody) > budget
+        if sliceCount > 0 and overBudget then
+            if not flushSlice() then
+                descBody.softDeleteVerifiedFactCount = factCount
+                descBody.softDeleteVerifiedFactPageCount = factCount
+                return {}, factCount, factCount, state
+            end
+            trial, trialCount = { [eventId] = entry }, 1
+            pageIdx = #pageSlices + 1
+            trialBody.facts = trial
+            trialBody.page = pageIdx
+            trialBody.pageCount = maxPages
+            trialId = "gs:sdf:" .. tostring(datasetId) .. ":p" .. tostring(pageIdx)
+            overBudget = EstimateWireRecordBytes(trialId, trialBody) > budget
+        end
+        if overBudget and sliceCount < 1 then
+            descBody.softDeleteVerifiedFactCount = factCount
+            descBody.softDeleteVerifiedFactPageCount = factCount
+            return {}, factCount, factCount, state
+        end
+        slice = trial
+        sliceCount = trialCount
+    end
+    if not flushSlice() then
+        descBody.softDeleteVerifiedFactCount = factCount
+        descBody.softDeleteVerifiedFactPageCount = factCount
+        return {}, factCount, factCount, state
+    end
+    local pageCount = #pageSlices
+    descBody.softDeleteVerifiedFactPageCount = pageCount
+    local pages = {}
+    for p = 1, pageCount do
+        local body = {
+            kind = "gs-soft-delete-facts-page",
+            datasetId = datasetId,
+            page = p,
+            pageCount = pageCount,
+            facts = pageSlices[p],
+        }
+        local pageId = "gs:sdf:" .. tostring(datasetId) .. ":p" .. tostring(p)
+        if EstimateWireRecordBytes(pageId, body) > budget then
+            descBody.softDeleteVerifiedFactCount = factCount
+            descBody.softDeleteVerifiedFactPageCount = factCount
+            return {}, factCount, factCount, state
+        end
+        pages[#pages + 1] = { id = pageId, body = body }
+    end
+    if EstimateWireRecordBytes(descId, descBody) > budget then
+        descBody.softDeleteVerifiedFactCount = factCount
+        descBody.softDeleteVerifiedFactPageCount = pageCount
+        return {}, factCount, pageCount, state
+    end
+    return pages, factCount, pageCount, state
+end
+
+local function SyncSoftDeleteVerifiedFactsExportPages(record, descId, descBody, upsertFn)
+    local pages, factCount, pageCount, state =
+        ApplySoftDeleteVerifiedFactsExportToDesc(record, descId, descBody)
+    if state == "deferred" then
+        return pages, factCount, pageCount, state
+    end
+    if type(upsertFn) == "function" then
+        for i = 1, #pages do
+            upsertFn(pages[i].id, pages[i].body)
+        end
+    end
+    if type(descBody.datasetId) == "string" and descBody.datasetId ~= "" then
+        local prefix = "gs:sdf:" .. descBody.datasetId .. ":p"
+        local stale = {}
+        for id in pairs(exportState.byId or {}) do
+            if type(id) == "string" and id:sub(1, #prefix) == prefix then
+                local pageNum = tonumber(id:sub(#prefix + 1))
+                if pageNum and (pageCount < 1 or pageNum > pageCount) then
+                    stale[#stale + 1] = id
+                end
+            end
+        end
+        for i = 1, #stale do
+            exportState.byId[stale[i]] = nil
+        end
+    end
+    local pageN = tonumber(pageCount) or 0
+    if (pageN == 0 or #pages == pageN) and type(descBody) == "table" then
+        exportState.softDeleteFactExport = {
+            datasetId = descBody.datasetId,
+            guildKey = descBody.guildKey,
+            epoch = tonumber(GS._adoptionEpoch) or 0,
+            localGuid = exportState.localGuid,
+            factCount = tonumber(factCount) or 0,
+            pageCount = pageN,
+            facts = pageN == 0 and descBody.softDeleteVerifiedFacts or nil,
+            pages = pages,
+        }
+    end
+    return pages, factCount, pageCount, state
 end
 
 --- Inputs that affect required alias collection / packing (#459 export maint).
@@ -2260,6 +2452,9 @@ local function RebuildExportIndex()
         creditEventAliases = {},
         creditEventAliasCount = 0,
         creditEventAliasPageCount = 0,
+        softDeleteVerifiedFacts = {},
+        softDeleteVerifiedFactCount = 0,
+        softDeleteVerifiedFactPageCount = 0,
     }
     add("gs:desc:" .. record.datasetId, desc)
 
@@ -2392,6 +2587,7 @@ local function RebuildExportIndex()
         -- map is not otherwise transferred; page under the wrapper-inclusive
         -- Guild Gossip wire budget when the full map cannot fit on the desc.
         SyncCreditAliasExportPages(record, descId, descEntry.body, add)
+        SyncSoftDeleteVerifiedFactsExportPages(record, descId, descEntry.body, add)
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
@@ -4400,6 +4596,7 @@ function GS:DisableGossipProvider()
     exportState.ledgerBuildNeeded = false
     exportState.donationEvidenceBuildNeeded = false
     exportState.valuationBuildNeeded = false
+    exportState.softDeleteFactExport = nil
     exportState.valuationBuildCursor = nil
     exportState.valuationBuildKeys = nil
     exportState.valuationBuildKeysStore = nil
@@ -5495,8 +5692,12 @@ function GS.NotifyLocalDurableChange(reason)
             creditEventAliases = {},
             creditEventAliasCount = 0,
             creditEventAliasPageCount = 0,
+            softDeleteVerifiedFacts = {},
+            softDeleteVerifiedFactCount = 0,
+            softDeleteVerifiedFactPageCount = 0,
         }
         SyncCreditAliasExportPages(record, descId, desc, UpsertExportBody)
+        SyncSoftDeleteVerifiedFactsExportPages(record, descId, desc, UpsertExportBody)
         UpsertExportBody(descId, desc)
         if not exportState.maintIdle then
             ScheduleExportMaintContinuation()
@@ -5521,6 +5722,8 @@ GS._ApplyCreditAliasExportToDescForTest = ApplyCreditAliasExportToDesc
 GS._SyncCreditAliasExportPagesForTest = SyncCreditAliasExportPages
 GS._ClearCreditAliasExportCacheForTest = ClearCreditAliasExportCache
 GS._CreditAliasExportStampForTest = CreditAliasExportStamp
+GS._ApplySoftDeleteVerifiedFactsExportToDescForTest = ApplySoftDeleteVerifiedFactsExportToDesc
+GS._SyncSoftDeleteVerifiedFactsExportPagesForTest = SyncSoftDeleteVerifiedFactsExportPages
 GS._OrdinaryArchiveEqualForTest = OrdinaryArchiveEqual
 GS._ValidateAndApplyForTest = ValidateAndApply
 
