@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.19-beta.7] - 2026-11-18
+
+### Removed
+- Officer soft-delete for Raid Supplies logs (#465)
+
 ## [1.5.19-beta.6] - 2026-11-13
 
 ### Added
