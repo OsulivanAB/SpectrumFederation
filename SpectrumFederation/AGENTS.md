@@ -230,6 +230,62 @@ Protect cleanup, re-entrancy guards, and scheduling where appropriate while
 preserving unexpected-error visibility. Neither swallowing errors nor
 rethrowing before required cleanup is a complete recovery strategy.
 
+## UI Layout And Geometry
+
+Applies to settings pages, boards, and any hand-positioned addon UI. These are
+firm outcomes with flexible implementation: do not mandate a universal column
+ratio, pixel spacing, layout manager, or anchor chain, and do not require a new
+design document, approval cycle, simulator, or screenshot for an ordinary local
+UI fix.
+
+- **Respect the established visual language.** Reuse existing frames, controls,
+  fonts, icons, spacing conventions, and interaction patterns. A layout
+  improvement does not implicitly authorize changing the surrounding settings
+  frame or introducing a different UI style. When a reference (mockup, sketch)
+  differs from the approved look, distinguish intentional layout changes from
+  incidental artwork.
+- **Make relationships visually clear.** Labels, fields, icons, and actions
+  must clearly belong to the relevant item or group. Align repeated rows
+  consistently and use headings, proximity, and restrained spacing to explain
+  relationships rather than relying on users recognizing icons. Maintain
+  readable hierarchy and breathing room without excessive empty space.
+- **Budget space before positioning content.** Fit content to the actual
+  available container width, accounting for fixed-size controls, padding,
+  gaps, and text before assigning remaining space. Content positioned
+  independently from opposite edges must not be able to collide. Use one
+  consistent set of column geometry for headers and their rows, and treat
+  temporary fallback dimensions as temporary — never as a substitute for a
+  genuinely narrow, already-measured container.
+- **Make geometry reflect real content.** Stack dependent sections below the
+  preceding content's actual bottom. Container heights must include wrapped
+  text, every grid row, expanded controls, and padding. Choose anchor points
+  deliberately: an offset meant as "below the top" uses a top-relative origin.
+  Fixed dimensions and offsets are fine when justified, but must stay
+  consistent with the resulting content bounds. Accidental overlap,
+  inaccessible clipping, and controls escaping their assigned region are
+  defects; intentional overlays, scrolling, and deliberate truncation remain
+  valid when the full information stays accessible.
+- **Keep resizing and updates coherent.** Update child placement and container
+  dimensions from the same effective layout, and recalculate when any input
+  affecting geometry changes: available width, wrapping, grid-column count,
+  text, and count length. Layout caching must invalidate when its actual
+  dependencies change. Keep work event-driven, bounded, and settled when idle
+  — never solve layout problems with continuous polling or repeated full
+  rebuilds (see Client Stability).
+- **Check representative states.** Consider normal and narrower supported
+  widths, longer/localized labels, multi-digit counts, empty and populated
+  lists, missing alternatives, expanded editors, and changes in action
+  visibility where relevant. Reflow or truncate deliberately when space runs
+  out; do not silently shrink the whole interface, hide required information,
+  or enlarge the settings frame just to make one example fit.
+- **Verify outcomes, not just anchor declarations.** Use existing tests to
+  check meaningful bounds, separation, alignment, and content containment
+  where practical. Recording `SetPoint` calls or repeating production sizing
+  formulas does not establish that controls fit. Use screenshots and
+  live-client evidence when available, and clearly distinguish automated
+  geometry checks from visual verification in WoW — report specific remaining
+  visual checks without claiming they passed.
+
 ## WoW Lua constraints (hard rules)
 - Lua runtime is **Lua 5.1** (WoW embedded). Avoid 5.2+ syntax/features.
 - No `io`, `os`, filesystem access, sockets, or external processes (WoW sandbox).
