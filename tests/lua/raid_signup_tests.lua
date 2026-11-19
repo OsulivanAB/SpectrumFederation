@@ -3105,7 +3105,9 @@ do
             return n
         end
         for _, child in ipairs({ host:GetChildren() }) do
-            if child._h == 86 and child.IsShown and child:IsShown() then
+            -- Draft/editor rows are sized from their stacked content (>26px);
+            -- collapsed rows are exactly 26.
+            if child._h and child._h > 26 and child.IsShown and child:IsShown() then
                 n = n + 1
             end
         end
@@ -3256,19 +3258,39 @@ do
     local nickBox = nickBoxes[1]
     local nameLabel = FindFontStringByText(entryHost, "Name")
     assertTrue(nameLabel ~= nil, "Name label present in expanded row")
-    assertTrue(AnchorTarget(nickBox, "LEFT") == nameLabel,
+    assertTrue(AnchorTarget(nickBox, "TOPLEFT") == nameLabel,
         "nickname box sits right of the Name label")
     local classLabel = FindFontStringByText(entryHost, "Class / Spec")
     assertTrue(classLabel ~= nil, "Class / Spec label present in expanded row")
-    local altPicker = FindBySize(entryHost, 380, 24)
+    -- The picker width is derived from the column geometry, so find it by its
+    -- anchor to the Class / Spec label rather than a fixed size.
+    local altPicker = nil
+    local function FindAnchoredTopLeft(root, target)
+        local found = nil
+        local function walk(f)
+            if found or not f then
+                return
+            end
+            if AnchorTarget(f, "TOPLEFT") == target then
+                found = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+        end
+        walk(root)
+        return found
+    end
+    altPicker = FindAnchoredTopLeft(entryHost, classLabel)
     assertTrue(altPicker ~= nil, "alt class picker painted")
-    assertTrue(AnchorTarget(altPicker, "LEFT") == classLabel,
-        "class picker sits right of the Class / Spec label")
     local notesLabel = FindFontStringByText(entryHost, "Notes")
     assertTrue(notesLabel ~= nil, "Notes label present in expanded row")
     local notesBoxes = UIPage._FindEditBoxesForTests(entryHost, "notes")
     assertEq(#notesBoxes, 1, "notes box present in expanded row")
-    assertTrue(AnchorTarget(notesBoxes[1], "LEFT") == notesLabel,
+    assertTrue(AnchorTarget(notesBoxes[1], "TOPLEFT") == notesLabel,
         "notes box sits right of the Notes label")
     local doneBtn = nil
     local function FindDoneButton(root)
@@ -3338,6 +3360,284 @@ do
     UIPage._ResetSessionForTests()
     RS:SelectPlan(tabPlanId)
     UIPage:Refresh(panel, { force = true })
+
+local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
+    -- Layout defect repairs: width-derived columns, measured role totals,
+    -- summary rebuilds on small resizes, and content-sized draft/editor rows.
+    local boardHost = panel.__sfRaidSignupBoardHost
+    assertTrue(boardHost ~= nil, "board host exists for layout checks")
+    local entriesHost = panel.__sfRaidSignupEntriesHost
+    local summaryHost = panel.__sfRaidSignupSummaryHost
+
+    local function TopLeftOffset(widget)
+        for _, pt in ipairs((widget and widget._points) or {}) do
+            if pt[1] == "TOPLEFT" and pt[3] == "TOPLEFT" then
+                return pt[4], pt[5]
+            end
+        end
+        return nil, nil
+    end
+    local function FindFontStringByText(root, text)
+        local found = nil
+        local function walk(f)
+            if found or not f then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "FontString"
+                and f.GetText and f:GetText() == text then
+                found = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+            if f.GetRegions then
+                for _, r in ipairs({ f:GetRegions() }) do
+                    walk(r)
+                end
+            end
+        end
+        walk(root)
+        return found
+    end
+    local function FindAnchoredTopLeft(root, target)
+        local found = nil
+        local function walk(f)
+            if found or not f then
+                return
+            end
+            for _, pt in ipairs((f._points) or {}) do
+                if pt[1] == "TOPLEFT" and pt[2] == target then
+                    found = f
+                    return
+                end
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+        end
+        walk(root)
+        return found
+    end
+
+    -- 1. Narrow signup column (~340px): columns and actions get separate space.
+    boardHost._w = 548 -- real, already-sized host: left column ~= 339px
+    UIPage:Refresh(panel, { force = true })
+    local narrowGeom = panel.__sfEntryGeom
+    assertTrue(narrowGeom ~= nil, "row geometry computed from board width")
+    local contentRight = narrowGeom.leftW - narrowGeom.rightReserve
+    assertTrue(narrowGeom.mainX + 22 <= contentRight,
+        "Main column clears the reserved action group at narrow width")
+    assertTrue(narrowGeom.altX + 22 <= contentRight,
+        "Alt column clears the reserved action group at narrow width")
+    assertTrue(narrowGeom.notesX < contentRight,
+        "notes start left of the action group at narrow width")
+    assertTrue(narrowGeom.mainX < narrowGeom.altX and narrowGeom.altX < narrowGeom.notesX,
+        "column order Nickname/Main/Alt/Notes preserved")
+    local headerX, headerY = TopLeftOffset(panel.__sfRaidSignupMainHeader)
+    assertEq(headerX, narrowGeom.mainX, "Main header shares row geometry")
+    local altHeaderX = TopLeftOffset(panel.__sfRaidSignupAltHeader)
+    assertEq(altHeaderX, narrowGeom.altX, "Alt header shares row geometry")
+    local mainIcons = UIPage._FindSpecButtonsForTests(entriesHost, "main")
+    assertTrue(#mainIcons >= 1, "collapsed main icons present for geometry check")
+    local iconX = nil
+    for _, pt in ipairs(mainIcons[1]._points or {}) do
+        if pt[1] == "LEFT" then
+            iconX = pt[4]
+        end
+    end
+    assertEq(iconX, narrowGeom.mainX, "collapsed Main icon matches header column")
+
+    -- Nickname and notes are bounded by rendered width, not character count.
+    local longNick = string.rep("n", 40)
+    RS:UpsertEntry({ planId = tabPlanId, nickname = longNick,
+        mainClass = "MAGE", mainSpec = 62 })
+    UIPage:Refresh(panel, { force = true })
+    local clippedNick = nil
+    local function FindClipped(root)
+        local function walk(f)
+            if clippedNick or not f then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "FontString"
+                and f.GetText and f:GetText():sub(1, 1) == "n"
+                and #f:GetText() < 40 and f:GetText():sub(-3) == "…" then
+                clippedNick = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+            if f.GetRegions then
+                for _, r in ipairs({ f:GetRegions() }) do
+                    walk(r)
+                end
+            end
+        end
+        walk(root)
+    end
+    FindClipped(entriesHost)
+    assertTrue(clippedNick ~= nil, "long nickname clipped with ellipsis")
+    assertTrue((clippedNick:GetStringWidth() or 0) <= narrowGeom.nickW,
+        "clipped nickname fits its column width")
+
+    -- 2. Role totals: one line at the owner's width, deliberate wrap when narrow,
+    -- and multi-digit counts recalculate without leaving the column.
+    boardHost._w = nil -- back to the 720 fallback (left column 446px)
+    for i = 1, 10 do
+        RS:UpsertEntry({ planId = tabPlanId, nickname = "Tot" .. i,
+            mainClass = "MAGE", mainSpec = 62 })
+    end
+    UIPage:Refresh(panel, { force = true })
+    local rangedCount = panel.__sfRaidSignupRole.ranged.count:GetText()
+    assertTrue(#rangedCount >= 2, "multi-digit role total rendered")
+    local function DistinctTotalLines()
+        local ys = {}
+        for _, key in ipairs({ "tank", "healer", "ranged", "melee" }) do
+            local _, y = TopLeftOffset(panel.__sfRaidSignupRole[key].label)
+            if y ~= nil then
+                ys[y] = true
+            end
+        end
+        local n = 0
+        for _ in pairs(ys) do
+            n = n + 1
+        end
+        return n
+    end
+    assertEq(DistinctTotalLines(), 1, "multi-digit totals stay on one line at full width")
+    local wideHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
+    assertEq(wideHeaderY, -49, "single-line totals keep the approved header position")
+    boardHost._w = 548 -- narrow: totals must reflow, not cross the divider
+    UIPage:Refresh(panel, { force = true })
+    assertTrue(DistinctTotalLines() >= 2, "narrow width wraps role totals deliberately")
+    local narrowHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
+    local _, entriesY = TopLeftOffset(entriesHost)
+    assertTrue(narrowHeaderY < wideHeaderY, "column headers move down with wrapped totals")
+    assertEq(entriesY, narrowHeaderY - 20,
+        "signup rows start below the wrapped totals and headers")
+
+    -- 3. Summary: a 2px resize across the class-grid threshold rebuilds geometry.
+    boardHost._w = 650
+    summaryHost._w = 231
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true }) -- let LayoutBoard settle the width
+    local keyThree = summaryHost.__sfSummaryBuiltKey
+    local heightThree = summaryHost:GetHeight()
+    boardHost._w = 654
+    summaryHost._w = 233
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true })
+    local keyFour = summaryHost.__sfSummaryBuiltKey
+    assertTrue(keyThree ~= nil and keyFour ~= nil and keyThree ~= keyFour,
+        "small resize across the grid threshold changes summary geometry")
+    local hasFourthColumn = false
+    for _, btn in pairs(summaryHost.__sfClassIcons or {}) do
+        local x = TopLeftOffset(btn)
+        if x == 180 then
+            hasFourthColumn = true
+        end
+    end
+    assertTrue(hasFourthColumn, "four-class-column layout rendered after resize")
+    assertTrue(summaryHost:GetHeight() < heightThree,
+        "sidebar height follows the rendered grid rows")
+    -- Settled: further refreshes reuse widgets instead of rebuilding.
+    local iconsBefore = summaryHost.__sfClassIcons
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true })
+    assertTrue(summaryHost.__sfClassIcons == iconsBefore,
+        "repeated refreshes converge without rebuilding summary widgets")
+
+    -- 4. Draft and expanded-editor rows: fields anchored from the row top,
+    -- wrapped picker height drives the row size, fields below clear it.
+    boardHost._w = 548
+    summaryHost._w = 233
+    UIPage._SetDraftForTests(RS.MakeDraft(tabPlanId))
+    UIPage:Refresh(panel, { force = true })
+    local draftRow = nil
+    for _, child in ipairs({ entriesHost:GetChildren() }) do
+        if child._h and child._h > 26 and child.IsShown and child:IsShown()
+            and #UIPage._FindEditBoxesForTests(child, "nickname") > 0 then
+            draftRow = child
+            break
+        end
+    end
+    assertTrue(draftRow ~= nil, "draft row present for bounds check")
+    local draftNameLabel = FindFontStringByText(entriesHost, "Name")
+    local draftClassLabel = FindFontStringByText(entriesHost, "Class / Spec")
+    local draftNotesLabel = FindFontStringByText(entriesHost, "Notes")
+    assertTrue(draftNameLabel and draftClassLabel and draftNotesLabel,
+        "draft row shows Name/Class-Spec/Notes labels")
+    local _, nameY = TopLeftOffset(draftNameLabel)
+    assertEq(nameY, -6, "draft Name label anchored at the row top")
+    local draftPicker = FindAnchoredTopLeft(entriesHost, draftClassLabel)
+    assertTrue(draftPicker ~= nil, "draft class picker painted")
+    assertTrue((draftPicker._h or 0) > 24, "picker wraps at narrow column width")
+    local pickerH = draftPicker._h
+    local _, notesY = TopLeftOffset(draftNotesLabel)
+    assertEq(notesY, -(pickerH + 40),
+        "draft Notes label clears the wrapped picker's real bottom")
+    assertEq(draftRow:GetHeight(), pickerH + 66,
+        "draft row sized from its resulting content")
+    UIPage._SetDraftForTests(nil)
+
+    -- Main replacement editor gets the same bounds treatment.
+    local editTarget = RS:GetSortedEntries(tabPlanId)[1]
+    assertTrue(editTarget ~= nil, "entry available for editor bounds check")
+    UIPage._SetEditingForTests({
+        entryId = editTarget.entryId,
+        slot = "main",
+        draft = {
+            nickname = editTarget.nickname,
+            nicknameCommitted = true,
+            classFile = nil,
+            specId = nil,
+            phase = "class",
+        },
+    })
+    UIPage:Refresh(panel, { force = true })
+    local editRow = nil
+    for _, child in ipairs({ entriesHost:GetChildren() }) do
+        if child._h and child._h > 26 and child.IsShown and child:IsShown()
+            and #UIPage._FindEditBoxesForTests(child, "nickname") > 0 then
+            editRow = child
+            break
+        end
+    end
+    assertTrue(editRow ~= nil, "expanded editor row present for bounds check")
+    local editClassLabel = FindFontStringByText(entriesHost, "Class / Spec")
+    local editNotesLabel = FindFontStringByText(entriesHost, "Notes")
+    local editPicker = FindAnchoredTopLeft(entriesHost, editClassLabel)
+    assertTrue(editPicker ~= nil, "editor class picker painted")
+    local editPickerH = editPicker._h or 0
+    assertTrue(editPickerH > 24, "editor picker wraps at narrow column width")
+    local _, editNotesY = TopLeftOffset(editNotesLabel)
+    assertEq(editNotesY, -(editPickerH + 40),
+        "editor Notes label clears the wrapped picker's real bottom")
+    assertEq(editRow:GetHeight(), editPickerH + 66,
+        "editor row sized from its resulting content")
+    UIPage._SetEditingForTests(nil)
+
+    -- 5. Convergence: board height and summary widgets stable once settled.
+    boardHost._w = nil
+    UIPage:Refresh(panel, { force = true })
+    local settledH = panel.__sfRaidSignupBoardRow:GetHeight()
+    UIPage:Refresh(panel, { force = true })
+    assertEq(panel.__sfRaidSignupBoardRow:GetHeight(), settledH,
+        "board height converges across refreshes")
+    local settledIcons = summaryHost.__sfClassIcons
+    UIPage:Refresh(panel, { force = true })
+    assertTrue(summaryHost.__sfClassIcons == settledIcons,
+        "summary widgets stable once layout settles")
+
+end
+RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
 
     -- Two hosts (Blizzard Settings panel + standalone window) each get rebuilt
     -- and refreshed; hosts keep their own panel association.

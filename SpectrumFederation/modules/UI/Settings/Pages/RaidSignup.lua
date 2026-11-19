@@ -87,7 +87,6 @@ local BOARD_STATUS_H = 18
 -- Fixed columns for collapsed signup rows (Nickname | Main | Alt | Notes).
 local COL_MAIN_X = 140
 local COL_ALT_X = COL_MAIN_X + 36
-local COL_NOTES_X = COL_ALT_X + 36
 local CLASS_COUNT_WIDTH = 24
 
 local function TrackCreate(frame)
@@ -683,6 +682,73 @@ local function ClipDisplay(text, maxChars)
 	return text
 end
 
+local ENTRY_ACTION_W = 4 + 70 + 8 + 90 -- right margin + Delete + gap + alt action
+local ENTRY_CHAR_W = 7 -- fallback estimate for GameFontHighlight text
+
+-- Rendered width of a fontstring's text (GetStringWidth when available).
+local function MeasureFontWidth(fs, text)
+	if fs and fs.SetText and text ~= nil then
+		fs:SetText(text)
+	end
+	if fs and fs.GetStringWidth then
+		local ok, w = pcall(function()
+			return fs:GetStringWidth()
+		end)
+		if ok and type(w) == "number" then
+			return w
+		end
+	end
+	return #(tostring(text or "")) * ENTRY_CHAR_W
+end
+
+-- Bound displayed text by rendered width rather than a fixed character count,
+-- clipping at UTF-8 boundaries like ClipDisplay.
+local function ClipToWidth(fs, text, maxPx)
+	text = text or ""
+	if maxPx <= 0 then
+		fs:SetText("")
+		return ""
+	end
+	if MeasureFontWidth(fs, text) <= maxPx then
+		return text
+	end
+	local chars = {}
+	for ch in tostring(text):gmatch("[\1-\127\194-\244][\128-\191]*") do
+		chars[#chars + 1] = ch
+	end
+	local n = #chars
+	while n > 0 do
+		local candidate = table.concat(chars, "", 1, n) .. "…"
+		if MeasureFontWidth(fs, candidate) <= maxPx then
+			fs:SetText(candidate)
+			return candidate
+		end
+		n = n - 1
+	end
+	fs:SetText("…")
+	return "…"
+end
+
+-- Shared column geometry for collapsed rows and their headings: reserve the
+-- action-button group first, then allocate bounded Nickname / Main / Alt /
+-- Notes space from the real row width.
+local function EntryColGeom(leftW, reserveActions)
+	local rightReserve = reserveActions and ENTRY_ACTION_W or 8
+	local contentW = math.max(96, (tonumber(leftW) or 0) - rightReserve)
+	local nickW = math.min(150, math.max(48, math.floor(contentW * 0.36)))
+	local mainX = 4 + nickW + 10
+	local altX = mainX + ICON + 12
+	local notesX = altX + ICON + 12
+	return {
+		nickW = nickW,
+		mainX = mainX,
+		altX = altX,
+		notesX = notesX,
+		rightReserve = rightReserve,
+		leftW = leftW,
+	}
+end
+
 local function AcquireFieldLabel(parent, text)
 	local fs = AcquireFontString(parent, "OVERLAY", "GameFontHighlight")
 	fs:ClearAllPoints()
@@ -718,17 +784,34 @@ local function SafeSetEditText(edit, text)
 	edit:SetText(text or "")
 end
 
-local function LayoutPicker(host, draft, opts)
+local function LayoutPicker(host, draft, opts, width)
 	opts = opts or {}
 	ReleaseHostChildren(host)
 
+	-- Wrap icons within the available width instead of one fixed strip; the
+	-- returned height lets callers place following fields below the real bottom.
+	width = tonumber(width) or (host.GetWidth and host:GetWidth()) or 0
+	if width <= 0 then
+		width = 380
+	end
+	local pitch = ICON + ICON_GAP
+	local perRow = math.max(1, math.floor((width + ICON_GAP) / pitch))
 	local x = 0
-	local function place(btn, width)
+	local y = 0
+	local col = 0
+	local function place(btn, w)
 		btn:SetParent(host)
 		btn:ClearAllPoints()
-		btn:SetPoint("LEFT", host, "LEFT", x, 0)
+		local itemW = w or ICON
+		if col > 0 and (col >= perRow or x + itemW > width) then
+			col = 0
+			x = 0
+			y = y + ICON + ICON_GAP
+		end
+		btn:SetPoint("TOPLEFT", host, "TOPLEFT", x, -y)
 		btn:Show()
-		x = x + (width or ICON) + ICON_GAP
+		x = x + itemW + ICON_GAP
+		col = col + 1
 	end
 
 	local phase = draft.phase or "class"
@@ -823,8 +906,9 @@ local function LayoutPicker(host, draft, opts)
 			end
 		end
 	end
-	host:SetHeight(ICON + 2)
-	return x
+	local height = y + ICON + 2
+	host:SetHeight(height)
+	return height
 end
 
 local function CurrentPlans()
@@ -1205,6 +1289,22 @@ local function SidebarWidth(host)
 	return w
 end
 
+local function BoardWidth(host)
+	local w = host and host.GetWidth and host:GetWidth() or 0
+	if not w or w < BOARD_MIN_WIDTH then
+		w = 720
+	end
+	return w
+end
+
+local function ColumnWidths(host)
+	local w = BoardWidth(host)
+	local leftW = math.floor(w * BOARD_LEFT_RATIO)
+	local rightW = w - leftW - BOARD_COL_GAP
+	return leftW, rightW
+end
+
+
 -- Sidebar column count for the compact class/coverage grids.
 local function SidebarCols(width, pitch)
 	return math.max(1, math.min(5, math.floor((width + 8) / pitch)))
@@ -1249,9 +1349,13 @@ PaintSummary = function(host, planId)
 	host:SetHeight(height)
 	LayoutBoard(host.__sfRaidSignupPanel)
 
-	-- Build once per width bucket, then update counts / coverage greys in place.
+	-- Rebuild when the effective grid geometry changes (column counts drive
+	-- every position and the container height), not just on large width deltas:
+	-- a 2px resize can cross a grid-column threshold.
+	local geomKey = cols .. ":" .. iconCols
 	local builtW = host.__sfSummaryBuiltW or 0
-	if not host.__sfSummaryBuilt or math.abs(builtW - w) > 24 then
+	if not host.__sfSummaryBuilt or host.__sfSummaryBuiltKey ~= geomKey
+		or math.abs(builtW - w) > 24 then
 		ReleaseHostChildren(host)
 		host.__sfClassCounts = nil
 		host.__sfClassIcons = nil
@@ -1314,6 +1418,7 @@ PaintSummary = function(host, planId)
 
 		host.__sfSummaryBuilt = true
 		host.__sfSummaryBuiltW = w
+		host.__sfSummaryBuiltKey = geomKey
 	end
 
 	for i = 1, #order do
@@ -1351,14 +1456,28 @@ PaintEntries = function(host, planId, planOpen, caps)
 	local rs = RS()
 	local entries = rs and rs.GetSortedEntries and rs:GetSortedEntries(planId) or {}
 	local y = -2
+	-- Column geometry shared by rows and headings, from the real board width.
+	local panel = host.__sfRaidSignupPanel
+	local boardHost = panel and panel.__sfRaidSignupBoardHost
+	local leftW = boardHost and ColumnWidths(boardHost) or 446
+	local geom = EntryColGeom(leftW, planOpen)
+	if panel then
+		panel.__sfEntryGeom = geom
+		panel.__sfRaidSignupPlanOpen = planOpen
+	end
 
 	local function placeRow(height, builder)
 		local row = AcquireFrame(host)
 		row:ClearAllPoints()
 		row:SetPoint("TOPLEFT", host, "TOPLEFT", 0, y)
 		row:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, y)
-		row:SetHeight(height)
-		builder(row)
+		row:SetHeight(height or 26)
+		local contentH = builder(row)
+		local finalH = height or 26
+		if type(contentH) == "number" and contentH > 0 then
+			finalH = contentH
+		end
+		row:SetHeight(finalH)
 		-- Subtle divider beneath each signup row; created once per pooled row.
 		if not row.__sfRowLine then
 			local line = TrackRegionCreate(row:CreateTexture(nil, "ARTWORK"))
@@ -1370,17 +1489,19 @@ PaintEntries = function(host, planId, planOpen, caps)
 		row.__sfRowLine:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 4, 0)
 		row.__sfRowLine:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -4, 0)
 		row.__sfRowLine:Show()
-		y = y - height - 4
+		y = y - finalH - 4
 	end
 
 	if session.draft and planOpen and session.draft.planId == planId then
-		placeRow(86, function(row)
+		placeRow(26, function(row)
+			local PAD, bandH, gap = 6, 22, 6
+			local yOff = PAD
 			local nameLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NAME", "Name"))
-			nameLabel:SetPoint("LEFT", row, "LEFT", 4, -13)
+			nameLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
 			local nick = AcquireEditBox(row)
 			nick.__sfRaidSignupField = "nickname"
 			nick:SetSize(170, 22)
-			nick:SetPoint("LEFT", nameLabel, "RIGHT", 6, 0)
+			nick:SetPoint("TOPLEFT", nameLabel, "TOPRIGHT", 6, 0)
 			nick:SetMaxLetters(RS().MAX_NICKNAME or 48)
 			nick:Enable()
 			SafeSetEditText(nick, session.draft.nickname or "")
@@ -1414,12 +1535,15 @@ PaintEntries = function(host, planId, planOpen, caps)
 				self:ClearFocus()
 			end)
 
+			yOff = yOff + bandH + gap
 			local classLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
-			classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
+			classLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
+			local pickerX = 4 + MeasureFontWidth(classLabel, classLabel:GetText()) + 6
+			local pickerW = math.max(120, geom.leftW - pickerX - 8)
 			local picker = AcquireFrame(row)
-			picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
-			picker:SetSize(380, ICON + 2)
-			LayoutPicker(picker, session.draft, {
+			picker:SetPoint("TOPLEFT", classLabel, "TOPRIGHT", 6, 0)
+			picker:SetSize(pickerW, ICON + 2)
+			local pickerH = LayoutPicker(picker, session.draft, {
 				onClass = function(classFile)
 					RS().UpdateDraftField(session.draft, "classFile", classFile)
 					TryPersistDraft()
@@ -1434,14 +1558,16 @@ PaintEntries = function(host, planId, planOpen, caps)
 					RS().UpdateDraftField(session.draft, "classFile", nil)
 					QueueRefresh({ force = true })
 				end,
-			})
+			}, pickerW)
+			picker:SetHeight(pickerH)
 
+			yOff = yOff + pickerH + gap
 			local notesLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NOTES", "Notes"))
-			notesLabel:SetPoint("LEFT", row, "LEFT", 4, -69)
+			notesLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
 			local notes = AcquireEditBox(row)
 			notes.__sfRaidSignupField = "notes"
 			notes:SetSize(240, 22)
-			notes:SetPoint("LEFT", notesLabel, "RIGHT", 6, 0)
+			notes:SetPoint("TOPLEFT", notesLabel, "TOPRIGHT", 6, 0)
 			notes:SetMaxLetters(RS().MAX_NOTES or 160)
 			notes:Enable()
 			SafeSetEditText(notes, session.draft.notes or "")
@@ -1473,6 +1599,8 @@ PaintEntries = function(host, planId, planOpen, caps)
 				end
 				self:ClearFocus()
 			end)
+			yOff = yOff + bandH + 4
+			return yOff
 		end)
 	end
 
@@ -1481,17 +1609,20 @@ PaintEntries = function(host, planId, planOpen, caps)
 		local editingThis = session.editing and session.editing.entryId == entry.entryId
 		local altThis = session.altDraft and session.altDraft.entryId == entry.entryId
 		local expanded = editingThis or altThis
-		placeRow(expanded and 86 or 26, function(row)
+		placeRow(26, function(row)
 			local canEdit = planOpen and RS().CanEditEntry(caps, caps.actorGuid, entry)
 			if expanded then
-				-- Editing: labeled fields stacked Name / Class + Spec / Notes, with a
-				-- Done button that leaves edit mode without changing class/spec.
+				-- Editing: labeled fields stacked Name / Class + Spec / Notes, anchored
+				-- from the row top; the row is sized from the resulting content,
+				-- including the picker's wrapped height.
+				local PAD, bandH, gap = 6, 22, 6
+				local yOff = PAD
 				local nameLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NAME", "Name"))
-				nameLabel:SetPoint("LEFT", row, "LEFT", 4, -13)
+				nameLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
 				local nickBox = AcquireEditBox(row)
 				nickBox.__sfRaidSignupField = "nickname"
 				nickBox:SetSize(170, 20)
-				nickBox:SetPoint("LEFT", nameLabel, "RIGHT", 6, 0)
+				nickBox:SetPoint("TOPLEFT", nameLabel, "TOPRIGHT", 6, 0)
 				nickBox:SetMaxLetters(RS().MAX_NICKNAME or 48)
 				SafeSetEditText(nickBox, entry.nickname or "")
 				if nickBox.Instructions then
@@ -1531,14 +1662,18 @@ PaintEntries = function(host, planId, planOpen, caps)
 					self:ClearFocus()
 				end)
 
+				yOff = yOff + bandH + gap
 				local classLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
-				classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
+				classLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
+				local pickerX = 4 + MeasureFontWidth(classLabel, classLabel:GetText()) + 6
+				local pickerW = math.max(120, geom.leftW - pickerX - 8)
 				local picker = AcquireFrame(row)
-				picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
-				picker:SetSize(380, ICON + 2)
+				picker:SetPoint("TOPLEFT", classLabel, "TOPRIGHT", 6, 0)
+				picker:SetSize(pickerW, ICON + 2)
+				local pickerH = ICON + 2
 				if editingThis then
 					local draft = session.editing.draft
-					LayoutPicker(picker, draft, {
+					pickerH = LayoutPicker(picker, draft, {
 						disableSpec = function(specId)
 							return session.editing.slot == "alt"
 								and RS().IsAltSpecDisabled(draft, specId)
@@ -1569,10 +1704,10 @@ PaintEntries = function(host, planId, planOpen, caps)
 							end
 							QueueRefresh({ force = true })
 						end,
-					})
+					}, pickerW)
 				else
 					local draft = session.altDraft.draft
-					LayoutPicker(picker, draft, {
+					pickerH = LayoutPicker(picker, draft, {
 						disableSpec = function(specId)
 							return RS().IsAltSpecDisabled(draft, specId)
 						end,
@@ -1590,15 +1725,17 @@ PaintEntries = function(host, planId, planOpen, caps)
 							RS().UpdateAltDraftField(draft, "classFile", nil)
 							QueueRefresh({ force = true })
 						end,
-					})
+					}, pickerW)
 				end
+				picker:SetHeight(pickerH)
 
+				yOff = yOff + pickerH + gap
 				local notesLabel = AcquireFieldLabel(row, Loc("RAID_SIGNUP_LABEL_NOTES", "Notes"))
-				notesLabel:SetPoint("LEFT", row, "LEFT", 4, -69)
+				notesLabel:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -yOff)
 				local notesBox = AcquireEditBox(row)
 				notesBox.__sfRaidSignupField = "notes"
 				notesBox:SetSize(240, 20)
-				notesBox:SetPoint("LEFT", notesLabel, "RIGHT", 6, 0)
+				notesBox:SetPoint("TOPLEFT", notesLabel, "TOPRIGHT", 6, 0)
 				notesBox:SetMaxLetters(RS().MAX_NOTES or 160)
 				SafeSetEditText(notesBox, entry.notes or "")
 				if notesBox.Instructions then
@@ -1663,18 +1800,21 @@ PaintEntries = function(host, planId, planOpen, caps)
 					end
 					QueueRefresh({ force = true })
 				end)
-				return
+				yOff = yOff + bandH + 4
+				return yOff
 			end
 
 			-- Collapsed: fixed columns — Nickname, Main icon, Alt icon (or a muted
 			-- dash), then notes; Remove Alt / Delete stay right-aligned. Clicking an
-			-- icon opens the editor for that slot.
-			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 16))
+			-- icon opens the editor for that slot. Columns come from the shared
+			-- geometry so rows and headings always agree.
+			local nameFs = AcquireFieldLabel(row, entry.nickname or "")
+			ClipToWidth(nameFs, entry.nickname or "", geom.nickW)
 			nameFs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			nameFs:SetTextColor(ClassColor(entry.mainClass))
 			local mainBtn = MakeIconButton(row, ICON)
 			mainBtn.__sfRaidSignupSpecSlot = "main"
-			mainBtn:SetPoint("LEFT", row, "LEFT", COL_MAIN_X, 0)
+			mainBtn:SetPoint("LEFT", row, "LEFT", geom.mainX, 0)
 			-- Enabled presentation follows canEdit (plan open + edit eligibility).
 			-- Informative hover tooltips stay assigned even when the button is disabled.
 			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), canEdit, false)
@@ -1702,7 +1842,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 			if entry.altClass and entry.altSpec then
 				local altBtn = MakeIconButton(row, ICON)
 				altBtn.__sfRaidSignupSpecSlot = "alt"
-				altBtn:SetPoint("LEFT", row, "LEFT", COL_ALT_X, 0)
+				altBtn:SetPoint("LEFT", row, "LEFT", geom.altX, 0)
 				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), canEdit, false)
 				altBtn.tooltipTitle = Loc("RAID_SIGNUP_COL_ALT", "Alt")
 				altBtn.tooltipText = ClassName(entry.altClass) .. " · " .. SpecName(entry.altSpec)
@@ -1729,22 +1869,18 @@ PaintEntries = function(host, planId, planOpen, caps)
 				-- No alternate: muted dash keeps the Alt column aligned; adding one
 				-- still goes through the Add an Alt? action below.
 				local dash = AcquireFieldLabel(row, "—")
-				dash:SetPoint("LEFT", row, "LEFT", COL_ALT_X, 0)
+				dash:SetPoint("LEFT", row, "LEFT", geom.altX, 0)
 				dash:SetTextColor(0.5, 0.5, 0.5)
 			end
 			local notesText = entry.notes or ""
 			if notesText ~= "" then
-				-- Clip notes to the space left of the action buttons so long text
-				-- never runs under Remove Alt / Delete.
-				local rowW = host.GetWidth and host:GetWidth() or 0
-				if rowW < 200 then
-					rowW = 446
-				end
-				local reserve = (planOpen and canEdit) and 176 or 10
-				local chars = math.floor((rowW - COL_NOTES_X - reserve - 8) / 7)
-				chars = math.max(4, math.min(28, chars))
-				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, chars))
-				notesFs:SetPoint("LEFT", row, "LEFT", COL_NOTES_X, 0)
+				-- Clip notes to the rendered space left of the action buttons so
+				-- long text never runs under Remove Alt / Delete.
+				local showActions = planOpen and canEdit
+				local notesBudget = geom.leftW - geom.notesX - (showActions and ENTRY_ACTION_W or 8) - 6
+				local notesFs = AcquireFieldLabel(row, notesText)
+				ClipToWidth(notesFs, notesText, notesBudget)
+				notesFs:SetPoint("LEFT", row, "LEFT", geom.notesX, 0)
 				notesFs:SetTextColor(0.6, 0.6, 0.6)
 			end
 			if planOpen and canEdit then
@@ -1822,29 +1958,117 @@ end
 
 local BOARD_ROLE_ORDER = { "tank", "healer", "ranged", "melee" }
 
-local function BoardWidth(host)
-	local w = host and host.GetWidth and host:GetWidth() or 0
-	if not w or w < BOARD_MIN_WIDTH then
-		w = 720
-	end
-	return w
-end
-
-local function ColumnWidths(host)
-	local w = BoardWidth(host)
-	local leftW = math.floor(w * BOARD_LEFT_RATIO)
-	local rightW = w - leftW - BOARD_COL_GAP
-	return leftW, rightW
-end
-
 -- Position chrome and both columns for the current width, then size the row
 -- so the page scroll includes the taller column.
+local ROLE_TOTALS_TOP = -26
+local ROLE_LINE_H = 15
+local ROLE_HEADER_GAP = 8
+local ROLE_HEADER_H = 20 -- header band between column headings and rows
+
+-- Position the role totals from their measured widths (labels, counts,
+-- separators), wrapping onto extra lines rather than crossing the column
+-- divider or clipping a count. Returns the number of lines used.
+local function LayoutRoleTotals(panel, availW)
+	local role = panel and panel.__sfRaidSignupRole
+	local host = panel and panel.__sfRaidSignupBoardHost
+	if not role or not host then
+		return 1
+	end
+	availW = math.max(120, (tonumber(availW) or 0) - 4)
+	local seps = panel.__sfRaidSignupRoleSeps or {}
+	local sepW = 0
+	for i = 2, #BOARD_ROLE_ORDER do
+		local sep = seps[i]
+		if sep and sep.GetText then
+			sepW = MeasureFontWidth(sep, sep:GetText())
+			break
+		end
+	end
+	local gap = 18 + sepW -- 12 before the separator + 6 after it
+	local items = {}
+	for i, key in ipairs(BOARD_ROLE_ORDER) do
+		local slot = role[key]
+		if slot and slot.label and slot.count then
+			local labelText = slot.label.GetText and slot.label:GetText() or ""
+			local countText = slot.count.GetText and slot.count:GetText() or "0"
+			items[#items + 1] = {
+				label = slot.label,
+				count = slot.count,
+				sep = seps[i],
+				w = MeasureFontWidth(slot.label, labelText) + 4
+					+ MeasureFontWidth(slot.count, countText),
+			}
+		end
+	end
+	if #items == 0 then
+		return 1
+	end
+	-- Greedy wrap: keep every total intact on one line.
+	local lines = {}
+	local cur, curW = nil, 0
+	for _, it in ipairs(items) do
+		local need = it.w + (cur and gap or 0)
+		if cur and curW + need > availW then
+			lines[#lines + 1] = cur
+			cur, curW, need = nil, 0, it.w
+		end
+		if not cur then
+			cur = {}
+		end
+		cur[#cur + 1] = it
+		curW = curW + need
+	end
+	if cur then
+		lines[#lines + 1] = cur
+	end
+	local y = ROLE_TOTALS_TOP
+	for _, line in ipairs(lines) do
+		local prevCount = nil
+		for j, it in ipairs(line) do
+			it.count:ClearAllPoints()
+			it.count:SetPoint("LEFT", it.label, "RIGHT", 4, 0)
+			if j == 1 then
+				it.label:ClearAllPoints()
+				it.label:SetPoint("TOPLEFT", host, "TOPLEFT", 0, y)
+				if it.sep and it.sep.Hide then
+					it.sep:Hide()
+				end
+			else
+				if it.sep and it.sep.SetPoint then
+					it.sep:ClearAllPoints()
+					it.sep:SetPoint("LEFT", prevCount, "RIGHT", 12, 0)
+					if it.sep.Show then
+						it.sep:Show()
+					end
+				end
+				it.label:ClearAllPoints()
+				if it.sep and it.sep.SetPoint then
+					it.label:SetPoint("LEFT", it.sep, "RIGHT", 6, 0)
+				else
+					it.label:SetPoint("LEFT", prevCount, "RIGHT", 18, 0)
+				end
+			end
+			prevCount = it.count
+		end
+		y = y - ROLE_LINE_H
+	end
+	return #lines
+end
+
 LayoutBoard = function(panel)
 	local host = panel and panel.__sfRaidSignupBoardHost
 	if not host then
 		return
 	end
 	local leftW, rightW = ColumnWidths(host)
+	local totalsLines = LayoutRoleTotals(panel, leftW)
+	local geom = panel.__sfEntryGeom
+	if not geom then
+		geom = EntryColGeom(leftW, panel.__sfRaidSignupPlanOpen ~= false)
+	end
+	local headersY = ROLE_TOTALS_TOP - totalsLines * ROLE_LINE_H - ROLE_HEADER_GAP
+	local topH = -headersY + ROLE_HEADER_H
+	panel.__sfRaidSignupTopH = topH
 	local entriesHost = panel.__sfRaidSignupEntriesHost
 	local summaryHost = panel.__sfRaidSignupSummaryHost
 	local entriesH = math.max(24, (entriesHost and entriesHost.__sfEntriesContentH) or 24)
@@ -1877,40 +2101,43 @@ LayoutBoard = function(panel)
 		panel.__sfRaidSignupRightLine:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -20)
 	end
 	if panel.__sfRaidSignupNickHeader then
-		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -49)
+		panel.__sfRaidSignupNickHeader:ClearAllPoints()
+		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, headersY)
 	end
 	if panel.__sfRaidSignupMainHeader then
-		panel.__sfRaidSignupMainHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_MAIN_X, -49)
+		panel.__sfRaidSignupMainHeader:ClearAllPoints()
+		panel.__sfRaidSignupMainHeader:SetPoint("TOPLEFT", host, "TOPLEFT", geom.mainX, headersY)
 	end
 	if panel.__sfRaidSignupAltHeader then
-		panel.__sfRaidSignupAltHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_ALT_X, -49)
+		panel.__sfRaidSignupAltHeader:ClearAllPoints()
+		panel.__sfRaidSignupAltHeader:SetPoint("TOPLEFT", host, "TOPLEFT", geom.altX, headersY)
 	end
 	if entriesHost then
 		entriesHost:ClearAllPoints()
-		entriesHost:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -BOARD_TOP_H)
+		entriesHost:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -topH)
 		entriesHost:SetSize(leftW, entriesH)
 	end
 	if summaryHost then
 		summaryHost:ClearAllPoints()
-		summaryHost:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -BOARD_TOP_H)
+		summaryHost:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -topH)
 		summaryHost:SetSize(rightW, summaryH)
 	end
 	local vdiv = panel.__sfRaidSignupVDivider
 	if vdiv then
 		vdiv:ClearAllPoints()
 		vdiv:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -20)
-		vdiv:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -(BOARD_TOP_H + bodyH))
+		vdiv:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -(topH + bodyH))
 	end
 	local status = panel.__sfRaidSignupStatusFs
 	if status then
 		status:ClearAllPoints()
-		status:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -(BOARD_TOP_H + entriesH + 4))
+		status:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -(topH + entriesH + 4))
 		if status.SetWidth then
 			status:SetWidth(leftW)
 		end
 	end
 
-	local total = BOARD_TOP_H + bodyH + BOARD_STATUS_H + 6
+	local total = topH + bodyH + BOARD_STATUS_H + 6
 	host:SetHeight(total)
 	local row = panel.__sfRaidSignupBoardRow
 	if row then
@@ -1995,6 +2222,7 @@ local function BuildBoardChrome(panel, host)
 		{ key = "melee", label = Loc("RAID_SIGNUP_ROLE_MELEE", "Melee DPS") },
 	}
 	panel.__sfRaidSignupRole = {}
+	panel.__sfRaidSignupRoleSeps = {}
 	local anchor = nil
 	for i, def in ipairs(roleDefs) do
 		if i > 1 then
@@ -2004,6 +2232,7 @@ local function BuildBoardChrome(panel, host)
 			end
 			sep:SetText("·")
 			sep:SetTextColor(0.6, 0.6, 0.6)
+			panel.__sfRaidSignupRoleSeps[i] = sep
 			anchor = sep
 		end
 		local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
