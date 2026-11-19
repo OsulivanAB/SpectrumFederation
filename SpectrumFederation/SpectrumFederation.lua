@@ -51,6 +51,11 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.GuildInfo:Initialize(SpectrumFederationDB)
         end
 
+        -- Raid Signup season/tier roster plans (independent of Loot Helper profiles).
+        if SF.RaidSignup and SF.RaidSignup.Initialize then
+            SF.RaidSignup:Initialize(SpectrumFederationDB)
+        end
+
         -- Enable Loot Helper Sync system (registers slash commands and event handlers)
         if SF.LootHelperSync and SF.LootHelperSync.Enable then
             SF.LootHelperSync:Enable()
