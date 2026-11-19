@@ -435,6 +435,54 @@ function RS.CategoryCoveredBySelection(category, classFile, specId)
     return false
 end
 
+-- Static spec -> signup role for the role totals line. "melee"/"ranged" split
+-- damage specs; tanks and healers are role-locked. Devourer (1480) is a caster
+-- spec per Blizzard, so it counts as ranged DPS.
+RS.SPEC_ROLES = {
+    [71] = "melee", [72] = "melee", [73] = "tank",
+    [65] = "healer", [66] = "tank", [70] = "melee",
+    [253] = "ranged", [254] = "ranged", [255] = "ranged",
+    [259] = "melee", [260] = "melee", [261] = "melee",
+    [256] = "healer", [257] = "healer", [258] = "ranged",
+    [250] = "tank", [251] = "melee", [252] = "melee",
+    [262] = "ranged", [263] = "melee", [264] = "healer",
+    [62] = "ranged", [63] = "ranged", [64] = "ranged",
+    [265] = "ranged", [266] = "ranged", [267] = "ranged",
+    [268] = "tank", [269] = "melee", [270] = "healer",
+    [102] = "ranged", [103] = "melee", [104] = "tank", [105] = "healer",
+    [577] = "melee", [581] = "tank", [1480] = "ranged",
+    [1467] = "ranged", [1468] = "healer", [1473] = "ranged",
+}
+
+--- Role for a specialization ID, or nil when unknown/incomplete.
+function RS.SpecRole(specId)
+    return RS.SPEC_ROLES[tonumber(specId)]
+end
+
+--- Count Tanks / Healers / Ranged DPS / Melee DPS from MAIN selections only.
+-- Mirrors BuildSummary semantics: one role per non-deleted entry with a valid
+-- main spec, so stored alternates never inflate the participating headcount
+-- and incomplete signups contribute nothing.
+function RS.BuildRoleTotals(entries)
+    local totals = { tank = 0, healer = 0, ranged = 0, melee = 0 }
+    if type(entries) ~= "table" then
+        return totals
+    end
+    for _, entry in pairs(entries) do
+        if type(entry) == "table" and not entry.deleted then
+            local classFile = NormalizeClass(entry.mainClass)
+            local specId = tonumber(entry.mainSpec)
+            if classFile and RS.IsValidSpecForClass(classFile, specId) then
+                local role = RS.SpecRole(specId)
+                if role then
+                    totals[role] = totals[role] + 1
+                end
+            end
+        end
+    end
+    return totals
+end
+
 --- Build class counts + coverage from completed MAIN selections only.
 -- entries: iterable of { mainClass, mainSpec, deleted? }
 function RS.BuildSummary(entries)

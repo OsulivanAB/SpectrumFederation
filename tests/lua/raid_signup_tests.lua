@@ -864,6 +864,27 @@ assertEq(summary.utility.atrophic_poison, false, "atrophic explicitly false")
 assertTrue(summary.major.versatility, "druid covers versatility")
 
 ---------------------------------------------------------------------------
+-- Role totals aggregation
+---------------------------------------------------------------------------
+do
+    local totals = RS.BuildRoleTotals({
+        { mainClass = "MAGE", mainSpec = 62 },
+        { mainClass = "PALADIN", mainSpec = 65, altClass = "WARRIOR", altSpec = 73 },
+        { mainClass = "DRUID", mainSpec = 105 },
+        { mainClass = "DEATHKNIGHT", mainSpec = 251 },
+        { mainClass = "PRIEST", mainSpec = 999 }, -- invalid spec: skipped
+        { mainClass = "HUNTER", mainSpec = 253, deleted = true }, -- deleted: skipped
+    })
+    assertEq(totals.ranged, 1, "fire mage counts as ranged DPS")
+    assertEq(totals.healer, 2, "holy paladin and resto druid count as healers")
+    assertEq(totals.tank, 0, "no tanks in fixture")
+    assertEq(totals.melee, 1, "melee death knight counts as melee DPS")
+    assertEq(totals.tank + totals.healer + totals.ranged + totals.melee, 4,
+        "alternate selections never inflate role totals")
+    assertEq(RS.SpecRole(1480), "ranged", "devourer counts as ranged DPS")
+end
+
+---------------------------------------------------------------------------
 -- Reload persistence
 ---------------------------------------------------------------------------
 
@@ -2830,8 +2851,7 @@ do
     assertEq(bar.tabs[2].id, "manage", "second tab is manage")
     local vis = UIPage._GetSectionVisibilityForTests(panel)
     assertEq(vis.raidSignupPlanSelect, true, "signup plan selector visible")
-    assertEq(vis.raidSignupSummary, true, "summary visible in signup view")
-    assertEq(vis.raidSignupEntries, true, "entries visible in signup view")
+    assertEq(vis.raidSignupBoard, true, "signup board visible in signup view")
     assertEq(vis.raidSignupPlans, false, "manage section hidden in signup view")
     assertEq(vis.raidSignupStatus, nil, "status/access section removed")
 
@@ -2841,8 +2861,7 @@ do
     vis = UIPage._GetSectionVisibilityForTests(panel)
     assertEq(vis.raidSignupPlans, true, "roster plans visible in manage view")
     assertEq(vis.raidSignupPlanSelect, false, "signup selector hidden in manage view")
-    assertEq(vis.raidSignupSummary, false, "summary hidden in manage view")
-    assertEq(vis.raidSignupEntries, false, "entries hidden in manage view")
+    assertEq(vis.raidSignupBoard, false, "signup board hidden in manage view")
     local snap = UIPage._GetDefinitionSnapshotForTests()
     assertEq(snap.selectedId, tabPlanId, "manage view shares selected plan")
     assertEq(snap.canManagePlans, true, "officer capability retained")
@@ -2898,7 +2917,7 @@ do
     assertTrue(not bar:IsShown(), "tab bar hidden when manage eligibility lost")
     vis = UIPage._GetSectionVisibilityForTests(panel)
     assertEq(vis.raidSignupPlans, false, "manage section hidden after eligibility loss")
-    assertEq(vis.raidSignupEntries, true, "signup view still shown after eligibility loss")
+    assertEq(vis.raidSignupBoard, true, "signup view still shown after eligibility loss")
     world.impersonationActive = false
     UIPage:Refresh(panel, { force = true })
 
@@ -2911,8 +2930,7 @@ do
     assertTrue(UIPage._GetTabBarForTests(memberPanel) == nil, "member gets no tab bar")
     vis = UIPage._GetSectionVisibilityForTests(memberPanel)
     assertEq(vis.raidSignupPlanSelect, true, "member plan selector visible")
-    assertEq(vis.raidSignupSummary, true, "member summary visible")
-    assertEq(vis.raidSignupEntries, true, "member entries visible")
+    assertEq(vis.raidSignupBoard, true, "member signup board visible")
     assertEq(vis.raidSignupPlans, false, "member never sees manage section")
     RS:SelectPlan(tabPlanId)
     UIPage:Refresh(memberPanel, { force = true })
@@ -2936,37 +2954,48 @@ do
     for _, classFile in ipairs(RS.CLASS_ORDER) do
         assertTrue(seen[classFile], "class present in summary: " .. tostring(classFile))
     end
-    local classArea = host.__sfClassArea
-    assertTrue(classArea ~= nil, "class area exists")
-    local colXs = {}
-    for _, region in ipairs(classArea._regions or {}) do
-        if region._type == "Texture" then
-            for _, pt in ipairs(region._points) do
-                if pt[1] == "TOPLEFT" then
-                    colXs[pt[4]] = (colXs[pt[4]] or 0) + 1
-                end
+    -- Compact sidebar grid: row-major, width-adaptive columns, content height
+    local classXs = {}
+    local classIconCount = 0
+    for _, btn in pairs(host.__sfClassIcons or {}) do
+        classIconCount = classIconCount + 1
+        for _, pt in ipairs(btn._points or {}) do
+            if pt[1] == "TOPLEFT" then
+                classXs[pt[4]] = (classXs[pt[4]] or 0) + 1
             end
         end
     end
+    assertEq(classIconCount, #RS.CLASS_ORDER, "one class icon button per class")
     do
-        local classColPitch = 22 + 6 + 24
-        local colGap = 16
-        local perCol = math.ceil(#RS.CLASS_ORDER / 3)
-        assertEq(colXs[0], perCol, "first column holds its share")
-        assertEq(colXs[classColPitch + colGap], perCol, "second column holds its share")
-        assertEq(colXs[2 * (classColPitch + colGap)], #RS.CLASS_ORDER - 2 * perCol,
-            "third column holds the rest")
-        local groupPerCol = 4
-        local majorCols = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / groupPerCol))
-        local utilityCols = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / groupPerCol))
-        local expectedRows = math.max(
-            math.ceil(#RS.CLASS_ORDER / 3),
-            math.ceil(#RS.MAJOR_CATEGORIES / majorCols),
-            math.ceil(#RS.UTILITY_CATEGORIES / utilityCols))
-        local expectedH = 2 + 18 + 4 + expectedRows * 24 + 8
-        assertEq(host:GetHeight(), expectedH, "summary height sized to content rows")
-        assertEq(memberPanel.__sfRaidSignupSummaryRow:GetHeight(), expectedH, "summary row height synced")
+        -- Stub: board width falls back to 720, sidebar gets the remaining column.
+        local w = 720 - math.floor(720 * 0.62) - 16
+        local classPitch = 22 + 6 + 24 + 8
+        local cols = math.max(1, math.min(5, math.floor((w + 8) / classPitch)))
+        local classRows = math.ceil(#RS.CLASS_ORDER / cols)
+        local iconPitch = 22 + 8
+        local iconCols = math.max(1, math.min(5, math.floor((w + 8) / iconPitch)))
+        local majorRows = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / iconCols))
+        local utilityRows = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / iconCols))
+        local rowH = 26
+        local expectedH = 4 + 16 + classRows * rowH + 10 + 16 + majorRows * rowH + 10 + 16 + utilityRows * rowH + 4
+        assertEq(host:GetHeight(), expectedH, "summary height sized to stacked groups")
+        assertEq(classXs[0], classRows, "first grid column holds one icon per row")
+        assertTrue(memberPanel.__sfRaidSignupBoardRow ~= nil, "board row exists")
+        assertTrue((memberPanel.__sfRaidSignupBoardRow:GetHeight() or 0) > 0, "board row sized")
     end
+
+    -- Board chrome: headings, + button, column headers, role totals, status line
+    assertTrue(memberPanel.__sfRaidSignupAddBtn ~= nil, "add-signup + button exists")
+    assertTrue(memberPanel.__sfRaidSignupNickHeader ~= nil, "Nickname column header exists")
+    assertTrue(memberPanel.__sfRaidSignupSpecHeader ~= nil, "Class / Spec column header exists")
+    assertTrue(memberPanel.__sfRaidSignupStatusFs ~= nil, "status line beneath list exists")
+    local role = memberPanel.__sfRaidSignupRole
+    assertTrue(role ~= nil, "role totals row exists")
+    for _, key in ipairs({ "tank", "healer", "ranged", "melee" }) do
+        assertTrue(role[key] and role[key].count, "role total slot present: " .. key)
+    end
+    assertEq(role.tank.count:GetText(), "0", "empty plan tank total is zero")
+    assertEq(role.ranged.count:GetText(), "0", "empty plan ranged total is zero")
 
     -- Main-only counts update; alternatives excluded
     local upsertStatus = select(1, RS:UpsertEntry({
@@ -2982,6 +3011,15 @@ do
     counts = memberPanel.__sfRaidSignupSummaryHost.__sfClassCounts
     assertEq(counts.MAGE:GetText(), "1", "main class counted in summary")
     assertEq(counts.WARRIOR:GetText(), "0", "alternative class excluded from summary counts")
+    do
+        local roleNow = memberPanel.__sfRaidSignupRole
+        local totalsNow = RS.BuildRoleTotals(RS:GetSortedEntries(tabPlanId))
+        for _, key in ipairs({ "tank", "healer", "ranged", "melee" }) do
+            assertEq(roleNow[key].count:GetText(), tostring(totalsNow[key] or 0),
+                "role total line matches aggregation: " .. key)
+        end
+        assertEq(roleNow.ranged.count:GetText(), "1", "fire mage signup counts as ranged DPS")
+    end
 
     -- Review repairs: scroll offset, create-plan draft safety, plan-bound
     -- draft rendering, localized class names, expanded-row layout.
@@ -3191,7 +3229,7 @@ do
         "nickname box sits right of the Name label")
     local classLabel = FindFontStringByText(entryHost, "Class / Spec")
     assertTrue(classLabel ~= nil, "Class / Spec label present in expanded row")
-    local altPicker = FindBySize(entryHost, 520, 24)
+    local altPicker = FindBySize(entryHost, 380, 24)
     assertTrue(altPicker ~= nil, "alt class picker painted")
     assertTrue(AnchorTarget(altPicker, "LEFT") == classLabel,
         "class picker sits right of the Class / Spec label")

@@ -79,13 +79,12 @@ local TAB_BAR_TOP_OFFSET = -2
 local TAB_BAR_RIGHT_INSET = -24
 local TAB_BAR_SCROLL_DROP = 34 -- 2px top pad + 28px bar + 4px gap
 
-local SUMMARY_PAD_TOP = 2
-local SUMMARY_HEADING_H = 18
-local SUMMARY_HEADING_GAP = 4
-local SUMMARY_PAD_BOTTOM = 8
-local GROUP_PER_COL = 4
+local BOARD_COL_GAP = 16
+local BOARD_LEFT_RATIO = 0.62
+local BOARD_MIN_WIDTH = 480
+local BOARD_TOP_H = 62
+local BOARD_STATUS_H = 18
 local CLASS_COUNT_WIDTH = 24
-local CLASS_COL_GAP = 16
 
 local function TrackCreate(frame)
 	session.frameCreateCount = session.frameCreateCount + 1
@@ -936,7 +935,7 @@ local function SyncFeedback(panel, view)
 	if not sections then
 		return
 	end
-	local targetId = (view == VIEW_MANAGE) and "raidSignupPlans" or "raidSignupEntries"
+	local targetId = (view == VIEW_MANAGE) and "raidSignupPlans" or nil
 	local applied = panel.__sfRaidSignupMessages
 	if not applied then
 		applied = {}
@@ -959,6 +958,26 @@ local function SyncFeedback(panel, view)
 				end
 				applied[id] = wantText and { text = wantText, kind = wantKind } or nil
 			end
+		end
+	end
+	-- Signup view feedback renders beneath the signup list, not in a section header.
+	local fs = panel.__sfRaidSignupStatusFs
+	if fs and fs.SetText then
+		if view == VIEW_SIGNUP and session.status and session.status ~= "" then
+			fs:SetText(session.status)
+			local r, g, b = 1, 1, 1
+			if session.statusKind == "error" then
+				r, g, b = 1, 0.25, 0.25
+			elseif session.statusKind == "success" then
+				r, g, b = 0.25, 1, 0.25
+			elseif session.statusKind == "warn" then
+				r, g, b = 1, 0.82, 0
+			end
+			if fs.SetTextColor then fs:SetTextColor(r, g, b) end
+			if fs.Show then fs:Show() end
+		else
+			fs:SetText("")
+			if fs.Hide then fs:Hide() end
 		end
 	end
 end
@@ -1029,7 +1048,7 @@ end
 
 -- Forward-declare page-local paint/host helpers used by Definition closures
 -- before their bodies (avoids accidental globals).
-local PaintSummary, PaintEntries, EnsureSummaryHost, EnsureEntriesHost
+local PaintSummary, PaintEntries, EnsureBoardHost, LayoutBoard, PaintRoleTotals
 
 local function SubmitCreatePlan(text)
 	session.newPlanName = text or ""
@@ -1058,6 +1077,7 @@ local function Definition()
 			{
 				id = "raidSignupPlanSelect",
 				view = VIEW_SIGNUP,
+				headerless = true,
 				title = Loc("RAID_SIGNUP_SECTION_PLAN", "Roster plan"),
 				items = {
 					MakePlanDropdownItem(),
@@ -1156,46 +1176,15 @@ local function Definition()
 				},
 			},
 			{
-				id = "raidSignupSummary",
+				id = "raidSignupBoard",
 				view = VIEW_SIGNUP,
-				title = Loc("RAID_SIGNUP_SECTION_SUMMARY", "Summary"),
-				items = {
-					{
-						type = "custom",
-						build = function(section)
-							EnsureSummaryHost(section)
-						end,
-					},
-				},
-			},
-			{
-				id = "raidSignupEntries",
-				view = VIEW_SIGNUP,
+				headerless = true,
 				title = Loc("RAID_SIGNUP_SECTION_ENTRIES", "Signups"),
 				items = {
 					{
-						type = "button",
-						label = Loc("RAID_SIGNUP_ADD_ROW", "Add signup"),
-						buttonText = Loc("RAID_SIGNUP_ADD_ROW_BTN", "Add Row"),
-						enabled = function()
-							return Caps().canCreateEntry and CurrentPlanOpen() and session.draft == nil
-						end,
-						onClick = function()
-							local mod = RS()
-							local selectedId = CurrentSelectedId()
-							if not mod or not selectedId then
-								return
-							end
-							session.editing = nil
-							session.altDraft = nil
-							session.draft = mod.MakeDraft(selectedId)
-							QueueRefresh({ force = true })
-						end,
-					},
-					{
 						type = "custom",
 						build = function(section)
-							EnsureEntriesHost(section)
+							EnsureBoardHost(section)
 						end,
 					},
 				},
@@ -1204,32 +1193,17 @@ local function Definition()
 	}
 end
 
-local function SyncSummaryRowHeight(host, height)
-	local panel = (host and host.__sfRaidSignupPanel) or Page.panel
-	local row = panel and panel.__sfRaidSignupSummaryRow
-	if row then
-		row.__sfBaseHeight = height
-		row:SetHeight(height)
+local function SidebarWidth(host)
+	local w = host and host.GetWidth and host:GetWidth() or 0
+	if not w or w < 120 then
+		w = 300
 	end
-	host:SetHeight(height)
-	local section = panel and panel.__sfRaidSignupSummarySection
-	if section and section.ReflowRows then
-		section:ReflowRows()
-	end
-	if section and section._NotifyPageReflow then
-		section:_NotifyPageReflow()
-	elseif panel and panel.__sfPageBuilder and panel.__sfPageBuilder.Reflow then
-		panel.__sfPageBuilder:Reflow()
-	end
+	return w
 end
 
-local function GroupColumns(categories)
-	return math.max(1, math.ceil(#(categories or {}) / GROUP_PER_COL))
-end
-
-local function GroupWidth(categories)
-	local cols = GroupColumns(categories)
-	return cols * (ICON + 2) + (cols - 1) * 8
+-- Sidebar column count for the compact class/coverage grids.
+local function SidebarCols(width, pitch)
+	return math.max(1, math.min(5, math.floor((width + 8) / pitch)))
 end
 
 PaintSummary = function(host, planId)
@@ -1241,105 +1215,90 @@ PaintSummary = function(host, planId)
 	local order = ClassOrder()
 	local majorCats = (rs and rs.MAJOR_CATEGORIES) or {}
 	local utilityCats = (rs and rs.UTILITY_CATEGORIES) or {}
+	local w = SidebarWidth(host)
 
-	-- Content-sized height: three balanced class columns beside the coverage
-	-- groups; the shorter class layout no longer reserves a full column.
-	local classRows = math.max(1, math.ceil(#order / 3))
-	local function GroupRows(categories)
-		return math.max(1, math.ceil(#(categories or {}) / GroupColumns(categories)))
-	end
-	local contentRows = math.max(classRows, GroupRows(majorCats), GroupRows(utilityCats))
-	local height = SUMMARY_PAD_TOP + SUMMARY_HEADING_H + SUMMARY_HEADING_GAP
-		+ contentRows * (ICON + 2) + SUMMARY_PAD_BOTTOM
+	local classPitch = ICON + 6 + CLASS_COUNT_WIDTH + 8
+	local iconPitch = ICON + 8
+	local cols = SidebarCols(w, classPitch)
+	local iconCols = SidebarCols(w, iconPitch)
+	local rowH = ICON + 4
+	local classRows = math.max(1, math.ceil(#order / cols))
+	local majorRows = math.max(1, math.ceil(#majorCats / iconCols))
+	local utilityRows = math.max(1, math.ceil(#utilityCats / iconCols))
+	local height = 4 + 16 + classRows * rowH + 10 + 16 + majorRows * rowH + 10 + 16 + utilityRows * rowH + 4
+	host.__sfSummaryContentH = height
 	host:SetHeight(height)
-	SyncSummaryRowHeight(host, height)
+	LayoutBoard(host.__sfRaidSignupPanel)
 
-	-- Build once, then update counts / coverage greys in place so CreateFrame plateaus.
-	if not host.__sfSummaryBuilt then
+	-- Build once per width bucket, then update counts / coverage greys in place.
+	local builtW = host.__sfSummaryBuiltW or 0
+	if not host.__sfSummaryBuilt or math.abs(builtW - w) > 24 then
 		ReleaseHostChildren(host)
-		local classColPitch = ICON + 6 + CLASS_COUNT_WIDTH
-		local classesWidth = classColPitch * 3 + CLASS_COL_GAP * 2
+		host.__sfClassCounts = nil
+		host.__sfClassIcons = nil
+		host.__sfMajorButtons = nil
+		host.__sfUtilityButtons = nil
 
-		local classArea = AcquireFrame(host)
-		classArea:SetPoint("TOPLEFT", host, "TOPLEFT", 0,
-			-(SUMMARY_PAD_TOP + SUMMARY_HEADING_H + SUMMARY_HEADING_GAP))
-		classArea:SetSize(classesWidth, classRows * (ICON + 2))
-		host.__sfClassArea = classArea
-		host.__sfClassCounts = {}
+		local function addTitle(text, y)
+			local t = AcquireFontString(host, "OVERLAY", "GameFontNormal")
+			t:SetPoint("TOPLEFT", host, "TOPLEFT", 0, y)
+			t:SetText(text)
+			return t
+		end
 
-		local classesTitle = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
-		classesTitle:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -SUMMARY_PAD_TOP)
-		classesTitle:SetText(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"))
+		addTitle(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"), -4)
+		local classY = -24
 
-		-- Column-major split keeps CLASS_ORDER reading down each column.
-		local perCol = math.ceil(#order / 3)
+		-- Row-major compact grid: icon + count, CLASS_ORDER preserved.
 		for i = 1, #order do
 			local classFile = order[i]
-			local col = math.ceil(i / perCol)
-			local rowIndex = i - (col - 1) * perCol
-			local x = (col - 1) * (classColPitch + CLASS_COL_GAP)
-			local y = -(rowIndex - 1) * (ICON + 2)
-			local icon = TrackRegionCreate(classArea:CreateTexture(nil, "ARTWORK"))
-			icon:SetSize(ICON, ICON)
-			icon:SetPoint("TOPLEFT", classArea, "TOPLEFT", x, y)
-			icon:SetTexture(TextureForClass(classFile))
-			local count = TrackRegionCreate(classArea:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+			local idx = i - 1
+			local col = idx % cols
+			local rowIndex = math.floor(idx / cols)
+			local x = col * classPitch
+			local y = classY - rowIndex * rowH
+			local icon = MakeIconButton(host, ICON)
+			icon:SetPoint("TOPLEFT", host, "TOPLEFT", x, y)
+			SetIconVisual(icon, TextureForClass(classFile), true, false)
+			host.__sfClassIcons = host.__sfClassIcons or {}
+			host.__sfClassIcons[classFile] = icon
+			local count = AcquireFontString(host, "OVERLAY", "GameFontHighlight")
 			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+			host.__sfClassCounts = host.__sfClassCounts or {}
 			host.__sfClassCounts[classFile] = count
 		end
 
-		local function paintGroup(title, categories, coveredMap, x)
-			local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
-			label:SetPoint("TOPLEFT", host, "TOPLEFT", x, -SUMMARY_PAD_TOP)
-			label:SetText(title)
-			local wrap = AcquireFrame(host)
-			wrap:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
-			wrap:SetSize(GroupWidth(categories) + 8, contentRows * (ICON + 2))
-			local px, py, colW = 0, 0, ICON + 2
-			local perCol = GROUP_PER_COL
+		local function paintGroup(title, categories, coveredMap, y)
+			addTitle(title, y)
 			local buttons = {}
+			local gridY = y - 20
 			for i = 1, #categories do
 				local cat = categories[i]
-				local btn = MakeIconButton(wrap, ICON)
-				btn:SetPoint("TOPLEFT", wrap, "TOPLEFT", px, -py)
+				local idx = i - 1
+				local col = idx % iconCols
+				local rowIndex = math.floor(idx / iconCols)
+				local btn = MakeIconButton(host, ICON)
+				btn:SetPoint("TOPLEFT", host, "TOPLEFT",
+					col * iconPitch, gridY - rowIndex * rowH)
 				SetIconVisual(btn, TextureForCategory(cat), true, not (coveredMap and coveredMap[cat.id]))
 				btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
 				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
 				buttons[cat.id] = btn
-				if (i % perCol) == 0 then
-					px = px + colW + 8
-					py = 0
-				else
-					py = py + ICON + 2
-				end
 			end
-			-- The group label is wider than the icon grid for sparse groups;
-			-- reserve the label width so the next group never overlaps it.
-			local labelW = 0
-			if label.GetStringWidth then
-				labelW = label:GetStringWidth() or 0
-			end
-			local blockW = math.max(GroupWidth(categories) + 8, labelW + 8)
-			return label, buttons, blockW
+			return buttons
 		end
 
-		local majorX = classesWidth + 24
-		local _, majorButtons, majorBlockW = paintGroup(
+		local majorY = classY - classRows * rowH - 10
+		host.__sfMajorButtons = paintGroup(
 			Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
-			majorCats,
-			summary.major,
-			majorX
-		)
-		local utilityX = majorX + majorBlockW + 24
-		local _, utilityButtons = paintGroup(
+			majorCats, summary.major, majorY)
+		local utilityY = majorY - majorRows * rowH - 10
+		host.__sfUtilityButtons = paintGroup(
 			Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
-			utilityCats,
-			summary.utility,
-			utilityX
-		)
-		host.__sfMajorButtons = majorButtons
-		host.__sfUtilityButtons = utilityButtons
+			utilityCats, summary.utility, utilityY)
+
 		host.__sfSummaryBuilt = true
+		host.__sfSummaryBuiltW = w
 	end
 
 	for i = 1, #order do
@@ -1365,25 +1324,6 @@ PaintSummary = function(host, planId)
 	refreshButtons(host.__sfUtilityButtons, summary.utility, rs and rs.UTILITY_CATEGORIES)
 end
 
-local function SyncEntriesRowHeight(host, height)
-	local panel = (host and host.__sfRaidSignupPanel) or Page.panel
-	local row = panel and panel.__sfRaidSignupEntriesRow
-	if row then
-		row.__sfBaseHeight = height
-		row:SetHeight(height)
-	end
-	host:SetHeight(height)
-	local section = panel and panel.__sfRaidSignupEntriesSection
-	if section and section.ReflowRows then
-		section:ReflowRows()
-	end
-	if section and section._NotifyPageReflow then
-		section:_NotifyPageReflow()
-	elseif panel and panel.__sfPageBuilder and panel.__sfPageBuilder.Reflow then
-		panel.__sfPageBuilder:Reflow()
-	end
-end
-
 PaintEntries = function(host, planId, planOpen, caps)
 	-- Preserve focused edit text across pooled rebuilds.
 	local focusedText, focusedCursor = nil, nil
@@ -1404,6 +1344,17 @@ PaintEntries = function(host, planId, planOpen, caps)
 		row:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, y)
 		row:SetHeight(height)
 		builder(row)
+		-- Subtle divider beneath each signup row; created once per pooled row.
+		if not row.__sfRowLine then
+			local line = TrackRegionCreate(row:CreateTexture(nil, "ARTWORK"))
+			line:SetHeight(1)
+			line:SetColorTexture(1, 1, 1, 0.18)
+			row.__sfRowLine = line
+		end
+		row.__sfRowLine:ClearAllPoints()
+		row.__sfRowLine:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 4, 0)
+		row.__sfRowLine:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -4, 0)
+		row.__sfRowLine:Show()
 		y = y - height - 4
 	end
 
@@ -1452,7 +1403,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 			classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
 			local picker = AcquireFrame(row)
 			picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
-			picker:SetSize(500, ICON + 2)
+			picker:SetSize(380, ICON + 2)
 			LayoutPicker(picker, session.draft, {
 				onClass = function(classFile)
 					RS().UpdateDraftField(session.draft, "classFile", classFile)
@@ -1569,7 +1520,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 				classLabel:SetPoint("LEFT", row, "LEFT", 4, -42)
 				local picker = AcquireFrame(row)
 				picker:SetPoint("LEFT", classLabel, "RIGHT", 6, 0)
-				picker:SetSize(520, ICON + 2)
+				picker:SetSize(380, ICON + 2)
 				if editingThis then
 					local draft = session.editing.draft
 					LayoutPicker(picker, draft, {
@@ -1702,7 +1653,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 
 			-- Collapsed: one line — class-colored name, spec icon(s), alt spec
 			-- name + icon, then notes. Clicking an icon opens the editor.
-			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 24))
+			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 20))
 			nameFs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			nameFs:SetTextColor(ClassColor(entry.mainClass))
 			local mainBtn = MakeIconButton(row, ICON)
@@ -1767,7 +1718,7 @@ PaintEntries = function(host, planId, planOpen, caps)
 			end
 			local notesText = entry.notes or ""
 			if notesText ~= "" then
-				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, 40))
+				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, 28))
 				notesFs:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
 				notesFs:SetTextColor(0.6, 0.6, 0.6)
 				anchor = notesFs
@@ -1838,58 +1789,324 @@ PaintEntries = function(host, planId, planOpen, caps)
 		end
 	end
 
-	SyncEntriesRowHeight(host, math.max(24, -y + 4))
+	host.__sfEntriesContentH = math.max(24, -y + 4)
+	host:SetHeight(host.__sfEntriesContentH)
+	if LayoutBoard then
+		LayoutBoard(host.__sfRaidSignupPanel)
+	end
 end
 
-EnsureSummaryHost = function(section)
+local BOARD_ROLE_ORDER = { "tank", "healer", "ranged", "melee" }
+
+local function BoardWidth(host)
+	local w = host and host.GetWidth and host:GetWidth() or 0
+	if not w or w < BOARD_MIN_WIDTH then
+		w = 720
+	end
+	return w
+end
+
+local function ColumnWidths(host)
+	local w = BoardWidth(host)
+	local leftW = math.floor(w * BOARD_LEFT_RATIO)
+	local rightW = w - leftW - BOARD_COL_GAP
+	return leftW, rightW
+end
+
+-- Position chrome and both columns for the current width, then size the row
+-- so the page scroll includes the taller column.
+LayoutBoard = function(panel)
+	local host = panel and panel.__sfRaidSignupBoardHost
+	if not host then
+		return
+	end
+	local leftW, rightW = ColumnWidths(host)
+	local entriesHost = panel.__sfRaidSignupEntriesHost
+	local summaryHost = panel.__sfRaidSignupSummaryHost
+	local entriesH = math.max(24, (entriesHost and entriesHost.__sfEntriesContentH) or 24)
+	local summaryH = math.max(24, (summaryHost and summaryHost.__sfSummaryContentH) or 24)
+	local bodyH = math.max(entriesH, summaryH)
+
+	if panel.__sfRaidSignupSummaryTitle and panel.__sfRaidSignupSummaryTitle.SetPoint then
+		panel.__sfRaidSignupSummaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
+	end
+	if panel.__sfRaidSignupLeftLine then
+		panel.__sfRaidSignupLeftLine:ClearAllPoints()
+		panel.__sfRaidSignupLeftLine:SetPoint("BOTTOMLEFT", host, "TOPLEFT", 0, -20)
+		panel.__sfRaidSignupLeftLine:SetPoint("BOTTOMRIGHT", host, "TOPLEFT", leftW, -20)
+	end
+	if panel.__sfRaidSignupRightLine then
+		panel.__sfRaidSignupRightLine:ClearAllPoints()
+		panel.__sfRaidSignupRightLine:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -20)
+		panel.__sfRaidSignupRightLine:SetPoint("BOTTOMRIGHT", host, "TOPRIGHT", 0, -20)
+	end
+	local plus = panel.__sfRaidSignupAddBtn
+	if plus and plus.SetPoint then
+		plus:ClearAllPoints()
+		plus:SetPoint("TOPRIGHT", host, "TOPLEFT", leftW - 2, -4)
+	end
+	if panel.__sfRaidSignupNickHeader then
+		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -42)
+	end
+	if panel.__sfRaidSignupSpecHeader then
+		panel.__sfRaidSignupSpecHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -42)
+	end
+	if entriesHost then
+		entriesHost:ClearAllPoints()
+		entriesHost:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -BOARD_TOP_H)
+		entriesHost:SetSize(leftW, entriesH)
+	end
+	if summaryHost then
+		summaryHost:ClearAllPoints()
+		summaryHost:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -BOARD_TOP_H)
+		summaryHost:SetSize(rightW, summaryH)
+	end
+	local vdiv = panel.__sfRaidSignupVDivider
+	if vdiv then
+		vdiv:ClearAllPoints()
+		vdiv:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -20)
+		vdiv:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -(BOARD_TOP_H + bodyH))
+	end
+	local status = panel.__sfRaidSignupStatusFs
+	if status then
+		status:ClearAllPoints()
+		status:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -(BOARD_TOP_H + entriesH + 4))
+		if status.SetWidth then
+			status:SetWidth(leftW)
+		end
+	end
+
+	local total = BOARD_TOP_H + bodyH + BOARD_STATUS_H + 6
+	host:SetHeight(total)
+	local row = panel.__sfRaidSignupBoardRow
+	if row then
+		row.__sfBaseHeight = total
+		row:SetHeight(total)
+	end
+	local section = panel.__sfRaidSignupBoardSection
+	if section and section.ReflowRows then
+		section:ReflowRows()
+	end
+	if section and section._NotifyPageReflow then
+		section:_NotifyPageReflow()
+	elseif panel.__sfPageBuilder and panel.__sfPageBuilder.Reflow then
+		panel.__sfPageBuilder:Reflow()
+	end
+end
+
+PaintRoleTotals = function(panel)
+	local role = panel and panel.__sfRaidSignupRole
+	if not role then
+		return
+	end
+	local rs = RS()
+	local entries = rs and rs.GetSortedEntries and rs:GetSortedEntries(CurrentSelectedId()) or {}
+	local totals = nil
+	if rs and rs.BuildRoleTotals then
+		totals = rs.BuildRoleTotals(entries)
+	end
+	totals = totals or { tank = 0, healer = 0, ranged = 0, melee = 0 }
+	for _, key in ipairs(BOARD_ROLE_ORDER) do
+		local slot = role[key]
+		if slot and slot.count and slot.count.SetText then
+			slot.count:SetText(tostring(totals[key] or 0))
+		end
+	end
+end
+
+local function BoardTooltipEnter(self)
+	if self.tooltipTitle or self.tooltipText then
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		if self.tooltipTitle then
+			GameTooltip:SetText(self.tooltipTitle, 1, 1, 1)
+		end
+		if self.tooltipText then
+			GameTooltip:AddLine(self.tooltipText, 0.9, 0.9, 0.9, true)
+		end
+		GameTooltip:Show()
+	end
+end
+
+local function BuildBoardChrome(panel, host)
+	local signupsTitle = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
+	signupsTitle:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -2)
+	signupsTitle:SetText(Loc("RAID_SIGNUP_SECTION_ENTRIES", "Signups"))
+	panel.__sfRaidSignupSignupsTitle = signupsTitle
+
+	local summaryTitle = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
+	summaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
+	summaryTitle:SetText(Loc("RAID_SIGNUP_SECTION_SUMMARY", "Summary"))
+	panel.__sfRaidSignupSummaryTitle = summaryTitle
+
+	local function headingLine()
+		local line = TrackRegionCreate(host:CreateTexture(nil, "ARTWORK"))
+		line:SetHeight(1)
+		line:SetColorTexture(1, 1, 1, 0.28)
+		if line.SetWidth then
+			line:SetWidth(1)
+		end
+		return line
+	end
+	panel.__sfRaidSignupLeftLine = headingLine()
+	panel.__sfRaidSignupRightLine = headingLine()
+	local vdiv = TrackRegionCreate(host:CreateTexture(nil, "ARTWORK"))
+	vdiv:SetColorTexture(1, 1, 1, 0.14)
+	if vdiv.SetWidth then
+		vdiv:SetWidth(1)
+	end
+	panel.__sfRaidSignupVDivider = vdiv
+
+	-- Role totals: white labels, yellow counts, one line.
+	local roleDefs = {
+		{ key = "tank", label = Loc("RAID_SIGNUP_ROLE_TANKS", "Tanks") },
+		{ key = "healer", label = Loc("RAID_SIGNUP_ROLE_HEALERS", "Healers") },
+		{ key = "ranged", label = Loc("RAID_SIGNUP_ROLE_RANGED", "Ranged DPS") },
+		{ key = "melee", label = Loc("RAID_SIGNUP_ROLE_MELEE", "Melee DPS") },
+	}
+	panel.__sfRaidSignupRole = {}
+	local anchor = nil
+	for i, def in ipairs(roleDefs) do
+		if i > 1 then
+			local sep = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+			if anchor then
+				sep:SetPoint("LEFT", anchor, "RIGHT", 12, 0)
+			end
+			sep:SetText("·")
+			sep:SetTextColor(0.6, 0.6, 0.6)
+			anchor = sep
+		end
+		local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+		if anchor then
+			label:SetPoint("LEFT", anchor, "RIGHT", 6, 0)
+		else
+			label:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -26)
+		end
+		label:SetText(def.label .. ":")
+		label:SetTextColor(1, 1, 1)
+		local count = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+		count:SetPoint("LEFT", label, "RIGHT", 4, 0)
+		count:SetText("0")
+		count:SetTextColor(1, 0.82, 0.18)
+		panel.__sfRaidSignupRole[def.key] = { label = label, count = count }
+		anchor = count
+	end
+
+	-- Column headers above the signup rows.
+	local nickHeader = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	nickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -42)
+	nickHeader:SetText(Loc("RAID_SIGNUP_COL_NICKNAME", "Nickname"))
+	nickHeader:SetTextColor(0.8, 0.8, 0.8)
+	panel.__sfRaidSignupNickHeader = nickHeader
+	local specHeader = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	specHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -42)
+	specHeader:SetText(Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
+	specHeader:SetTextColor(0.8, 0.8, 0.8)
+	panel.__sfRaidSignupSpecHeader = specHeader
+
+	-- Dynamic columns and status line.
+	local entriesHost = TrackCreate(CreateFrame("Frame", nil, host))
+	entriesHost.__sfRaidSignupPanel = panel
+	entriesHost.__sfEntriesContentH = 24
+	panel.__sfRaidSignupEntriesHost = entriesHost
+	local summaryHost = TrackCreate(CreateFrame("Frame", nil, host))
+	summaryHost.__sfRaidSignupPanel = panel
+	summaryHost.__sfSummaryContentH = 24
+	panel.__sfRaidSignupSummaryHost = summaryHost
+
+	local statusFs = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	statusFs:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -BOARD_TOP_H)
+	statusFs:SetText("")
+	statusFs:SetTextColor(1, 1, 1)
+	panel.__sfRaidSignupStatusFs = statusFs
+
+	-- Small square "+" button at the right end of the Signups heading.
+	local plus = TrackCreate(CreateFrame("Button", nil, host, "UIPanelButtonTemplate"))
+	plus:SetSize(24, 24)
+	local plusText = TrackRegionCreate(plus:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
+	plusText:SetPoint("CENTER", plus, "CENTER", 0, -1)
+	plusText:SetText("+")
+	plusText:SetTextColor(1, 0.82, 0.18)
+	plus.tooltipTitle = Loc("RAID_SIGNUP_ADD_ROW", "Add signup")
+	plus:SetScript("OnEnter", BoardTooltipEnter)
+	plus:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+	plus:SetScript("OnClick", function()
+		local mod = RS()
+		local selectedId = CurrentSelectedId()
+		if not mod or not selectedId then
+			return
+		end
+		if not (Caps().canCreateEntry and CurrentPlanOpen() and session.draft == nil) then
+			return
+		end
+		session.editing = nil
+		session.altDraft = nil
+		session.draft = mod.MakeDraft(selectedId)
+		QueueRefresh({ force = true })
+	end)
+	panel.__sfRaidSignupAddBtn = plus
+
+	host:SetScript("OnSizeChanged", function(self)
+		local w = self.GetWidth and self:GetWidth() or 0
+		local last = panel.__sfRaidSignupBoardLastW or 0
+		if math.abs(w - last) > 4 then
+			panel.__sfRaidSignupBoardLastW = w
+			QueueRefresh({ force = true })
+		end
+	end)
+end
+
+local function PaintBoardChrome(panel)
+	local plus = panel and panel.__sfRaidSignupAddBtn
+	if plus then
+		local ok = Caps().canCreateEntry and CurrentPlanOpen() and session.draft == nil
+		if ok then
+			if plus.Enable then plus:Enable() end
+		else
+			if plus.Disable then plus:Disable() end
+		end
+	end
+	PaintRoleTotals(panel)
+end
+
+EnsureBoardHost = function(section)
 	local panel = buildPanel or Page.panel
 	if not panel then
 		return
 	end
-	if panel.__sfRaidSignupSummaryHost then
+	if panel.__sfRaidSignupBoardHost then
 		return
 	end
-	panel.__sfRaidSignupSummarySection = section
-	local row = section:AddRow(240, function(rowFrame)
+	panel.__sfRaidSignupBoardSection = section
+	local row = section:AddRow(BOARD_TOP_H + BOARD_STATUS_H + 48, function(rowFrame)
 		local host = TrackCreate(CreateFrame("Frame", nil, rowFrame))
 		host:SetAllPoints()
 		host.__sfRaidSignupPanel = panel
-		panel.__sfRaidSignupSummaryHost = host
-	end)
-	panel.__sfRaidSignupSummaryRow = row
-	if panel.__sfRaidSignupSummaryHost then
+		panel.__sfRaidSignupBoardHost = host
+		BuildBoardChrome(panel, host)
+		PaintBoardChrome(panel)
+		PaintEntries(panel.__sfRaidSignupEntriesHost, CurrentSelectedId(), CurrentPlanOpen(), Caps())
 		PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
-	end
-end
-
-EnsureEntriesHost = function(section)
-	local panel = buildPanel or Page.panel
-	if not panel then
-		return
-	end
-	if panel.__sfRaidSignupEntriesHost then
-		return
-	end
-	panel.__sfRaidSignupEntriesSection = section
-	local row = section:AddRow(220, function(rowFrame)
-		local host = TrackCreate(CreateFrame("Frame", nil, rowFrame))
-		host:SetAllPoints()
-		host.__sfRaidSignupPanel = panel
-		panel.__sfRaidSignupEntriesHost = host
-		PaintEntries(host, CurrentSelectedId(), CurrentPlanOpen(), Caps())
+		PaintRoleTotals(panel)
+		LayoutBoard(panel)
 	end)
-	panel.__sfRaidSignupEntriesRow = row
+	panel.__sfRaidSignupBoardRow = row
+	LayoutBoard(panel)
 end
 
 local function PaintOwnedBoards(panel)
 	-- A paint failure must not take down the whole refresh; log and continue.
 	local ok, err = pcall(function()
-		if panel.__sfRaidSignupSummaryHost then
-			PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
-		end
+		PaintBoardChrome(panel)
 		if panel.__sfRaidSignupEntriesHost then
 			PaintEntries(panel.__sfRaidSignupEntriesHost, CurrentSelectedId(), CurrentPlanOpen(), Caps())
 		end
+		if panel.__sfRaidSignupSummaryHost then
+			PaintSummary(panel.__sfRaidSignupSummaryHost, CurrentSelectedId())
+		end
+		PaintRoleTotals(panel)
+		LayoutBoard(panel)
 	end)
 	if not ok then
 		local detail = tostring(err)
@@ -1908,12 +2125,23 @@ local function WipePageBuilder(panel)
 	end
 	if panel then
 		panel.__sfPageBuilder = nil
-		panel.__sfRaidSignupSummaryHost = nil
+		panel.__sfRaidSignupBoardHost = nil
+		panel.__sfRaidSignupBoardRow = nil
+		panel.__sfRaidSignupBoardSection = nil
 		panel.__sfRaidSignupEntriesHost = nil
+		panel.__sfRaidSignupSummaryHost = nil
+		panel.__sfRaidSignupStatusFs = nil
+		panel.__sfRaidSignupRole = nil
+		panel.__sfRaidSignupAddBtn = nil
+		panel.__sfRaidSignupSignupsTitle = nil
+		panel.__sfRaidSignupSummaryTitle = nil
+		panel.__sfRaidSignupLeftLine = nil
+		panel.__sfRaidSignupRightLine = nil
+		panel.__sfRaidSignupVDivider = nil
+		panel.__sfRaidSignupNickHeader = nil
+		panel.__sfRaidSignupSpecHeader = nil
 		panel.__sfRaidSignupSections = nil
 		panel.__sfRaidSignupMessages = nil
-		panel.__sfRaidSignupSummarySection = nil
-		panel.__sfRaidSignupSummaryRow = nil
 	end
 end
 
@@ -1943,7 +2171,10 @@ local function BuildWithPageBuilder(panel, opts)
 	local def = Definition()
 	panel.__sfRaidSignupSections = {}
 	for _, secDef in ipairs(def.sections or {}) do
-		local section = pageBuilder:AddSection({ title = secDef.title or secDef.id })
+		local section = pageBuilder:AddSection({
+			title = secDef.title or secDef.id,
+			headerless = secDef.headerless == true,
+		})
 		section.__sfRaidSignupView = secDef.view or VIEW_SIGNUP
 		panel.__sfRaidSignupSections[secDef.id] = section
 		for itemIndex, item in ipairs(secDef.items or {}) do
