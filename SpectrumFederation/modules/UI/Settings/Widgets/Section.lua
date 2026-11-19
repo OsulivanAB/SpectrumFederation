@@ -44,12 +44,14 @@ local function NormalizeSectionOptions(titleOrOptions, tooltipText)
 		return {
 			title = titleOrOptions.title,
 			tooltip = titleOrOptions.tooltip,
+			headerless = titleOrOptions.headerless == true,
 		}
 	end
 
 	return {
 		title = titleOrOptions,
 		tooltip = tooltipText,
+		headerless = false,
 	}
 end
 
@@ -95,6 +97,7 @@ function SectionMixin:Init(titleOrOptions)
 	local options = NormalizeSectionOptions(titleOrOptions)
 	self.title = options.title or ""
 	self.tooltipText = options.tooltip or ""
+	self.__sfHeaderless = options.headerless == true
 	self._rows = {}
 	self._contentHeight = 0
 	self.__sfAssignedHeight = nil
@@ -155,11 +158,21 @@ function SectionMixin:Init(titleOrOptions)
 	rightLine:SetPoint("LEFT", titleContainer, "RIGHT", TITLE_GAP, 0)
 	rightLine:SetPoint("RIGHT", header, "RIGHT", 0, 0)
 
+	if self.__sfHeaderless then
+		-- Chromeless section: no title bar, header occupies no height.
+		header:Hide()
+	end
+
 	-- Content container
 	local content = CreateFrame("Frame", nil, self)
 	self.Content = content
-	content:SetPoint("TOPLEFT", header, "BOTTOMLEFT", CONTENT_INSET_X, -CONTENT_PADDING_TOP)
-	content:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", -CONTENT_INSET_X, -CONTENT_PADDING_TOP)
+	if self.__sfHeaderless then
+		content:SetPoint("TOPLEFT", self, "TOPLEFT", CONTENT_INSET_X, -CONTENT_PADDING_TOP)
+		content:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CONTENT_INSET_X, -CONTENT_PADDING_TOP)
+	else
+		content:SetPoint("TOPLEFT", header, "BOTTOMLEFT", CONTENT_INSET_X, -CONTENT_PADDING_TOP)
+		content:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", -CONTENT_INSET_X, -CONTENT_PADDING_TOP)
+	end
 	content:SetHeight(1)
 
 	-- Message row (hidden by default)
@@ -435,7 +448,7 @@ function SectionMixin:ReflowRows()
 	if #fillRows > 0 then
 		local targetContentHeight = nil
 		if self.__sfAssignedHeight then
-			targetContentHeight = math.max(1, self.__sfAssignedHeight - HEADER_HEIGHT - CONTENT_PADDING_TOP - CONTENT_PADDING_BOTTOM)
+			targetContentHeight = math.max(1, self.__sfAssignedHeight - self:_HeaderHeight() - CONTENT_PADDING_TOP - CONTENT_PADDING_BOTTOM)
 		end
 
 		local extra = targetContentHeight and math.max(0, targetContentHeight - baseContentHeight) or 0
@@ -470,6 +483,10 @@ end
 -- Height this section would use without leftover fill-height expansion.
 -- PageBuilder uses this so idle reflows can keep an existing assigned height
 -- instead of shrinking and expanding fill rows on every pass.
+function SectionMixin:_HeaderHeight()
+	return self.__sfHeaderless and 0 or HEADER_HEIGHT
+end
+
 function SectionMixin:GetNaturalHeight()
 	local baseContentHeight = 0
 	local visibleCount = 0
@@ -489,7 +506,7 @@ function SectionMixin:GetNaturalHeight()
 		end
 	end
 
-	return HEADER_HEIGHT + CONTENT_PADDING_TOP + baseContentHeight + CONTENT_PADDING_BOTTOM
+	return self:_HeaderHeight() + CONTENT_PADDING_TOP + baseContentHeight + CONTENT_PADDING_BOTTOM
 end
 
 -- Internal: recalc section frame height based on content
@@ -497,7 +514,7 @@ end
 function SectionMixin:_UpdateHeight()
 	local contentHeight = self.Content:GetHeight() or 0
 	local total =
-		HEADER_HEIGHT
+		self:_HeaderHeight()
 		+ CONTENT_PADDING_TOP
 		+ contentHeight
 		+ CONTENT_PADDING_BOTTOM
