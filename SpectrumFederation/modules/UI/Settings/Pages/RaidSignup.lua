@@ -585,6 +585,13 @@ local function MakeIconButton(parent, size)
 	btn.tooltipText = nil
 	btn.tooltipLines = nil
 	btn.__sfRaidSignupSpecSlot = nil
+	-- Provider-count badges belong to overlay categories only: hide any
+	-- pooled badge so a reused button never shows a stale count. paintOverlays
+	-- re-shows and resizes it for the new category on the same repaint.
+	if btn.__sfProviderBadge then
+		btn.__sfProviderBadge.border:Hide()
+		btn.__sfProviderBadge.bg:Hide()
+	end
 	SafeClearScript(btn, "OnClick")
 	btn:Show()
 	return btn
@@ -1717,16 +1724,16 @@ PaintSummary = function(host, planId)
 				btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
 				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
 				buttons[cat.id] = btn
-				-- Small white provider-count overlay at the bottom-right for
-				-- categories that count eligible signed-up mains. The text is
-				-- parented to the icon button (not the grid host) so it renders
-				-- above the button's ARTWORK texture, and font/draw-layer/
-				-- shadow are reapplied on every pooled acquire.
+				-- Small white provider-count badge at the bottom-right for
+				-- categories that count eligible signed-up mains. The text and
+				-- its dark badge background are parented to the icon button
+				-- (not the grid host) so they render above the button's
+				-- ARTWORK texture, and font/draw-layer/shadow are reapplied on
+				-- every pooled acquire. paintOverlays sizes, positions, and
+				-- shows/hides both on every repaint (zero hides both).
 				if cat.overlay then
 					local overlay = AcquireFontString(btn, "OVERLAY", "GameFontHighlightSmall")
-					overlay:ClearAllPoints()
-					overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 2, 1)
-					overlay:SetText("0")
+					overlay:SetText("")
 					overlay:SetTextColor(1, 1, 1)
 					if overlay.SetDrawLayer then
 						overlay:SetDrawLayer("OVERLAY")
@@ -1826,9 +1833,14 @@ PaintSummary = function(host, planId)
 
 	refreshButtons(host.__sfMajorButtons, summary.major, rs and rs.MAJOR_CATEGORIES)
 	refreshButtons(host.__sfUtilityButtons, summary.utility, rs and rs.UTILITY_CATEGORIES)
-	-- Provider-count overlays: white numbers of eligible signed-up mains,
-	-- shown even at zero. Counts come from BuildSummary's providerCounts.
-	-- The same count (and what it means) is appended to the category tooltip.
+	-- Provider-count badges: a white number on a small dark badge at the
+	-- bottom-right of eligible-category icons, shown only for positive counts
+	-- (zero hides both badge and number; the grey missing-coverage icon stays
+	-- hoverable). Counts come from BuildSummary's providerCounts. The same
+	-- count (and what it means) is appended to the category tooltip. Badge
+	-- size comes from the rendered text plus ~2px horizontal / ~1px vertical
+	-- padding, and both layers are re-anchored, resized, and shown/hidden on
+	-- every repaint so plan changes, deletions, and pooled reuse stay correct.
 	local providerCounts = summary.providerCounts or {}
 	local function paintOverlays(categories, buttons)
 		for i = 1, #(categories or {}) do
@@ -1836,10 +1848,48 @@ PaintSummary = function(host, planId)
 			if cat.overlay then
 				local count = providerCounts[cat.id] or 0
 				local ov = host.__sfProviderOverlays and host.__sfProviderOverlays[cat.id]
-				if ov and ov.SetText then
-					ov:SetText(tostring(count))
-				end
 				local btn = buttons and buttons[cat.id]
+				local badge = btn and btn.__sfProviderBadge
+				if count > 0 and ov and btn then
+					local text = tostring(count)
+					ov:SetText(text)
+					local textW = MeasureFontWidth(ov, text)
+					local textH = (ov.GetStringHeight and ov:GetStringHeight()) or 10
+					local badgeW = textW + 4
+					local badgeH = textH + 2
+					if not badge then
+						-- Border first so the dark fill renders above it; both on
+						-- the OVERLAY layer above the button's ARTWORK icon.
+						local border = TrackRegionCreate(btn:CreateTexture(nil, "OVERLAY"))
+						border:SetColorTexture(1, 1, 1, 0.28)
+						local bg = TrackRegionCreate(btn:CreateTexture(nil, "OVERLAY"))
+						bg:SetColorTexture(0, 0, 0, 0.82)
+						btn.__sfProviderBadge = { border = border, bg = bg }
+						badge = btn.__sfProviderBadge
+					end
+					badge.border:ClearAllPoints()
+					badge.border:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 1, 0)
+					badge.border:SetSize(badgeW + 2, badgeH + 2)
+					badge.border:Show()
+					badge.bg:ClearAllPoints()
+					badge.bg:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 2, 1)
+					badge.bg:SetSize(badgeW, badgeH)
+					badge.bg:Show()
+					ov:ClearAllPoints()
+					ov:SetPoint("CENTER", badge.bg, "CENTER")
+					ov:Show()
+				else
+					if ov then
+						ov:SetText("")
+						if ov.Hide then
+							ov:Hide()
+						end
+					end
+					if badge then
+						badge.border:Hide()
+						badge.bg:Hide()
+					end
+				end
 				if btn then
 					btn.tooltipLines = {
 						string.format(Loc("RAID_SIGNUP_PROVIDER_COUNT_TIP",

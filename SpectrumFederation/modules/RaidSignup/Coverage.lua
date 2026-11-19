@@ -116,10 +116,11 @@ RS.MAJOR_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_DEVO",
         nameDefault = "3% DR (Devo Aura)",
         tipKey = "RAID_SIGNUP_COV_DEVO_TIP",
-        tipDefault = "Devotion Aura — reduces damage taken (Holy and Protection Paladin).",
+        tipDefault = "Devotion Aura — reduces damage taken. All Paladin specs can provide baseline coverage (Retribution swaps aura choice in combat).",
         icon = "Interface\\Icons\\Spell_Holy_DevotionAura",
-        -- Retribution uses Retribution Aura instead of Devotion Aura.
-        providers = { ClassSpecs("PALADIN", 65, 66) },
+        -- Baseline coverage potential: every Paladin spec learns Devotion
+        -- Aura (Retribution may switch auras in combat). Counts mains only.
+        providers = { ClassAll("PALADIN") },
     },
     {
         id = "physical",

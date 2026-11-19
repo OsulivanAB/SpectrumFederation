@@ -837,7 +837,7 @@ RS:UpsertEntry({
     planId = plan3,
     nickname = "Ret",
     mainClass = "PALADIN",
-    mainSpec = 70, -- Retribution: no Devotion Aura
+    mainSpec = 70, -- Retribution: also covers Devotion Aura
 })
 RS:UpsertEntry({
     planId = plan3,
@@ -853,8 +853,29 @@ assertEq(summary.classCounts.PALADIN, 2, "two paladin mains")
 assertEq(summary.classCounts.PRIEST, 0, "zero classes included")
 assertTrue(summary.major.intellect, "mage covers intellect")
 assertTrue(not summary.major.attack_power, "warrior alt does not cover AP")
-assertTrue(summary.major.devo_aura, "holy paladin covers deovo")
--- Ret alone would not; holy does.
+assertTrue(summary.major.devo_aura, "paladin mains cover devo aura")
+
+-- Devotion Aura: all three paladin specs cover it; alts, incomplete drafts,
+-- and deleted entries never contribute.
+do
+    local function devoCovered(entries)
+        local s = RS.BuildSummary(entries)
+        return s.major.devo_aura == true
+    end
+    assertTrue(devoCovered({ { mainClass = "PALADIN", mainSpec = 70 } }),
+        "Retribution-only main covers Devotion Aura")
+    assertTrue(devoCovered({ { mainClass = "PALADIN", mainSpec = 65 } }),
+        "Holy paladin covers Devotion Aura")
+    assertTrue(devoCovered({ { mainClass = "PALADIN", mainSpec = 66 } }),
+        "Protection paladin covers Devotion Aura")
+    assertTrue(not devoCovered({ { mainClass = "MAGE", mainSpec = 62,
+        altClass = "PALADIN", altSpec = 70 } }),
+        "paladin alt does not cover Devotion Aura")
+    assertTrue(not devoCovered({ { mainClass = "PALADIN" } }),
+        "incomplete paladin draft does not cover Devotion Aura")
+    assertTrue(not devoCovered({ { mainClass = "PALADIN", mainSpec = 70, deleted = true } }),
+        "deleted paladin entry does not cover Devotion Aura")
+end
 
 -- Innervate requires resto druid
 assertTrue(not summary.utility.innervate, "no resto druid => no innervate")
@@ -4546,13 +4567,53 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
     end
     assertEq(overlayText("combat_res"), "4", "combat res counts warlock + 3 DKs")
     assertEq(overlayText("dk_grip_amz"), "3", "grip overlay counts Blood, Frost, and Unholy DK mains")
-    assertEq(overlayText("burst_move"), "0", "zero providers still shown")
+    assertEq(overlayText("burst_move"), "", "zero providers show no number")
     for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
         assertEq(overlayColor(id), 1, "overlay count is white: " .. id)
     end
 
+    -- Positive counts show a dark badge sized from the rendered text; zero
+    -- counts hide both badge and number while the icon stays hoverable.
+    local function badgeFor(id)
+        local btn = nil
+        for catId, b in pairs(summaryHost.__sfUtilityButtons or {}) do
+            if catId == id then btn = b end
+        end
+        for catId, b in pairs(summaryHost.__sfMajorButtons or {}) do
+            if catId == id then btn = b end
+        end
+        return btn and btn.__sfProviderBadge or nil, btn
+    end
+    local badge, crBtn = badgeFor("combat_res")
+    assertTrue(badge ~= nil, "positive count has a badge background")
+    assertTrue(badge.bg.IsShown and badge.bg:IsShown(), "badge background visible")
+    assertTrue(badge.border.IsShown and badge.border:IsShown(), "badge border visible")
+    local ovCr = overlays["combat_res"]
+    local textW = ovCr.GetStringWidth and ovCr:GetStringWidth() or 8
+    local bw = badge.bg.GetWidth and badge.bg:GetWidth() or 0
+    local bh = badge.bg.GetHeight and badge.bg:GetHeight() or 0
+    assertTrue(math.abs(bw - (textW + 4)) < 0.01, "badge width sized from text + padding")
+    assertTrue(bh > 0 and bh <= 16, "badge height only slightly larger than the number")
+    local borderW = badge.border.GetWidth and badge.border:GetWidth() or 0
+    assertTrue(borderW > bw, "subtle border sits outside the dark fill")
+    -- The count text is centered on the badge, which hugs the icon's
+    -- bottom-right corner.
+    local anchoredCenter = false
+    for _, pt in ipairs(ovCr._points or {}) do
+        if pt[1] == "CENTER" and pt[3] == "CENTER" then
+            anchoredCenter = true
+        end
+    end
+    assertTrue(anchoredCenter, "count centered inside the badge")
+    local zeroBadge, zeroBtn = badgeFor("burst_move")
+    assertTrue(zeroBadge == nil or not (zeroBadge.bg.IsShown and zeroBadge.bg:IsShown()),
+        "zero count shows no badge background")
+    assertTrue(overlays["burst_move"].IsShown == nil or not overlays["burst_move"]:IsShown(),
+        "zero count hides the number")
+    assertTrue(zeroBtn ~= nil, "zero-count icon button still exists for hover")
+
     -- Overlays render above their icon button's artwork: each overlay is a
-    -- child region of its category button, anchored inside the bottom-right.
+    -- child region of its category button.
     local function overlayBtn(id)
         local ov = overlays[id]
         local parent = ov and ov.GetParent and ov:GetParent() or nil
@@ -4574,14 +4635,6 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
     for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
         local btn = overlayBtn(id)
         assertTrue(btn ~= nil, "overlay parented to its icon button: " .. id)
-        local ov = overlays[id]
-        local anchored = false
-        for _, pt in ipairs(ov._points or {}) do
-            if pt[1] == "BOTTOMRIGHT" and pt[3] == "BOTTOMRIGHT" then
-                anchored = true
-            end
-        end
-        assertTrue(anchored, "overlay anchored bottom-right of icon: " .. id)
         assertTrue(type(btn.tooltipLines) == "table" and #btn.tooltipLines == 1
             and btn.tooltipLines[1]:find("eligible signed-up mains", 1, true) ~= nil,
             "tooltip includes provider count meaning: " .. id)
@@ -4590,6 +4643,18 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
     assertTrue(gripBtn ~= nil and gripBtn.tooltipLines
         and gripBtn.tooltipLines[1]:find("3 eligible", 1, true) ~= nil,
         "Death Grip tooltip shows the three-spec provider count")
+
+    -- Multi-digit counts resize the badge from the rendered text.
+    for i = 1, 6 do
+        add("OvLock" .. i, "WARLOCK", 266)
+    end
+    UIPage:Refresh(panel, { force = true })
+    assertEq(overlayText("combat_res"), "10", "combat res reaches a double-digit count")
+    local badge10 = badgeFor("combat_res")
+    local w10 = badge10 and badge10.bg.GetWidth and badge10.bg:GetWidth() or 0
+    assertTrue(w10 > bw, "multi-digit badge is wider than the single-digit badge")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(overlayText("combat_res"), "10", "badge count stable across repaints")
 
     -- Role totals are the first Summary content, above Classes.
     -- Stub point tuples: { point, relativeTo, relativePoint, x, y }.
@@ -4625,8 +4690,12 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
         end
     end
     UIPage:Refresh(panel, { force = true })
-    assertEq(overlayText("combat_res"), "0", "overlay resets to zero after deletions")
-    assertEq(overlayText("dk_grip_amz"), "0", "grip overlay resets after deletions")
+    assertEq(overlayText("combat_res"), "", "overlay number clears after deletions")
+    assertEq(overlayText("dk_grip_amz"), "", "grip overlay number clears after deletions")
+    local crBtnAfter = overlayBtn("combat_res")
+    assertTrue(crBtnAfter ~= nil and crBtnAfter.__sfProviderBadge ~= nil
+        and not (crBtnAfter.__sfProviderBadge.bg.IsShown and crBtnAfter.__sfProviderBadge.bg:IsShown()),
+        "badge background hides when the count returns to zero")
 
     RS:SelectPlan(tabPlanId)
     UIPage:Refresh(panel, { force = true })
