@@ -3222,15 +3222,19 @@ do
     end
     FindDoneButton(entryHost)
     assertTrue(doneBtn ~= nil, "Done button present in expanded row")
-    -- Done leaves edit mode without touching the entry.
+    -- Done saves pending Name/Notes edits, then leaves edit mode.
     local nickBeforeDone = entriesForAlt[1].nickname
-    local notesBeforeDone = entriesForAlt[1].notes
+    if notesBoxes[1]:IsEnabled() then
+        SimulateUserType(notesBoxes[1], "Saved via Done")
+    else
+        notesBoxes[1]:SetText("Saved via Done", true)
+    end
     doneBtn:GetScript("OnClick")(doneBtn)
     assertTrue(UIPage._GetAltDraftForTests() == nil, "Done clears the alt draft")
     UIPage:Refresh(memberPanel, { force = true })
     local afterDone = RS:GetSortedEntries(tabPlanId)[1]
     assertEq(afterDone.nickname, nickBeforeDone, "Done does not rename the entry")
-    assertEq(afterDone.notes or "", notesBeforeDone or "", "Done does not change notes")
+    assertEq(afterDone.notes or "", "Saved via Done", "Done persists pending notes")
     -- Re-arm the alt picker for the localized class-name checks below.
     UIPage._SetAltDraftForTests({
         entryId = entriesForAlt[1].entryId,

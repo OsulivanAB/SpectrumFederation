@@ -1671,6 +1671,25 @@ PaintEntries = function(host, planId, planOpen, caps)
 				done:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4, -4)
 				done:SetText(Loc("RAID_SIGNUP_DONE", "Done"))
 				done:SetScript("OnClick", function()
+					-- Done saves pending Name/Notes edits (Enter commits individually);
+					-- both fields go in one write so the version check stays valid.
+					if canEdit then
+						local newNick = nickBox:GetText() or ""
+						local newNotes = notesBox:GetText() or ""
+						if newNick ~= (entry.nickname or "") or newNotes ~= (entry.notes or "") then
+							local status, reason = RS():UpsertEntry({
+								entryId = entry.entryId,
+								planId = entry.planId,
+								nickname = newNick,
+								mainClass = entry.mainClass,
+								mainSpec = entry.mainSpec,
+								notes = newNotes,
+								altClass = entry.altClass,
+								altSpec = entry.altSpec,
+							}, { expectedVer = entry.ver })
+							Report(status, reason)
+						end
+					end
 					if editingThis then
 						session.editing = nil
 					else
