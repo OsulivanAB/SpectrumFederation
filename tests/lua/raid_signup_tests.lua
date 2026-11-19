@@ -3639,6 +3639,408 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
 end
 RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
 
+local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
+    -- Collapsed-row actions: notes preview + full-note hover, clickable alt
+    -- dash, in-editor Remove Alt, and the compact delete X.
+    local entriesHost = panel.__sfRaidSignupEntriesHost
+    local boardHost = panel.__sfRaidSignupBoardHost
+    assertTrue(entriesHost ~= nil, "entries host exists for row action checks")
+
+    local function WalkAll(root, fn)
+        local function walk(f)
+            if not f then
+                return
+            end
+            fn(f)
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+            if f.GetRegions then
+                for _, r in ipairs({ f:GetRegions() }) do
+                    walk(r)
+                end
+            end
+        end
+        walk(root)
+    end
+    local function FindButtonsByTooltip(title)
+        local found = {}
+        WalkAll(entriesHost, function(f)
+            if f.GetObjectType and f:GetObjectType() == "Button"
+                and f.tooltipTitle == title then
+                found[#found + 1] = f
+            end
+        end)
+        return found
+    end
+    local function FindHovers()
+        local found = {}
+        WalkAll(entriesHost, function(f)
+            if f.__sfRaidSignupHover then
+                found[#found + 1] = f
+            end
+        end)
+        return found
+    end
+    local function FindFontString(root, text)
+        local found = nil
+        WalkAll(root, function(f)
+            if found then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "FontString"
+                and f.GetText and f:GetText() == text then
+                found = f
+            end
+        end)
+        return found
+    end
+    local function RowHasText(widget, text)
+        local has = false
+        WalkAll(widget, function(f)
+            if has then
+                return
+            end
+            if f.GetObjectType and f:GetObjectType() == "FontString"
+                and f.GetText and f:GetText() == text then
+                has = true
+            end
+        end)
+        return has
+    end
+    local function EntryByNick(nick)
+        for _, e in ipairs(RS:GetSortedEntries(tabPlanId)) do
+            if e.nickname == nick and not e.deleted then
+                return e
+            end
+        end
+        return nil
+    end
+
+    -- Capture GameTooltip output so the real hover handlers can be exercised.
+    local tooltipEvents = {}
+    local savedTooltip = {
+        SetOwner = GameTooltip.SetOwner,
+        SetText = GameTooltip.SetText,
+        AddLine = GameTooltip.AddLine,
+        Show = GameTooltip.Show,
+        Hide = GameTooltip.Hide,
+    }
+    GameTooltip.SetOwner = function() end
+    GameTooltip.SetText = function(_, text)
+        tooltipEvents[#tooltipEvents + 1] = "text:" .. tostring(text)
+    end
+    GameTooltip.AddLine = function(_, text)
+        tooltipEvents[#tooltipEvents + 1] = "line:" .. tostring(text)
+    end
+    GameTooltip.Show = function()
+        tooltipEvents[#tooltipEvents + 1] = "show"
+    end
+    GameTooltip.Hide = function()
+        tooltipEvents[#tooltipEvents + 1] = "hide"
+    end
+    local function TooltipSaw(fullText)
+        local sawText, sawShow = false, false
+        for _, ev in ipairs(tooltipEvents) do
+            if ev == "text:" .. fullText then
+                sawText = true
+            elseif ev == "show" then
+                sawShow = true
+            end
+        end
+        return sawText and sawShow
+    end
+
+    -- 1. Notes: short shown in full, long clipped with the full text on hover,
+    -- pooled rows reset cleanly when the note changes or is removed.
+    assertEq(select(1, RS:UpsertEntry({
+        planId = tabPlanId, nickname = "NoteFull",
+        mainClass = "MAGE", mainSpec = 62, notes = "Short note",
+    })), "accepted", "note test entry created")
+    UIPage:Refresh(panel, { force = true })
+    local noteEntry = EntryByNick("NoteFull")
+    assertTrue(noteEntry ~= nil, "note test entry found")
+    assertTrue(FindFontString(entriesHost, "Short note") ~= nil,
+        "short note displayed in full")
+    local shortHover = nil
+    for _, h in ipairs(FindHovers()) do
+        if h.__sfHoverText == "Short note" then
+            shortHover = h
+            break
+        end
+    end
+    assertTrue(shortHover ~= nil, "short note has a hover region")
+    if shortHover then
+        tooltipEvents = {}
+        shortHover:GetScript("OnEnter")(shortHover)
+        assertTrue(TooltipSaw("Short note"), "hover shows the full short note")
+        shortHover:GetScript("OnLeave")(shortHover)
+        assertTrue(tooltipEvents[#tooltipEvents] == "hide", "hover leave hides tooltip")
+    end
+
+    local longNote = string.rep("x", 120)
+    assertEq(select(1, RS:UpsertEntry({
+        entryId = noteEntry.entryId, planId = tabPlanId,
+        nickname = "NoteFull", mainClass = "MAGE", mainSpec = 62,
+        notes = longNote,
+    }, { expectedVer = noteEntry.ver })), "accepted", "long note saved")
+    UIPage:Refresh(panel, { force = true })
+    local clippedNote = nil
+    WalkAll(entriesHost, function(f)
+        if clippedNote then
+            return
+        end
+        if f.GetObjectType and f:GetObjectType() == "FontString" and f.GetText then
+            local t = f:GetText() or ""
+            if t:sub(1, 1) == "x" and t:sub(-3) == "…" and #t < #longNote then
+                clippedNote = f
+            end
+        end
+    end)
+    assertTrue(clippedNote ~= nil, "long note truncated with ellipsis")
+    local geomNow = panel.__sfEntryGeom
+    local noteBudget = geomNow.leftW - geomNow.notesX - geomNow.rightReserve - 6
+    assertTrue((clippedNote:GetStringWidth() or 0) <= noteBudget,
+        "truncated note fits its allocated region")
+    local longHover = nil
+    for _, h in ipairs(FindHovers()) do
+        if h.__sfHoverText == longNote then
+            longHover = h
+            break
+        end
+    end
+    assertTrue(longHover ~= nil, "truncated note keeps the full text on hover")
+    if longHover then
+        tooltipEvents = {}
+        longHover:GetScript("OnEnter")(longHover)
+        assertTrue(TooltipSaw(longNote), "hover delivers the complete untruncated note")
+    end
+
+    local fresh = EntryByNick("NoteFull")
+    assertEq(select(1, RS:UpsertEntry({
+        entryId = fresh.entryId, planId = tabPlanId,
+        nickname = "NoteFull", mainClass = "MAGE", mainSpec = 62,
+        notes = "Second note",
+    }, { expectedVer = fresh.ver })), "accepted", "note changed on reused row")
+    UIPage:Refresh(panel, { force = true })
+    local secondHover = nil
+    for _, h in ipairs(FindHovers()) do
+        assertTrue(h.__sfHoverText ~= longNote, "no hover retains the previous note")
+        if h.__sfHoverText == "Second note" then
+            secondHover = h
+        end
+    end
+    assertTrue(secondHover ~= nil, "changed note shows its own preview")
+    assertTrue(FindFontString(entriesHost, "Second note") ~= nil,
+        "short replacement note shown in full")
+
+    fresh = EntryByNick("NoteFull")
+    assertEq(select(1, RS:UpsertEntry({
+        entryId = fresh.entryId, planId = tabPlanId,
+        nickname = "NoteFull", mainClass = "MAGE", mainSpec = 62, notes = "",
+    }, { expectedVer = fresh.ver })), "accepted", "note emptied")
+    UIPage:Refresh(panel, { force = true })
+    assertTrue(FindFontString(entriesHost, "Second note") == nil,
+        "empty note shows no preview")
+    for _, h in ipairs(FindHovers()) do
+        assertTrue(h.__sfHoverText ~= "" and h.__sfHoverText ~= "Second note",
+            "empty note leaves no hover text behind")
+    end
+    GameTooltip.SetOwner = savedTooltip.SetOwner
+    GameTooltip.SetText = savedTooltip.SetText
+    GameTooltip.AddLine = savedTooltip.AddLine
+    GameTooltip.Show = savedTooltip.Show
+    GameTooltip.Hide = savedTooltip.Hide
+
+    -- 2. The empty Alt slot is a clickable dash that starts the add-alt workflow.
+    assertEq(select(1, RS:UpsertEntry({
+        planId = tabPlanId, nickname = "DashTest",
+        mainClass = "MAGE", mainSpec = 62,
+    })), "accepted", "dash test entry created")
+    UIPage:Refresh(panel, { force = true })
+    local dashEntry = EntryByNick("DashTest")
+    assertTrue(dashEntry ~= nil, "dash test entry found")
+    local dash = nil
+    for _, b in ipairs(FindButtonsByTooltip("Add alternative")) do
+        if b._parent and RowHasText(b._parent, "DashTest") then
+            dash = b
+            break
+        end
+    end
+    assertTrue(dash ~= nil, "empty alt slot renders a clickable dash")
+    assertTrue(dash ~= nil and dash.GetWidth and dash:GetWidth() >= 22,
+        "dash hit area comparable to the spec icons")
+    if dash then
+        dash:GetScript("OnClick")(dash)
+    end
+    local altDraft = UIPage._GetAltDraftForTests()
+    assertTrue(altDraft ~= nil and altDraft.entryId == dashEntry.entryId,
+        "dash click starts the add-alt workflow for its entry")
+    UIPage._SetAltDraftForTests(nil)
+    UIPage:Refresh(panel, { force = true })
+
+    -- Read-only users cannot mutate through the dash.
+    ActAs("Carol-Garona", "Player-1-Carol")
+    UIPage:Refresh(panel, { force = true })
+    local roDash = nil
+    for _, b in ipairs(FindButtonsByTooltip("Add alternative")) do
+        if b._parent and RowHasText(b._parent, "DashTest") then
+            roDash = b
+            break
+        end
+    end
+    assertTrue(roDash ~= nil, "dash still rendered for read-only users")
+    assertTrue(roDash ~= nil and roDash:IsEnabled() == false,
+        "dash disabled for read-only users")
+    if roDash then
+        roDash:GetScript("OnClick")(roDash)
+    end
+    assertTrue(UIPage._GetAltDraftForTests() == nil,
+        "read-only dash click cannot start an alternative")
+    ActAs("Alice-Garona", "Player-1-Alice")
+    UIPage:Refresh(panel, { force = true })
+
+    -- 3. Remove Alt lives inside the alt editor and preserves the main signup.
+    assertEq(select(1, RS:UpsertEntry({
+        planId = tabPlanId, nickname = "AltTest",
+        mainClass = "MAGE", mainSpec = 62, notes = "keep me",
+        altClass = "WARRIOR", altSpec = 71,
+    })), "accepted", "alt test entry created")
+    UIPage:Refresh(panel, { force = true })
+    local altEntry = EntryByNick("AltTest")
+    assertTrue(altEntry ~= nil, "alt test entry found")
+    -- Add-alt flow (no alternative yet) has no Remove Alt action.
+    UIPage._SetAltDraftForTests({
+        entryId = dashEntry.entryId,
+        draft = RS.MakeAltDraft(dashEntry),
+    })
+    UIPage:Refresh(panel, { force = true })
+    local removeButtons = {}
+    WalkAll(entriesHost, function(f)
+        if f.GetObjectType and f:GetObjectType() == "Button" and f.GetText
+            and f:GetText() == "Remove Alt" then
+            removeButtons[#removeButtons + 1] = f
+        end
+    end)
+    assertEq(#removeButtons, 0, "add-alt editor offers no Remove Alt")
+    -- Alt editor for an entry that has an alternative does.
+    UIPage._SetAltDraftForTests({
+        entryId = altEntry.entryId,
+        draft = RS.MakeAltDraft(altEntry),
+    })
+    UIPage:Refresh(panel, { force = true })
+    removeButtons = {}
+    WalkAll(entriesHost, function(f)
+        if f.GetObjectType and f:GetObjectType() == "Button" and f.GetText
+            and f:GetText() == "Remove Alt" then
+            removeButtons[#removeButtons + 1] = f
+        end
+    end)
+    assertEq(#removeButtons, 1, "alt editor shows Remove Alt")
+    if #removeButtons == 1 then
+        removeButtons[1]:GetScript("OnClick")(removeButtons[1])
+    end
+    local afterRemoval = EntryByNick("AltTest")
+    assertTrue(afterRemoval ~= nil, "main signup survives alt removal")
+    assertEq(afterRemoval.mainClass, "MAGE", "main class preserved")
+    assertEq(afterRemoval.mainSpec, 62, "main spec preserved")
+    assertEq(afterRemoval.nickname, "AltTest", "nickname preserved")
+    assertEq(afterRemoval.notes or "", "keep me", "notes preserved")
+    assertTrue(afterRemoval.altClass == nil, "alternative removed")
+    assertTrue(UIPage._GetAltDraftForTests() == nil, "editor closes after removal")
+    UIPage:Refresh(panel, { force = true })
+
+    -- 4. The compact X keeps the confirmation flow and deletes its entry.
+    assertEq(select(1, RS:UpsertEntry({
+        planId = tabPlanId, nickname = "DeleteMe",
+        mainClass = "MAGE", mainSpec = 62,
+    })), "accepted", "delete test entry created")
+    UIPage:Refresh(panel, { force = true })
+    local delEntry = EntryByNick("DeleteMe")
+    assertTrue(delEntry ~= nil, "delete test entry found")
+    local delX = nil
+    for _, b in ipairs(FindButtonsByTooltip("Delete signup")) do
+        if b._parent and RowHasText(b._parent, "DeleteMe") then
+            delX = b
+            break
+        end
+    end
+    assertTrue(delX ~= nil, "compact delete X rendered")
+    if delX then
+        assertTrue(delX.GetWidth and delX:GetWidth() <= 28,
+            "delete control is compact, not a wide button")
+    end
+    local savedDialogs = SF.SettingsUI.Dialogs
+    local confirmCalls = {}
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, msg, title, commit)
+            confirmCalls[#confirmCalls + 1] = { msg = msg, title = title, commit = commit }
+        end,
+    }
+    if delX then
+        delX:GetScript("OnClick")(delX)
+    end
+    assertEq(#confirmCalls, 1, "delete still asks for confirmation")
+    assertEq(confirmCalls[1] and confirmCalls[1].msg, "Delete this signup entry?",
+        "confirmation text preserved")
+    assertTrue(EntryByNick("DeleteMe") ~= nil, "entry kept until confirmed")
+    if confirmCalls[1] and confirmCalls[1].commit then
+        confirmCalls[1].commit()
+        UIPage:Refresh(panel, { force = true })
+        assertTrue(EntryByNick("DeleteMe") == nil, "confirmed delete removes the entry")
+    end
+    SF.SettingsUI.Dialogs = savedDialogs
+
+    -- 5. Geometry: hover region and X stay inside the signup column, separated
+    -- from the note preview, at the current and a narrow width.
+    for _, width in ipairs({ nil, 548 }) do
+        boardHost._w = width
+        UIPage:Refresh(panel, { force = true })
+        local g = panel.__sfEntryGeom
+        assertTrue(g ~= nil, "row geometry present at width " .. tostring(width))
+        if not g then
+            break
+        end
+        assertEq(g.rightReserve, 28, "only the compact X is reserved")
+        local anyHover = nil
+        for _, h in ipairs(FindHovers()) do
+            if h.__sfHoverText and h.__sfHoverText ~= "" then
+                anyHover = h
+                break
+            end
+        end
+        if anyHover then
+            local rightX = nil
+            for _, pt in ipairs(anyHover._points or {}) do
+                if pt[1] == "BOTTOMRIGHT" then
+                    rightX = pt[4]
+                end
+            end
+            assertEq(rightX, -(28 + 4),
+                "note hover region clears the delete X at width " .. tostring(width))
+        end
+        local xs = FindButtonsByTooltip("Delete signup")
+        assertTrue(#xs >= 1, "delete X present at width " .. tostring(width))
+        if #xs < 1 then
+            break
+        end
+        local xRight = nil
+        for _, pt in ipairs(xs[1]._points or {}) do
+            if pt[1] == "RIGHT" then
+                xRight = pt[4]
+            end
+        end
+        assertEq(xRight, -4, "delete X hugs the row's right edge")
+        assertTrue(g.notesX + 24 <= g.leftW - 28,
+            "notes region and X do not overlap at width " .. tostring(width))
+    end
+    boardHost._w = nil
+    UIPage:Refresh(panel, { force = true })
+end
+RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
+
     -- Two hosts (Blizzard Settings panel + standalone window) each get rebuilt
     -- and refreshed; hosts keep their own panel association.
     local savedPanels = UIPage._builtPanels

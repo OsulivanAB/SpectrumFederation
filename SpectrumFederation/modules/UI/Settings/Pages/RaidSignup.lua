@@ -408,6 +408,8 @@ end
 
 local iconButtonPool = {}
 local textButtonPool = {}
+local rowButtonPool = {}
+local hoverPool = {}
 local framePool = {}
 local editPool = {}
 local fontStringPool = {}
@@ -588,6 +590,16 @@ local function ReleaseHostChildren(host)
 				ReleasePooled(child, iconButtonPool, "icon")
 			elseif kind == "text" then
 				ReleasePooled(child, textButtonPool, "text")
+			elseif kind == "rowbtn" then
+				ReleasePooled(child, rowButtonPool, "rowbtn")
+			elseif kind == "hover" then
+				-- Never leave a pooled note tooltip orphaned on reuse.
+				if child.__sfHoverText ~= nil then
+					GameTooltip:Hide()
+				end
+				child.__sfHoverText = nil
+				child.__sfRaidSignupHover = nil
+				ReleasePooled(child, hoverPool, "hover")
 			elseif kind == "edit" then
 				ReleasePooled(child, editPool, "edit")
 			elseif kind == "frame" then
@@ -682,7 +694,8 @@ local function ClipDisplay(text, maxChars)
 	return text
 end
 
-local ENTRY_ACTION_W = 4 + 70 + 8 + 90 -- right margin + Delete + gap + alt action
+local ENTRY_ACTION_W = 4 + 24 -- right margin + compact delete X
+local ENTRY_BTN = 24 -- hit target for the Alt dash and delete row buttons
 local ENTRY_CHAR_W = 7 -- fallback estimate for GameFontHighlight text
 
 -- Rendered width of a fontstring's text (GetStringWidth when available).
@@ -772,6 +785,73 @@ local function AcquireTextButton(parent)
 	SafeClearScript(btn, "OnClick")
 	btn:Show()
 	return btn
+end
+
+-- Small glyph row button (Alt dash / delete X): pooled, tooltip-capable,
+-- with the same stable OnEnter/OnLeave pattern as the spec icons.
+local function AcquireRowButton(parent)
+	local btn = AcquirePooled(rowButtonPool, function()
+		local b = TrackCreate(CreateFrame("Button", nil, parent))
+		b.__sfRaidSignupOwned = true
+		b.__sfPoolKind = "rowbtn"
+		local label = TrackRegionCreate(b:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
+		label:SetPoint("CENTER", b, "CENTER", 0, -1)
+		b.rowLabel = label
+		b:SetScript("OnEnter", function(self)
+			if self.tooltipTitle or self.tooltipText then
+				GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+				if self.tooltipTitle then
+					GameTooltip:SetText(self.tooltipTitle, 1, 1, 1)
+				end
+				if self.tooltipText then
+					GameTooltip:AddLine(self.tooltipText, 0.9, 0.9, 0.9, true)
+				end
+				GameTooltip:Show()
+			end
+		end)
+		b:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+		return b
+	end)
+	btn.__sfRaidSignupOwned = true
+	btn.__sfPoolKind = "rowbtn"
+	btn.tooltipTitle = nil
+	btn.tooltipText = nil
+	btn:SetParent(parent)
+	SafeClearScript(btn, "OnClick")
+	btn:Show()
+	return btn
+end
+
+-- Mouse-enabled hover target over a collapsed row's note preview. FontStrings
+-- cannot take frame scripts, so the full saved note is shown from this region.
+local function AcquireNotesHover(parent)
+	local hover = AcquirePooled(hoverPool, function()
+		local f = TrackCreate(CreateFrame("Frame", nil, parent))
+		f.__sfRaidSignupOwned = true
+		f.__sfPoolKind = "hover"
+		f:EnableMouse(true)
+		f:SetScript("OnEnter", function(self)
+			local text = self.__sfHoverText
+			if text and text ~= "" then
+				GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+				GameTooltip:SetText(text, 0.9, 0.9, 0.9)
+				GameTooltip:Show()
+			end
+		end)
+		f:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+		return f
+	end)
+	hover.__sfRaidSignupOwned = true
+	hover.__sfPoolKind = "hover"
+	hover.__sfHoverText = nil
+	hover.__sfRaidSignupHover = nil
+	hover:SetParent(parent)
+	hover:Show()
+	return hover
 end
 
 local function SafeSetEditText(edit, text)
@@ -1800,13 +1880,32 @@ PaintEntries = function(host, planId, planOpen, caps)
 					end
 					QueueRefresh({ force = true })
 				end)
+				-- Alt editor only: removing the alternative preserves the main
+				-- signup and reuses the same version-checked removal operation.
+				local isAltEditor = altThis
+					or (editingThis and session.editing and session.editing.slot == "alt")
+				if isAltEditor and entry.altClass and canEdit then
+					local rmAlt = AcquireTextButton(row)
+					rmAlt:SetSize(84, 20)
+					rmAlt:SetPoint("RIGHT", done, "LEFT", -6, 0)
+					rmAlt:SetText(Loc("RAID_SIGNUP_REMOVE_ALT", "Remove Alt"))
+					rmAlt:SetScript("OnClick", function()
+						local status, reason = RS():RemoveAlternative(entry.entryId, {
+							expectedVer = entry.ver,
+						})
+						Report(status, reason)
+						session.altDraft = nil
+						session.editing = nil
+						QueueRefresh({ force = true })
+					end)
+				end
 				yOff = yOff + bandH + 4
 				return yOff
 			end
 
-			-- Collapsed: fixed columns — Nickname, Main icon, Alt icon (or a muted
-			-- dash), then notes; Remove Alt / Delete stay right-aligned. Clicking an
-			-- icon opens the editor for that slot. Columns come from the shared
+			-- Collapsed: fixed columns — Nickname, Main icon, Alt icon (or a clickable
+			-- muted dash), note preview, compact delete X. Clicking an icon or the
+			-- dash opens the editor for that slot. Columns come from the shared
 			-- geometry so rows and headings always agree.
 			local nameFs = AcquireFieldLabel(row, entry.nickname or "")
 			ClipToWidth(nameFs, entry.nickname or "", geom.nickW)
@@ -1866,28 +1965,64 @@ PaintEntries = function(host, planId, planOpen, caps)
 					QueueRefresh({ force = true })
 				end)
 			else
-				-- No alternate: muted dash keeps the Alt column aligned; adding one
-				-- still goes through the Add an Alt? action below.
-				local dash = AcquireFieldLabel(row, "—")
+				-- No alternate: a muted, clickable dash keeps the Alt column aligned
+				-- and starts the add-alt workflow; read-only users get it disabled.
+				local dash = AcquireRowButton(row)
+				dash:SetSize(ENTRY_BTN, ENTRY_BTN)
 				dash:SetPoint("LEFT", row, "LEFT", geom.altX, 0)
-				dash:SetTextColor(0.5, 0.5, 0.5)
+				if dash.rowLabel then
+					dash.rowLabel:SetText("—")
+					dash.rowLabel:SetTextColor(0.5, 0.5, 0.5)
+				end
+				dash.tooltipTitle = Loc("RAID_SIGNUP_TIP_ADD_ALT", "Add alternative")
+				if canEdit then
+					dash:Enable()
+				else
+					dash:Disable()
+				end
+				dash:SetScript("OnClick", function()
+					if not canEdit then
+						return
+					end
+					session.draft = nil
+					session.editing = nil
+					session.altDraft = {
+						entryId = entry.entryId,
+						draft = RS().MakeAltDraft(entry),
+					}
+					QueueRefresh({ force = true })
+				end)
 			end
+			-- The compact X is the only reserved action, so notes get the space
+			-- between the Alt slot and the delete button.
+			local showActions = planOpen and canEdit
+			local notesReserve = showActions and ENTRY_ACTION_W or 8
 			local notesText = entry.notes or ""
 			if notesText ~= "" then
-				-- Clip notes to the rendered space left of the action buttons so
-				-- long text never runs under Remove Alt / Delete.
-				local showActions = planOpen and canEdit
-				local notesBudget = geom.leftW - geom.notesX - (showActions and ENTRY_ACTION_W or 8) - 6
+				-- Clip notes to the rendered space left of the delete X so long
+				-- text never runs under it; the full note stays on hover.
+				local notesBudget = geom.leftW - geom.notesX - notesReserve - 6
 				local notesFs = AcquireFieldLabel(row, notesText)
-				ClipToWidth(notesFs, notesText, notesBudget)
+				ClipToWidth(notesFs, notesText, math.max(24, notesBudget))
 				notesFs:SetPoint("LEFT", row, "LEFT", geom.notesX, 0)
 				notesFs:SetTextColor(0.6, 0.6, 0.6)
+				local hover = AcquireNotesHover(row)
+				hover.__sfRaidSignupHover = true
+				hover.__sfHoverText = notesText
+				hover:ClearAllPoints()
+				hover:SetPoint("TOPLEFT", row, "TOPLEFT", geom.notesX, -3)
+				hover:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -(notesReserve + 4), 3)
 			end
-			if planOpen and canEdit then
-				local del = AcquireTextButton(row)
-				del:SetSize(70, 20)
+			if showActions then
+				local del = AcquireRowButton(row)
+				del:SetSize(ENTRY_BTN, ENTRY_BTN)
 				del:SetPoint("RIGHT", row, "RIGHT", -4, 0)
-				del:SetText(Loc("RAID_SIGNUP_DELETE", "Delete"))
+				if del.rowLabel then
+					del.rowLabel:SetText("×")
+					del.rowLabel:SetTextColor(1, 0.2, 0.2)
+				end
+				del.tooltipTitle = Loc("RAID_SIGNUP_TIP_DELETE", "Delete signup")
+				del:Enable()
 				del:SetScript("OnClick", function()
 					local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 					local msg = Loc("RAID_SIGNUP_DELETE_CONFIRM",
@@ -1904,29 +2039,6 @@ PaintEntries = function(host, planId, planOpen, caps)
 						commit()
 					end
 				end)
-				local altAction = AcquireTextButton(row)
-				altAction:SetSize(90, 20)
-				altAction:SetPoint("RIGHT", del, "LEFT", -8, 0)
-				if not entry.altClass then
-					altAction:SetText(Loc("RAID_SIGNUP_ADD_ALT", "Add an Alt?"))
-					altAction:SetScript("OnClick", function()
-						session.draft = nil
-						session.editing = nil
-						session.altDraft = {
-							entryId = entry.entryId,
-							draft = RS().MakeAltDraft(entry),
-						}
-						QueueRefresh({ force = true })
-					end)
-				else
-					altAction:SetText(Loc("RAID_SIGNUP_REMOVE_ALT", "Remove Alt"))
-					altAction:SetScript("OnClick", function()
-						local status, reason = RS():RemoveAlternative(entry.entryId, {
-							expectedVer = entry.ver,
-						})
-						Report(status, reason)
-					end)
-				end
 			end
 		end)
 	end
