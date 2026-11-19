@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.23-beta.2] - 2026-11-19
+
+### Changed
+- Hide same-main alts in Alt suggestions
+
 ## [1.5.22-beta.1] - 2026-11-19
 
 ### Fixed
