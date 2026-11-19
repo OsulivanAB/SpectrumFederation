@@ -492,6 +492,7 @@ function RS.ClonePlan(plan)
         createdBy = plan.createdBy,
         ver = plan.ver and { n = plan.ver.n, w = plan.ver.w } or nil,
         at = tonumber(plan.at) or 0,
+        createdAt = tonumber(plan.createdAt) or 0,
     }
 end
 
@@ -534,6 +535,7 @@ function RS.SanitizePlan(plan)
         createdBy = plan.createdBy,
         ver = { n = tonumber(plan.ver.n), w = tostring(plan.ver.w) },
         at = tonumber(plan.at) or 0,
+        createdAt = tonumber(plan.createdAt) or 0,
     }, nil
 end
 
@@ -599,6 +601,16 @@ function RS.MergePlan(record, plan, opts)
         return "rejected", err or "malformed"
     end
     local prev = record.plans[clean.planId]
+    -- Creation time is immutable once known: metadata updates (rename,
+    -- activation, edits, gossip) must never erase or replace it. Plans first
+    -- seen without the field (legacy saves, older clients) keep 0 and fall
+    -- back to deterministic plan-ID ordering for default selection.
+    if type(prev) == "table" then
+        local prevCreated = tonumber(prev.createdAt) or 0
+        if prevCreated > 0 then
+            clean.createdAt = prevCreated
+        end
+    end
     if opts.remote then
         local okRev, revReason = RS.RemoteRevisionPlausible(prev and prev.ver, clean.ver)
         if not okRev then
@@ -708,6 +720,45 @@ function RS.MergeEntry(record, entry, opts)
 
     record.entries[clean.entryId] = clean
     return "accepted", opts.remote and "remote" or "local"
+end
+
+--- Default viewed sheet: the most recently created active plan, falling back
+--- to the most recently created inactive plan when none are active. Creation
+-- time (`createdAt`) orders plans; equal times break ties by plan ID so the
+-- result is deterministic. Plans without creation metadata (legacy saves,
+-- older clients) all share createdAt 0 and order by plan ID — their original
+-- creation time is unknown and is not reconstructed.
+function RS.PickDefaultPlanId(record)
+    if type(record) ~= "table" or type(record.plans) ~= "table" then
+        return nil
+    end
+    local bestActive, bestInactive = nil, nil
+    for _, plan in pairs(record.plans) do
+        if type(plan) == "table" and type(plan.planId) == "string" then
+            local created = tonumber(plan.createdAt) or 0
+            local function isBetter(candCreated, candId, cur)
+                if type(cur) ~= "table" then
+                    return true
+                end
+                local curCreated = tonumber(cur.createdAt) or 0
+                if candCreated ~= curCreated then
+                    return candCreated > curCreated
+                end
+                return tostring(candId) < tostring(cur.planId)
+            end
+            if plan.archived then
+                if isBetter(created, plan.planId, bestInactive) then
+                    bestInactive = plan
+                end
+            else
+                if isBetter(created, plan.planId, bestActive) then
+                    bestActive = plan
+                end
+            end
+        end
+    end
+    local best = bestActive or bestInactive
+    return best and best.planId or nil
 end
 
 function RS.ListPlans(record, opts)

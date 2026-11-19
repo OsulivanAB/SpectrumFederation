@@ -52,6 +52,10 @@ local session = {
 	view = "signup", -- "signup" | "manage" (manage is officer-only)
 	newPlanName = "",
 	renamePlanName = "",
+	-- Default-selection state for the page-opening boundary (session-only).
+	openDefaultPending = false,
+	visitExplicitSelection = false,
+	noActiveNotice = false,
 	openCount = 0,
 	refreshCount = 0,
 	fullRebuildCount = 0,
@@ -69,6 +73,10 @@ local buildPanel = nil
 local uiHooked = false
 local officerHooked = false
 local typingFocus = nil
+
+-- Forward-declared so the early UI listener can use the plan helpers.
+local CurrentPlans, CurrentSelectedId, CurrentSelectedPlan, CurrentPlanOpen
+local ApplyDefaultSelection
 
 local ICON = 22
 local ICON_GAP = 4
@@ -238,6 +246,16 @@ local function EnsureUIListener()
 		end
 		if session.altDraft then
 			session.altDraft = nil
+		end
+		-- Guild data may arrive after the page opened: apply the opening
+		-- default once, unless the user already picked a sheet explicitly.
+		if session.openDefaultPending and not session.visitExplicitSelection then
+			ApplyDefaultSelection()
+		end
+		-- A sheet that became inactive locks immediately: end any editing
+		-- state and discard unsaved drafts (saved entries stay untouched).
+		if not CurrentPlanOpen() then
+			DiscardEphemeral()
 		end
 		QueueRefresh({ force = not HasTypingFocus() })
 	end)
@@ -1026,17 +1044,17 @@ local function LayoutPicker(host, draft, opts, width)
 	return height
 end
 
-local function CurrentPlans()
+CurrentPlans = function()
 	local rs = RS()
 	return rs and rs.GetSortedPlans and rs:GetSortedPlans(true) or {}
 end
 
-local function CurrentSelectedId()
+CurrentSelectedId = function()
 	local rs = RS()
 	return rs and rs.GetSelectedPlanId and rs:GetSelectedPlanId() or nil
 end
 
-local function CurrentSelectedPlan()
+CurrentSelectedPlan = function()
 	local selectedId = CurrentSelectedId()
 	local plans = CurrentPlans()
 	for i = 1, #plans do
@@ -1047,9 +1065,41 @@ local function CurrentSelectedPlan()
 	return nil
 end
 
-local function CurrentPlanOpen()
+CurrentPlanOpen = function()
 	local plan = CurrentSelectedPlan()
 	return plan ~= nil and not plan.archived
+end
+
+-- Page-opening default: the newest-created active sheet, falling back to the
+-- newest-created inactive sheet (viewed read-only with the "No active
+-- signups" notice). Only the open boundary and the late-data path (guild
+-- record arriving after open) call this; ordinary refreshes, tab switches,
+-- and gossip updates never re-apply it over a valid selection.
+ApplyDefaultSelection = function()
+	local mod = RS()
+	if not mod or not Caps().canRead then
+		return false
+	end
+	local record = mod.GetActiveGuildRecord and mod:GetActiveGuildRecord() or nil
+	if type(record) ~= "table" or type(record.plans) ~= "table" then
+		-- Guild data not available yet: stay pending for the UI listener.
+		return false
+	end
+	local hasPlans = false
+	for _ in pairs(record.plans) do
+		hasPlans = true
+		break
+	end
+	if not hasPlans then
+		return false
+	end
+	session.openDefaultPending = false
+	local defaultId = mod.PickDefaultPlanId and mod.PickDefaultPlanId(record) or nil
+	if defaultId and defaultId ~= CurrentSelectedId() then
+		DiscardEphemeral()
+		mod:SelectPlan(defaultId)
+	end
+	return true
 end
 
 local function CurrentPlanOptions()
@@ -1059,17 +1109,20 @@ local function CurrentPlanOptions()
 		local p = plans[i]
 		local label = p.name
 		if p.archived then
-			label = label .. Loc("RAID_SIGNUP_ARCHIVED_SUFFIX", " (archived)")
+			label = label .. Loc("RAID_SIGNUP_PLAN_INACTIVE_TAG", " (Inactive)")
+		else
+			label = label .. Loc("RAID_SIGNUP_PLAN_ACTIVE_TAG", " (Active)")
 		end
 		planOptions[#planOptions + 1] = { value = p.planId, label = label }
 	end
 	return planOptions
 end
 
-local function MakePlanDropdownItem()
+local function MakePlanDropdownItem(labelKey, labelDefault, itemId)
 	return {
 		type = "dropdown",
-		label = Loc("RAID_SIGNUP_PLAN_SELECT", "Active plan"),
+		id = itemId,
+		label = Loc(labelKey, labelDefault),
 		get = function()
 			return CurrentSelectedId()
 		end,
@@ -1079,6 +1132,9 @@ local function MakePlanDropdownItem()
 				return
 			end
 			DiscardEphemeral()
+			-- An explicit user selection ends the opening default for this visit.
+			session.visitExplicitSelection = true
+			session.openDefaultPending = false
 			mod:SelectPlan(value)
 			QueueRefresh({ force = true })
 		end,
@@ -1166,14 +1222,23 @@ local function SyncFeedback(panel, view)
 	-- Signup view feedback renders beneath the signup list, not in a section header.
 	local fs = panel.__sfRaidSignupStatusFs
 	if fs and fs.SetText then
-		if view == VIEW_SIGNUP and session.status and session.status ~= "" then
-			fs:SetText(session.status)
+		local noticeText, noticeKind = nil, nil
+		if view == VIEW_SIGNUP then
+			if session.status and session.status ~= "" then
+				noticeText, noticeKind = session.status, session.statusKind
+			elseif session.noActiveNotice then
+				noticeText = Loc("RAID_SIGNUP_NO_ACTIVE", "No active signups")
+				noticeKind = "warn"
+			end
+		end
+		if noticeText then
+			fs:SetText(noticeText)
 			local r, g, b = 1, 1, 1
-			if session.statusKind == "error" then
+			if noticeKind == "error" then
 				r, g, b = 1, 0.25, 0.25
-			elseif session.statusKind == "success" then
+			elseif noticeKind == "success" then
 				r, g, b = 0.25, 1, 0.25
-			elseif session.statusKind == "warn" then
+			elseif noticeKind == "warn" then
 				r, g, b = 1, 0.82, 0
 			end
 			if fs.SetTextColor then fs:SetTextColor(r, g, b) end
@@ -1198,6 +1263,21 @@ local function SyncChrome(panel)
 		session.view = VIEW_SIGNUP
 	end
 	local view = (session.view == VIEW_MANAGE) and VIEW_MANAGE or VIEW_SIGNUP
+
+	-- Derived read-only notice: the viewed sheet is inactive and no active
+	-- sheets exist (the all-inactive opening fallback).
+	session.noActiveNotice = false
+	local selPlan = CurrentSelectedPlan()
+	if selPlan and selPlan.archived then
+		local anyActive = false
+		for _, p in ipairs(CurrentPlans()) do
+			if p and not p.archived then
+				anyActive = true
+				break
+			end
+		end
+		session.noActiveNotice = not anyActive
+	end
 
 	local sections = panel.__sfRaidSignupSections
 	if sections then
@@ -1266,6 +1346,9 @@ local function SubmitCreatePlan(text)
 		-- Creating a plan switches selection; never carry an in-progress
 		-- signup/edit draft into the new roster.
 		DiscardEphemeral()
+		-- Creation is an explicit selection; the opening default ends here.
+		session.visitExplicitSelection = true
+		session.openDefaultPending = false
 		mod:SelectPlan(planId)
 	end
 end
@@ -1283,7 +1366,7 @@ local function Definition()
 				headerless = true,
 				title = Loc("RAID_SIGNUP_SECTION_PLAN", "Roster plan"),
 				items = {
-					MakePlanDropdownItem(),
+					MakePlanDropdownItem("RAID_SIGNUP_PLAN_VIEWING", "Viewing signup", "raidSignupPlanSelectSignup"),
 				},
 			},
 			{
@@ -1291,7 +1374,7 @@ local function Definition()
 				view = VIEW_MANAGE,
 				title = Loc("RAID_SIGNUP_SECTION_PLANS", "Roster plans"),
 				items = {
-					MakePlanDropdownItem(),
+					MakePlanDropdownItem("RAID_SIGNUP_PLAN_SIGNUP", "Signup", "raidSignupPlanSelectManage"),
 					{
 						type = "editbox_button",
 						label = Loc("RAID_SIGNUP_PLAN_CREATE", "Create plan"),
@@ -1344,36 +1427,40 @@ local function Definition()
 							local selectedPlan = CurrentSelectedPlan()
 							if selectedPlan and selectedPlan.archived then
 								return Loc("RAID_SIGNUP_TIP_RENAME_ARCHIVED",
-									"Archived plans are read-only. Reopen the plan before renaming.")
+									"Inactive sheets are read-only. Set the sheet Active before renaming.")
 							end
 							return nil
 						end,
 					},
 					{
-						type = "button",
-						label = Loc("RAID_SIGNUP_PLAN_ARCHIVE", "Archive / reopen"),
-						buttonText = function()
+						type = "checkbox",
+						id = "raidSignupActiveToggle",
+						label = Loc("RAID_SIGNUP_PLAN_ACTIVE", "Active"),
+						tooltip = Loc("RAID_SIGNUP_TIP_ACTIVE_TOGGLE",
+							"Active sheets can be edited by their creator or officers. Inactive sheets stay viewable but read-only for everyone until set Active again."),
+						get = function()
 							local selectedPlan = CurrentSelectedPlan()
-							if selectedPlan and selectedPlan.archived then
-								return Loc("RAID_SIGNUP_PLAN_REOPEN_BTN", "Reopen")
-							end
-							return Loc("RAID_SIGNUP_PLAN_ARCHIVE_BTN", "Archive")
+							return selectedPlan ~= nil and not selectedPlan.archived
 						end,
-						enabled = function()
-							return Caps().canManagePlans and CurrentSelectedPlan() ~= nil
-						end,
-						onClick = function()
+						set = function(value)
 							local mod = RS()
 							local selectedId = CurrentSelectedId()
 							local selectedPlan = CurrentSelectedPlan()
 							if not mod or not selectedId or not selectedPlan then
 								return
 							end
-							local status, reason = mod:SetPlanArchived(selectedId, not selectedPlan.archived, {
+							-- Checked means Active; the persisted flag is archived.
+							local status, reason = mod:SetPlanArchived(selectedId, not value, {
 								expectedVer = selectedPlan.ver,
 							})
 							Report(status, reason)
-							DiscardEphemeral()
+							if status == "accepted" then
+								DiscardEphemeral()
+							end
+						end,
+						enabled = function()
+							-- Usable for the selected sheet whether active or inactive.
+							return Caps().canManagePlans and CurrentSelectedPlan() ~= nil
 						end,
 					},
 				},
@@ -2923,6 +3010,8 @@ local function BuildWithPageBuilder(panel, opts)
 					controls:AddButton(section, item)
 				elseif controls and item.type == "dropdown" then
 					controls:AddDropdown(section, item)
+				elseif controls and item.type == "checkbox" then
+					controls:AddCheckbox(section, item)
 				elseif controls and item.type == "editbox_button" then
 					controls:AddEditBoxWithButton(section, item)
 				end
@@ -2955,6 +3044,12 @@ function Page:Build(panel)
 	if panel.HookScript and not panel.__sfRaidSignupHook then
 		panel.__sfRaidSignupHook = true
 		panel:HookScript("OnShow", function()
+			-- Genuine page opening: pick the default sheet (newest-created
+			-- active, else newest-created inactive). Refreshes, resizes, tab
+			-- switches, and gossip updates never re-apply it.
+			session.openDefaultPending = true
+			session.visitExplicitSelection = false
+			ApplyDefaultSelection()
 			QueueRefresh({ force = true })
 		end)
 		panel:HookScript("OnHide", function()
@@ -3013,6 +3108,9 @@ function Page._ResetSessionForTests()
 	session.view = VIEW_SIGNUP
 	session.newPlanName = ""
 	session.renamePlanName = ""
+	session.openDefaultPending = false
+	session.visitExplicitSelection = false
+	session.noActiveNotice = false
 	session.frameCreateCount = 0
 	session.frameReuseCount = 0
 	session.regionCreateCount = 0
@@ -3026,6 +3124,9 @@ function Page._GetDefinitionSnapshotForTests()
 	return {
 		selectedId = CurrentSelectedId(),
 		planOpen = CurrentPlanOpen(),
+		noActiveNotice = session.noActiveNotice,
+		openDefaultPending = session.openDefaultPending,
+		visitExplicitSelection = session.visitExplicitSelection,
 		canCreateEntry = Caps().canCreateEntry,
 		canManagePlans = Caps().canManagePlans,
 		planOptions = CurrentPlanOptions(),
@@ -3034,6 +3135,35 @@ function Page._GetDefinitionSnapshotForTests()
 			and not (CurrentSelectedPlan() and CurrentSelectedPlan().archived),
 		view = session.view,
 	}
+end
+
+function Page._GetPlanDropdownItemsForTests()
+	local out = {}
+	for _, secDef in ipairs(Definition().sections or {}) do
+		for _, item in ipairs(secDef.items or {}) do
+			if item.id == "raidSignupPlanSelectSignup" then
+				out.signup = item
+			elseif item.id == "raidSignupPlanSelectManage" then
+				out.manage = item
+			end
+		end
+	end
+	return out
+end
+
+function Page._GetActiveToggleItemForTests()
+	for _, secDef in ipairs(Definition().sections or {}) do
+		for _, item in ipairs(secDef.items or {}) do
+			if item.id == "raidSignupActiveToggle" then
+				return item
+			end
+		end
+	end
+	return nil
+end
+
+function Page._ApplyDefaultSelectionForTests()
+	return ApplyDefaultSelection()
 end
 
 function Page._GetViewForTests()

@@ -1410,6 +1410,7 @@ SF.SettingsUI.Controls = {
     AddDisplay = function() end,
     AddButton = function() end,
     AddDropdown = function() end,
+    AddCheckbox = function() end,
     AddEditBoxWithButton = function() end,
 }
 
@@ -4986,7 +4987,273 @@ local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     boardHost._w = nil
     UIPage:Refresh(panel, { force = true })
 end
-RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
+RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId);
+
+---------------------------------------------------------------------------
+-- Active-sheet lifecycle: createdAt ordering, Active/Inactive model,
+-- opening default selection, read-only inactive sheets (#404 retrofit)
+---------------------------------------------------------------------------
+(function()
+    ActAs("Alice-Garona", "Player-1-Alice")
+    -- Fresh guild so no plans from earlier tests interfere with selection.
+    local savedClubId77 = world.guild.clubId
+    world.guild.clubId = 77
+    -- Officer policy is per-guild; bootstrap it for the fresh club.
+    assertEq(select(1, GO:Bootstrap()), "accepted", "bootstrap officer policy for fresh club")
+    local record77 = select(1, RS:EnsureGuildRecord("club:77"))
+
+    -- 1. Creation time is immutable and ordered independently of `at`.
+    local savedTime = world.time
+    world.time = 61000
+    local stA, _, lifeA = RS:CreatePlan("Lifecycle A")
+    world.time = 62000
+    local stB, _, lifeB = RS:CreatePlan("Lifecycle B")
+    world.time = 63000
+    local stC, _, lifeC = RS:CreatePlan("Lifecycle C")
+    world.time = savedTime
+    assertEq(stA, "accepted", "plan A created")
+    assertEq(stB, "accepted", "plan B created")
+    assertEq(stC, "accepted", "plan C created")
+    assertEq(record77.plans[lifeA].createdAt, 61000, "plan A createdAt recorded")
+    assertEq(record77.plans[lifeB].createdAt, 62000, "plan B createdAt recorded")
+    assertEq(record77.plans[lifeC].createdAt, 63000, "plan C createdAt recorded")
+    assertTrue(RS.ClonePlan(record77.plans[lifeA]).createdAt == 61000,
+        "ClonePlan carries createdAt (gossip export path)")
+
+    -- Rename and activation updates preserve creation time.
+    assertEq(select(1, RS:RenamePlan(lifeB, "Lifecycle B Renamed")), "accepted", "rename active plan")
+    assertEq(record77.plans[lifeB].createdAt, 62000, "rename preserves createdAt")
+    assertEq(select(1, RS:SetPlanArchived(lifeB, true)), "accepted", "deactivate plan B")
+    assertEq(record77.plans[lifeB].createdAt, 62000, "deactivation preserves createdAt")
+    assertEq(select(1, RS:SetPlanArchived(lifeB, false)), "accepted", "reactivate plan B")
+    assertEq(record77.plans[lifeB].createdAt, 62000, "reactivation preserves createdAt")
+
+    -- A metadata update without createdAt (older client / legacy save) must
+    -- not erase a known creation time.
+    local lifeACopy = RS.ClonePlan(record77.plans[lifeA])
+    lifeACopy.createdAt = nil
+    lifeACopy.ver = { n = lifeACopy.ver.n + 1, w = "officerofficerofficeroff" }
+    assertEq(select(1, RS.MergePlan(record77, lifeACopy, { remote = true })), "accepted",
+        "remote metadata without createdAt merges")
+    assertEq(record77.plans[lifeA].createdAt, 61000, "known createdAt survives metadata update")
+
+    -- Legacy plans without creation metadata order deterministically by plan ID.
+    local legacyPick = RS.PickDefaultPlanId({
+        plans = {
+            ["plan-zz"] = { planId = "plan-zz", archived = false, createdAt = 0 },
+            ["plan-aa"] = { planId = "plan-aa", archived = false, createdAt = 0 },
+        },
+    })
+    assertEq(legacyPick, "plan-aa", "legacy plans without createdAt fall back to plan-ID order")
+    local mixedPick = RS.PickDefaultPlanId({
+        plans = {
+            ["plan-old"] = { planId = "plan-old", archived = false, createdAt = 50000 },
+            ["plan-new"] = { planId = "plan-new", archived = false, createdAt = 90000 },
+        },
+    })
+    assertEq(mixedPick, "plan-new", "newest createdAt wins regardless of plan ID")
+
+    -- 2. Opening default: newest-created active sheet.
+    UIPage._ResetSessionForTests()
+    panel._scripts.OnShow()
+    UIPage:Refresh(panel, { force = true })
+    local snap = UIPage._GetDefinitionSnapshotForTests()
+    assertEq(snap.selectedId, lifeC, "opening selects newest-created active sheet")
+    assertTrue(snap.planOpen, "newest active sheet is editable")
+    assertTrue(snap.openDefaultPending == false, "default applied, no longer pending")
+
+    -- 3. Dropdown wording and Active/Inactive tags.
+    local dd = UIPage._GetPlanDropdownItemsForTests()
+    assertTrue(dd.signup ~= nil and dd.signup.label == "Viewing signup",
+        "Signup tab dropdown labeled 'Viewing signup'")
+    assertTrue(dd.manage ~= nil and dd.manage.label == "Signup",
+        "Manage tab selector labeled 'Signup'")
+    local foundActiveTag = false
+    for _, opt in ipairs(snap.planOptions) do
+        if opt.label:find("(Active)", 1, true) then foundActiveTag = true end
+    end
+    assertTrue(foundActiveTag, "dropdown marks active sheets")
+    assertTrue(snap.planOpen, "selected active sheet stays editable")
+
+    -- 4. Explicit selection survives refreshes and tab switches; reopening
+    -- re-applies the default.
+    dd.signup.set(lifeA)
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, lifeA, "explicit selection applied")
+    UIPage:Refresh(panel, { force = true })
+    UIPage._SetViewForTests("manage")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, lifeA,
+        "selection survives tab switch")
+    UIPage._SetViewForTests("signup")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, lifeA,
+        "selection survives ordinary refresh")
+    panel._scripts.OnShow()
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, lifeC,
+        "genuine reopening re-applies the newest-active default")
+
+    -- 5. All-inactive fallback: newest inactive selected, read-only, notice.
+    assertEq(select(1, RS:SetPlanArchived(lifeA, true)), "accepted", "deactivate A")
+    assertEq(select(1, RS:SetPlanArchived(lifeB, true)), "accepted", "deactivate B")
+    assertEq(select(1, RS:SetPlanArchived(lifeC, true)), "accepted", "deactivate C")
+    UIPage._ResetSessionForTests()
+    panel._scripts.OnShow()
+    UIPage:Refresh(panel, { force = true })
+    snap = UIPage._GetDefinitionSnapshotForTests()
+    assertEq(snap.selectedId, lifeC, "all-inactive fallback selects newest inactive sheet")
+    assertTrue(snap.planOpen == false, "inactive fallback sheet is read-only")
+    assertTrue(snap.noActiveNotice, "'No active signups' notice shown")
+    local foundInactiveTag = false
+    for _, opt in ipairs(snap.planOptions) do
+        if opt.label:find("(Inactive)", 1, true) then foundInactiveTag = true end
+    end
+    assertTrue(foundInactiveTag, "dropdown marks inactive sheets")
+
+    -- 6. Officer-only Active toggle, usable while inactive, independent per sheet.
+    local toggle = UIPage._GetActiveToggleItemForTests()
+    assertTrue(toggle ~= nil, "Manage tab Active toggle present")
+    assertEq(toggle.get(), false, "toggle reflects inactive selected sheet")
+    assertTrue(toggle.enabled(), "toggle usable while sheet is inactive")
+    ActAs("Carol-Garona", "Player-1-Carol")
+    assertTrue(toggle.enabled() == false, "toggle officer-only (member cannot use)")
+    ActAs("Alice-Garona", "Player-1-Alice")
+    toggle.set(true)
+    assertEq(record77.plans[lifeC].archived, false, "toggle reactivates selected sheet")
+    assertEq(record77.plans[lifeA].archived, true, "other sheets unchanged (A stays inactive)")
+    assertEq(record77.plans[lifeB].archived, true, "other sheets unchanged (B stays inactive)")
+    assertEq(toggle.get(), true, "toggle reflects active state")
+    UIPage:Refresh(panel, { force = true })
+    local foundActiveTag2, foundInactiveTag2 = false, false
+    for _, opt in ipairs(UIPage._GetDefinitionSnapshotForTests().planOptions) do
+        if opt.label:find("(Active)", 1, true) then foundActiveTag2 = true end
+        if opt.label:find("(Inactive)", 1, true) then foundInactiveTag2 = true end
+    end
+    assertTrue(foundActiveTag2 and foundInactiveTag2,
+        "dropdown shows both Active and Inactive tags after toggle")
+
+    -- 7. Inactive sheets reject every local mutation path, even for officers;
+    -- reactivation restores editing.
+    ActAs("Carol-Garona", "Player-1-Carol")
+    RS:SelectPlan(lifeC)
+    local carolEntryStatus, _, carolEntry = RS:UpsertEntry({
+        planId = lifeC,
+        nickname = "CarolMain",
+        mainClass = "MAGE",
+        mainSpec = 62,
+        notes = "",
+    })
+    assertEq(carolEntryStatus, "accepted", "entry created while sheet active")
+    ActAs("Alice-Garona", "Player-1-Alice")
+    assertEq(select(1, RS:SetPlanArchived(lifeC, true)), "accepted", "deactivate C with entry")
+    ActAs("Carol-Garona", "Player-1-Carol")
+    assertEq(select(1, RS:UpsertEntry({
+        entryId = carolEntry,
+        nickname = "CarolMain",
+        mainClass = "MAGE",
+        mainSpec = 63,
+    })), "rejected", "member edit rejected while inactive")
+    assertEq(select(1, RS:UpsertEntry({
+        planId = lifeC,
+        nickname = "DaveMain",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+    })), "rejected", "member create rejected while inactive")
+    assertEq(select(1, RS:DeleteEntry(carolEntry)), "rejected", "delete rejected while inactive")
+    ActAs("Alice-Garona", "Player-1-Alice")
+    assertEq(select(1, RS:RenamePlan(lifeC, "Nope")), "rejected", "officer rename rejected while inactive")
+    assertEq(select(1, RS:UpsertEntry({
+        planId = lifeC,
+        nickname = "AliceMain",
+        mainClass = "PRIEST",
+        mainSpec = 256,
+    })), "rejected", "officer create also rejected while inactive")
+    assertEq(select(1, RS:SetPlanArchived(lifeC, false)), "accepted", "reactivate C")
+    ActAs("Carol-Garona", "Player-1-Carol")
+    assertEq(select(1, RS:UpsertEntry({
+        entryId = carolEntry,
+        nickname = "CarolMain",
+        mainClass = "MAGE",
+        mainSpec = 63,
+    })), "accepted", "editing restored after reactivation")
+
+    -- 8. Deactivation during an open editor discards unsaved drafts without
+    -- touching saved entries, and blocks focus-loss commits.
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(lifeC)
+    local draft = RS.MakeDraft(lifeC)
+    RS.UpdateDraftField(draft, "classFile", "MAGE")
+    RS.UpdateDraftField(draft, "specId", 62)
+    RS.UpdateDraftField(draft, "nickname", "UnsavedDraft")
+    UIPage._SetDraftForTests(draft)
+    UIPage:Refresh(panel, { force = true })
+    assertTrue(UIPage._GetDraftForTests() ~= nil, "draft open before deactivation")
+    ActAs("Alice-Garona", "Player-1-Alice")
+    assertEq(select(1, RS:SetPlanArchived(lifeC, true)), "accepted", "deactivate with draft open")
+    assertTrue(UIPage._GetDraftForTests() == nil, "deactivation discards unsaved draft")
+    assertTrue(UIPage._GetDefinitionSnapshotForTests().planOpen == false,
+        "viewed sheet stays selected but read-only")
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, lifeC,
+        "no jump to another sheet on deactivation")
+    assertTrue(record77.entries[carolEntry] ~= nil, "saved entries untouched by deactivation")
+    -- Focus-loss commit after teardown cannot persist (draft already gone).
+    RS.CommitDraftNickname(draft)
+    UIPage._RefreshShownPanelsForTests({ force = true })
+    assertEq(select(1, RS:UpsertEntry({
+        planId = lifeC,
+        nickname = "UnsavedDraft",
+        mainClass = "MAGE",
+        mainSpec = 62,
+    })), "rejected", "inactive sheet rejects late commit attempts")
+    assertEq(select(1, RS:SetPlanArchived(lifeC, false)), "accepted", "reactivate C again")
+    ActAs("Carol-Garona", "Player-1-Carol")
+
+    -- 9. Late guild data: opening with no sheets stays pending; the first
+    -- plans to arrive become the default (newest active) without an explicit
+    -- selection.
+    local savedClubId = world.guild.clubId
+    world.guild.clubId = 99
+    UIPage._ResetSessionForTests()
+    panel._scripts.OnShow()
+    UIPage:Refresh(panel, { force = true })
+    snap = UIPage._GetDefinitionSnapshotForTests()
+    assertEq(snap.selectedId, nil, "empty guild: no sheet selected")
+    assertTrue(snap.openDefaultPending, "default still pending while no sheets exist")
+    local club99 = select(1, RS:EnsureGuildRecord("club:99"))
+    local function remotePlan(planId, name, createdAt)
+        return {
+            planId = planId,
+            name = name,
+            archived = false,
+            createdBy = "Player-1-Bob",
+            ver = { n = 1, w = "peerwriterpeerwriterpeer" },
+            at = createdAt,
+            createdAt = createdAt,
+        }
+    end
+    assertEq(select(1, RS.MergePlan(club99, remotePlan("plan-old99", "Old", 70000), { remote = true })),
+        "accepted", "old remote plan merges")
+    RS.NotifyUI("remote")
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, "plan-old99",
+        "first arrival selected while still the only sheet")
+    local newPlan = remotePlan("plan-new99", "New", 71000)
+    newPlan.ver = { n = 2, w = "peerwriterpeerwriterpeer" }
+    assertEq(select(1, RS.MergePlan(club99, newPlan, { remote = true })), "accepted",
+        "newer remote plan merges")
+    RS.NotifyUI("remote")
+    -- A newer sheet arriving mid-visit must NOT steal the selection; it
+    -- becomes the default on the next opening.
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, "plan-old99",
+        "mid-visit gossip does not reset the selection")
+    panel._scripts.OnShow()
+    UIPage:Refresh(panel, { force = true })
+    assertEq(UIPage._GetDefinitionSnapshotForTests().selectedId, "plan-new99",
+        "next opening selects newest-created active sheet")
+    world.guild.clubId = savedClubId77
+    UIPage._ResetSessionForTests()
+    RS:SelectPlan(lifeC)
+end)()
 
     -- Two hosts (Blizzard Settings panel + standalone window) each get rebuilt
     -- and refreshed; hosts keep their own panel association.

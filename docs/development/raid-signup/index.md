@@ -24,9 +24,20 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
   abandoned incomplete drafts are discarded.
 - Creators and officers can edit saved nicknames with `expectedVer` stale-edit protection.
 - At most one alternative; never identical main/alt class+spec.
-- Local mutations against archived plans are rejected (including rename). Remote Gossip may
-  still catch up already-saved historical roster contents/metadata onto archived plans;
-  the UI stays read-only.
+- Sheets have an **Active / Inactive** state carried by the existing `archived`
+  flag (`Active = not archived`). Inactive sheets stay fully viewable — entries,
+  summaries, notes, and tooltips — but are read-only for everyone, officers
+  included, until reactivated. The lock is enforced by mutation checks
+  (`UpsertEntry`, `DeleteEntry`, `RemoveAlternative`, `RenamePlan` all reject
+  inactive plans), not just by hidden controls; deactivating a sheet that is
+  being viewed promptly discards its unsaved drafts without touching saved
+  entries. Remote Gossip may still catch up already-saved historical roster
+  contents/metadata onto inactive sheets.
+- On the **Manage** tab, officers toggle a sheet's Active state; the toggle
+  stays usable while the selected sheet is inactive, and changing one sheet
+  never changes another's. Newly created sheets start active and become
+  selected for their creator. There is no second persisted active flag and no
+  guild-wide `activePlanId`.
 - Deletions use versioned tombstones. There is no restore: live never overwrites a
   tombstone, and an authorized incoming tombstone wins over live for the same entry even
   when its `(n, w)` tuple is equal or lower. New Add Row uses new IDs.
@@ -39,7 +50,7 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
   `MAX_ENTRIES_PER_PLAN`. Deleting an already-retained live entry at capacity remains
   allowed. Remote revisions must stay advanceable (`n < MAX_REV`) and within
   `MAX_REV_CATCHUP` of the local revision.
-- `MAX_PLANS = 32` is a lifetime creation cap that includes archived history. There is no
+- `MAX_PLANS = 32` is a lifetime creation cap that includes inactive history. There is no
   automatic plan deletion/compaction; overflow returns `plans_overflow`. Revisit
   reclamation only when real usage approaches the cap or the owner requests it.
 - Coverage summary uses ability/utility category icons (not class-icon stand-ins) with
@@ -48,6 +59,31 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 - Typing does not rebuild the settings page; durable board hosts and pooled controls are
   reused so allocations plateau after warm-up. Control callbacks read live selected plan /
   permissions. Idle visible page does not poll or broadcast.
+
+### Sheet selection and creation time
+
+Multiple sheets can be active at once; which sheet is being viewed is a **local**
+selection (`selectedPlanId`, never gossiped). Whenever Raid Signup is genuinely
+opened, the page selects a default: the most recently **created** active sheet,
+or — when none are active — the most recently created inactive sheet (shown
+read-only with a "No active signups" notice), or the empty state when no sheets
+exist. The default is applied once per opening: refreshes, resizes/rebuilds,
+tab switches, and Gossip updates never reset a valid selection, and a newer
+sheet arriving mid-visit only becomes the default on the next opening. If the
+viewed sheet turns inactive, the page keeps showing it and transitions to
+read-only. When guild data or the plan list arrives after the page first
+opens, the pending default is applied once without overriding an explicit
+user selection.
+
+Plans carry an immutable `createdAt` (server time at creation), distinct from
+`at` (last mutation, which rename/archive/edits update). `createdAt` flows
+through clone, validation, merge, persistence, and Gossip export; merge never
+erases a known creation time, so rename, activation changes, entry edits,
+reload, and synchronization preserve it. New plans get `createdAt = at =
+creation time`. Plans saved before this field existed (and older clients'
+payloads) have `createdAt = 0`; default ordering then falls back to
+deterministic plan-ID order as a stable approximation — original creation
+times for legacy plans are unknowable and are not invented.
 
 ### Summary sidebar order and guidance palette
 
@@ -161,7 +197,7 @@ SpectrumFederationDB.raidSignup = {
       guildKey = "club:<id>",
       clubId = "<id>",
       selectedPlanId = "<planId>" | nil, -- local UI preference; not gossiped
-      plans = { -- [planId] = { planId, name, archived, createdBy, ver={n,w}, at } },
+      plans = { -- [planId] = { planId, name, archived, createdBy, ver={n,w}, at, createdAt } },
       entries = { -- [entryId] = { entryId, planId, nickname, mainClass, mainSpec,
                   --   altClass?, altSpec?, notes, creatorGuid, deleted?, ver, at } },
     },

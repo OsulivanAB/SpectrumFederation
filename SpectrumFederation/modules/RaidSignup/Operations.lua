@@ -255,13 +255,17 @@ function RS:CreatePlan(name, opts)
         LogMutation("CreatePlan", "rejected", verErr or "revision_exhausted")
         return "rejected", verErr or "revision_exhausted"
     end
+    -- `at` tracks the last mutation; `createdAt` is immutable creation time
+    -- used for default sheet selection (rename/activation must not change it).
+    local now = (GetServerTime and GetServerTime()) or (time and time()) or 0
     local plan = {
         planId = RS.NewId("plan"),
         name = planName,
         archived = false,
         createdBy = ctx.actorGuid,
         ver = ver,
-        at = (GetServerTime and GetServerTime()) or (time and time()) or 0,
+        at = now,
+        createdAt = now,
     }
     local status, detail = RS.MergePlan(record, plan, { remote = false })
     if status == "accepted" then
@@ -637,6 +641,13 @@ end
 function RS:GetSelectedPlanId()
     local record = select(1, RS:GetActiveGuildRecord())
     return record and record.selectedPlanId or nil
+end
+
+--- Default sheet to view when Raid Signup is opened: newest-created active
+--- sheet, else newest-created inactive sheet, else nil (empty state).
+function RS:GetDefaultPlanId()
+    local record = select(1, RS:GetActiveGuildRecord())
+    return RS.PickDefaultPlanId(record)
 end
 
 function RS:GetSortedPlans(all)
