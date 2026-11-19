@@ -1132,31 +1132,32 @@ local function injectProductionAdjustment(record, opts)
     return event
 end
 
-assertEq(GS.PROVIDER_SCHEMA, 6, "459: PROVIDER_SCHEMA is 6")
+assertEq(GS.PROVIDER_SCHEMA, 7, "459: PROVIDER_SCHEMA is 7")
 assertTrue(GS.KIND.CORRECT_CONTRIBUTOR == "correct-contributor", "459: correction kind registered")
 
 do
-    -- Combined protocol schema 6: released schema-5 peers are excluded by GG
-    -- equality; two schema-6 peers transfer a correction and agree on credit
-    -- (discussion_r4483753485).
-    assertEq(GS.PROVIDER_SCHEMA, 6, "459-schema6: wire schema is 6")
+    -- Combined protocol schema 7 (#465): older peers are excluded by GG equality;
+    -- two schema-7 peers transfer a correction and agree on credit.
+    assertEq(GS.PROVIDER_SCHEMA, 7, "459-schema6: wire schema is 7")
     assertEq(GS.SCHEMA_VERSION, 1, "459-schema6: persisted root schema unchanged")
     GS:EnsureGossipProvider()
     local prov = GG.GetProvider(GS.PROVIDER_ID)
     assertTrue(type(prov) == "table", "459-schema6: provider registered")
-    assertEq(tonumber(prov.schema), 6, "459-schema6: registered schema 6")
+    assertEq(tonumber(prov.schema), 7, "459-schema6: registered schema 7")
     local caps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
     assertTrue(type(caps) == "table", "459-schema6: capabilities")
-    assertEq(tonumber(caps.schema), 6, "459-schema6: advertised schema 6")
+    assertEq(tonumber(caps.schema), 7, "459-schema6: advertised schema 7")
     -- Strict equality gate (GuildGossip compatibleProviders / handleView).
     local function schemaMatches(remoteSchema)
         return tonumber(remoteSchema) == tonumber(prov.schema)
     end
+    assertTrue(not schemaMatches(6),
+        "459-schema6: schema-6 peer incompatible")
     assertTrue(not schemaMatches(5),
         "459-schema6: released schema-5 peer incompatible")
     assertTrue(not schemaMatches(4),
         "459-schema6: schema-4 peer incompatible")
-    assertTrue(schemaMatches(6),
+    assertTrue(schemaMatches(7),
         "459-schema6: new-protocol peers match")
     -- VIEW payload with released schema 5 must not equal local provider schema.
     assertTrue(tonumber(5) ~= tonumber(prov.schema),
@@ -10440,6 +10441,16 @@ do
         function region:SetBackdrop() end
         function region:SetBackdropColor() end
         function region:SetBackdropBorderColor() end
+        function region:SetScrollChild(child)
+            self._scrollChild = child
+        end
+        function region:GetScrollChild()
+            return self._scrollChild
+        end
+        function region:SetVerticalScroll() end
+        function region:GetVerticalScroll()
+            return 0
+        end
         function region:CreateFontString()
             return makeRegion("FontString", nil, self)
         end

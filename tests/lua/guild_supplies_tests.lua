@@ -35901,16 +35901,16 @@ do
 end
 
 do
-    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#459 combined → 6).
-    assertEq(GS.PROVIDER_SCHEMA, 6, "val: B1 PROVIDER_SCHEMA is 6 (#459)")
+    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#465 soft-delete → 7).
+    assertEq(GS.PROVIDER_SCHEMA, 7, "val: B1 PROVIDER_SCHEMA is 7 (#465)")
     local record = activateValuationGuild(9903)
     assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
     assertTrue(type(prov) == "table", "val: B1 provider registered")
-    assertEq(tonumber(prov.schema), 6, "val: B1 registered schema 6 (#459)")
+    assertEq(tonumber(prov.schema), 7, "val: B1 registered schema 7 (#465)")
     local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
     assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
-    assertEq(tonumber(wireCaps.schema), 6, "val: B1 wire capabilities schema 6 (#459)")
+    assertEq(tonumber(wireCaps.schema), 7, "val: B1 wire capabilities schema 7 (#465)")
     drainExportMaint(32)
     local descSchema = nil
     for _, row in ipairs(collectAllExportBodies()) do
@@ -35919,15 +35919,16 @@ do
             descSchema = row.body.schemaVersion
         end
     end
-    assertEq(descSchema, 6, "val: B1 descriptor schemaVersion 6 (#459)")
-    -- Strict GG equality: older schemas are incompatible with local schema 6.
+    assertEq(descSchema, 7, "val: B1 descriptor schemaVersion 7 (#465)")
+    -- Strict GG equality: older schemas are incompatible with local schema 7.
     local localSchema = tonumber(prov.schema)
-    assertEq(localSchema, 6, "val: B1 local schema 6 (#459)")
-    assertTrue(localSchema ~= 5, "val: B1 old schema 5 incompatible with local 6")
-    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 6")
-    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 6")
-    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 6")
-    assertEq(tonumber(6) == localSchema, true, "val: B1 new/new compatible")
+    assertEq(localSchema, 7, "val: B1 local schema 7 (#465)")
+    assertTrue(localSchema ~= 6, "val: B1 schema-6 peer incompatible with local 7")
+    assertTrue(localSchema ~= 5, "val: B1 old schema 5 incompatible with local 7")
+    assertTrue(localSchema ~= 4, "val: B1 old schema 4 incompatible with local 7")
+    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 7")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 7")
+    assertEq(tonumber(7) == localSchema, true, "val: B1 new/new compatible")
     -- Persisted local schema stays 1 across the wire bump.
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
         "val: B1 persisted root schema unchanged")
@@ -40171,7 +40172,7 @@ do
     local camp1Id = record.currentCampaignId
     assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
         "424: new campaign falls back to ID")
-    assertEq(GS.PROVIDER_SCHEMA, 6, "424: provider schema is 6 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 7, "424: provider schema is 7 (#465)")
 
     -- Ordinary member cannot rename.
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
@@ -40509,7 +40510,7 @@ do
 end
 
 -- #424 multi-rename adoption newest-first retains losers; projects LWW winner
--- #424 adoption carries names; wrong dataset rejected; provider schema is 6 (#459)
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 7 (#465)
 do
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
@@ -40566,7 +40567,7 @@ do
     assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
-    assertEq(GS.PROVIDER_SCHEMA, 6, "424-adopt: schema is 6 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 7, "424-adopt: schema is 7 (#465)")
 end
 
 local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
@@ -41901,7 +41902,7 @@ do
     assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "427-legacy: links valid")
     assertEq(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"), false,
         "427-legacy: links do not drive witness identity")
-    assertEq(GS.PROVIDER_SCHEMA, 6, "427-schema: provider schema 6 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 7, "427-schema: provider schema 7 (#465)")
     assertEq(GS.SCHEMA_VERSION, 1, "427-schema: durable root schema unchanged")
 end
 
@@ -43426,14 +43427,14 @@ end
 
 do
     -- 447-r1) Provider schema tracks wire gate (#459 → 6); SV schema unchanged.
-    assertEq(GS.PROVIDER_SCHEMA, 6, "447-r1: PROVIDER_SCHEMA is 6 (#459)")
+    assertEq(GS.PROVIDER_SCHEMA, 7, "447-r1: PROVIDER_SCHEMA is 7 (#465)")
     assertEq(GS.SCHEMA_VERSION, 1, "447-r1: SCHEMA_VERSION stays 1")
     local record = activateValuationGuild(9452)
     assertEq(GS:EnsureGossipProvider(), true, "447-r1: provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
-    assertEq(tonumber(prov.schema), 6, "447-r1: registered schema 6 (#459)")
+    assertEq(tonumber(prov.schema), 7, "447-r1: registered schema 7 (#465)")
     local caps = prov.api.GetCapabilities()
-    assertEq(tonumber(caps.schema), 6, "447-r1: wire caps schema 6 (#459)")
+    assertEq(tonumber(caps.schema), 7, "447-r1: wire caps schema 7 (#465)")
     assertTrue(tonumber(prov.schema) ~= 3, "447-r1: schema-3 incompatible")
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 1,
         "447-r1: persisted root schema preserved")
