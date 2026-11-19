@@ -274,7 +274,11 @@ local function resetEnv()
         repairQueue = { order = {}, items = {} },
         convergence = {},
         _adminConvergence = nil,
+        peers = {},
     }
+    for _, peerName in ipairs({ OWNER, OTHER, ALT_A, ALT_B, ALT_C, ALT_D, ALT_E, "Member-Garona", "Foxtrot-Garona", "Zulu-Garona", "AlphaAdmin-Garona" }) do
+        Sync.state.peers[peerName] = { inGroup = true, online = true }
+    end
     Sync._identityAdminReconcileNeeded = {}
     Sync._identityAdminReconcilePending = {}
     Sync._pendingLiveRelationship = {}
@@ -5117,6 +5121,10 @@ local function become(id)
     Sync.state.coordEpoch = 1
     Sync.state.isCoordinator = peer.isCoordinator
     Sync.state.helpers = { OTHER }
+    Sync.state.peers = {}
+    for peerId, _ in pairs(peers) do
+        Sync.state.peers[peerId] = { inGroup = true, online = true }
+    end
 end
 
 become(OTHER)
