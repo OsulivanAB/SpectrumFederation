@@ -753,6 +753,28 @@ function Sync:_PeerInGroup(name)
     return type(peer) == "table" and peer.inGroup == true
 end
 
+-- Function True when this peer is currently in the group and online enough to whisper.
+-- Raid roster online is 1/nil before the peer registry normalizes it; party uses booleans.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_PeerOnlineInGroup(name)
+    if type(name) ~= "string" or name == "" or type(self.state) ~= "table" then return false end
+    local peers = self.state.peers
+    if type(peers) ~= "table" then return false end
+
+    for key, peer in pairs(peers) do
+        if type(peer) == "table" and peer.inGroup == true then
+            if peer.online == true or peer.online == 1 then
+                local candidate = peer.name or key
+                if self:_SamePlayer(name, candidate) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 -- Function True when local history already stores a current grant for this player.
 -- The row must be authored by a different canonical admin. A missing row is not
 -- proof, and it is not a revocation. One walk per player is reused until the

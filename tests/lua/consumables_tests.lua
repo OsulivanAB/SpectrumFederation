@@ -2685,6 +2685,7 @@ end
 
 local function makeLootHelperFrame()
     local frame = FrameMock("Frame")
+    frame.frameStrata = "MEDIUM"
     frame.Content = FrameMock("Frame", frame)
     frame.Content.SupplyReminder = FrameMock("Frame", frame.Content)
     frame.Content.SupplyReminder.MobileAnchor = FrameMock("Frame", frame.Content.SupplyReminder)
@@ -2814,6 +2815,9 @@ local function checkRuntimeReminder()
         "the banner Mobile Banking button uses SecureActionButtonTemplate")
     assertFalse(contains(RT.bannerMobileButton.template or "", "UIPanelButtonTemplate"),
         "the banner Mobile Banking control is a compact icon, not a full panel button")
+    assertEq(window.frameStrata, "MEDIUM", "fixture mirrors production Loot Helper strata")
+    assertEq(RT.bannerMobileHolder.frameStrata, window.frameStrata,
+        "banner holder shares Loot Helper strata instead of floating at DIALOG")
     assertEq(RT.bannerMobileButton.attributes.type, "spell", "the banner button is a secure spell action")
     assertEq(RT.bannerMobileButton.attributes.spell, "Mobile Banking", "the banner button casts Mobile Banking")
     assertTrue(RT.bannerMobileButton.enabled, "the banner Mobile Banking button is enabled when ready")

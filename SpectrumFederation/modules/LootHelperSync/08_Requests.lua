@@ -88,21 +88,31 @@ function Sync:_PickNextTargetForRequest(req)
         return nil
     end
 
-    -- Single target: keep retrying the same peer unless that peer was revoked.
+    local function targetAllowed(name)
+        if self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, name) then
+            return false
+        end
+        if self._PeerOnlineInGroup and not self:_PeerOnlineInGroup(name) then
+            return false
+        end
+        return true
+    end
+
+    -- Single target: keep retrying the same peer unless that peer was revoked or unreachable.
     if #req.targets == 1 then
-        if self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, req.targets[1]) then
+        if not targetAllowed(req.targets[1]) then
             return nil
         end
         req.targetIdx = 1
         return req.targets[1]
     end
 
-    -- Multi target: walk the list once (no wrap), skipping revoked peers.
+    -- Multi target: walk the list once (no wrap), skipping revoked or unreachable peers.
     local idx = (tonumber(req.targetIdx) or 0) + 1
     while idx <= #req.targets do
         local name = req.targets[idx]
         req.targetIdx = idx
-        if not (self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, name)) then
+        if targetAllowed(name) then
             return name
         end
         idx = idx + 1
@@ -261,6 +271,13 @@ function Sync:_SendRequestAttempt(req)
             self:_FailRequest(req, "stale session")
             return
         end
+    end
+
+    if self._EnforceGroupedSessionActive and not self:_EnforceGroupedSessionActive("RequestAttempt") then
+        return
+    end
+    if self.UpdatePeersFromRoster then
+        self:UpdatePeersFromRoster()
     end
 
     -- Look at the next peer before the attempt cap. A helper or coordinator added

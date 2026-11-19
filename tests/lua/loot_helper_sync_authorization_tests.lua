@@ -337,10 +337,17 @@ local function reset(selfName)
     Sync._relinquishingCoordination = nil
 end
 
-Sync._EnforceGroupedSessionActive = function()
-    return "RAID"
-end
-Sync.UpdatePeersFromRoster = function() end
+SF_TEST_SYNC_STUBS = {
+    enforceGroupedSessionActive = Sync._EnforceGroupedSessionActive,
+    updatePeersFromRoster = Sync.UpdatePeersFromRoster,
+    stubEnforceGroupedSessionActive = function()
+        return "RAID"
+    end,
+    stubUpdatePeersFromRoster = function() end,
+}
+Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.stubEnforceGroupedSessionActive
+Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.stubUpdatePeersFromRoster
+Sync._testProductionUpdatePeersFromRoster = SF_TEST_SYNC_STUBS.updatePeersFromRoster
 local originalBeginAdminConvergence = Sync.BeginAdminConvergence
 Sync.BeginAdminConvergence = function()
     return true
@@ -677,6 +684,100 @@ local preferredTargets = Sync:_CurrentAuthorizedRoutingTargets({ preferredTarget
 assertTrue(not listHas(preferredTargets, KINO), "former helper preferred target is not a new route")
 assertTrue(listHas(preferredTargets, SUSPENDERS), "current helper remains a route")
 assertTrue(listHas(preferredTargets, COORD), "current coordinator remains a route")
+
+-- Request retries only whisper current in-group online peers.
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = false, online = true }
+local departedReq = seedRequest("need-departed-route", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(departedReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "request timeout skips an out-of-group target")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 1, "request timeout falls back to the in-group coordinator")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = true, online = false }
+local offlineReq = seedRequest("need-offline-route", "NEED_LOGS", { KINO })
+Sync:OnRequestTimeout(offlineReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "request timeout skips an offline target")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.peers[KINO] = { inGroup = true, online = false }
+Sync.state.peers[COORD] = { inGroup = true, online = false }
+assertEq(Sync:RequestProfileSnapshot("offline-profile"), true, "profile request registers while targets are unreachable")
+assertEq(Sync.state._profileReqInFlight, nil, "a synchronously failed profile request does not latch in-flight")
+Sync.state.peers[KINO] = { inGroup = true, online = true }
+Sync.state.peers[COORD] = { inGroup = true, online = true }
+assertEq(Sync:RequestProfileSnapshot("online-profile"), true, "profile request retries after targets return")
+assertEq(sendCount(Sync.MSG.NEED_PROFILE), 1, "returned profile target receives NEED_PROFILE")
+end)()
+
+-- Request attempts refresh peers from the live roster, and leaving the group cancels pending work.
+;(function()
+local productionIsInRaid = IsInRaid
+local productionIsInGroup = IsInGroup
+local productionGetNumGroupMembers = GetNumGroupMembers
+local productionGetRaidRosterInfo = GetRaidRosterInfo
+
+local function useProductionRoster(entries)
+    IsInRaid = function() return true end
+    IsInGroup = function() return true end
+    GetNumGroupMembers = function() return #entries end
+    GetRaidRosterInfo = function(index)
+        local entry = entries[index]
+        if not entry then return nil end
+        -- GetRaidRosterInfo reports online as 1 or nil in raids.
+        return entry.name, nil, nil, nil, nil, nil, nil, entry.online
+    end
+    Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.enforceGroupedSessionActive
+    Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.updatePeersFromRoster
+end
+
+local function restoreRosterStubs()
+    IsInRaid = productionIsInRaid
+    IsInGroup = productionIsInGroup
+    GetNumGroupMembers = productionGetNumGroupMembers
+    GetRaidRosterInfo = productionGetRaidRosterInfo
+    Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.stubEnforceGroupedSessionActive
+    Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.stubUpdatePeersFromRoster
+end
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+useProductionRoster({
+    { name = "Kino", online = 1 },
+    { name = "Coord" },
+})
+Sync:UpdatePeersFromRoster()
+assertEq(Sync.state.peers[KINO].online, true, "raid roster normalizes the numeric online flag")
+assertTrue(Sync:_PeerOnlineInGroup(KINO), "normalized online flag makes the peer reachable")
+assertTrue(not Sync:_PeerOnlineInGroup(COORD), "nil roster online makes the peer unreachable")
+local rosterReq = seedRequest("need-roster-online", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(rosterReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 1, "request attempt whispers the online roster peer")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "request attempt skips the offline roster peer")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+IsInRaid = function() return false end
+IsInGroup = function() return false end
+Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.enforceGroupedSessionActive
+Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.updatePeersFromRoster
+local leaveReq = seedRequest("need-left-group", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(leaveReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "leaving the group sends no whisper")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "leaving the group sends no whisper to any target")
+assertNil(Sync.state.requests["need-left-group"], "leaving the group drops the pending request")
+
+restoreRosterStubs()
+end)()
 
 -- Authorized coordinator NEW_LOG is not rejected as unauthorized.
 reset(MEMBER)
@@ -3394,6 +3495,92 @@ for _, item in pairs(Sync.state.repairQueue.items) do
     end
 end
 assertEq(repairItem and repairItem.preferredTarget, OWNER, "integrity queue keeps the advertising admin")
+
+-- Admin convergence whispers only to profile admins who are currently in the group.
+do
+reset(COORD)
+setAdmins({ COORD, KINO, SUSPENDERS, OWNER, MEMBER })
+
+-- Raid roster online is 1/nil; peer state normalizes it to true/false.
+local function raidRosterInfo(index)
+    if index == 1 then
+        return "Kino-Realm", 0, 1, 80, "Mage", "MAGE", "Zone", 1
+    end
+    if index == 2 then
+        return "Suspenders-Realm", 0, 1, 80, "Warrior", "WARRIOR", "Offline", nil
+    end
+end
+local originalGetNumGroupMembers = GetNumGroupMembers
+local originalGetRaidRosterInfo = GetRaidRosterInfo
+GetNumGroupMembers = function() return 2 end
+GetRaidRosterInfo = raidRosterInfo
+Sync._testProductionUpdatePeersFromRoster(Sync)
+GetNumGroupMembers = originalGetNumGroupMembers
+GetRaidRosterInfo = originalGetRaidRosterInfo
+assertEq(Sync.state.peers[KINO].online, true, "raid online roster value normalizes to true")
+assertEq(Sync.state.peers[SUSPENDERS].online, false, "raid offline roster value normalizes to false")
+
+Sync.state.isCoordinator = true
+Sync.state.peers = {
+    [COORD] = { inGroup = true, online = true },
+    [KINO] = { inGroup = true, online = true },
+    [SUSPENDERS] = { inGroup = true, online = false },
+    [OWNER] = { inGroup = false, online = true },
+    [MEMBER] = { inGroup = false, online = true },
+}
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local rosterRefreshes = 0
+local originalRosterRefresh = Sync.UpdatePeersFromRoster
+Sync.UpdatePeersFromRoster = function()
+    rosterRefreshes = rosterRefreshes + 1
+end
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function() end,
+})
+Sync.UpdatePeersFromRoster = originalRosterRefresh
+assertEq(rosterRefreshes, 1, "admin convergence refreshes the roster once")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC), 1, "admin convergence sends one ADMIN_SYNC total")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, KINO), 1, "admin convergence whispers the in-group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, SUSPENDERS), 0, "admin convergence does not whisper an offline group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, OWNER), 0, "admin convergence does not whisper an out-of-group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, MEMBER), 0, "admin convergence does not whisper another out-of-group admin")
+local conv = Sync.state._adminConvergence
+assertTrue(type(conv) == "table", "admin convergence state exists")
+assertTrue(conv.expected["Kino-Realm"] == true, "in-group admin is an expected responder")
+assertNil(conv.expected["Suspenders-Realm"], "offline group admin is not an expected responder")
+assertNil(conv.expected["Owner-Realm"], "out-of-group admin is not an expected responder")
+assertNil(conv.expected["Member-Realm"], "another out-of-group admin is not an expected responder")
+assertEq(#profile._adminUsers, 5, "convergence filtering does not change profile admins")
+assertTrue(listHas(profile._adminUsers, OWNER), "out-of-group admin remains a profile admin")
+
+Sync:HandleAdminStatus(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    adminSyncId = conv.adminSyncId,
+    hasProfile = false,
+    authorMax = {},
+    hasGaps = false,
+})
+assertNil(Sync.state._adminConvergence, "eligible response finalizes without waiting for excluded admins")
+
+Sync.state.peers[OWNER] = { inGroup = true, online = true }
+local adminSyncBeforeRejoin = sendCount(Sync.MSG.ADMIN_SYNC)
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function() end,
+})
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC), adminSyncBeforeRejoin + 2,
+    "a later in-group admin joins the next convergence target set")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, OWNER), 1, "rejoined admin receives ADMIN_SYNC")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, SUSPENDERS), 0, "rejoin round still skips the offline admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, MEMBER), 0, "rejoin round still skips out-of-group admins")
+conv = Sync.state._adminConvergence
+assertTrue(conv.expected["Owner-Realm"] == true, "rejoined admin is expected on the next round")
+assertTrue(conv.expected["Kino-Realm"] == true, "still-in-group admin remains expected on the next round")
+assertNil(conv.expected["Suspenders-Realm"], "offline admin remains excluded on the next round")
+assertNil(conv.expected["Member-Realm"], "out-of-group admin remains excluded on the next round")
+end
 
 -- Abandoned convergence timers must not finalize a replacement round.
 reset(COORD)
