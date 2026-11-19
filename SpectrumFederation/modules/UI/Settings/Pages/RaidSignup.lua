@@ -2333,31 +2333,54 @@ local function BuildBoardChrome(panel, host)
 
 	-- Role totals: small role icon + yellow count per group. The visible role
 	-- names are gone; hovering the icon/count pair shows the full localized
-	-- role name. Icons prefer the native LFG role icon atlases and fall back
-	-- to distinct file icons when an atlas is unavailable.
+	-- role name. Icons use the native circular LFG role icons: the gold-rimmed
+	-- GroupFinder micro atlases first, then the plain Micro variants. Both
+	-- damage roles stay distinct (ranged bow vs melee dagger). SetAtlas must
+	-- not adopt the atlas's native size, so the final 14x14 size is enforced
+	-- after the artwork is assigned on every path.
 	local roleDefs = {
-		{ key = "tank", atlas = "UI-LFG-RoleIcon-Tank-Micro",
-			fallback = "Interface\\Icons\\Ability_Warrior_DefensiveStance",
+		{ key = "tank",
+			atlas = "UI-LFG-RoleIcon-Tank-Micro-GroupFinder",
+			fallbackAtlas = "UI-LFG-RoleIcon-Tank-Micro",
+			fallbackTexCoord = { 0, 19 / 64, 22 / 64, 41 / 64 },
 			name = Loc("RAID_SIGNUP_ROLE_TANKS", "Tanks") },
-		{ key = "healer", atlas = "UI-LFG-RoleIcon-Healer-Micro",
-			fallback = "Interface\\Icons\\Spell_Holy_GuardianSpirit",
+		{ key = "healer",
+			atlas = "UI-LFG-RoleIcon-Healer-Micro-GroupFinder",
+			fallbackAtlas = "UI-LFG-RoleIcon-Healer-Micro",
+			fallbackTexCoord = { 20 / 64, 39 / 64, 1 / 64, 20 / 64 },
 			name = Loc("RAID_SIGNUP_ROLE_HEALERS", "Healers") },
-		{ key = "ranged", atlas = "UI-LFG-RoleIcon-RangedDPS-Micro",
-			fallback = "Interface\\Icons\\Ability_Hunter_SteadyShot",
+		{ key = "ranged",
+			atlas = "UI-LFG-RoleIcon-RangedDPS-Micro-GroupFinder",
+			fallbackAtlas = "UI-LFG-RoleIcon-RangedDPS-Micro",
+			fallbackTexCoord = { 20 / 64, 39 / 64, 22 / 64, 41 / 64 },
 			name = Loc("RAID_SIGNUP_ROLE_RANGED", "Ranged DPS") },
-		{ key = "melee", atlas = "UI-LFG-RoleIcon-MeleeDPS-Micro",
-			fallback = "Interface\\Icons\\INV_Sword_48",
+		{ key = "melee",
+			atlas = "UI-LFG-RoleIcon-DPS-Micro-GroupFinder",
+			fallbackAtlas = "UI-LFG-RoleIcon-DPS-Micro",
+			fallbackTexCoord = { 20 / 64, 39 / 64, 22 / 64, 41 / 64 },
 			name = Loc("RAID_SIGNUP_ROLE_MELEE", "Melee DPS") },
 	}
+	local function RoleIconAtlasAvailable(name)
+		return C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(name) ~= nil
+	end
 	panel.__sfRaidSignupRole = {}
 	for _, def in ipairs(roleDefs) do
 		local icon = TrackRegionCreate(host:CreateTexture(nil, "ARTWORK"))
-		icon:SetSize(ROLE_ICON_SIZE, ROLE_ICON_SIZE)
-		if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(def.atlas) then
-			icon:SetAtlas(def.atlas, true)
+		local atlas = RoleIconAtlasAvailable(def.atlas) and def.atlas
+			or (RoleIconAtlasAvailable(def.fallbackAtlas) and def.fallbackAtlas)
+			or nil
+		if atlas then
+			icon:SetAtlas(atlas, false)
 		else
-			icon:SetTexture(def.fallback)
+			-- Last resort for clients without the LFG role atlases: the same
+			-- circular role portraits BetterFriendlist crops from the classic
+			-- group-finder sheet.
+			icon:SetTexture("Interface\\LFGFrame\\UI-LFG-ICON-PORTRAITROLES")
+			if def.fallbackTexCoord then
+				icon:SetTexCoord(unpack(def.fallbackTexCoord))
+			end
 		end
+		icon:SetSize(ROLE_ICON_SIZE, ROLE_ICON_SIZE)
 		local count = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
 		count:SetText("0")
 		count:SetTextColor(1, 0.82, 0.18)

@@ -1075,6 +1075,20 @@ local function makeRegion(objectType)
     end
     function r:GetText() return self._text or "" end
     function r:SetTexture(t) self._texture = t end
+    function r:SetAtlas(name, useAtlasSize)
+        self._atlas = name
+        self._texture = nil
+        -- Mimic the client: useAtlasSize adopts the atlas's native dimensions.
+        if useAtlasSize then
+            local native = C_Texture and C_Texture.GetAtlasInfo
+                and C_Texture.GetAtlasInfo(name)
+            if native then
+                self._w = native
+                self._h = native
+            end
+        end
+    end
+    function r:SetTexCoord(l, r, t, b) self._texCoord = { l, r, t, b } end
     function r:SetDesaturated() end
     function r:SetVertexColor() end
     function r:SetMaxLetters() end
@@ -1233,6 +1247,32 @@ GameTooltip = {
     AddLine = function() end,
     Show = function() end,
     Hide = function() end,
+}
+
+-- Atlas registry for role-icon tests. Values are native square sizes in UI
+-- pixels; the LFG role atlases are 64px natively, far larger than the 14px
+-- role totals icons, so native-size adoption is observable.
+SF.__testAtlases = {
+    ["UI-LFG-RoleIcon-Tank-Micro-GroupFinder"] = 64,
+    ["UI-LFG-RoleIcon-Healer-Micro-GroupFinder"] = 64,
+    ["UI-LFG-RoleIcon-RangedDPS-Micro-GroupFinder"] = 64,
+    ["UI-LFG-RoleIcon-DPS-Micro-GroupFinder"] = 64,
+    ["UI-LFG-RoleIcon-Tank-Micro"] = 64,
+    ["UI-LFG-RoleIcon-Healer-Micro"] = 64,
+    ["UI-LFG-RoleIcon-RangedDPS-Micro"] = 64,
+    ["UI-LFG-RoleIcon-DPS-Micro"] = 64,
+    -- Names the first icon implementation used; kept so fallback ordering is
+    -- exercised against the real atlas family.
+    ["UI-LFG-RoleIcon-MeleeDPS-Micro"] = 64,
+}
+C_Texture = {
+    GetAtlasInfo = function(name)
+        local size = SF.__testAtlases and SF.__testAtlases[name]
+        if size then
+            return size, size
+        end
+        return nil
+    end,
 }
 
 SF.SettingsUI = SF.SettingsUI or {}
@@ -3547,18 +3587,32 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local expectedNames = {
         tank = "Tanks", healer = "Healers", ranged = "Ranged DPS", melee = "Melee DPS",
     }
-    local seenTextures = {}
+    local expectedAtlases = {
+        tank = "UI-LFG-RoleIcon-Tank-Micro-GroupFinder",
+        healer = "UI-LFG-RoleIcon-Healer-Micro-GroupFinder",
+        ranged = "UI-LFG-RoleIcon-RangedDPS-Micro-GroupFinder",
+        melee = "UI-LFG-RoleIcon-DPS-Micro-GroupFinder",
+    }
+    local seenArt = {}
     for _, key in ipairs(roleOrder) do
         local slot = panel.__sfRaidSignupRole[key]
         assertTrue(slot ~= nil and slot.icon ~= nil, "role icon present: " .. key)
         assertTrue(slot and slot.count ~= nil, "role count present: " .. key)
         assertTrue(slot and slot.hover ~= nil, "role hover region present: " .. key)
         assertEq(slot and slot.name, expectedNames[key], "localized role name: " .. key)
-        local tex = slot and slot.icon and slot.icon._texture
-        assertTrue(type(tex) == "string" and tex ~= "", "role icon has a texture: " .. key)
-        if type(tex) == "string" and tex ~= "" then
-            assertTrue(seenTextures[tex] == nil, "role icons are distinct: " .. key)
-            seenTextures[tex] = true
+        assertEq(slot and slot.icon._atlas, expectedAtlases[key],
+            "role icon uses the circular group-finder atlas: " .. key)
+        -- The atlas's native size (64px in the stub) must not survive: the
+        -- layout budgets 14px, so the final size is enforced after SetAtlas.
+        assertEq(slot and slot.icon.GetWidth and slot.icon:GetWidth(), 14,
+            "role icon final width is 14px: " .. key)
+        assertEq(slot and slot.icon.GetHeight and slot.icon:GetHeight(), 14,
+            "role icon final height is 14px: " .. key)
+        local art = slot and slot.icon and (slot.icon._atlas or slot.icon._texture)
+        assertTrue(type(art) == "string" and art ~= "", "role icon has artwork: " .. key)
+        if type(art) == "string" and art ~= "" then
+            assertTrue(seenArt[art] == nil, "role icons are distinct: " .. key)
+            seenArt[art] = true
         end
         assertTrue(slot and slot.count and slot.count:GetText() ~= "",
             "zero counts still render: " .. key)
@@ -3763,6 +3817,49 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
 
 end
 RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
+
+-- Role icon asset fallback chain: GroupFinder atlas -> plain Micro atlas ->
+-- circular portrait sheet, with the final 14x14 size enforced on every path.
+local function RaidSignupRoleIconFallbackTests(UIPage)
+    local savedAtlases = SF.__testAtlases
+    local roleOrder = { "tank", "healer", "ranged", "melee" }
+    local microOnly = {
+        ["UI-LFG-RoleIcon-Tank-Micro"] = 64,
+        ["UI-LFG-RoleIcon-Healer-Micro"] = 64,
+        ["UI-LFG-RoleIcon-RangedDPS-Micro"] = 64,
+        ["UI-LFG-RoleIcon-DPS-Micro"] = 64,
+    }
+    local expectedMicro = {
+        tank = "UI-LFG-RoleIcon-Tank-Micro",
+        healer = "UI-LFG-RoleIcon-Healer-Micro",
+        ranged = "UI-LFG-RoleIcon-RangedDPS-Micro",
+        melee = "UI-LFG-RoleIcon-DPS-Micro",
+    }
+
+    SF.__testAtlases = microOnly
+    local microPanel = NewPagePanel()
+    UIPage:Build(microPanel)
+    for _, key in ipairs(roleOrder) do
+        local icon = microPanel.__sfRaidSignupRole[key].icon
+        assertEq(icon._atlas, expectedMicro[key], "micro atlas fallback: " .. key)
+        assertEq(icon:GetWidth(), 14, "micro fallback icon width: " .. key)
+        assertEq(icon:GetHeight(), 14, "micro fallback icon height: " .. key)
+    end
+
+    SF.__testAtlases = {}
+    local sheetPanel = NewPagePanel()
+    UIPage:Build(sheetPanel)
+    for _, key in ipairs(roleOrder) do
+        local icon = sheetPanel.__sfRaidSignupRole[key].icon
+        assertEq(icon._texture, "Interface\\LFGFrame\\UI-LFG-ICON-PORTRAITROLES",
+            "portrait-sheet fallback texture: " .. key)
+        assertTrue(icon._texCoord ~= nil, "portrait-sheet fallback texcoord: " .. key)
+        assertEq(icon:GetWidth(), 14, "sheet fallback icon width: " .. key)
+        assertEq(icon:GetHeight(), 14, "sheet fallback icon height: " .. key)
+    end
+    SF.__testAtlases = savedAtlases
+end
+RaidSignupRoleIconFallbackTests(UIPage)
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt
