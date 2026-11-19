@@ -164,13 +164,48 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         return self:_NormalizeNameRealmForCompare(name) or name
     end
 
-    -- Who do we ask?
+    -- Who do we ask? Profile admins are authorization state; only admins
+    -- currently reachable through the group are convergence targets.
     local admins = self:_GetProfileAdminUsers(profile)
     local me = self:_SelfId()
-    
+
+    if self.UpdatePeersFromRoster then
+        self:UpdatePeersFromRoster()
+    end
+
+    local function normalizeTargetName(name)
+        if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+            return SF.NameUtil.NormalizeNameRealm(name) or name
+        end
+        return self:_NormalizeNameRealmForCompare(name) or name
+    end
+
+    local function isConvergenceTarget(admin)
+        if type(admin) ~= "string" or admin == "" then return false end
+        if me and self:_SamePlayer(admin, me) then return false end
+
+        local peerName = normalizeTargetName(admin)
+        local peer = self.GetPeer and self:GetPeer(peerName) or nil
+        if peer and peer.inGroup == true and peer.online ~= false then
+            return true
+        end
+
+        -- Admin spellings can differ in case from the roster key. Scan the
+        -- refreshed peer table before deciding this admin is unreachable.
+        for peerKey, candidate in pairs(self.state.peers or {}) do
+            if candidate and candidate.inGroup == true and candidate.online ~= false then
+                local candidateName = candidate.name or peerKey
+                if self:_SamePlayer(peerName, candidateName) or self:_SamePlayer(admin, candidateName) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     local adminList = {}
     for _, admin in ipairs(admins) do
-        if admin ~= me then
+        if isConvergenceTarget(admin) then
             table.insert(adminList, admin)
         end
     end
@@ -180,7 +215,7 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
             tostring(mode), tostring(adminSyncId), (self.cfg.adminConvergenceCollectSec or 1.5),
             (#adminList > 0) and table.concat(adminList, ",") or "none")
     end
-    
+
     if SF.Debug then
         SF.Debug:Info("SYNC", "Beginning admin convergence (mode=%s, adminSyncId=%s, targetAdmins=%d)",
             tostring(mode), tostring(adminSyncId), #adminList)
@@ -199,27 +234,21 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         onComplete      = opts.onComplete or function() self:BroadcastSessionStart() end,
     }
 
-    -- Who do we ask?
-    local admins = self:_GetProfileAdminUsers(profile)
-    local me = self:_SelfId()
-
-    for _, admin in ipairs(admins) do
-        if admin ~= me then
-            local norm = normalize(admin)
-            if norm then
-                self.state._adminConvergence.expected[norm] = true
-                self.state._adminConvergence.expectedRaw[norm] = admin
-            end
-            if SF.LootHelperComm then
-                local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
-                    sessionId       = sessionId,
-                    profileId       = profileId,
-                    adminSyncId     = adminSyncId,
-                }, "WHISPER", admin, "NORMAL")
-                if SF.Debug then
-                    SF.Debug:Verbose("SYNC", "Sent ADMIN_SYNC to %s (adminSyncId=%s, ok=%s)",
-                        tostring(admin), tostring(adminSyncId), tostring(sendOk))
-                end
+    for _, admin in ipairs(adminList) do
+        local norm = normalize(admin)
+        if norm then
+            self.state._adminConvergence.expected[norm] = true
+            self.state._adminConvergence.expectedRaw[norm] = admin
+        end
+        if SF.LootHelperComm then
+            local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
+                sessionId       = sessionId,
+                profileId       = profileId,
+                adminSyncId     = adminSyncId,
+            }, "WHISPER", admin, "NORMAL")
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Sent ADMIN_SYNC to %s (adminSyncId=%s, ok=%s)",
+                    tostring(admin), tostring(adminSyncId), tostring(sendOk))
             end
         end
     end

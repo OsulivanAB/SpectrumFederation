@@ -340,6 +340,7 @@ end
 Sync._EnforceGroupedSessionActive = function()
     return "RAID"
 end
+Sync._testProductionUpdatePeersFromRoster = Sync.UpdatePeersFromRoster
 Sync.UpdatePeersFromRoster = function() end
 local originalBeginAdminConvergence = Sync.BeginAdminConvergence
 Sync.BeginAdminConvergence = function()
@@ -3394,6 +3395,92 @@ for _, item in pairs(Sync.state.repairQueue.items) do
     end
 end
 assertEq(repairItem and repairItem.preferredTarget, OWNER, "integrity queue keeps the advertising admin")
+
+-- Admin convergence whispers only to profile admins who are currently in the group.
+do
+reset(COORD)
+setAdmins({ COORD, KINO, SUSPENDERS, OWNER, MEMBER })
+
+-- Raid roster online is 1/nil; peer state normalizes it to true/false.
+local function raidRosterInfo(index)
+    if index == 1 then
+        return "Kino-Realm", 0, 1, 80, "Mage", "MAGE", "Zone", 1
+    end
+    if index == 2 then
+        return "Suspenders-Realm", 0, 1, 80, "Warrior", "WARRIOR", "Offline", nil
+    end
+end
+local originalGetNumGroupMembers = GetNumGroupMembers
+local originalGetRaidRosterInfo = GetRaidRosterInfo
+GetNumGroupMembers = function() return 2 end
+GetRaidRosterInfo = raidRosterInfo
+Sync._testProductionUpdatePeersFromRoster(Sync)
+GetNumGroupMembers = originalGetNumGroupMembers
+GetRaidRosterInfo = originalGetRaidRosterInfo
+assertEq(Sync.state.peers[KINO].online, true, "raid online roster value normalizes to true")
+assertEq(Sync.state.peers[SUSPENDERS].online, false, "raid offline roster value normalizes to false")
+
+Sync.state.isCoordinator = true
+Sync.state.peers = {
+    [COORD] = { inGroup = true, online = true },
+    [KINO] = { inGroup = true, online = true },
+    [SUSPENDERS] = { inGroup = true, online = false },
+    [OWNER] = { inGroup = false, online = true },
+    [MEMBER] = { inGroup = false, online = true },
+}
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local rosterRefreshes = 0
+local originalRosterRefresh = Sync.UpdatePeersFromRoster
+Sync.UpdatePeersFromRoster = function()
+    rosterRefreshes = rosterRefreshes + 1
+end
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function() end,
+})
+Sync.UpdatePeersFromRoster = originalRosterRefresh
+assertEq(rosterRefreshes, 1, "admin convergence refreshes the roster once")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC), 1, "admin convergence sends one ADMIN_SYNC total")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, KINO), 1, "admin convergence whispers the in-group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, SUSPENDERS), 0, "admin convergence does not whisper an offline group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, OWNER), 0, "admin convergence does not whisper an out-of-group admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, MEMBER), 0, "admin convergence does not whisper another out-of-group admin")
+local conv = Sync.state._adminConvergence
+assertTrue(type(conv) == "table", "admin convergence state exists")
+assertTrue(conv.expected["Kino-Realm"] == true, "in-group admin is an expected responder")
+assertNil(conv.expected["Suspenders-Realm"], "offline group admin is not an expected responder")
+assertNil(conv.expected["Owner-Realm"], "out-of-group admin is not an expected responder")
+assertNil(conv.expected["Member-Realm"], "another out-of-group admin is not an expected responder")
+assertEq(#profile._adminUsers, 5, "convergence filtering does not change profile admins")
+assertTrue(listHas(profile._adminUsers, OWNER), "out-of-group admin remains a profile admin")
+
+Sync:HandleAdminStatus(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    adminSyncId = conv.adminSyncId,
+    hasProfile = false,
+    authorMax = {},
+    hasGaps = false,
+})
+assertNil(Sync.state._adminConvergence, "eligible response finalizes without waiting for excluded admins")
+
+Sync.state.peers[OWNER] = { inGroup = true, online = true }
+local adminSyncBeforeRejoin = sendCount(Sync.MSG.ADMIN_SYNC)
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function() end,
+})
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC), adminSyncBeforeRejoin + 2,
+    "a later in-group admin joins the next convergence target set")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, OWNER), 1, "rejoined admin receives ADMIN_SYNC")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, SUSPENDERS), 0, "rejoin round still skips the offline admin")
+assertEq(sendCount(Sync.MSG.ADMIN_SYNC, MEMBER), 0, "rejoin round still skips out-of-group admins")
+conv = Sync.state._adminConvergence
+assertTrue(conv.expected["Owner-Realm"] == true, "rejoined admin is expected on the next round")
+assertTrue(conv.expected["Kino-Realm"] == true, "still-in-group admin remains expected on the next round")
+assertNil(conv.expected["Suspenders-Realm"], "offline admin remains excluded on the next round")
+assertNil(conv.expected["Member-Realm"], "out-of-group admin remains excluded on the next round")
+end
 
 -- Abandoned convergence timers must not finalize a replacement round.
 reset(COORD)

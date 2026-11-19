@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.20-beta.1] - 2026-11-19
+
+### Fixed
+- Fix admin convergence targeting for unavailable profile admins
+
 ## [1.5.19] - 2026-11-18
 
 ### Added
