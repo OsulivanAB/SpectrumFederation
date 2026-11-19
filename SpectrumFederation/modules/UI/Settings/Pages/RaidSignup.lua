@@ -84,6 +84,10 @@ local BOARD_LEFT_RATIO = 0.62
 local BOARD_MIN_WIDTH = 480
 local BOARD_TOP_H = 69
 local BOARD_STATUS_H = 18
+-- Fixed columns for collapsed signup rows (Nickname | Main | Alt | Notes).
+local COL_MAIN_X = 140
+local COL_ALT_X = COL_MAIN_X + 36
+local COL_NOTES_X = COL_ALT_X + 36
 local CLASS_COUNT_WIDTH = 24
 
 local function TrackCreate(frame)
@@ -1662,18 +1666,19 @@ PaintEntries = function(host, planId, planOpen, caps)
 				return
 			end
 
-			-- Collapsed: one line — class-colored name, spec icon(s), alt spec
-			-- name + icon, then notes. Clicking an icon opens the editor.
-			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 20))
+			-- Collapsed: fixed columns — Nickname, Main icon, Alt icon (or a muted
+			-- dash), then notes; Remove Alt / Delete stay right-aligned. Clicking an
+			-- icon opens the editor for that slot.
+			local nameFs = AcquireFieldLabel(row, ClipDisplay(entry.nickname or "", 16))
 			nameFs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			nameFs:SetTextColor(ClassColor(entry.mainClass))
 			local mainBtn = MakeIconButton(row, ICON)
 			mainBtn.__sfRaidSignupSpecSlot = "main"
-			mainBtn:SetPoint("LEFT", nameFs, "RIGHT", 6, 0)
+			mainBtn:SetPoint("LEFT", row, "LEFT", COL_MAIN_X, 0)
 			-- Enabled presentation follows canEdit (plan open + edit eligibility).
 			-- Informative hover tooltips stay assigned even when the button is disabled.
 			SetIconVisual(mainBtn, TextureForSpec(entry.mainSpec), canEdit, false)
-			mainBtn.tooltipTitle = SpecName(entry.mainSpec)
+			mainBtn.tooltipTitle = Loc("RAID_SIGNUP_COL_MAIN", "Main")
 			mainBtn.tooltipText = ClassName(entry.mainClass) .. " · " .. SpecName(entry.mainSpec)
 			mainBtn:SetScript("OnClick", function()
 				if not canEdit then
@@ -1694,18 +1699,13 @@ PaintEntries = function(host, planId, planOpen, caps)
 				}
 				QueueRefresh({ force = true })
 			end)
-			local anchor = mainBtn
 			if entry.altClass and entry.altSpec then
-				local altNameFs = AcquireFieldLabel(row, SpecName(entry.altSpec))
-				altNameFs:SetPoint("LEFT", anchor, "RIGHT", 6, 0)
-				altNameFs:SetTextColor(0.85, 0.85, 0.85)
 				local altBtn = MakeIconButton(row, ICON)
 				altBtn.__sfRaidSignupSpecSlot = "alt"
-				altBtn:SetPoint("LEFT", altNameFs, "RIGHT", 4, 0)
+				altBtn:SetPoint("LEFT", row, "LEFT", COL_ALT_X, 0)
 				SetIconVisual(altBtn, TextureForSpec(entry.altSpec), canEdit, false)
-				altBtn.tooltipTitle = SpecName(entry.altSpec)
-				altBtn.tooltipText = Loc("RAID_SIGNUP_ALT_LABEL", "Alternative")
-					.. ": " .. ClassName(entry.altClass) .. " · " .. SpecName(entry.altSpec)
+				altBtn.tooltipTitle = Loc("RAID_SIGNUP_COL_ALT", "Alt")
+				altBtn.tooltipText = ClassName(entry.altClass) .. " · " .. SpecName(entry.altSpec)
 				altBtn:SetScript("OnClick", function()
 					if not canEdit then
 						return
@@ -1725,14 +1725,27 @@ PaintEntries = function(host, planId, planOpen, caps)
 					}
 					QueueRefresh({ force = true })
 				end)
-				anchor = altBtn
+			else
+				-- No alternate: muted dash keeps the Alt column aligned; adding one
+				-- still goes through the Add an Alt? action below.
+				local dash = AcquireFieldLabel(row, "—")
+				dash:SetPoint("LEFT", row, "LEFT", COL_ALT_X, 0)
+				dash:SetTextColor(0.5, 0.5, 0.5)
 			end
 			local notesText = entry.notes or ""
 			if notesText ~= "" then
-				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, 28))
-				notesFs:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
+				-- Clip notes to the space left of the action buttons so long text
+				-- never runs under Remove Alt / Delete.
+				local rowW = host.GetWidth and host:GetWidth() or 0
+				if rowW < 200 then
+					rowW = 446
+				end
+				local reserve = (planOpen and canEdit) and 176 or 10
+				local chars = math.floor((rowW - COL_NOTES_X - reserve - 8) / 7)
+				chars = math.max(4, math.min(28, chars))
+				local notesFs = AcquireFieldLabel(row, ClipDisplay(notesText, chars))
+				notesFs:SetPoint("LEFT", row, "LEFT", COL_NOTES_X, 0)
 				notesFs:SetTextColor(0.6, 0.6, 0.6)
-				anchor = notesFs
 			end
 			if planOpen and canEdit then
 				local del = AcquireTextButton(row)
@@ -1866,8 +1879,11 @@ LayoutBoard = function(panel)
 	if panel.__sfRaidSignupNickHeader then
 		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -49)
 	end
-	if panel.__sfRaidSignupSpecHeader then
-		panel.__sfRaidSignupSpecHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -49)
+	if panel.__sfRaidSignupMainHeader then
+		panel.__sfRaidSignupMainHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_MAIN_X, -49)
+	end
+	if panel.__sfRaidSignupAltHeader then
+		panel.__sfRaidSignupAltHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_ALT_X, -49)
 	end
 	if entriesHost then
 		entriesHost:ClearAllPoints()
@@ -2012,11 +2028,16 @@ local function BuildBoardChrome(panel, host)
 	nickHeader:SetText(Loc("RAID_SIGNUP_COL_NICKNAME", "Nickname"))
 	nickHeader:SetTextColor(0.8, 0.8, 0.8)
 	panel.__sfRaidSignupNickHeader = nickHeader
-	local specHeader = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
-	specHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -42)
-	specHeader:SetText(Loc("RAID_SIGNUP_LABEL_CLASS_SPEC", "Class / Spec"))
-	specHeader:SetTextColor(0.8, 0.8, 0.8)
-	panel.__sfRaidSignupSpecHeader = specHeader
+	local mainHeader = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	mainHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_MAIN_X, -42)
+	mainHeader:SetText(Loc("RAID_SIGNUP_COL_MAIN", "Main"))
+	mainHeader:SetTextColor(0.8, 0.8, 0.8)
+	panel.__sfRaidSignupMainHeader = mainHeader
+	local altHeader = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	altHeader:SetPoint("TOPLEFT", host, "TOPLEFT", COL_ALT_X, -42)
+	altHeader:SetText(Loc("RAID_SIGNUP_COL_ALT", "Alt"))
+	altHeader:SetTextColor(0.8, 0.8, 0.8)
+	panel.__sfRaidSignupAltHeader = altHeader
 
 	-- Dynamic columns and status line.
 	local entriesHost = TrackCreate(CreateFrame("Frame", nil, host))
@@ -2154,7 +2175,8 @@ local function WipePageBuilder(panel)
 		panel.__sfRaidSignupRightLine = nil
 		panel.__sfRaidSignupVDivider = nil
 		panel.__sfRaidSignupNickHeader = nil
-		panel.__sfRaidSignupSpecHeader = nil
+		panel.__sfRaidSignupMainHeader = nil
+		panel.__sfRaidSignupAltHeader = nil
 		panel.__sfRaidSignupSections = nil
 		panel.__sfRaidSignupMessages = nil
 	end

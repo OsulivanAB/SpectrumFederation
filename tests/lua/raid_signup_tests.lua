@@ -2993,7 +2993,10 @@ do
     -- Board chrome: headings, + button, column headers, role totals, status line
     assertTrue(memberPanel.__sfRaidSignupAddBtn ~= nil, "add-signup + button exists")
     assertTrue(memberPanel.__sfRaidSignupNickHeader ~= nil, "Nickname column header exists")
-    assertTrue(memberPanel.__sfRaidSignupSpecHeader ~= nil, "Class / Spec column header exists")
+    assertTrue(memberPanel.__sfRaidSignupMainHeader ~= nil, "Main column header exists")
+    assertTrue(memberPanel.__sfRaidSignupAltHeader ~= nil, "Alt column header exists")
+    assertEq(memberPanel.__sfRaidSignupMainHeader:GetText(), "Main", "Main header text")
+    assertEq(memberPanel.__sfRaidSignupAltHeader:GetText(), "Alt", "Alt header text")
     assertTrue(memberPanel.__sfRaidSignupStatusFs ~= nil, "status line beneath list exists")
     local role = memberPanel.__sfRaidSignupRole
     assertTrue(role ~= nil, "role totals row exists")
@@ -3131,11 +3134,13 @@ do
     local entryHost = memberPanel.__sfRaidSignupEntriesHost
     local mainBtns = UIPage._FindSpecButtonsForTests(entryHost, "main")
     assertTrue(#mainBtns >= 1, "main spec button present for tooltip check")
+    assertEq(mainBtns[1].tooltipTitle, "Main", "main icon tooltip identifies Main")
     assertEq(mainBtns[1].tooltipText, "Localized8 · Arcane",
         "main tooltip uses localized class name")
     local altBtns = UIPage._FindSpecButtonsForTests(entryHost, "alt")
     assertTrue(#altBtns >= 1, "alt spec button present for tooltip check")
-    assertEq(altBtns[1].tooltipText, "Alternative: Localized1 · Arms",
+    assertEq(altBtns[1].tooltipTitle, "Alt", "alt icon tooltip identifies Alt")
+    assertEq(altBtns[1].tooltipText, "Localized1 · Arms",
         "alt tooltip uses localized class name")
     local function FindBySize(root, w, h)
         local found = nil
@@ -3192,8 +3197,9 @@ do
     end
 
     do
-    -- Collapsed rows render one text line: class-colored name, spec icons,
-    -- alt spec name + icon, notes — with no inline edit boxes.
+    -- Collapsed rows render fixed Main / Alt icon columns: class-colored
+    -- nickname, spec icons with Main/Alt tooltips, notes — no standalone spec
+    -- text, and a muted dash in the Alt column when no alternate is selected.
     local collapsedEntries = RS:GetSortedEntries(tabPlanId)
     assertTrue(#collapsedEntries >= 1, "entry available for collapsed row check")
     local collapsedTarget = collapsedEntries[1]
@@ -3217,9 +3223,20 @@ do
     if collapsedTarget.altClass and collapsedTarget.altSpec then
         local altSpecName = RS.SpecDisplayName and RS.SpecDisplayName(collapsedTarget.altSpec)
         if altSpecName then
-            assertTrue(FindFontStringByText(entryHost, altSpecName) ~= nil,
-                "collapsed row shows alt spec name")
+            assertTrue(FindFontStringByText(entryHost, altSpecName) == nil,
+                "collapsed row no longer shows standalone alt spec name")
         end
+    end
+    local noAltEntry = nil
+    for _, e in ipairs(collapsedEntries) do
+        if not (e.altClass and e.altSpec) then
+            noAltEntry = e
+            break
+        end
+    end
+    if noAltEntry then
+        assertTrue(FindFontStringByText(entryHost, "—") ~= nil,
+            "collapsed row without alt shows muted dash in Alt column")
     end
     end
 
