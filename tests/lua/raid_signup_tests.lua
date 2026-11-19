@@ -891,7 +891,8 @@ do
         { mainClass = "PRIEST", mainSpec = 256 },     -- stamina, mass dispel
         { mainClass = "WARLOCK", mainSpec = 265 },    -- heroism? no; 3 warlock utils, combat res, cast slow
         { mainClass = "DEATHKNIGHT", mainSpec = 251 },-- frost: grip overlay +1
-        { mainClass = "DEATHKNIGHT", mainSpec = 250 },-- blood: AMZ coverage, no grip overlay
+        { mainClass = "DEATHKNIGHT", mainSpec = 250 },-- blood: grip overlay +1 (all DK specs have Death Grip)
+        { mainClass = "DEATHKNIGHT", mainSpec = 252 },-- unholy: grip overlay +1
         { mainClass = "DRUID", mainSpec = 102 },      -- balance: innervate now eligible
         { mainClass = "DRUID", mainSpec = 105 },      -- resto: innervate
         { mainClass = "ROGUE", mainSpec = 259, deleted = true },
@@ -902,11 +903,11 @@ do
     assertEq(pc.intellect, 1, "intellect counts the mage main once")
     assertEq(pc.bloodlust, 1, "heroism counts mage only (internal category id retained)")
     assertEq(pc.mass_dispel, 1, "mass dispel counts the priest main")
-    assertEq(pc.combat_res, 5, "combat res counts warlock + 2 DKs + 2 druids")
+    assertEq(pc.combat_res, 6, "combat res counts warlock + 3 DKs + 2 druids")
     assertEq(pc.warlock_ritual, 1, "ritual of summoning counts warlock mains")
     assertEq(pc.warlock_healthstone, 1, "healthstone counts warlock mains")
     assertEq(pc.warlock_gateway, 1, "demonic gateway counts warlock mains")
-    assertEq(pc.dk_grip_amz, 1, "grip overlay counts Frost DK providers only")
+    assertEq(pc.dk_grip_amz, 3, "grip overlay counts Blood, Frost, and Unholy DK mains once each")
     assertEq(pc.burst_move, 2, "burst move counts two druids; deleted shaman and spec-less monk draft excluded")
     assertEq(pc.innervate, 2, "innervate counts balance and resto druids")
     assertEq(pc.atk_speed_slow, 0, "deleted rogue excluded from provider counts")
@@ -3085,21 +3086,23 @@ do
     do
         -- Stub: board width falls back to 720, sidebar gets the remaining column.
         local w = 720 - math.floor(720 * 0.62) - 16
-        local classPitch = 22 + 6 + 24 + 8
+        local classPitch = 24 + 6 + 24 + 8
         local cols = math.max(1, math.min(5, math.floor((w + 8) / classPitch)))
         local classRows = math.ceil(#RS.CLASS_ORDER / cols)
         local tokenRows = math.max(1, math.ceil(#(RS.ARMOR_TOKEN_GROUPS or {}) / cols))
-        local iconPitch = 22 + 8
-        local iconCols = math.max(1, math.min(5, math.floor((w + 8) / iconPitch)))
+        local iconPitch = 24 + 8
+        -- Icon-only grids derive their column count from the sidebar width
+        -- with no cap; the count-labelled class/token grids keep the cap.
+        local iconCols = math.max(1, math.floor((w + 8) / iconPitch))
         local majorRows = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / iconCols))
         local utilityRows = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / iconCols))
         -- Mirrors PaintSummary group geometry: title, 20px gap, icon rows,
         -- 8px gap to the next heading below the actual grid bottom.
         local function gridBottom(titleY, rows)
-            return titleY - 20 - (rows - 1) * 26 - 22
+            return titleY - 20 - (rows - 1) * 28 - 24
         end
-        -- Role totals lead the sidebar: one 15px line plus a 10px gap.
-        local classTitleY = -(15 + 10)
+        -- Role totals lead the sidebar: one 17px line plus a 10px gap.
+        local classTitleY = -(17 + 10)
         local tokenTitleY = gridBottom(classTitleY, classRows) - 8
         local majorTitleY = gridBottom(tokenTitleY, tokenRows) - 8
         local utilityTitleY = gridBottom(majorTitleY, majorRows) - 8
@@ -3550,9 +3553,9 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local narrowGeom = panel.__sfEntryGeom
     assertTrue(narrowGeom ~= nil, "row geometry computed from board width")
     local contentRight = narrowGeom.leftW - narrowGeom.rightReserve
-    assertTrue(narrowGeom.mainX + 22 <= contentRight,
+    assertTrue(narrowGeom.mainX + 24 <= contentRight,
         "Main column clears the reserved action group at narrow width")
-    assertTrue(narrowGeom.altX + 22 <= contentRight,
+    assertTrue(narrowGeom.altX + 24 <= contentRight,
         "Alt column clears the reserved action group at narrow width")
     assertTrue(narrowGeom.notesX < contentRight,
         "notes start left of the action group at narrow width")
@@ -3684,9 +3687,9 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
             "role icon uses the circular group-finder atlas: " .. key)
         -- The atlas's native size (64px in the stub) must not survive: the
         -- layout budgets 14px, so the final size is enforced after SetAtlas.
-        assertEq(slot and slot.icon.GetWidth and slot.icon:GetWidth(), 14,
+        assertEq(slot and slot.icon.GetWidth and slot.icon:GetWidth(), 16,
             "role icon final width is 14px: " .. key)
-        assertEq(slot and slot.icon.GetHeight and slot.icon:GetHeight(), 14,
+        assertEq(slot and slot.icon.GetHeight and slot.icon:GetHeight(), 16,
             "role icon final height is 14px: " .. key)
         local art = slot and slot.icon and (slot.icon._atlas or slot.icon._texture)
         assertTrue(type(art) == "string" and art ~= "", "role icon has artwork: " .. key)
@@ -3784,15 +3787,17 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     assertTrue(boardHost:GetHeight() >= entriesBottom + 24 - 1,
         "board height still contains the signup entries")
 
-    -- 3. Summary: a 2px resize across the class-grid threshold rebuilds geometry.
-    boardHost._w = 650
-    summaryHost._w = 231
+    -- 3. Summary: a small resize across the class-grid threshold rebuilds
+    -- geometry. With the 24px icons the class pitch is 62px, so sidebar
+    -- widths 238 -> 240 cross from 3 to 4 columns.
+    boardHost._w = 668
+    summaryHost._w = 238
     UIPage:Refresh(panel, { force = true })
     UIPage:Refresh(panel, { force = true }) -- let LayoutBoard settle the width
     local keyThree = summaryHost.__sfSummaryBuiltKey
     local heightThree = summaryHost:GetHeight()
-    boardHost._w = 654
-    summaryHost._w = 233
+    boardHost._w = 672
+    summaryHost._w = 240
     UIPage:Refresh(panel, { force = true })
     UIPage:Refresh(panel, { force = true })
     local keyFour = summaryHost.__sfSummaryBuiltKey
@@ -3801,7 +3806,7 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local hasFourthColumn = false
     for _, btn in pairs(summaryHost.__sfClassIcons or {}) do
         local x = TopLeftOffset(btn)
-        if x == 180 then
+        if x == 186 then
             hasFourthColumn = true
         end
     end
@@ -3924,8 +3929,8 @@ local function RaidSignupRoleIconFallbackTests(UIPage)
     for _, key in ipairs(roleOrder) do
         local icon = microPanel.__sfRaidSignupRole[key].icon
         assertEq(icon._atlas, expectedMicro[key], "micro atlas fallback: " .. key)
-        assertEq(icon:GetWidth(), 14, "micro fallback icon width: " .. key)
-        assertEq(icon:GetHeight(), 14, "micro fallback icon height: " .. key)
+        assertEq(icon:GetWidth(), 16, "micro fallback icon width: " .. key)
+        assertEq(icon:GetHeight(), 16, "micro fallback icon height: " .. key)
     end
 
     SF.__testAtlases = {}
@@ -3936,8 +3941,8 @@ local function RaidSignupRoleIconFallbackTests(UIPage)
         assertEq(icon._texture, "Interface\\LFGFrame\\UI-LFG-ICON-PORTRAITROLES",
             "portrait-sheet fallback texture: " .. key)
         assertTrue(icon._texCoord ~= nil, "portrait-sheet fallback texcoord: " .. key)
-        assertEq(icon:GetWidth(), 14, "sheet fallback icon width: " .. key)
-        assertEq(icon:GetHeight(), 14, "sheet fallback icon height: " .. key)
+        assertEq(icon:GetWidth(), 16, "sheet fallback icon width: " .. key)
+        assertEq(icon:GetHeight(), 16, "sheet fallback icon height: " .. key)
     end
     SF.__testAtlases = savedAtlases
 end
@@ -4522,6 +4527,7 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
     add("OvLock", "WARLOCK", 266)
     add("OvFrost", "DEATHKNIGHT", 251)
     add("OvBlood", "DEATHKNIGHT", 250)
+    add("OvUnholy", "DEATHKNIGHT", 252)
     UIPage:Refresh(panel, { force = true })
 
     local overlays = summaryHost.__sfProviderOverlays
@@ -4538,12 +4544,52 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
         local c = ov and ov._textColor
         return c and c[1] or nil
     end
-    assertEq(overlayText("combat_res"), "3", "combat res counts warlock + 2 DKs")
-    assertEq(overlayText("dk_grip_amz"), "1", "grip overlay counts Frost DK only")
+    assertEq(overlayText("combat_res"), "4", "combat res counts warlock + 3 DKs")
+    assertEq(overlayText("dk_grip_amz"), "3", "grip overlay counts Blood, Frost, and Unholy DK mains")
     assertEq(overlayText("burst_move"), "0", "zero providers still shown")
     for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
         assertEq(overlayColor(id), 1, "overlay count is white: " .. id)
     end
+
+    -- Overlays render above their icon button's artwork: each overlay is a
+    -- child region of its category button, anchored inside the bottom-right.
+    local function overlayBtn(id)
+        local ov = overlays[id]
+        local parent = ov and ov.GetParent and ov:GetParent() or nil
+        if not parent then
+            return nil
+        end
+        for catId, btn in pairs(summaryHost.__sfUtilityButtons or {}) do
+            if catId == id and btn == parent then
+                return btn
+            end
+        end
+        for catId, btn in pairs(summaryHost.__sfMajorButtons or {}) do
+            if catId == id and btn == parent then
+                return btn
+            end
+        end
+        return nil
+    end
+    for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
+        local btn = overlayBtn(id)
+        assertTrue(btn ~= nil, "overlay parented to its icon button: " .. id)
+        local ov = overlays[id]
+        local anchored = false
+        for _, pt in ipairs(ov._points or {}) do
+            if pt[1] == "BOTTOMRIGHT" and pt[3] == "BOTTOMRIGHT" then
+                anchored = true
+            end
+        end
+        assertTrue(anchored, "overlay anchored bottom-right of icon: " .. id)
+        assertTrue(type(btn.tooltipLines) == "table" and #btn.tooltipLines == 1
+            and btn.tooltipLines[1]:find("eligible signed-up mains", 1, true) ~= nil,
+            "tooltip includes provider count meaning: " .. id)
+    end
+    local gripBtn = overlayBtn("dk_grip_amz")
+    assertTrue(gripBtn ~= nil and gripBtn.tooltipLines
+        and gripBtn.tooltipLines[1]:find("3 eligible", 1, true) ~= nil,
+        "Death Grip tooltip shows the three-spec provider count")
 
     -- Role totals are the first Summary content, above Classes.
     -- Stub point tuples: { point, relativeTo, relativePoint, x, y }.
@@ -4586,6 +4632,149 @@ local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
 end
 RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
+
+;(function()
+    -- Cosmetic batch: shared sidebar geometry, Main / Alt heading slash,
+    -- enlarged icons, and pooled overlay font/draw-layer reapplication.
+    local summaryHost = panel.__sfRaidSignupSummaryHost
+    assertTrue(summaryHost ~= nil, "summary host exists for geometry checks")
+
+    local function TopLeft(widget)
+        for _, pt in ipairs(widget._points or {}) do
+            if pt[1] == "TOPLEFT" then
+                return pt[4], pt[5]
+            end
+        end
+        return nil, nil
+    end
+    local function RegionsWithText(root, text)
+        local found = {}
+        local function walk(f)
+            if not f then
+                return
+            end
+            if f.GetText and f:GetText() == text then
+                found[#found + 1] = f
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+            if f.GetRegions then
+                for _, r in ipairs({ f:GetRegions() }) do
+                    walk(r)
+                end
+            end
+        end
+        walk(root)
+        return found
+    end
+
+    -- 1. Main / Alt heading slash: present, between the two labels, heading only.
+    local slash = panel.__sfRaidSignupMainAltSlash
+    assertTrue(slash ~= nil, "Main / Alt separator exists")
+    assertEq(slash:GetText(), "/", "separator is a slash")
+    local mainHeader = panel.__sfRaidSignupMainHeader
+    local altHeader = panel.__sfRaidSignupAltHeader
+    local sx = TopLeft(slash)
+    local mx = TopLeft(mainHeader)
+    local ax = TopLeft(altHeader)
+    assertTrue(sx ~= nil and mx ~= nil and ax ~= nil, "headers positioned")
+    assertTrue(sx > mx and sx < ax, "slash sits between Main and Alt headings")
+    -- Row icons keep their own columns; no slash text appears on rows.
+    local rowSlashes = 0
+    local entriesHost = panel.__sfRaidSignupEntriesHost
+    for _, r in ipairs(RegionsWithText(entriesHost, "/")) do
+        rowSlashes = rowSlashes + 1
+    end
+    assertEq(rowSlashes, 0, "no slash separators on signup rows")
+
+    -- 2. Shared sidebar geometry: all four group titles share one left edge,
+    --    and Major/Utility icon grids share identical column geometry that
+    --    stays inside the sidebar width.
+    local titleXs = {}
+    for _, label in ipairs({ "Classes", "Tier Tokens", "Major Buffs/Debuffs", "Utility" }) do
+        local matches = RegionsWithText(summaryHost, label)
+        assertTrue(#matches >= 1, "group title present: " .. label)
+        local x = TopLeft(matches[1])
+        assertTrue(x ~= nil, "group title positioned: " .. label)
+        titleXs[label] = x
+    end
+    for _, label in ipairs({ "Tier Tokens", "Major Buffs/Debuffs", "Utility" }) do
+        assertEq(titleXs[label], titleXs.Classes,
+            "shared sidebar left edge: " .. label)
+    end
+    -- Uncapped icon-grid columns: at the stub width the pitch admits more
+    -- than five columns, and both icon-only grids use the same count.
+    local function IconColumns(gridButtons)
+        local xs = {}
+        for _, btn in pairs(gridButtons or {}) do
+            local x = TopLeft(btn)
+            if x ~= nil then
+                xs[x] = true
+            end
+        end
+        local n = 0
+        for _ in pairs(xs) do
+            n = n + 1
+        end
+        return n
+    end
+    local majorCols = IconColumns(summaryHost.__sfMajorButtons)
+    local utilityCols = IconColumns(summaryHost.__sfUtilityButtons)
+    assertTrue(majorCols > 5, "icon grid column count is uncapped (>5 at stub width)")
+    assertEq(utilityCols, majorCols, "Major and Utility share grid geometry")
+    -- Small width changes that keep the column count must not stale positions:
+    -- grid x comes from the pitch, so icons stay put while the host resizes.
+    local beforeX = {}
+    for id, btn in pairs(summaryHost.__sfUtilityButtons or {}) do
+        beforeX[id] = TopLeft(btn)
+    end
+    local savedW = nil
+    local boardHost = panel.__sfRaidSignupBoardHost
+    if boardHost then
+        savedW = boardHost._w
+        boardHost._w = (savedW or 720) + 10 -- same column count, different width
+    end
+    UIPage:Refresh(panel, { force = true })
+    if boardHost then
+        boardHost._w = savedW
+    end
+    UIPage:Refresh(panel, { force = true })
+    local rebuilt = summaryHost.__sfSummaryBuiltKey
+    assertTrue(rebuilt ~= nil, "summary rebuilt with a geometry key")
+
+    -- 3. Enlarged icons: standard icons are ~24px, role icons ~16px.
+    local mainIcon = nil
+    local mainIcons = UIPage._FindSpecButtonsForTests
+        and UIPage._FindSpecButtonsForTests(entriesHost, "main") or {}
+    if #mainIcons >= 1 then
+        mainIcon = mainIcons[1]
+    end
+    if mainIcon and mainIcon.GetWidth then
+        assertTrue(mainIcon:GetWidth() >= 23 and mainIcon:GetWidth() <= 25,
+            "standard board icons are approximately 24px")
+    end
+    local roleIcon = panel.__sfRaidSignupRole and panel.__sfRaidSignupRole.tank
+        and panel.__sfRaidSignupRole.tank.icon
+    if roleIcon and roleIcon.GetWidth then
+        assertTrue(roleIcon:GetWidth() >= 15 and roleIcon:GetWidth() <= 17,
+            "role icons are approximately 16px")
+    end
+
+    -- 4. Overlay pooling: font object and draw layer reapplied on reuse, and
+    --    overlays for categories without counts are hidden/cleared.
+    local overlays = summaryHost.__sfProviderOverlays or {}
+    for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
+        local ov = overlays[id]
+        assertTrue(ov ~= nil, "overlay exists after rebuild: " .. id)
+        if ov and ov.GetParent and ov:GetParent() then
+            assertTrue(ov:GetParent() ~= summaryHost,
+                "overlay parented to its icon button, not the grid host: " .. id)
+        end
+    end
+end)();
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt

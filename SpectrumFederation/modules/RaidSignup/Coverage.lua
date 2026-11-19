@@ -259,12 +259,13 @@ RS.UTILITY_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_DK",
         nameDefault = "Death Grip/AMZ",
         tipKey = "RAID_SIGNUP_COV_DK_TIP",
-        tipDefault = "Death Grip and Anti-Magic Zone from Death Knights. The overlay counts potential Death Grip providers (Frost Death Knights).",
+        tipDefault = "Death Grip and Anti-Magic Zone from Death Knights. The overlay counts Death Grip-capable Death Knight mains (Blood, Frost, Unholy).",
         icon = "Interface\\Icons\\Spell_DeathKnight_Strangulate",
         overlay = true,
         -- Coverage stays any Death Knight; the overlay counts Death Grip
-        -- (Frost) providers only, so Grip and AMZ never double-count.
-        overlayProviders = { ClassSpecs("DEATHKNIGHT", 251) },
+        -- providers. Every DK spec learns Death Grip, and one main counts
+        -- once for the category, so Grip and AMZ never double-count.
+        overlayProviders = { ClassSpecs("DEATHKNIGHT", 250, 251, 252) },
         providers = { ClassAll("DEATHKNIGHT") },
     },
     {

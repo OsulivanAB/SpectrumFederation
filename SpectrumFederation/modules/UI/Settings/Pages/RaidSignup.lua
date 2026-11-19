@@ -78,7 +78,7 @@ local typingFocus = nil
 local CurrentPlans, CurrentSelectedId, CurrentSelectedPlan, CurrentPlanOpen
 local ApplyDefaultSelection
 
-local ICON = 22
+local ICON = 24
 local ICON_GAP = 4
 
 local VIEW_SIGNUP = "signup"
@@ -119,9 +119,9 @@ local GUIDANCE_COLORS = {
 -- Role totals now render as the first content of the Summary sidebar.
 local BOARD_ROLE_ORDER = { "tank", "healer", "ranged", "melee" }
 local ROLE_TOTALS_TOP = 0 -- relative to the summary host's content top
-local ROLE_LINE_H = 15
+local ROLE_LINE_H = 17
 local ROLE_GROUP_GAP = 14 -- consistent separation between role groups
-local ROLE_ICON_SIZE = 14 -- role icons stay close to the text-line height
+local ROLE_ICON_SIZE = 16 -- role icons stay close to the text-line height
 local ROLE_HEADER_H = 20 -- header band between column headings and rows
 
 local function TrackCreate(frame)
@@ -1507,9 +1507,11 @@ local function ColumnWidths(host)
 end
 
 
--- Sidebar column count for the compact class/coverage grids.
-local function SidebarCols(width, pitch)
-	return math.max(1, math.min(5, math.floor((width + 8) / pitch)))
+-- Sidebar column count for the compact class/coverage grids. The optional
+-- cap keeps the count-labelled grids compact; the icon-only ability grids
+-- derive their count from the actual sidebar width instead.
+local function SidebarCols(width, pitch, cap)
+	return math.max(1, math.min(cap or math.huge, math.floor((width + 8) / pitch)))
 end
 
 -- Tier token groups: Midnight armor-based class-set families. Presentation
@@ -1598,7 +1600,7 @@ PaintSummary = function(host, planId)
 
 	local classPitch = ICON + 6 + CLASS_COUNT_WIDTH + 8
 	local iconPitch = ICON + 8
-	local cols = SidebarCols(w, classPitch)
+	local cols = SidebarCols(w, classPitch, 5)
 	local iconCols = SidebarCols(w, iconPitch)
 	local rowH = ICON + 4
 	-- Role totals are the first Summary content, immediately beneath the
@@ -1716,12 +1718,22 @@ PaintSummary = function(host, planId)
 				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
 				buttons[cat.id] = btn
 				-- Small white provider-count overlay at the bottom-right for
-				-- categories that count eligible signed-up mains.
+				-- categories that count eligible signed-up mains. The text is
+				-- parented to the icon button (not the grid host) so it renders
+				-- above the button's ARTWORK texture, and font/draw-layer/
+				-- shadow are reapplied on every pooled acquire.
 				if cat.overlay then
-					local overlay = AcquireFontString(host, "OVERLAY", "GameFontHighlightSmall")
+					local overlay = AcquireFontString(btn, "OVERLAY", "GameFontHighlightSmall")
+					overlay:ClearAllPoints()
 					overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 2, 1)
 					overlay:SetText("0")
 					overlay:SetTextColor(1, 1, 1)
+					if overlay.SetDrawLayer then
+						overlay:SetDrawLayer("OVERLAY")
+					end
+					if overlay.SetFontObject then
+						overlay:SetFontObject("GameFontHighlightSmall")
+					end
 					if overlay.SetShadowColor then
 						overlay:SetShadowColor(0, 0, 0, 1)
 					end
@@ -1816,20 +1828,30 @@ PaintSummary = function(host, planId)
 	refreshButtons(host.__sfUtilityButtons, summary.utility, rs and rs.UTILITY_CATEGORIES)
 	-- Provider-count overlays: white numbers of eligible signed-up mains,
 	-- shown even at zero. Counts come from BuildSummary's providerCounts.
+	-- The same count (and what it means) is appended to the category tooltip.
 	local providerCounts = summary.providerCounts or {}
-	local function paintOverlays(categories)
+	local function paintOverlays(categories, buttons)
 		for i = 1, #(categories or {}) do
 			local cat = categories[i]
 			if cat.overlay then
+				local count = providerCounts[cat.id] or 0
 				local ov = host.__sfProviderOverlays and host.__sfProviderOverlays[cat.id]
 				if ov and ov.SetText then
-					ov:SetText(tostring(providerCounts[cat.id] or 0))
+					ov:SetText(tostring(count))
+				end
+				local btn = buttons and buttons[cat.id]
+				if btn then
+					btn.tooltipLines = {
+						string.format(Loc("RAID_SIGNUP_PROVIDER_COUNT_TIP",
+							"%d eligible signed-up mains can provide this (potential providers, not remaining uses)."),
+							count),
+					}
 				end
 			end
 		end
 	end
-	paintOverlays(rs and rs.MAJOR_CATEGORIES)
-	paintOverlays(rs and rs.UTILITY_CATEGORIES)
+	paintOverlays(rs and rs.MAJOR_CATEGORIES, host.__sfMajorButtons)
+	paintOverlays(rs and rs.UTILITY_CATEGORIES, host.__sfUtilityButtons)
 end
 
 PaintEntries = function(host, planId, planOpen, caps)
@@ -2524,6 +2546,20 @@ LayoutBoard = function(panel)
 		panel.__sfRaidSignupAltHeader:ClearAllPoints()
 		panel.__sfRaidSignupAltHeader:SetPoint("TOPLEFT", host, "TOPLEFT", geom.altX, headersY)
 	end
+	if panel.__sfRaidSignupMainAltSlash and panel.__sfRaidSignupMainHeader
+		and panel.__sfRaidSignupAltHeader then
+		-- Center the "/" in the measured gap between the Main and Alt header
+		-- texts so it never overlaps either label at any column width.
+		local slash = panel.__sfRaidSignupMainAltSlash
+		local mainW = MeasureFontWidth(panel.__sfRaidSignupMainHeader,
+			panel.__sfRaidSignupMainHeader.GetText and panel.__sfRaidSignupMainHeader:GetText() or "Main")
+		local slashW = MeasureFontWidth(slash, "/")
+		local gapStart = geom.mainX + mainW + 2
+		local gapEnd = geom.altX - 2
+		local x = gapStart + math.max(0, ((gapEnd - gapStart) - slashW) / 2)
+		slash:ClearAllPoints()
+		slash:SetPoint("TOPLEFT", host, "TOPLEFT", x, headersY)
+	end
 	if entriesHost then
 		entriesHost:ClearAllPoints()
 		entriesHost:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -topH)
@@ -2823,6 +2859,12 @@ local function BuildBoardChrome(panel, host)
 	altHeader:SetText(Loc("RAID_SIGNUP_COL_ALT", "Alt"))
 	altHeader:SetTextColor(0.8, 0.8, 0.8)
 	panel.__sfRaidSignupAltHeader = altHeader
+	-- The Main / Alt separator: a slash between the two column headings only
+	-- (never on rows). LayoutBoard centers it in the measured gap.
+	local mainAltSlash = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
+	mainAltSlash:SetText("/")
+	mainAltSlash:SetTextColor(0.8, 0.8, 0.8)
+	panel.__sfRaidSignupMainAltSlash = mainAltSlash
 
 	-- Dynamic columns and status line.
 	local entriesHost = TrackCreate(CreateFrame("Frame", nil, host))
@@ -2962,6 +3004,7 @@ local function WipePageBuilder(panel)
 		panel.__sfRaidSignupNickHeader = nil
 		panel.__sfRaidSignupMainHeader = nil
 		panel.__sfRaidSignupAltHeader = nil
+		panel.__sfRaidSignupMainAltSlash = nil
 		panel.__sfRaidSignupSections = nil
 		panel.__sfRaidSignupMessages = nil
 	end
