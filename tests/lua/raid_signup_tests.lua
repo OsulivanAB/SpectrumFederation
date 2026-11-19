@@ -3512,8 +3512,8 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     FindNickHover(entriesHost)
     assertTrue(nickHover ~= nil, "truncated nickname shows its full value on hover")
 
-    -- 2. Role totals: one line at the owner's width, deliberate wrap when narrow,
-    -- and multi-digit counts recalculate without leaving the column.
+    -- 2. Role totals: compact icon+count groups on one line at supported
+    -- widths, multi-digit counts, distinct icons, full-name hover tooltips.
     boardHost._w = nil -- back to the 720 fallback (left column 446px)
     for i = 1, 10 do
         RS:UpsertEntry({ planId = tabPlanId, nickname = "Tot" .. i,
@@ -3525,7 +3525,7 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local function DistinctTotalLines()
         local ys = {}
         for _, key in ipairs({ "tank", "healer", "ranged", "melee" }) do
-            local _, y = TopLeftOffset(panel.__sfRaidSignupRole[key].label)
+            local _, y = TopLeftOffset(panel.__sfRaidSignupRole[key].count)
             if y ~= nil then
                 ys[y] = true
             end
@@ -3541,17 +3541,83 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
         "nickname column width is consistent across window widths")
     local wideHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
     assertEq(wideHeaderY, -49, "single-line totals keep the approved header position")
-    boardHost._w = 548 -- narrow: totals must reflow, not cross the divider
+
+    -- Icon+count structure: distinct icons, zero counts visible, localized names.
+    local roleOrder = { "tank", "healer", "ranged", "melee" }
+    local expectedNames = {
+        tank = "Tanks", healer = "Healers", ranged = "Ranged DPS", melee = "Melee DPS",
+    }
+    local seenTextures = {}
+    for _, key in ipairs(roleOrder) do
+        local slot = panel.__sfRaidSignupRole[key]
+        assertTrue(slot ~= nil and slot.icon ~= nil, "role icon present: " .. key)
+        assertTrue(slot and slot.count ~= nil, "role count present: " .. key)
+        assertTrue(slot and slot.hover ~= nil, "role hover region present: " .. key)
+        assertEq(slot and slot.name, expectedNames[key], "localized role name: " .. key)
+        local tex = slot and slot.icon and slot.icon._texture
+        assertTrue(type(tex) == "string" and tex ~= "", "role icon has a texture: " .. key)
+        if type(tex) == "string" and tex ~= "" then
+            assertTrue(seenTextures[tex] == nil, "role icons are distinct: " .. key)
+            seenTextures[tex] = true
+        end
+        assertTrue(slot and slot.count and slot.count:GetText() ~= "",
+            "zero counts still render: " .. key)
+    end
+    -- Hovering either the icon or its count shows the full role name.
+    local realTooltip = GameTooltip
+    local tooltipTitles = {}
+    GameTooltip = {
+        SetOwner = function() end,
+        SetText = function(_, t) tooltipTitles[#tooltipTitles + 1] = t end,
+        Show = function() end,
+        Hide = function() end,
+    }
+    for _, key in ipairs(roleOrder) do
+        local slot = panel.__sfRaidSignupRole[key]
+        local enter = slot.hover and slot.hover._scripts and slot.hover._scripts.OnEnter
+        assertTrue(enter ~= nil, "role hover handler present: " .. key)
+        if enter then
+            tooltipTitles = {}
+            enter(slot.hover)
+            assertEq(tooltipTitles[1], expectedNames[key],
+                "hover shows the full role name: " .. key)
+        end
+    end
+    GameTooltip = realTooltip
+    -- Groups stay inside the signup column, clear of the divider.
+    local geomNow = panel.__sfEntryGeom
+    local maxRight = 0
+    for _, key in ipairs(roleOrder) do
+        local slot = panel.__sfRaidSignupRole[key]
+        local cx = TopLeftOffset(slot.count)
+        local countW = slot.count.GetStringWidth and slot.count:GetStringWidth() or 0
+        if cx and countW and cx + countW > maxRight then
+            maxRight = cx + countW
+        end
+    end
+    assertTrue(maxRight <= (geomNow and geomNow.leftW or 0) - 4 + 1,
+        "role totals stay inside the signup column")
+    -- Tight widths wrap whole icon+count groups rather than crossing the divider.
+    local wrapFn = UIPage._LayoutRoleTotalsForTests
+    local wrapLines = wrapFn and wrapFn(panel, 124)
+    assertTrue(wrapLines ~= nil and wrapLines >= 2,
+        "totals wrap deliberately when space is tight")
+    for _, key in ipairs(roleOrder) do
+        local slot = panel.__sfRaidSignupRole[key]
+        local cx = TopLeftOffset(slot.count)
+        local countW = slot.count.GetStringWidth and slot.count:GetStringWidth() or 0
+        assertTrue(cx ~= nil and cx + countW <= 120,
+            "wrapped group stays inside its line width: " .. key)
+    end
+    UIPage:Refresh(panel, { force = true }) -- restore the normal single-line layout
+    boardHost._w = 548 -- narrow supported width: icon groups still fit one line
     UIPage:Refresh(panel, { force = true })
-    assertTrue(DistinctTotalLines() >= 2, "narrow width wraps role totals deliberately")
-    local narrowHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
-    local _, entriesY = TopLeftOffset(entriesHost)
-    assertTrue(narrowHeaderY < wideHeaderY, "column headers move down with wrapped totals")
-    assertEq(entriesY, narrowHeaderY - 20,
-        "signup rows start below the wrapped totals and headers")
+    assertEq(DistinctTotalLines(), 1, "icon totals stay on one line at narrow width")
+    assertEq(select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader)), -49,
+        "column headers keep the approved position with icon totals")
 
     -- 2b. Summary content starts beneath its own divider, independent of the
-    -- left column's role totals wrapping onto extra lines.
+    -- left column's totals/header stack.
     boardHost._w = nil -- 720 fallback: totals on one line
     UIPage:Refresh(panel, { force = true })
     UIPage:Refresh(panel, { force = true })
@@ -3567,13 +3633,13 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local _, classTitleY = TopLeftOffset(classTitle)
     assertTrue(classTitleY ~= nil and classTitleY >= -8,
         "Classes heading sits just beneath the Summary divider")
-    boardHost._w = 548 -- totals wrap here; the sidebar must not move
+    boardHost._w = 548 -- narrower width: the sidebar keeps its own offset
     UIPage:Refresh(panel, { force = true })
     UIPage:Refresh(panel, { force = true })
     assertEq(select(2, TopLeftOffset(summaryHost)), summaryTopY,
-        "wrapping role totals does not push the summary down")
-    assertTrue(select(2, TopLeftOffset(entriesHost)) < entriesTopSingle,
-        "left column headers move down while the summary stays put")
+        "summary keeps its own offset across window widths")
+    assertEq(select(2, TopLeftOffset(entriesHost)), entriesTopSingle,
+        "left column headers keep the approved position with icon totals")
     local _, rightHostY = TopLeftOffset(summaryHost)
     local summaryBottom = math.abs(rightHostY) + (summaryHost:GetHeight() or 0)
     local entriesBottom = math.abs(entriesTopSingle) + (entriesHost:GetHeight() or 0)

@@ -2095,10 +2095,13 @@ local ROLE_TOTALS_TOP = -26
 local ROLE_LINE_H = 15
 local ROLE_HEADER_GAP = 8
 local ROLE_HEADER_H = 20 -- header band between column headings and rows
+local ROLE_ICON_SIZE = 14 -- role icons stay close to the text-line height
+local ROLE_GROUP_GAP = 14 -- consistent separation between role groups
 
--- Position the role totals from their measured widths (labels, counts,
--- separators), wrapping onto extra lines rather than crossing the column
--- divider or clipping a count. Returns the number of lines used.
+-- Position the role totals from their measured contents (icon, count, gaps),
+-- wrapping whole groups onto extra lines rather than crossing the column
+-- divider. Groups are compact enough to stay on one line at supported widths.
+-- Returns the number of lines used.
 local function LayoutRoleTotals(panel, availW)
 	local role = panel and panel.__sfRaidSignupRole
 	local host = panel and panel.__sfRaidSignupBoardHost
@@ -2106,39 +2109,27 @@ local function LayoutRoleTotals(panel, availW)
 		return 1
 	end
 	availW = math.max(120, (tonumber(availW) or 0) - 4)
-	local seps = panel.__sfRaidSignupRoleSeps or {}
-	local sepW = 0
-	for i = 2, #BOARD_ROLE_ORDER do
-		local sep = seps[i]
-		if sep and sep.GetText then
-			sepW = MeasureFontWidth(sep, sep:GetText())
-			break
-		end
-	end
-	local gap = 18 + sepW -- 12 before the separator + 6 after it
 	local items = {}
-	for i, key in ipairs(BOARD_ROLE_ORDER) do
+	for _, key in ipairs(BOARD_ROLE_ORDER) do
 		local slot = role[key]
-		if slot and slot.label and slot.count then
-			local labelText = slot.label.GetText and slot.label:GetText() or ""
+		if slot and slot.icon and slot.count then
 			local countText = slot.count.GetText and slot.count:GetText() or "0"
 			items[#items + 1] = {
-				label = slot.label,
+				icon = slot.icon,
 				count = slot.count,
-				sep = seps[i],
-				w = MeasureFontWidth(slot.label, labelText) + 4
-					+ MeasureFontWidth(slot.count, countText),
+				hover = slot.hover,
+				w = ROLE_ICON_SIZE + 4 + MeasureFontWidth(slot.count, countText),
 			}
 		end
 	end
 	if #items == 0 then
 		return 1
 	end
-	-- Greedy wrap: keep every total intact on one line.
+	-- Greedy wrap: keep every icon+count group intact on one line.
 	local lines = {}
 	local cur, curW = nil, 0
 	for _, it in ipairs(items) do
-		local need = it.w + (cur and gap or 0)
+		local need = it.w + (cur and ROLE_GROUP_GAP or 0)
 		if cur and curW + need > availW then
 			lines[#lines + 1] = cur
 			cur, curW, need = nil, 0, it.w
@@ -2154,37 +2145,26 @@ local function LayoutRoleTotals(panel, availW)
 	end
 	local y = ROLE_TOTALS_TOP
 	for _, line in ipairs(lines) do
-		local prevCount = nil
-		for j, it in ipairs(line) do
+		local x = 0
+		for _, it in ipairs(line) do
+			it.icon:ClearAllPoints()
+			it.icon:SetPoint("TOPLEFT", host, "TOPLEFT", x, y)
 			it.count:ClearAllPoints()
-			it.count:SetPoint("LEFT", it.label, "RIGHT", 4, 0)
-			if j == 1 then
-				it.label:ClearAllPoints()
-				it.label:SetPoint("TOPLEFT", host, "TOPLEFT", 0, y)
-				if it.sep and it.sep.Hide then
-					it.sep:Hide()
-				end
-			else
-				if it.sep and it.sep.SetPoint then
-					it.sep:ClearAllPoints()
-					it.sep:SetPoint("LEFT", prevCount, "RIGHT", 12, 0)
-					if it.sep.Show then
-						it.sep:Show()
-					end
-				end
-				it.label:ClearAllPoints()
-				if it.sep and it.sep.SetPoint then
-					it.label:SetPoint("LEFT", it.sep, "RIGHT", 6, 0)
-				else
-					it.label:SetPoint("LEFT", prevCount, "RIGHT", 18, 0)
-				end
+			it.count:SetPoint("TOPLEFT", host, "TOPLEFT", x + ROLE_ICON_SIZE + 4, y - 1)
+			if it.hover and it.hover.SetPoint then
+				it.hover:ClearAllPoints()
+				it.hover:SetPoint("TOPLEFT", host, "TOPLEFT", x - 3, y + 3)
+				it.hover:SetPoint("BOTTOMRIGHT", it.count, "BOTTOMRIGHT", 4, -3)
+				it.hover:Show()
 			end
-			prevCount = it.count
+			x = x + it.w + ROLE_GROUP_GAP
 		end
 		y = y - ROLE_LINE_H
 	end
 	return #lines
 end
+
+Page._LayoutRoleTotalsForTests = LayoutRoleTotals
 
 LayoutBoard = function(panel)
 	local host = panel and panel.__sfRaidSignupBoardHost
@@ -2351,41 +2331,49 @@ local function BuildBoardChrome(panel, host)
 	end
 	panel.__sfRaidSignupVDivider = vdiv
 
-	-- Role totals: white labels, yellow counts, one line.
+	-- Role totals: small role icon + yellow count per group. The visible role
+	-- names are gone; hovering the icon/count pair shows the full localized
+	-- role name. Icons prefer the native LFG role icon atlases and fall back
+	-- to distinct file icons when an atlas is unavailable.
 	local roleDefs = {
-		{ key = "tank", label = Loc("RAID_SIGNUP_ROLE_TANKS", "Tanks") },
-		{ key = "healer", label = Loc("RAID_SIGNUP_ROLE_HEALERS", "Healers") },
-		{ key = "ranged", label = Loc("RAID_SIGNUP_ROLE_RANGED", "Ranged DPS") },
-		{ key = "melee", label = Loc("RAID_SIGNUP_ROLE_MELEE", "Melee DPS") },
+		{ key = "tank", atlas = "UI-LFG-RoleIcon-Tank-Micro",
+			fallback = "Interface\\Icons\\Ability_Warrior_DefensiveStance",
+			name = Loc("RAID_SIGNUP_ROLE_TANKS", "Tanks") },
+		{ key = "healer", atlas = "UI-LFG-RoleIcon-Healer-Micro",
+			fallback = "Interface\\Icons\\Spell_Holy_GuardianSpirit",
+			name = Loc("RAID_SIGNUP_ROLE_HEALERS", "Healers") },
+		{ key = "ranged", atlas = "UI-LFG-RoleIcon-RangedDPS-Micro",
+			fallback = "Interface\\Icons\\Ability_Hunter_SteadyShot",
+			name = Loc("RAID_SIGNUP_ROLE_RANGED", "Ranged DPS") },
+		{ key = "melee", atlas = "UI-LFG-RoleIcon-MeleeDPS-Micro",
+			fallback = "Interface\\Icons\\INV_Sword_48",
+			name = Loc("RAID_SIGNUP_ROLE_MELEE", "Melee DPS") },
 	}
 	panel.__sfRaidSignupRole = {}
-	panel.__sfRaidSignupRoleSeps = {}
-	local anchor = nil
-	for i, def in ipairs(roleDefs) do
-		if i > 1 then
-			local sep = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
-			if anchor then
-				sep:SetPoint("LEFT", anchor, "RIGHT", 12, 0)
-			end
-			sep:SetText("·")
-			sep:SetTextColor(0.6, 0.6, 0.6)
-			panel.__sfRaidSignupRoleSeps[i] = sep
-			anchor = sep
-		end
-		local label = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
-		if anchor then
-			label:SetPoint("LEFT", anchor, "RIGHT", 6, 0)
+	for _, def in ipairs(roleDefs) do
+		local icon = TrackRegionCreate(host:CreateTexture(nil, "ARTWORK"))
+		icon:SetSize(ROLE_ICON_SIZE, ROLE_ICON_SIZE)
+		if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(def.atlas) then
+			icon:SetAtlas(def.atlas, true)
 		else
-			label:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -26)
+			icon:SetTexture(def.fallback)
 		end
-		label:SetText(def.label .. ":")
-		label:SetTextColor(1, 1, 1)
 		local count = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
-		count:SetPoint("LEFT", label, "RIGHT", 4, 0)
 		count:SetText("0")
 		count:SetTextColor(1, 0.82, 0.18)
-		panel.__sfRaidSignupRole[def.key] = { label = label, count = count }
-		anchor = count
+		-- Informational hover over the icon+count pair (not clickable).
+		local hover = TrackCreate(CreateFrame("Frame", nil, host))
+		hover:EnableMouse(true)
+		hover.__sfRoleName = def.name
+		hover:SetScript("OnEnter", function(self)
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText(self.__sfRoleName, 1, 1, 1)
+			GameTooltip:Show()
+		end)
+		hover:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+		panel.__sfRaidSignupRole[def.key] = { icon = icon, count = count, hover = hover, name = def.name }
 	end
 
 	-- Column headers above the signup rows.
