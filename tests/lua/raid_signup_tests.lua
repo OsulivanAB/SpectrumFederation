@@ -415,12 +415,28 @@ assertTrue(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1]) ~= nil, "category icon
 assertTrue(tostring(RS.CategoryIconTexture(RS.MAJOR_CATEGORIES[1])):find("Spell_Holy_MagicalSentry", 1, true) ~= nil,
     "intellect uses ability icon not class icon")
 for _, cat in ipairs(RS.MAJOR_CATEGORIES) do
-    assertTrue(type(cat.icon) == "string" and cat.icon ~= "",
+    assertTrue((type(cat.icon) == "string" and cat.icon ~= "") or type(cat.icon) == "number",
         "major category has icon: " .. tostring(cat.id))
 end
 for _, cat in ipairs(RS.UTILITY_CATEGORIES) do
-    assertTrue(type(cat.icon) == "string" and cat.icon ~= "",
+    assertTrue((type(cat.icon) == "string" and cat.icon ~= "") or type(cat.icon) == "number",
         "utility category has icon: " .. tostring(cat.id))
+end
+-- Skyfury uses the owner-specified numeric FileDataID and survives icon resolution.
+do
+    local skyfuryCat, bronzeCat
+    for _, cat in ipairs(RS.MAJOR_CATEGORIES) do
+        if cat.id == "skyfury" then
+            skyfuryCat = cat
+        end
+        if cat.id == "blessing_bronze" then
+            bronzeCat = cat
+        end
+    end
+    assertTrue(skyfuryCat ~= nil, "skyfury relocated to Major Buffs/Debuffs")
+    assertEq(skyfuryCat and skyfuryCat.icon, 4630367, "skyfury uses numeric FileDataID 4630367")
+    assertEq(RS.CategoryIconTexture(skyfuryCat), 4630367, "numeric FileDataID passes through")
+    assertTrue(bronzeCat ~= nil, "blessing of the bronze relocated to Major Buffs/Debuffs")
 end
 
 -- UTF-8-safe byte-cap truncation never persists split multibyte characters.
@@ -849,7 +865,7 @@ RS:UpsertEntry({
     mainSpec = 102, -- balance
 })
 summary = RS:GetPlanSummary(plan3)
-assertTrue(not summary.utility.innervate, "balance druid does not cover innervate")
+assertTrue(summary.utility.innervate, "balance druid covers innervate (talent-dependent, all specs)")
 RS:UpsertEntry({
     planId = plan3,
     nickname = "Resto",
@@ -862,6 +878,62 @@ assertTrue(summary.utility.atrophic_poison == false or summary.utility.atrophic_
     "no rogue => atrophic uncovered")
 assertEq(summary.utility.atrophic_poison, false, "atrophic explicitly false")
 assertTrue(summary.major.versatility, "druid covers versatility")
+
+---------------------------------------------------------------------------
+-- Provider-count aggregation, warlock split, and category placement
+---------------------------------------------------------------------------
+do
+    -- One summary covering: heroism equivalents, warlock utilities, DK grip
+    -- overlay split, innervate eligibility, and exclusion of deleted entries
+    -- and incomplete drafts.
+    local summary = RS.BuildSummary({
+        { mainClass = "MAGE", mainSpec = 62 },        -- heroism, intellect
+        { mainClass = "PRIEST", mainSpec = 256 },     -- stamina, mass dispel
+        { mainClass = "WARLOCK", mainSpec = 265 },    -- heroism? no; 3 warlock utils, combat res, cast slow
+        { mainClass = "DEATHKNIGHT", mainSpec = 251 },-- frost: grip overlay +1
+        { mainClass = "DEATHKNIGHT", mainSpec = 250 },-- blood: AMZ coverage, no grip overlay
+        { mainClass = "DRUID", mainSpec = 102 },      -- balance: innervate now eligible
+        { mainClass = "DRUID", mainSpec = 105 },      -- resto: innervate
+        { mainClass = "ROGUE", mainSpec = 259, deleted = true },
+        { mainClass = "MONK" },                       -- incomplete draft: no spec
+    })
+    local pc = summary.providerCounts
+    assertTrue(type(pc) == "table", "provider counts aggregated")
+    assertEq(pc.intellect, 1, "intellect counts the mage main once")
+    assertEq(pc.bloodlust, 1, "heroism counts mage only (internal category id retained)")
+    assertEq(pc.mass_dispel, 1, "mass dispel counts the priest main")
+    assertEq(pc.combat_res, 5, "combat res counts warlock + 2 DKs + 2 druids")
+    assertEq(pc.warlock_ritual, 1, "ritual of summoning counts warlock mains")
+    assertEq(pc.warlock_healthstone, 1, "healthstone counts warlock mains")
+    assertEq(pc.warlock_gateway, 1, "demonic gateway counts warlock mains")
+    assertEq(pc.dk_grip_amz, 1, "grip overlay counts Frost DK providers only")
+    assertEq(pc.burst_move, 2, "burst move counts two druids; deleted shaman and spec-less monk draft excluded")
+    assertEq(pc.innervate, 2, "innervate counts balance and resto druids")
+    assertEq(pc.atk_speed_slow, 0, "deleted rogue excluded from provider counts")
+    -- Coverage booleans still derive from any-provider rules.
+    assertTrue(summary.utility.dk_grip_amz, "any DK covers grip/AMZ")
+    assertEq(summary.utility.lock_stuff, nil, "lock stuff category removed")
+    assertTrue(summary.major.skyfury == false, "skyfury uncovered without shaman, but present")
+    assertTrue(summary.major.blessing_bronze == false, "bronze uncovered without evoker")
+    assertTrue(summary.utility.skyfury == nil, "skyfury no longer in utility")
+    assertTrue(summary.utility.blessing_bronze == nil, "bronze no longer in utility")
+    -- Heroism: equivalent abilities keep coverage on the retained category id.
+    local heroismCat
+    for _, cat in ipairs(RS.UTILITY_CATEGORIES) do
+        if cat.id == "bloodlust" then
+            heroismCat = cat
+        end
+    end
+    assertEq(heroismCat and heroismCat.nameDefault, "Heroism", "visible name is Heroism")
+    assertTrue(heroismCat and heroismCat.iconSpell == 32182, "heroism spell artwork reference")
+    assertTrue(RS.CategoryCoveredBySelection(heroismCat, "SHAMAN", 262)
+        and RS.CategoryCoveredBySelection(heroismCat, "MAGE", 62),
+        "heroism equivalents still covered")
+    -- One main matching several rules counts once per category.
+    local one = RS.BuildSummary({ { mainClass = "WARLOCK", mainSpec = 266 } })
+    assertEq(one.providerCounts.combat_res, 1, "one warlock counts once for combat res")
+    assertEq(one.providerCounts.warlock_ritual, 1, "one warlock counts once for ritual")
+end
 
 ---------------------------------------------------------------------------
 -- Role totals aggregation
@@ -955,6 +1027,9 @@ for i = 1, #RS.UTILITY_CATEGORIES do
     if cat.id == "atrophic_poison" then
         foundAtrophic = cat.nameDefault == "Atrophic Poison"
     end
+end
+for i = 1, #RS.MAJOR_CATEGORIES do
+    local cat = RS.MAJOR_CATEGORIES[i]
     if cat.id == "blessing_bronze" then
         foundBronze = cat.nameDefault == "Blessing of the Bronze"
     end
@@ -3022,7 +3097,9 @@ do
         local function gridBottom(titleY, rows)
             return titleY - 20 - (rows - 1) * 26 - 22
         end
-        local tokenTitleY = gridBottom(-4, classRows) - 8
+        -- Role totals lead the sidebar: one 15px line plus a 10px gap.
+        local classTitleY = -(15 + 10)
+        local tokenTitleY = gridBottom(classTitleY, classRows) - 8
         local majorTitleY = gridBottom(tokenTitleY, tokenRows) - 8
         local utilityTitleY = gridBottom(majorTitleY, majorRows) - 8
         local expectedH = -gridBottom(utilityTitleY, utilityRows) + 4
@@ -3582,7 +3659,7 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     assertEq(panel.__sfEntryGeom.nickW, narrowGeom.nickW,
         "nickname column width is consistent across window widths")
     local wideHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
-    assertEq(wideHeaderY, -49, "single-line totals keep the approved header position")
+    assertEq(wideHeaderY, -26, "headings sit beneath the Signups divider without role totals")
 
     -- Icon+count structure: distinct icons, zero counts visible, localized names.
     local roleOrder = { "tank", "healer", "ranged", "melee" }
@@ -3641,8 +3718,8 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
         end
     end
     GameTooltip = realTooltip
-    -- Groups stay inside the signup column, clear of the divider.
-    local geomNow = panel.__sfEntryGeom
+    -- Groups stay inside the Summary sidebar column, clear of its edges.
+    local sidebarW = summaryHost.GetWidth and summaryHost:GetWidth() or 258
     local maxRight = 0
     for _, key in ipairs(roleOrder) do
         local slot = panel.__sfRaidSignupRole[key]
@@ -3652,8 +3729,8 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
             maxRight = cx + countW
         end
     end
-    assertTrue(maxRight <= (geomNow and geomNow.leftW or 0) - 4 + 1,
-        "role totals stay inside the signup column")
+    assertTrue(maxRight <= sidebarW - 4 + 1,
+        "role totals stay inside the summary sidebar")
     -- Tight widths wrap whole icon+count groups rather than crossing the divider.
     local wrapFn = UIPage._LayoutRoleTotalsForTests
     local wrapLines = wrapFn and wrapFn(panel, 124)
@@ -3670,8 +3747,8 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     boardHost._w = 548 -- narrow supported width: icon groups still fit one line
     UIPage:Refresh(panel, { force = true })
     assertEq(DistinctTotalLines(), 1, "icon totals stay on one line at narrow width")
-    assertEq(select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader)), -49,
-        "column headers keep the approved position with icon totals")
+    assertEq(select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader)), -26,
+        "column headers keep the position without role totals")
 
     -- 2b. Summary content starts beneath its own divider, independent of the
     -- left column's totals/header stack.
@@ -3688,8 +3765,9 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     local classTitle = FindFontStringByText(summaryHost, "Classes")
     assertTrue(classTitle ~= nil, "Classes heading rendered in the sidebar")
     local _, classTitleY = TopLeftOffset(classTitle)
-    assertTrue(classTitleY ~= nil and classTitleY >= -8,
-        "Classes heading sits just beneath the Summary divider")
+    -- Role totals occupy the top 15px; Classes starts below them with a gap.
+    assertTrue(classTitleY ~= nil and classTitleY <= -23 and classTitleY >= -30,
+        "Classes heading sits below the role totals, clear of the Summary divider")
     boardHost._w = 548 -- narrower width: the sidebar keeps its own offset
     UIPage:Refresh(panel, { force = true })
     UIPage:Refresh(panel, { force = true })
@@ -4130,7 +4208,7 @@ local function RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
         return tc and tc[2]
     end
     -- T=2,H=1,M=1,R=1 -> N=5, D=2.
-    assertEq(countColor("tank"), 0.82, "tank count yellow at 2 tanks")
+    assertEq(countColor("tank"), 1, "tank count white at 2 tanks")
     assertEq(countColor("healer"), 0.2, "healer count red below two at any size")
     assertEq(countColor("melee"), 0.2, "melee count red below DPS minimum")
     assertEq(countColor("ranged"), 0.2, "ranged count red below DPS minimum")
@@ -4187,8 +4265,8 @@ local function RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
     assertEq(status, "accepted", "ranged entry switched to melee")
     assertTrue(cur ~= nil, "entry snapshot for ver lookup")
     UIPage:Refresh(panel, { force = true })
-    assertEq(countColor("melee"), 0.82, "melee count back to yellow when balanced")
-    assertEq(countColor("ranged"), 0.82, "ranged count resets with the split")
+    assertEq(countColor("melee"), 1, "melee count white when balanced")
+    assertEq(countColor("ranged"), 1, "ranged count white with the split")
 
     -- Cleanup: remove color-test entries and restore the tab plan.
     for _, entryId in ipairs(ids) do
@@ -4329,8 +4407,8 @@ local function RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
     assertEq(tokenCountText("leather"), "4", "leather count 4")
     assertEq(tokenCountText("mail"), "3", "mail count 3")
     assertEq(tokenCountText("plate"), "3", "plate count 3")
-    assertEq(tokenColor("cloth"), 0.82, "cloth yellow within share")
-    assertEq(tokenColor("leather"), 0.82, "leather yellow at fair share")
+    assertEq(tokenColor("cloth"), 1, "cloth white within share")
+    assertEq(tokenColor("leather"), 1, "leather white at fair share")
     local clothIcon = tokenIcon("cloth")
     assertTrue(clothIcon ~= nil, "cloth token icon exists")
     assertTrue(clothIcon.icon and clothIcon.icon._desaturated == false,
@@ -4376,7 +4454,7 @@ local function RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
     assertEq(tokenCountText("cloth"), "5", "cloth count 5")
     assertEq(tokenColor("cloth"), 0.6, "cloth orange one past fair share")
-    assertEq(tokenColor("leather"), 0.82, "leather stays yellow")
+    assertEq(tokenColor("leather"), 1, "leather stays white")
     ids[#ids + 1] = addEntry("TokMage4", "MAGE")
     UIPage:Refresh(panel, { force = true })
     assertEq(tokenCountText("cloth"), "6", "cloth count 6")
@@ -4393,7 +4471,7 @@ local function RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
     for _, id in ipairs({ "cloth", "leather", "mail", "plate" }) do
         assertEq(tokenCountText(id), "0", "empty plan zero count: " .. id)
-        assertEq(tokenColor(id), 0.82, "empty plan yellow zero count: " .. id)
+        assertEq(tokenColor(id), 1, "empty plan white zero count: " .. id)
         local icon = tokenIcon(id)
         assertTrue(icon and icon.icon and icon.icon._desaturated == true,
             "empty plan token icon greyed: " .. id)
@@ -4424,6 +4502,89 @@ local function RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
 end
 RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
+
+local function RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
+    -- Provider-count overlays on Combat Res / Burst Move Speed / Death Grip+AMZ,
+    -- role totals as the first Summary content, and Classes beneath them.
+    local summaryHost = panel.__sfRaidSignupSummaryHost
+    assertTrue(summaryHost ~= nil, "summary host exists for overlay checks")
+    local status, _, overlayPlanId = RS:CreatePlan("Provider Overlay Plan")
+    assertEq(status, "accepted", "officer creates overlay plan")
+    RS:SelectPlan(overlayPlanId)
+    local ids = {}
+    local function add(nick, classFile, specId)
+        local st, _, eid = RS:UpsertEntry({ planId = overlayPlanId, nickname = nick,
+            mainClass = classFile, mainSpec = specId })
+        assertEq(st, "accepted", "overlay plan entry: " .. nick)
+        ids[#ids + 1] = eid
+    end
+    add("OvLock", "WARLOCK", 266)
+    add("OvFrost", "DEATHKNIGHT", 251)
+    add("OvBlood", "DEATHKNIGHT", 250)
+    UIPage:Refresh(panel, { force = true })
+
+    local overlays = summaryHost.__sfProviderOverlays
+    assertTrue(type(overlays) == "table", "provider overlays created")
+    for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
+        assertTrue(overlays[id] ~= nil, "overlay present: " .. id)
+    end
+    local function overlayText(id)
+        local ov = overlays[id]
+        return ov and ov.GetText and ov:GetText() or nil
+    end
+    local function overlayColor(id)
+        local ov = overlays[id]
+        local c = ov and ov._textColor
+        return c and c[1] or nil
+    end
+    assertEq(overlayText("combat_res"), "3", "combat res counts warlock + 2 DKs")
+    assertEq(overlayText("dk_grip_amz"), "1", "grip overlay counts Frost DK only")
+    assertEq(overlayText("burst_move"), "0", "zero providers still shown")
+    for _, id in ipairs({ "combat_res", "burst_move", "dk_grip_amz" }) do
+        assertEq(overlayColor(id), 1, "overlay count is white: " .. id)
+    end
+
+    -- Role totals are the first Summary content, above Classes.
+    -- Stub point tuples: { point, relativeTo, relativePoint, x, y }.
+    local function TopLeftY(region)
+        for _, pt in ipairs(region._points or {}) do
+            if pt[1] == "TOPLEFT" then
+                return pt[5]
+            end
+        end
+        return nil
+    end
+    local roleCountY = TopLeftY(panel.__sfRaidSignupRole.tank.count)
+    assertTrue(roleCountY ~= nil and roleCountY >= -2 and roleCountY <= 2,
+        "role totals at the top of the summary content")
+    local classTitle
+    if summaryHost.GetRegions then
+        for _, r in ipairs({ summaryHost:GetRegions() }) do
+            if r.GetText and r:GetText() == "Classes" then
+                classTitle = r
+                break
+            end
+        end
+    end
+    local classTitleY = classTitle and TopLeftY(classTitle)
+    assertTrue(classTitleY ~= nil and classTitleY <= -23,
+        "Classes heading below the role totals")
+
+    -- Deletions repaint overlays back to zero without a rebuild.
+    for _, entryId in ipairs(ids) do
+        local live = RS.GetEntry(RS:EnsureGuildRecord("club:42"), entryId)
+        if live and not live.deleted then
+            RS:DeleteEntry(entryId, { expectedVer = live.ver })
+        end
+    end
+    UIPage:Refresh(panel, { force = true })
+    assertEq(overlayText("combat_res"), "0", "overlay resets to zero after deletions")
+    assertEq(overlayText("dk_grip_amz"), "0", "grip overlay resets after deletions")
+
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
+end
+RaidSignupProviderOverlayTests(panel, UIPage, RS, tabPlanId)
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt

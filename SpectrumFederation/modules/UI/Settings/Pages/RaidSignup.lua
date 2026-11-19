@@ -85,8 +85,11 @@ local BOARD_MIN_WIDTH = 480
 local BOARD_TOP_H = 69
 local BOARD_STATUS_H = 18
 -- Summary content starts just beneath its own heading divider, independent of
--- the left column's role totals and table headings.
+-- the left column's table headings.
 local SUMMARY_CONTENT_TOP = 30
+-- Left-column headings sit just beneath the Signups heading divider now that
+-- the role totals live in the Summary sidebar.
+local SIGNUP_HEADERS_Y = -26
 -- Compact, bounded nickname column for collapsed signup rows. Ordinary
 -- nicknames fit; the column does not keep expanding as the row widens, and
 -- longer nicknames ellipsize (full value on hover).
@@ -97,12 +100,21 @@ local COL_ALT_X = COL_MAIN_X + 36
 local CLASS_COUNT_WIDTH = 24
 
 -- Roster-planning guidance palette shared by the role totals and the tier
--- token groups. Advisory heuristics only, not Blizzard requirements.
+-- token groups: good counts are white, caution orange, bad red. Advisory
+-- heuristics only, not Blizzard requirements.
 local GUIDANCE_COLORS = {
-	yellow = { 1, 0.82, 0.18 },
+	yellow = { 1, 1, 1 },
 	orange = { 1, 0.6, 0.1 },
 	red = { 1, 0.2, 0.2 },
 }
+
+-- Role totals now render as the first content of the Summary sidebar.
+local BOARD_ROLE_ORDER = { "tank", "healer", "ranged", "melee" }
+local ROLE_TOTALS_TOP = 0 -- relative to the summary host's content top
+local ROLE_LINE_H = 15
+local ROLE_GROUP_GAP = 14 -- consistent separation between role groups
+local ROLE_ICON_SIZE = 14 -- role icons stay close to the text-line height
+local ROLE_HEADER_H = 20 -- header band between column headings and rows
 
 local function TrackCreate(frame)
 	session.frameCreateCount = session.frameCreateCount + 1
@@ -1239,7 +1251,7 @@ end
 
 -- Forward-declare page-local paint/host helpers used by Definition closures
 -- before their bodies (avoids accidental globals).
-local PaintSummary, PaintEntries, EnsureBoardHost, LayoutBoard, PaintRoleTotals
+local PaintSummary, PaintEntries, EnsureBoardHost, LayoutBoard, PaintRoleTotals, LayoutRoleTotals
 
 local function SubmitCreatePlan(text)
 	session.newPlanName = text or ""
@@ -1502,6 +1514,16 @@ PaintSummary = function(host, planId)
 	local cols = SidebarCols(w, classPitch)
 	local iconCols = SidebarCols(w, iconPitch)
 	local rowH = ICON + 4
+	-- Role totals are the first Summary content, immediately beneath the
+	-- Summary heading/divider. Repaint them first so the wrap measurement
+	-- uses current counts, then place Classes below their actual bottom.
+	local panel = host.__sfRaidSignupPanel
+	local roleLines = 1
+	if panel then
+		PaintRoleTotals(panel)
+		roleLines = LayoutRoleTotals(panel, w) or 1
+	end
+	local roleBlockH = roleLines * ROLE_LINE_H
 	local classRows = math.max(1, math.ceil(#order / cols))
 	local tokenRows = math.max(1, math.ceil(#tokenGroups / cols))
 	local majorRows = math.max(1, math.ceil(#majorCats / iconCols))
@@ -1515,7 +1537,7 @@ PaintSummary = function(host, planId)
 	local function gridBottom(titleY, rows)
 		return titleY - TITLE_TO_GRID - (rows - 1) * rowH - ICON
 	end
-	local classTitleY = -4
+	local classTitleY = -(roleBlockH + 10)
 	local classGridY = classTitleY - TITLE_TO_GRID
 	local tokenTitleY = gridBottom(classTitleY, classRows) - GROUP_GAP
 	local tokenGridY = tokenTitleY - TITLE_TO_GRID
@@ -1542,6 +1564,7 @@ PaintSummary = function(host, planId)
 		host.__sfTokenCounts = nil
 		host.__sfMajorButtons = nil
 		host.__sfUtilityButtons = nil
+		host.__sfProviderOverlays = nil
 
 		local function addTitle(text, y)
 			local t = AcquireFontString(host, "OVERLAY", "GameFontNormal")
@@ -1567,6 +1590,7 @@ PaintSummary = function(host, planId)
 			host.__sfClassIcons[classFile] = icon
 			local count = AcquireFontString(host, "OVERLAY", "GameFontHighlight")
 			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+			count:SetTextColor(1, 1, 1)
 			host.__sfClassCounts = host.__sfClassCounts or {}
 			host.__sfClassCounts[classFile] = count
 		end
@@ -1604,6 +1628,22 @@ PaintSummary = function(host, planId)
 				btn.tooltipTitle = Loc(cat.nameKey, cat.nameDefault)
 				btn.tooltipText = Loc(cat.tipKey, cat.tipDefault)
 				buttons[cat.id] = btn
+				-- Small white provider-count overlay at the bottom-right for
+				-- categories that count eligible signed-up mains.
+				if cat.overlay then
+					local overlay = AcquireFontString(host, "OVERLAY", "GameFontHighlightSmall")
+					overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 2, 1)
+					overlay:SetText("0")
+					overlay:SetTextColor(1, 1, 1)
+					if overlay.SetShadowColor then
+						overlay:SetShadowColor(0, 0, 0, 1)
+					end
+					if overlay.SetShadowOffset then
+						overlay:SetShadowOffset(1, -1)
+					end
+					host.__sfProviderOverlays = host.__sfProviderOverlays or {}
+					host.__sfProviderOverlays[cat.id] = overlay
+				end
 			end
 			return buttons
 		end
@@ -1687,6 +1727,22 @@ PaintSummary = function(host, planId)
 
 	refreshButtons(host.__sfMajorButtons, summary.major, rs and rs.MAJOR_CATEGORIES)
 	refreshButtons(host.__sfUtilityButtons, summary.utility, rs and rs.UTILITY_CATEGORIES)
+	-- Provider-count overlays: white numbers of eligible signed-up mains,
+	-- shown even at zero. Counts come from BuildSummary's providerCounts.
+	local providerCounts = summary.providerCounts or {}
+	local function paintOverlays(categories)
+		for i = 1, #(categories or {}) do
+			local cat = categories[i]
+			if cat.overlay then
+				local ov = host.__sfProviderOverlays and host.__sfProviderOverlays[cat.id]
+				if ov and ov.SetText then
+					ov:SetText(tostring(providerCounts[cat.id] or 0))
+				end
+			end
+		end
+	end
+	paintOverlays(rs and rs.MAJOR_CATEGORIES)
+	paintOverlays(rs and rs.UTILITY_CATEGORIES)
 end
 
 PaintEntries = function(host, planId, planOpen, caps)
@@ -2243,24 +2299,14 @@ PaintEntries = function(host, planId, planOpen, caps)
 	end
 end
 
-local BOARD_ROLE_ORDER = { "tank", "healer", "ranged", "melee" }
-
--- Position chrome and both columns for the current width, then size the row
--- so the page scroll includes the taller column.
-local ROLE_TOTALS_TOP = -26
-local ROLE_LINE_H = 15
-local ROLE_HEADER_GAP = 8
-local ROLE_HEADER_H = 20 -- header band between column headings and rows
-local ROLE_ICON_SIZE = 14 -- role icons stay close to the text-line height
-local ROLE_GROUP_GAP = 14 -- consistent separation between role groups
-
 -- Position the role totals from their measured contents (icon, count, gaps),
 -- wrapping whole groups onto extra lines rather than crossing the column
 -- divider. Groups are compact enough to stay on one line at supported widths.
--- Returns the number of lines used.
-local function LayoutRoleTotals(panel, availW)
+-- The totals live at the top of the Summary sidebar; Classes is placed below
+-- their actual bottom by PaintSummary. Returns the number of lines used.
+LayoutRoleTotals = function(panel, availW)
 	local role = panel and panel.__sfRaidSignupRole
-	local host = panel and panel.__sfRaidSignupBoardHost
+	local host = panel and panel.__sfRaidSignupSummaryHost
 	if not role or not host then
 		return 1
 	end
@@ -2322,23 +2368,26 @@ end
 
 Page._LayoutRoleTotalsForTests = LayoutRoleTotals
 
+-- Position chrome and both columns for the current width, then size the row
+-- so the page scroll includes the taller column.
 LayoutBoard = function(panel)
 	local host = panel and panel.__sfRaidSignupBoardHost
 	if not host then
 		return
 	end
 	local leftW, rightW = ColumnWidths(host)
-	local totalsLines = LayoutRoleTotals(panel, leftW)
+	-- The vacated role-total space above the Signups headings is gone: the
+	-- left column's headings sit just beneath the Signups divider.
+	local headersY = SIGNUP_HEADERS_Y
+	local topH = -headersY + ROLE_HEADER_H
+	panel.__sfRaidSignupTopH = topH
+	-- The sidebar starts beneath its own heading divider; the role totals are
+	-- its first content, laid out by PaintSummary.
+	panel.__sfRaidSignupSummaryTopH = SUMMARY_CONTENT_TOP
 	local geom = panel.__sfEntryGeom
 	if not geom then
 		geom = EntryColGeom(leftW, panel.__sfRaidSignupPlanOpen ~= false)
 	end
-	local headersY = ROLE_TOTALS_TOP - totalsLines * ROLE_LINE_H - ROLE_HEADER_GAP
-	local topH = -headersY + ROLE_HEADER_H
-	panel.__sfRaidSignupTopH = topH
-	-- The sidebar starts beneath its own divider, so its position never
-	-- depends on how many lines the left column's role totals wrap to.
-	panel.__sfRaidSignupSummaryTopH = SUMMARY_CONTENT_TOP
 	local entriesHost = panel.__sfRaidSignupEntriesHost
 	local summaryHost = panel.__sfRaidSignupSummaryHost
 	local entriesH = math.max(24, (entriesHost and entriesHost.__sfEntriesContentH) or 24)
@@ -2652,7 +2701,7 @@ local function BuildBoardChrome(panel, host)
 		icon:SetSize(ROLE_ICON_SIZE, ROLE_ICON_SIZE)
 		local count = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontHighlight"))
 		count:SetText("0")
-		count:SetTextColor(1, 0.82, 0.18)
+		count:SetTextColor(1, 1, 1)
 		-- Informational hover over the icon+count pair (not clickable).
 		local hover = TrackCreate(CreateFrame("Frame", nil, host))
 		hover:EnableMouse(true)

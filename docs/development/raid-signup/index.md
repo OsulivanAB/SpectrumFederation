@@ -49,9 +49,9 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
   reused so allocations plateau after warm-up. Control callbacks read live selected plan /
   permissions. Idle visible page does not poll or broadcast.
 
-### Role-total guidance colors
+### Summary sidebar order and guidance palette
 
-The Signups tab shows four compact role totals beneath the plan list: **Tanks**, **Healers**, **Ranged DPS**, and **Melee DPS**. Each is a small role icon plus a count. Only the **number** changes color; icons, sizing, spacing, and hover regions are fixed. Hovering a group shows the full localized role name plus a one-line assessment of the current totals.
+The Summary sidebar stacks, top to bottom: **role totals** → **Classes** → **Tier Tokens** → **Major Buffs/Debuffs** → **Utility**. The role totals (small Tank / Healer / Ranged DPS / Melee DPS icon-and-count groups) are the first content immediately beneath the Summary heading/divider; Classes starts below their actual bottom with a clear gap, and whole groups wrap onto extra lines at tight widths. Only the **numbers** use the guidance palette — **white** for good/default, **orange** for caution, **red** for bad — shared by the role totals and the tier-token counts. Class counts and the utility provider-count overlays are always white. Icons, sizing, spacing, hover regions, gold section headings, and the missing-icon greying are unchanged. Hovering a role group shows the full localized role name plus a one-line assessment of the current totals.
 
 Colors are **roster-planning guidance**, not Blizzard requirements and not a guarantee that a composition can complete an encounter. The thresholds below are owner-selected advisory values; encounter-specific needs (mechanics, assignments, enrage timers) always take precedence. The heuristics do not model every difficulty, special raid format, player skill, gear level, or bench arrangement, and the guidance never restricts roster size, saving, or signup permissions.
 
@@ -67,7 +67,7 @@ Colors and tooltip text are recomputed on every totals refresh (plan switches, m
 
 ### Tanks
 
-- Exactly **2** tanks: yellow.
+- Exactly **2** tanks: white.
 - Any other count: red.
 - Tooltip states the two-tank planning target.
 
@@ -77,20 +77,20 @@ Colors and tooltip text are recomputed on every totals refresh (plan switches, m
 - For rosters with **10–30** total signups (`N`), the typical band is:
   - Lower bound: `max(2, floor(N / 5 + 0.5))`
   - Upper bound: `max(lowerBound, floor(N / 4))`
-- **Yellow:** `H` inside the inclusive band. **Orange:** `H` exactly one below or one above the band, provided `H >= 2`. **Red:** anything else.
-- Representative bands: N=10 → yellow {2}; N=14–15 → yellow {3}; N=20 → yellow 4–5; N=25 → yellow 5–6; N=30 → yellow 6–7.
-- Outside 10–30 signups, the raid-size-based balance assessment is **not applied**: with 2+ healers the number stays its normal yellow and the tooltip explicitly says the balance assessment is not applied at this size (it is not described as optimal). Fewer than 2 healers is still red.
+- **White:** `H` inside the inclusive band. **Orange:** `H` exactly one below or one above the band, provided `H >= 2`. **Red:** anything else.
+- Representative bands: N=10 → white {2}; N=14–15 → white {3}; N=20 → white 4–5; N=25 → white 5–6; N=30 → white 6–7.
+- Outside 10–30 signups, the raid-size-based balance assessment is **not applied**: with 2+ healers the number stays its normal white and the tooltip explicitly says the balance assessment is not applied at this size (it is not described as optimal). Fewer than 2 healers is still red.
 
 ### Melee / ranged DPS
 
 - If `D < 9`, **both** DPS numbers are red. This overrides the split assessment. Nine is the owner's preferred roster target, not the game's minimum raid-entry requirement — a 2/2/6 composition has six DPS and ten total players.
 - When `D >= 9`, the melee share of combined DPS (`M / D`) is graded with exact integer comparisons (no display rounding at the boundaries):
-  - **Yellow:** 20% through 65% melee, inclusive.
+  - **White:** 20% through 65% melee, inclusive.
   - **Orange:** below 20%, or above 65% through 85%.
   - **Red:** above 85% melee.
 - Both DPS numbers always share the same balance color.
 - The asymmetry is deliberate: a **ranged-heavy** composition receives at worst orange unless the combined-DPS minimum fails, while a heavily melee-skewed one turns red above 85%.
-- For `D = 14`: 6/8 yellow, 9/5 yellow, 10/4 orange, 12/2 red, 2/12 orange, 0/14 orange.
+- For `D = 14`: 6/8 white, 9/5 white, 10/4 orange, 12/2 red, 2/12 orange, 0/14 orange.
 
 ### Tooltip wording
 
@@ -111,17 +111,29 @@ This is Midnight's armor-based class-set grouping (see the [Midnight Season 1 cl
 
 **Crowding assessment.** Unlike the healer heuristic, this applies at any roster size and measures **roster competition**, not actual gear need or drop probability. The assessment is deliberately asymmetric: underrepresentation is never a problem and never receives orange or red. For a category with `C` participants out of `N` total eligible mains (`N > 0`):
 
-- `fairMax = ceil(N / 4)` (the rounded even share — with 14 signups a balanced 4/4/3/3 roster is all yellow)
+- `fairMax = ceil(N / 4)` (the rounded even share — with 14 signups a balanced 4/4/3/3 roster is all white)
 - `wiggle = max(1, floor(N * 0.05 + 0.5))`
-- **Yellow:** `C <= fairMax`
+- **White:** `C <= fairMax`
 - **Orange:** `fairMax < C <= fairMax + wiggle`
 - **Red:** `C > fairMax + wiggle`
 
-Representative boundaries: N=14 → yellow 0–4, orange 5, red 6+; N=20 → yellow 0–5, orange 6, red 7+; N=25 → yellow 0–7, orange 8, red 9+; N=30 → yellow 0–8, orange 9–10, red 11+; N=40 → yellow 0–10, orange 11–12, red 13+.
+Representative boundaries: N=14 → white 0–4, orange 5, red 6+; N=20 → white 0–5, orange 6, red 7+; N=25 → white 0–7, orange 8, red 9+; N=30 → white 0–8, orange 9–10, red 11+; N=40 → white 0–10, orange 11–12, red 13+.
 
-For `N = 0` all four icons are grey with yellow zero counts, and the tooltip explains there are no completed signups (no division by zero, no misleading percentages). Percentages in tooltips are rounded for display only; colors come from the integer rules above.
+For `N = 0` all four icons are grey with white zero counts, and the tooltip explains there are no completed signups (no division by zero, no misleading percentages). Percentages in tooltips are rounded for display only; colors come from the integer rules above.
 
 **Tooltips.** Hovering an icon or count shows the armor type and token family, the eligible classes, the current count/total/percentage, the even-share target, and the crowding assessment ("Slightly crowded." / "Outside the usual range." / "Within the even-share range."). Counts, colors, greying, and tooltip data refresh on every summary repaint (plan switches, main-spec changes, deletions, remote updates) and reset when crowding decreases. Everything derives from existing signup data — no persisted counters, sync fields, polling, or idle work.
+
+### Coverage categories and provider-count overlays
+
+Coverage categories are planned-capability booleans derived from completed main selections only; alternatives, incomplete drafts, and deleted entries never contribute. Recent category decisions:
+
+- **Heroism** (internal id `bloodlust`): visible name is Heroism with the current Retail Heroism spell artwork; equivalent abilities (Bloodlust, Time Warp, Primal Rage, Fury of the Aspects) keep coverage through the same providers (Shaman, Mage, Hunter, Evoker).
+- **Warlock utilities are separate entries**: Ritual of Summoning, Healthstone, and Demonic Gateway each have their own icon, name, tooltip, and coverage state (any warlock main). The old combined "Lock Stuff" category is gone.
+- **Innervate** is eligible for **all druid specializations** as talent-dependent healer mana support (per Blizzard's Midnight class-tree notes), not Restoration only.
+- **Skyfury** and **Blessing of the Bronze** sit in **Major Buffs/Debuffs** alongside the other persistent raid buffs, each exactly once. Skyfury uses the numeric FileDataID `4630367`; `RS.CategoryIconTexture` accepts numeric FileDataIDs as well as texture paths, and `iconSpell` spell IDs resolve live Retail spell artwork with the path as fallback.
+- **Attack Speed Reduction** uses the actual Retail Numbing Poison artwork (spell 5760), and its title/tooltip/provider mapping all describe that same capability.
+
+**Provider-count overlays.** Three Utility icons — **Combat Res**, **Burst Move Speed**, and **Death Grip/AMZ** — show a small white outlined number at the bottom-right counting **eligible signed-up mains** for that category. The number shows even at zero; zero-provider icons keep the existing grey missing-coverage treatment while present-provider icons stay in their normal state. These counts represent mains, not charges, casts, cooldown readiness, or shared battle-res resources. They extend `RS.BuildSummary` (`providerCounts`) using the same completed-main-only aggregation as the coverage booleans: each main counts once per category even when several provider rules match. For Death Grip/AMZ the overlay counts potential Death Grip providers (Frost Death Knights) only, so Grip and AMZ never double-count one DK; coverage itself remains any Death Knight.
 
 ### Background references
 

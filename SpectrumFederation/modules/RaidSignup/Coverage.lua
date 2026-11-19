@@ -148,15 +148,37 @@ RS.MAJOR_CATEGORIES = {
         icon = "Interface\\Icons\\Spell_Nature_Regeneration",
         providers = { ClassAll("DRUID") },
     },
+    {
+        id = "skyfury",
+        nameKey = "RAID_SIGNUP_COV_SKYFURY",
+        nameDefault = "Skyfury",
+        tipKey = "RAID_SIGNUP_COV_SKYFURY_TIP",
+        tipDefault = "Skyfury — Mastery and empowered auto-attacks for the raid.",
+        -- Numeric FileDataID: current Retail Skyfury artwork.
+        icon = 4630367,
+        providers = { ClassAll("SHAMAN") },
+    },
+    {
+        id = "blessing_bronze",
+        nameKey = "RAID_SIGNUP_COV_BRONZE",
+        nameDefault = "Blessing of the Bronze",
+        tipKey = "RAID_SIGNUP_COV_BRONZE_TIP",
+        tipDefault = "Blessing of the Bronze — reduces major movement-ability cooldowns for the raid.",
+        icon = "Interface\\Icons\\Ability_Evoker_BlessingoftheBronze",
+        providers = { ClassAll("EVOKER") },
+    },
 }
 
 RS.UTILITY_CATEGORIES = {
     {
         id = "bloodlust",
-        nameKey = "RAID_SIGNUP_COV_BLOODLUST",
-        nameDefault = "Bloodlust",
-        tipKey = "RAID_SIGNUP_COV_BLOODLUST_TIP",
-        tipDefault = "Bloodlust / Heroism / Time Warp / Primal Rage / Fury of the Aspects.",
+        nameKey = "RAID_SIGNUP_COV_HEROISM",
+        nameDefault = "Heroism",
+        tipKey = "RAID_SIGNUP_COV_HEROISM_TIP",
+        tipDefault = "Heroism — raid-wide haste. Equivalent abilities such as Bloodlust, Time Warp, Primal Rage, and Fury of the Aspects count too.",
+        -- iconSpell resolves the current Retail Heroism artwork (spell 32182);
+        -- the icon path is only a fallback.
+        iconSpell = 32182,
         icon = "Interface\\Icons\\Spell_Nature_BloodLust",
         providers = {
             ClassAll("SHAMAN"), ClassAll("MAGE"), ClassAll("HUNTER"), ClassAll("EVOKER"),
@@ -167,8 +189,9 @@ RS.UTILITY_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_BATTLE_RES",
         nameDefault = "Combat Res",
         tipKey = "RAID_SIGNUP_COV_BATTLE_RES_TIP",
-        tipDefault = "Combat resurrection (Rebirth, Raise Ally, Soulstone, Intercession).",
+        tipDefault = "Combat resurrection (Rebirth, Raise Ally, Soulstone, Intercession). The overlay counts eligible signed-up mains.",
         icon = "Interface\\Icons\\Spell_Nature_Reincarnation",
+        overlay = true,
         providers = {
             ClassAll("DRUID"), ClassAll("DEATHKNIGHT"), ClassAll("WARLOCK"), ClassAll("PALADIN"),
         },
@@ -178,17 +201,39 @@ RS.UTILITY_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_BURST_MOVE",
         nameDefault = "Burst Move Speed",
         tipKey = "RAID_SIGNUP_COV_BURST_MOVE_TIP",
-        tipDefault = "Planned burst movement tools (for example Stampeding Roar, Wind Rush Totem, Tiger's Lust).",
+        tipDefault = "Planned burst movement tools (for example Stampeding Roar, Wind Rush Totem, Tiger's Lust). The overlay counts eligible signed-up mains.",
         icon = "Interface\\Icons\\Spell_Druid_StampedingRoar_Cat",
+        overlay = true,
         providers = { ClassAll("DRUID"), ClassAll("SHAMAN"), ClassAll("MONK") },
     },
     {
-        id = "lock_stuff",
-        nameKey = "RAID_SIGNUP_COV_LOCK",
-        nameDefault = "Lock Stuff (HS, Gate, Curse)",
-        tipKey = "RAID_SIGNUP_COV_LOCK_TIP",
-        tipDefault = "Warlock Healthstone, Demonic Gateway, and curses.",
-        icon = "Interface\\Icons\\Spell_Shadow_DemonicEmpathy",
+        id = "warlock_ritual",
+        nameKey = "RAID_SIGNUP_COV_RITUAL",
+        nameDefault = "Ritual of Summoning",
+        tipKey = "RAID_SIGNUP_COV_RITUAL_TIP",
+        tipDefault = "Ritual of Summoning — warlock portal for raid travel.",
+        iconSpell = 698,
+        icon = "Interface\\Icons\\Spell_Shadow_SummonDemon",
+        providers = { ClassAll("WARLOCK") },
+    },
+    {
+        id = "warlock_healthstone",
+        nameKey = "RAID_SIGNUP_COV_HEALTHSTONE",
+        nameDefault = "Healthstone",
+        tipKey = "RAID_SIGNUP_COV_HEALTHSTONE_TIP",
+        tipDefault = "Healthstone — warlock-created health recovery item.",
+        iconSpell = 6201,
+        icon = "Interface\\Icons\\Spell_Shadow_DeathCoil",
+        providers = { ClassAll("WARLOCK") },
+    },
+    {
+        id = "warlock_gateway",
+        nameKey = "RAID_SIGNUP_COV_GATEWAY",
+        nameDefault = "Demonic Gateway",
+        tipKey = "RAID_SIGNUP_COV_GATEWAY_TIP",
+        tipDefault = "Demonic Gateway — warlock-created teleport for raid movement.",
+        iconSpell = 111771,
+        icon = "Interface\\Icons\\Spell_Shadow_DemonicGateway",
         providers = { ClassAll("WARLOCK") },
     },
     {
@@ -205,17 +250,21 @@ RS.UTILITY_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_INNERVATE",
         nameDefault = "Innervate",
         tipKey = "RAID_SIGNUP_COV_INNERVATE_TIP",
-        tipDefault = "Innervate — Restoration Druid mana acceleration for a healer.",
+        tipDefault = "Innervate — talent-dependent druid mana support for healers.",
         icon = "Interface\\Icons\\Spell_Nature_Lightning",
-        providers = { ClassSpecs("DRUID", 105) },
+        providers = { ClassSpecs("DRUID", 102, 103, 104, 105) },
     },
     {
         id = "dk_grip_amz",
         nameKey = "RAID_SIGNUP_COV_DK",
         nameDefault = "Death Grip/AMZ",
         tipKey = "RAID_SIGNUP_COV_DK_TIP",
-        tipDefault = "Death Grip and Anti-Magic Zone from Death Knights.",
+        tipDefault = "Death Grip and Anti-Magic Zone from Death Knights. The overlay counts potential Death Grip providers (Frost Death Knights).",
         icon = "Interface\\Icons\\Spell_DeathKnight_Strangulate",
+        overlay = true,
+        -- Coverage stays any Death Knight; the overlay counts Death Grip
+        -- (Frost) providers only, so Grip and AMZ never double-count.
+        overlayProviders = { ClassSpecs("DEATHKNIGHT", 251) },
         providers = { ClassAll("DEATHKNIGHT") },
     },
     {
@@ -255,15 +304,6 @@ RS.UTILITY_CATEGORIES = {
         providers = { ClassAll("MAGE"), ClassAll("PALADIN"), ClassAll("HUNTER") },
     },
     {
-        id = "skyfury",
-        nameKey = "RAID_SIGNUP_COV_SKYFURY",
-        nameDefault = "Skyfury",
-        tipKey = "RAID_SIGNUP_COV_SKYFURY_TIP",
-        tipDefault = "Skyfury — Mastery and empowered auto-attacks for the raid.",
-        icon = "Interface\\Icons\\Ability_Shaman_FreedomWolf",
-        providers = { ClassAll("SHAMAN") },
-    },
-    {
         id = "atrophic_poison",
         nameKey = "RAID_SIGNUP_COV_ATROPHIC",
         nameDefault = "Atrophic Poison",
@@ -271,15 +311,6 @@ RS.UTILITY_CATEGORIES = {
         tipDefault = "Atrophic Poison — reduces damage dealt by the affected enemy.",
         icon = "Interface\\Icons\\Ability_PoisonSting",
         providers = { ClassAll("ROGUE") },
-    },
-    {
-        id = "blessing_bronze",
-        nameKey = "RAID_SIGNUP_COV_BRONZE",
-        nameDefault = "Blessing of the Bronze",
-        tipKey = "RAID_SIGNUP_COV_BRONZE_TIP",
-        tipDefault = "Blessing of the Bronze — reduces major movement-ability cooldowns for the raid.",
-        icon = "Interface\\Icons\\Ability_Evoker_BlessingoftheBronze",
-        providers = { ClassAll("EVOKER") },
     },
     {
         id = "execute",
@@ -295,8 +326,11 @@ RS.UTILITY_CATEGORIES = {
         nameKey = "RAID_SIGNUP_COV_ATK_SLOW",
         nameDefault = "Attack Speed Reduction",
         tipKey = "RAID_SIGNUP_COV_ATK_SLOW_TIP",
-        tipDefault = "Attack-speed reduction such as Numbing Poison.",
-        icon = "Interface\\Icons\\Spell_Nature_Slow",
+        tipDefault = "Attack-speed reduction from Numbing Poison.",
+        -- iconSpell resolves the actual Retail Numbing Poison artwork (spell
+        -- 5760); the icon path is only a fallback.
+        iconSpell = 5760,
+        icon = "Interface\\Icons\\Spell_Nature_NullifyDisease",
         providers = { ClassAll("ROGUE") },
     },
     {
@@ -404,7 +438,23 @@ function RS.SpecIconTexture(specId)
 end
 
 function RS.CategoryIconTexture(category)
-    if type(category) == "table" and type(category.icon) == "string" and category.icon ~= "" then
+    if type(category) ~= "table" then
+        return "Interface\\Icons\\INV_Misc_QuestionMark"
+    end
+    -- Numeric FileDataID (for example Skyfury) is valid current artwork.
+    if type(category.icon) == "number" then
+        return category.icon
+    end
+    -- Prefer live spell artwork so renamed or refreshed abilities show their
+    -- current Retail icon; the icon path remains the fallback.
+    local spellId = tonumber(category.iconSpell)
+    if spellId and C_Spell and C_Spell.GetSpellTexture then
+        local ok, tex = pcall(C_Spell.GetSpellTexture, spellId)
+        if ok and ((type(tex) == "string" and tex ~= "") or type(tex) == "number") then
+            return tex
+        end
+    end
+    if type(category.icon) == "string" and category.icon ~= "" then
         return category.icon
     end
     return "Interface\\Icons\\INV_Misc_QuestionMark"
@@ -501,15 +551,33 @@ function RS.BuildSummary(entries)
         counts[RS.CLASS_ORDER[i]] = 0
     end
 
+    local majorCovered = {}
+    local utilityCovered = {}
+    -- Provider-count overlays: eligible completed mains per category. Counted
+    -- once per main even when several provider rules match, and derived only
+    -- from the same completed-main selections as the coverage booleans.
+    local providerCounts = {}
     local function markCategories(list, covered)
         for i = 1, #list do
             local cat = list[i]
             covered[cat.id] = false
+            providerCounts[cat.id] = 0
         end
     end
 
-    local majorCovered = {}
-    local utilityCovered = {}
+    local function CountProviders(cat, classFile, specId)
+        local list = cat.overlayProviders or cat.providers
+        if type(list) ~= "table" then
+            return false
+        end
+        for i = 1, #list do
+            if ProviderMatches(list[i], classFile, specId) then
+                return true
+            end
+        end
+        return false
+    end
+
     markCategories(RS.MAJOR_CATEGORIES, majorCovered)
     markCategories(RS.UTILITY_CATEGORIES, utilityCovered)
 
@@ -522,16 +590,20 @@ function RS.BuildSummary(entries)
                     counts[classFile] = counts[classFile] + 1
                     for i = 1, #RS.MAJOR_CATEGORIES do
                         local cat = RS.MAJOR_CATEGORIES[i]
-                        if not majorCovered[cat.id]
-                            and RS.CategoryCoveredBySelection(cat, classFile, specId) then
+                        if RS.CategoryCoveredBySelection(cat, classFile, specId) then
                             majorCovered[cat.id] = true
+                            if CountProviders(cat, classFile, specId) then
+                                providerCounts[cat.id] = providerCounts[cat.id] + 1
+                            end
                         end
                     end
                     for i = 1, #RS.UTILITY_CATEGORIES do
                         local cat = RS.UTILITY_CATEGORIES[i]
-                        if not utilityCovered[cat.id]
-                            and RS.CategoryCoveredBySelection(cat, classFile, specId) then
+                        if RS.CategoryCoveredBySelection(cat, classFile, specId) then
                             utilityCovered[cat.id] = true
+                            if CountProviders(cat, classFile, specId) then
+                                providerCounts[cat.id] = providerCounts[cat.id] + 1
+                            end
                         end
                     end
                 end
@@ -543,5 +615,6 @@ function RS.BuildSummary(entries)
         classCounts = counts,
         major = majorCovered,
         utility = utilityCovered,
+        providerCounts = providerCounts,
     }
 end
