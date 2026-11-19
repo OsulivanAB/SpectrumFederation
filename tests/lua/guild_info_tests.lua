@@ -7052,6 +7052,199 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- #483 — Alt suggestions exclude the Main name target's current alts
+---------------------------------------------------------------------------
+
+do
+    local function suggestionGuids(items)
+        local set = {}
+        for i = 1, #(items or {}) do
+            local guid = items[i].guid or items[i].value
+            if type(guid) == "string" then
+                set[guid] = items[i]
+            end
+        end
+        return set
+    end
+
+    local function openAssignSuggestions()
+        local page = SF.SettingsUI.pagesById.guildInfoMainAlt
+        assertTrue(page ~= nil, "483: Main/Alt page available")
+        local panel = CreateFrame()
+        panel.IsVisible = function() return true end
+        page:Build(panel)
+        local def = panel.__sfPageDef
+        local ui = { page = page, panel = panel }
+        for _, sec in ipairs(def.sections or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "autocomplete" and item.label == "Main name" then
+                    ui.mainSug = item.getSuggestions
+                    ui.mainResolvedCb = item.onResolved
+                    ui.mainTextCb = item.onTextChanged
+                end
+                if item.type == "autocomplete" and item.label == "Alt name" then
+                    ui.altSug = item.getSuggestions
+                    ui.altResolvedCb = item.onResolved
+                    ui.altTextCb = item.onTextChanged
+                end
+                if item.type == "sideBySideScrollLists" then
+                    ui.dual = item
+                end
+            end
+        end
+        assertTrue(type(ui.mainSug) == "function", "483: main getSuggestions")
+        assertTrue(type(ui.altSug) == "function", "483: alt getSuggestions")
+        -- Clear session field state left by earlier UI tests.
+        if ui.mainTextCb then ui.mainTextCb(nil, "") end
+        if ui.altTextCb then ui.altTextCb(nil, "") end
+        return ui
+    end
+
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "483: Alice←Bob seed")
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "483: Alice←Eve seed")
+    assertEq(assign("Carol-Garona", "Dave-Garona"), "accepted", "483: Carol←Dave seed")
+
+    local ui = openAssignSuggestions()
+    assertTrue(ui.dual and ui.dual.left and ui.dual.left.onSelect,
+        "483: Assignments list selection available")
+    ui.dual.left.onSelect(nil, { guid = "Player-1-Carol" })
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] ~= nil,
+        "483: highlighted Assignments main does not filter Alt suggestions")
+
+    ui.mainResolvedCb(nil, { guid = "Player-1-Alice", nameRealm = "Alice-Garona", classFile = "MAGE" })
+    local aliceBob = suggestionGuids(ui.altSug(nil, "bo"))
+    assertTrue(aliceBob["Player-1-Bob"] == nil,
+        "483: selected main hides its same-realm alt")
+    assertTrue(aliceBob["Player-2-Bob"] ~= nil,
+        "483: same-name other-realm unassigned character remains")
+    assertTrue(suggestionGuids(ui.altSug(nil, "ev"))["Player-1-Eve"] == nil,
+        "483: selected main hides every assigned alt")
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] ~= nil,
+        "483: other-main alt remains selectable")
+
+    ui.mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] == nil,
+        "483: switching main excludes the new target's alt")
+    assertTrue(suggestionGuids(ui.altSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "483: switching main restores other-main alts")
+
+    ui = openAssignSuggestions()
+    ui.mainTextCb(nil, "Carol-Garona")
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] == nil,
+        "483: exact typed main excludes target alts")
+    assertTrue(suggestionGuids(ui.altSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "483: exact typed main keeps other-main alts")
+
+    ui.mainTextCb(nil, "Bob")
+    local _, bobErr = GI.GetRosterSnapshot(true):Resolve("Bob")
+    assertEq(bobErr, "ambiguous_name", "483: Bob short name is ambiguous across realms")
+    local ambiguousBob = suggestionGuids(ui.altSug(nil, "bo"))
+    assertTrue(ambiguousBob["Player-1-Bob"] ~= nil,
+        "483: ambiguous main name preserves existing Alt suggestions")
+    assertTrue(ambiguousBob["Player-2-Bob"] ~= nil,
+        "483: ambiguous main name does not guess a realm")
+
+    ui.mainTextCb(nil, "Bobby")
+    assertTrue(suggestionGuids(ui.altSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "483: unresolved main name preserves existing Alt suggestions")
+
+    ui.mainTextCb(nil, "Carol-Garona")
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] == nil,
+        "483: typed target hides Dave before unassignment")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "483: unassign Dave")
+    assertTrue(suggestionGuids(ui.altSug(nil, "da"))["Player-1-Dave"] ~= nil,
+        "483: unassigned alt becomes eligible again")
+
+    -- Synchronized relationship updates re-evaluate the same suggestion path.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "483 sync: Alice←Bob seed")
+    local dbEditor = deepCopy(SpectrumFederationDB)
+    local dbReader = {}
+    SpectrumFederationDB = dbReader
+    GI:Initialize(dbReader)
+    GI.InvalidateRosterSnapshot()
+    syncAll(dbEditor, dbReader, "Alice-Garona")
+    assertEq(select(1, peerRole(dbReader, "Player-1-Bob")), "alt",
+        "483 sync: reader receives Bob relationship")
+
+    local uiSync = openAssignSuggestions()
+    uiSync.mainResolvedCb(nil, { guid = "Player-1-Alice", nameRealm = "Alice-Garona", classFile = "MAGE" })
+    local syncedBob = suggestionGuids(uiSync.altSug(nil, "bo"))
+    assertTrue(syncedBob["Player-1-Bob"] == nil,
+        "483 sync: synchronized same-main alt is excluded")
+    assertTrue(syncedBob["Player-2-Bob"] ~= nil,
+        "483 sync: synchronized state preserves other-realm unassigned alt")
+
+    SpectrumFederationDB = dbEditor
+    GI:Initialize(dbEditor)
+    GI.InvalidateRosterSnapshot()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "483 sync: editor unassigns Bob")
+    local dbReader2 = {}
+    SpectrumFederationDB = dbReader2
+    GI:Initialize(dbReader2)
+    GI.InvalidateRosterSnapshot()
+    syncAll(dbEditor, dbReader2, "Alice-Garona")
+    assertNil(select(1, peerRole(dbReader2, "Player-1-Bob")),
+        "483 sync: reader receives Bob unassignment")
+    uiSync = openAssignSuggestions()
+    uiSync.mainResolvedCb(nil, { guid = "Player-1-Alice", nameRealm = "Alice-Garona", classFile = "MAGE" })
+    assertTrue(suggestionGuids(uiSync.altSug(nil, "bo"))["Player-1-Bob"] ~= nil,
+        "483 sync: synchronized unassignment makes Bob eligible again")
+
+    -- Syncing still fails closed even when a main target is selected.
+    local record = select(1, GI:GetCurrentRecord())
+    record.baseline = record.baseline or {}
+    record.baseline.complete = false
+    record.baseline.memberCount = 99
+    record.baseline.groupCount = 99
+    record.baseline.contentFp = "not-yet"
+    uiSync = openAssignSuggestions()
+    uiSync.mainResolvedCb(nil, { guid = "Player-1-Alice", nameRealm = "Alice-Garona", classFile = "MAGE" })
+    assertEq(#(uiSync.altSug(nil, "bo") or {}), 0,
+        "483: Alt suggestions stay empty while relationships synchronize")
+    record.baseline.complete = true
+    record.baseline.memberCount = countKeys(record.members)
+    record.baseline.groupCount = countKeys(record.groups)
+    record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+
+    -- The new exclusion is applied inside roster:Suggest, before the visible cap.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    for i = 1, 11 do
+        ensureRosterGuid(string.format("Cap%02d-Garona", i), string.format("Player-1-Cap%02d", i), 4)
+    end
+    ensureRosterGuid("Cap12-Garona", "Player-1-Cap12", 4)
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    for i = 1, 11 do
+        assertEq(assign("Alice-Garona", string.format("Cap%02d-Garona", i)),
+            "accepted", "483 cap: Alice←Cap" .. string.format("%02d", i))
+    end
+    assertEq(assign("Carol-Garona", "Cap12-Garona"), "accepted", "483 cap: Carol←Cap12")
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local uiCap = openAssignSuggestions()
+    uiCap.mainResolvedCb(nil, { guid = "Player-1-Alice", nameRealm = "Alice-Garona", classFile = "MAGE" })
+    local capItems = uiCap.altSug(nil, "cap") or {}
+    local capSet = suggestionGuids(capItems)
+    assertEq(#capItems, 1, "483 cap: excluded same-main alts do not consume the result cap")
+    assertTrue(capSet["Player-1-Cap12"] ~= nil,
+        "483 cap: other-main Cap12 remains discoverable after eleven excluded matches")
+    assertTrue(capSet["Player-1-Cap01"] == nil,
+        "483 cap: first same-main alt is excluded")
+
+    restoreBaseRoster()
+    pass("483 Alt suggestions exclude target main's current alts")
+end
+
+---------------------------------------------------------------------------
 -- Assignments list search + hover-copy wiring (session UI only)
 ---------------------------------------------------------------------------
 

@@ -2,6 +2,26 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.23-beta.2] - 2026-11-19
+
+### Changed
+- Hide same-main alts in Alt suggestions
+
+## [1.5.22-beta.1] - 2026-11-19
+
+### Fixed
+- Fix Mobile Banking banner strata layering
+
+## [1.5.21-beta.1] - 2026-11-19
+
+### Added
+- Add Raid Tools → Raid Signup for season roster planning (#404)
+
+## [1.5.20-beta.1] - 2026-11-19
+
+### Fixed
+- Fix admin convergence targeting for unavailable profile admins
+
 ## [1.5.19] - 2026-11-18
 
 ### Added

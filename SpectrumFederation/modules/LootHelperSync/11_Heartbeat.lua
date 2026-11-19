@@ -460,7 +460,12 @@ function Sync:RequestProfileSnapshot(reason, opts)
 
     if ok then
         self.state.pendingProfileSnapshot = nil
-        self.state._profileReqInFlight = self.state.sessionId
+        -- RegisterRequest can fail synchronously when no target is reachable.
+        -- Do not latch in-flight for a request that no longer exists; the
+        -- NEED_PROFILE retry path must be able to try again after peers return.
+        if self.state.requests and self.state.requests[requestId] then
+            self.state._profileReqInFlight = self.state.sessionId
+        end
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Requesting profile snapshot (reason: %s) from initial target %s (%d targets total: %s)", 
                 tostring(reason), tostring(targets[1]), #targets, table.concat(targets, ", "))
