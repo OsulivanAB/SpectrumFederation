@@ -1,0 +1,622 @@
+-- Raid Signup planned class/spec coverage (#404).
+-- Planned capability only — not live auras or talent inspection.
+local addonName, SF = ...
+
+SF.RaidSignup = SF.RaidSignup or {}
+local RS = SF.RaidSignup
+
+RS.CLASS_ORDER = {
+    "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "DEATHKNIGHT",
+    "SHAMAN", "MAGE", "WARLOCK", "MONK", "DRUID", "DEMONHUNTER", "EVOKER",
+}
+
+-- Armor-based tier-token families for the Raid Signup summary (#404).
+-- Midnight class-set grouping; presentation-only, not a statement about
+-- other expansions. Every CLASS_ORDER entry belongs to exactly one group.
+RS.ARMOR_TOKEN_GROUPS = {
+    { id = "cloth",   classes = { "MAGE", "PRIEST", "WARLOCK" } },
+    { id = "leather", classes = { "DEMONHUNTER", "DRUID", "MONK", "ROGUE" } },
+    { id = "mail",    classes = { "EVOKER", "HUNTER", "SHAMAN" } },
+    { id = "plate",   classes = { "DEATHKNIGHT", "PALADIN", "WARRIOR" } },
+}
+
+-- Stable Retail specialization IDs (match SpecWeapons).
+RS.CLASS_SPECS = {
+    WARRIOR = { 71, 72, 73 },
+    PALADIN = { 65, 66, 70 },
+    HUNTER = { 253, 254, 255 },
+    ROGUE = { 259, 260, 261 },
+    PRIEST = { 256, 257, 258 },
+    DEATHKNIGHT = { 250, 251, 252 },
+    SHAMAN = { 262, 263, 264 },
+    MAGE = { 62, 63, 64 },
+    WARLOCK = { 265, 266, 267 },
+    MONK = { 268, 269, 270 },
+    DRUID = { 102, 103, 104, 105 },
+    DEMONHUNTER = { 577, 581, 1480 },
+    EVOKER = { 1467, 1468, 1473 },
+}
+
+RS.SPEC_NAMES = {
+    [71] = "Arms", [72] = "Fury", [73] = "Protection",
+    [65] = "Holy", [66] = "Protection", [70] = "Retribution",
+    [253] = "Beast Mastery", [254] = "Marksmanship", [255] = "Survival",
+    [259] = "Assassination", [260] = "Outlaw", [261] = "Subtlety",
+    [256] = "Discipline", [257] = "Holy", [258] = "Shadow",
+    [250] = "Blood", [251] = "Frost", [252] = "Unholy",
+    [262] = "Elemental", [263] = "Enhancement", [264] = "Restoration",
+    [62] = "Arcane", [63] = "Fire", [64] = "Frost",
+    [265] = "Affliction", [266] = "Demonology", [267] = "Destruction",
+    [268] = "Brewmaster", [269] = "Windwalker", [270] = "Mistweaver",
+    [102] = "Balance", [103] = "Feral", [104] = "Guardian", [105] = "Restoration",
+    [577] = "Havoc", [581] = "Vengeance", [1480] = "Devourer",
+    [1467] = "Devastation", [1468] = "Preservation", [1473] = "Augmentation",
+}
+
+local function AllSpecs(classFile)
+    return RS.CLASS_SPECS[classFile]
+end
+
+local function SpecSet(classFile, ...)
+    local allowed = {}
+    local n = select("#", ...)
+    for i = 1, n do
+        allowed[select(i, ...)] = true
+    end
+    local out = {}
+    local list = AllSpecs(classFile) or {}
+    for i = 1, #list do
+        if allowed[list[i]] then
+            out[#out + 1] = list[i]
+        end
+    end
+    return out
+end
+
+-- providers: list of { classFile = "MAGE", specs = {62,63,64} | nil for all }
+-- nil specs ⇒ every known spec of that class.
+local function ClassAll(classFile)
+    return { classFile = classFile, specs = nil }
+end
+
+local function ClassSpecs(classFile, ...)
+    return { classFile = classFile, specs = SpecSet(classFile, ...) }
+end
+
+RS.MAJOR_CATEGORIES = {
+    {
+        id = "intellect",
+        nameKey = "RAID_SIGNUP_COV_INTELLECT",
+        nameDefault = "Intellect",
+        tipKey = "RAID_SIGNUP_COV_INTELLECT_TIP",
+        tipDefault = "Arcane Intellect — increases raid Intellect.",
+        icon = "Interface\\Icons\\Spell_Holy_MagicalSentry",
+        providers = { ClassAll("MAGE") },
+    },
+    {
+        id = "attack_power",
+        nameKey = "RAID_SIGNUP_COV_ATTACK_POWER",
+        nameDefault = "Attack Power",
+        tipKey = "RAID_SIGNUP_COV_ATTACK_POWER_TIP",
+        tipDefault = "Battle Shout — increases raid attack power.",
+        icon = "Interface\\Icons\\Ability_Warrior_BattleShout",
+        providers = { ClassAll("WARRIOR") },
+    },
+    {
+        id = "stamina",
+        nameKey = "RAID_SIGNUP_COV_STAMINA",
+        nameDefault = "Stamina",
+        tipKey = "RAID_SIGNUP_COV_STAMINA_TIP",
+        tipDefault = "Power Word: Fortitude — increases raid Stamina.",
+        icon = "Interface\\Icons\\Spell_Holy_WordFortitude",
+        providers = { ClassAll("PRIEST") },
+    },
+    {
+        id = "devo_aura",
+        nameKey = "RAID_SIGNUP_COV_DEVO",
+        nameDefault = "3% DR (Devo Aura)",
+        tipKey = "RAID_SIGNUP_COV_DEVO_TIP",
+        tipDefault = "Devotion Aura — reduces damage taken. All Paladin specs can provide baseline coverage (Retribution swaps aura choice in combat).",
+        icon = "Interface\\Icons\\Spell_Holy_DevotionAura",
+        -- Baseline coverage potential: every Paladin spec learns Devotion
+        -- Aura (Retribution may switch auras in combat). Counts mains only.
+        providers = { ClassAll("PALADIN") },
+    },
+    {
+        id = "physical",
+        nameKey = "RAID_SIGNUP_COV_PHYSICAL",
+        nameDefault = "5% Physical",
+        tipKey = "RAID_SIGNUP_COV_PHYSICAL_TIP",
+        tipDefault = "Mystic Touch — increases Physical damage taken by the enemy.",
+        icon = "Interface\\Icons\\Ability_Monk_Provoke",
+        providers = { ClassAll("MONK") },
+    },
+    {
+        id = "magic",
+        nameKey = "RAID_SIGNUP_COV_MAGIC",
+        nameDefault = "3% Magic",
+        tipKey = "RAID_SIGNUP_COV_MAGIC_TIP",
+        tipDefault = "Chaos Brand — increases magic damage taken by the enemy.",
+        icon = "Interface\\Icons\\Ability_DemonHunter_ChaosStrike",
+        providers = { ClassAll("DEMONHUNTER") },
+    },
+    {
+        id = "versatility",
+        nameKey = "RAID_SIGNUP_COV_VERS",
+        nameDefault = "3% Versatility",
+        tipKey = "RAID_SIGNUP_COV_VERS_TIP",
+        tipDefault = "Mark of the Wild — increases raid Versatility.",
+        icon = "Interface\\Icons\\Spell_Nature_Regeneration",
+        providers = { ClassAll("DRUID") },
+    },
+    {
+        id = "skyfury",
+        nameKey = "RAID_SIGNUP_COV_SKYFURY",
+        nameDefault = "Skyfury",
+        tipKey = "RAID_SIGNUP_COV_SKYFURY_TIP",
+        tipDefault = "Skyfury — Mastery and empowered auto-attacks for the raid.",
+        -- Numeric FileDataID: current Retail Skyfury artwork.
+        icon = 4630367,
+        providers = { ClassAll("SHAMAN") },
+    },
+    {
+        id = "blessing_bronze",
+        nameKey = "RAID_SIGNUP_COV_BRONZE",
+        nameDefault = "Blessing of the Bronze",
+        tipKey = "RAID_SIGNUP_COV_BRONZE_TIP",
+        tipDefault = "Blessing of the Bronze — reduces major movement-ability cooldowns for the raid.",
+        icon = "Interface\\Icons\\Ability_Evoker_BlessingoftheBronze",
+        providers = { ClassAll("EVOKER") },
+    },
+}
+
+RS.UTILITY_CATEGORIES = {
+    {
+        id = "bloodlust",
+        nameKey = "RAID_SIGNUP_COV_HEROISM",
+        nameDefault = "Heroism",
+        tipKey = "RAID_SIGNUP_COV_HEROISM_TIP",
+        tipDefault = "Heroism — raid-wide haste. Equivalent abilities such as Bloodlust, Time Warp, Primal Rage, and Fury of the Aspects count too.",
+        -- iconSpell resolves the current Retail Heroism artwork (spell 32182);
+        -- the icon path is only a fallback.
+        iconSpell = 32182,
+        icon = "Interface\\Icons\\Spell_Nature_BloodLust",
+        providers = {
+            ClassAll("SHAMAN"), ClassAll("MAGE"), ClassAll("HUNTER"), ClassAll("EVOKER"),
+        },
+    },
+    {
+        id = "combat_res",
+        nameKey = "RAID_SIGNUP_COV_BATTLE_RES",
+        nameDefault = "Combat Res",
+        tipKey = "RAID_SIGNUP_COV_BATTLE_RES_TIP",
+        tipDefault = "Combat resurrection (Rebirth, Raise Ally, Soulstone, Intercession). The overlay counts eligible signed-up mains.",
+        icon = "Interface\\Icons\\Spell_Nature_Reincarnation",
+        overlay = true,
+        providers = {
+            ClassAll("DRUID"), ClassAll("DEATHKNIGHT"), ClassAll("WARLOCK"), ClassAll("PALADIN"),
+        },
+    },
+    {
+        id = "burst_move",
+        nameKey = "RAID_SIGNUP_COV_BURST_MOVE",
+        nameDefault = "Burst Move Speed",
+        tipKey = "RAID_SIGNUP_COV_BURST_MOVE_TIP",
+        tipDefault = "Planned burst movement tools (for example Stampeding Roar, Wind Rush Totem, Tiger's Lust). The overlay counts eligible signed-up mains.",
+        icon = "Interface\\Icons\\Spell_Druid_StampedingRoar_Cat",
+        overlay = true,
+        providers = { ClassAll("DRUID"), ClassAll("SHAMAN"), ClassAll("MONK") },
+    },
+    {
+        id = "warlock_ritual",
+        nameKey = "RAID_SIGNUP_COV_RITUAL",
+        nameDefault = "Ritual of Summoning",
+        tipKey = "RAID_SIGNUP_COV_RITUAL_TIP",
+        tipDefault = "Ritual of Summoning — warlock portal for raid travel.",
+        iconSpell = 698,
+        icon = "Interface\\Icons\\Spell_Shadow_SummonDemon",
+        providers = { ClassAll("WARLOCK") },
+    },
+    {
+        id = "warlock_healthstone",
+        nameKey = "RAID_SIGNUP_COV_HEALTHSTONE",
+        nameDefault = "Healthstone",
+        tipKey = "RAID_SIGNUP_COV_HEALTHSTONE_TIP",
+        tipDefault = "Healthstone — warlock-created health recovery item.",
+        iconSpell = 6201,
+        icon = "Interface\\Icons\\Spell_Shadow_DeathCoil",
+        providers = { ClassAll("WARLOCK") },
+    },
+    {
+        id = "warlock_gateway",
+        nameKey = "RAID_SIGNUP_COV_GATEWAY",
+        nameDefault = "Demonic Gateway",
+        tipKey = "RAID_SIGNUP_COV_GATEWAY_TIP",
+        tipDefault = "Demonic Gateway — warlock-created teleport for raid movement.",
+        iconSpell = 111771,
+        icon = "Interface\\Icons\\Spell_Shadow_DemonicGateway",
+        providers = { ClassAll("WARLOCK") },
+    },
+    {
+        id = "mass_dispel",
+        nameKey = "RAID_SIGNUP_COV_MD",
+        nameDefault = "Mass Dispel",
+        tipKey = "RAID_SIGNUP_COV_MD_TIP",
+        tipDefault = "Mass Dispel — removes many harmful magic effects at once.",
+        icon = "Interface\\Icons\\Spell_Arcane_MassDispel",
+        providers = { ClassAll("PRIEST") },
+    },
+    {
+        id = "innervate",
+        nameKey = "RAID_SIGNUP_COV_INNERVATE",
+        nameDefault = "Innervate",
+        tipKey = "RAID_SIGNUP_COV_INNERVATE_TIP",
+        tipDefault = "Innervate — talent-dependent druid mana support for healers.",
+        icon = "Interface\\Icons\\Spell_Nature_Lightning",
+        providers = { ClassSpecs("DRUID", 102, 103, 104, 105) },
+    },
+    {
+        id = "dk_grip_amz",
+        nameKey = "RAID_SIGNUP_COV_DK",
+        nameDefault = "Death Grip/AMZ",
+        tipKey = "RAID_SIGNUP_COV_DK_TIP",
+        tipDefault = "Death Grip and Anti-Magic Zone from Death Knights. The overlay counts Death Grip-capable Death Knight mains (Blood, Frost, Unholy).",
+        icon = "Interface\\Icons\\Spell_DeathKnight_Strangulate",
+        overlay = true,
+        -- Coverage stays any Death Knight; the overlay counts Death Grip
+        -- providers. Every DK spec learns Death Grip, and one main counts
+        -- once for the category, so Grip and AMZ never double-count.
+        overlayProviders = { ClassSpecs("DEATHKNIGHT", 250, 251, 252) },
+        providers = { ClassAll("DEATHKNIGHT") },
+    },
+    {
+        id = "bop",
+        nameKey = "RAID_SIGNUP_COV_BOP",
+        nameDefault = "Blessing of Protection",
+        tipKey = "RAID_SIGNUP_COV_BOP_TIP",
+        tipDefault = "Blessing of Protection — physical immunity blessing.",
+        icon = "Interface\\Icons\\Spell_Holy_SealOfProtection",
+        providers = { ClassAll("PALADIN") },
+    },
+    {
+        id = "rally",
+        nameKey = "RAID_SIGNUP_COV_RALLY",
+        nameDefault = "Rallying Cry",
+        tipKey = "RAID_SIGNUP_COV_RALLY_TIP",
+        tipDefault = "Rallying Cry — temporary raid health increase.",
+        icon = "Interface\\Icons\\Ability_Warrior_RallyingCry",
+        providers = { ClassAll("WARRIOR") },
+    },
+    {
+        id = "darkness",
+        nameKey = "RAID_SIGNUP_COV_DARKNESS",
+        nameDefault = "Darkness",
+        tipKey = "RAID_SIGNUP_COV_DARKNESS_TIP",
+        tipDefault = "Darkness — Demon Hunter area damage reduction.",
+        icon = "Interface\\Icons\\Ability_DemonHunter_Darkness",
+        providers = { ClassAll("DEMONHUNTER") },
+    },
+    {
+        id = "immunities",
+        nameKey = "RAID_SIGNUP_COV_IMMUNE",
+        nameDefault = "Immunities",
+        tipKey = "RAID_SIGNUP_COV_IMMUNE_TIP",
+        tipDefault = "Full damage immunities such as Ice Block, Divine Shield, and Aspect of the Turtle.",
+        icon = "Interface\\Icons\\Spell_Frost_Frost",
+        providers = { ClassAll("MAGE"), ClassAll("PALADIN"), ClassAll("HUNTER") },
+    },
+    {
+        id = "atrophic_poison",
+        nameKey = "RAID_SIGNUP_COV_ATROPHIC",
+        nameDefault = "Atrophic Poison",
+        tipKey = "RAID_SIGNUP_COV_ATROPHIC_TIP",
+        tipDefault = "Atrophic Poison — reduces damage dealt by the affected enemy.",
+        icon = "Interface\\Icons\\Ability_PoisonSting",
+        providers = { ClassAll("ROGUE") },
+    },
+    {
+        id = "execute",
+        nameKey = "RAID_SIGNUP_COV_EXECUTE",
+        nameDefault = "Execute Damage",
+        tipKey = "RAID_SIGNUP_COV_EXECUTE_TIP",
+        tipDefault = "Execute-range finishing damage such as Execute or Kill Shot.",
+        icon = "Interface\\Icons\\INV_Sword_48",
+        providers = { ClassAll("WARRIOR"), ClassAll("HUNTER") },
+    },
+    {
+        id = "atk_speed_slow",
+        nameKey = "RAID_SIGNUP_COV_ATK_SLOW",
+        nameDefault = "Attack Speed Reduction",
+        tipKey = "RAID_SIGNUP_COV_ATK_SLOW_TIP",
+        tipDefault = "Attack-speed reduction from Numbing Poison.",
+        -- iconSpell resolves the actual Retail Numbing Poison artwork (spell
+        -- 5760); the icon path is only a fallback.
+        iconSpell = 5760,
+        icon = "Interface\\Icons\\Spell_Nature_NullifyDisease",
+        providers = { ClassAll("ROGUE") },
+    },
+    {
+        id = "cast_speed_slow",
+        nameKey = "RAID_SIGNUP_COV_CAST_SLOW",
+        nameDefault = "Cast Speed Reduction",
+        tipKey = "RAID_SIGNUP_COV_CAST_SLOW_TIP",
+        tipDefault = "Cast-speed reduction such as Curse of Tongues or Numbing Poison.",
+        icon = "Interface\\Icons\\Spell_Shadow_CurseOfTongues",
+        providers = { ClassAll("WARLOCK"), ClassAll("ROGUE") },
+    },
+}
+
+local function NormalizeClass(classFile)
+    if type(classFile) ~= "string" or classFile == "" then
+        return nil
+    end
+    return string.upper(classFile)
+end
+
+function RS.IsKnownClass(classFile)
+    classFile = NormalizeClass(classFile)
+    return classFile and RS.CLASS_SPECS[classFile] ~= nil
+end
+
+function RS.IsValidSpecForClass(classFile, specId)
+    classFile = NormalizeClass(classFile)
+    specId = tonumber(specId)
+    if not classFile or not specId then
+        return false
+    end
+    local list = RS.CLASS_SPECS[classFile]
+    if not list then
+        return false
+    end
+    for i = 1, #list do
+        if list[i] == specId then
+            return true
+        end
+    end
+    return false
+end
+
+function RS.SpecDisplayName(specId)
+    specId = tonumber(specId)
+    if not specId then
+        return nil
+    end
+    if GetSpecializationInfoByID then
+        -- pcall prepends ok; API returns id, name, description, icon, ...
+        local ok, _id, name = pcall(GetSpecializationInfoByID, specId)
+        if ok and type(name) == "string" and name ~= "" then
+            return name
+        end
+    end
+    return RS.SPEC_NAMES[specId]
+end
+
+-- Stable Retail class IDs for localized display names (match CLASS_ORDER).
+RS.CLASS_IDS = {
+    WARRIOR = 1, PALADIN = 2, HUNTER = 3, ROGUE = 4, PRIEST = 5,
+    DEATHKNIGHT = 6, SHAMAN = 7, MAGE = 8, WARLOCK = 9, MONK = 10,
+    DRUID = 11, DEMONHUNTER = 12, EVOKER = 13,
+}
+
+function RS.ClassDisplayName(classFile)
+    classFile = NormalizeClass(classFile)
+    if not classFile then
+        return nil
+    end
+    local classId = RS.CLASS_IDS[classFile]
+    if classId and C_CreatureInfo and C_CreatureInfo.GetClassInfo then
+        local ok, info = pcall(C_CreatureInfo.GetClassInfo, classId)
+        if ok and type(info) == "table"
+            and type(info.className) == "string" and info.className ~= "" then
+            return info.className
+        end
+    end
+    return classFile
+end
+
+function RS.ClassIconTexture(classFile)
+    classFile = NormalizeClass(classFile)
+    local data = classFile and SF.WOW_CLASSES and SF.WOW_CLASSES[classFile]
+    return data and data.textureFile or "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+function RS.SpecIconTexture(specId)
+    specId = tonumber(specId)
+    if not specId then
+        return "Interface\\Icons\\INV_Misc_QuestionMark"
+    end
+    if GetSpecializationInfoByID then
+        -- pcall prepends ok before GetSpecializationInfoByID returns:
+        -- id, name, description, icon, role, ...
+        local ok, _id, _name, _description, icon = pcall(GetSpecializationInfoByID, specId)
+        if ok and type(icon) == "string" and icon ~= "" then
+            return icon
+        end
+        if ok and type(icon) == "number" then
+            return icon
+        end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+function RS.CategoryIconTexture(category)
+    if type(category) ~= "table" then
+        return "Interface\\Icons\\INV_Misc_QuestionMark"
+    end
+    -- Numeric FileDataID (for example Skyfury) is valid current artwork.
+    if type(category.icon) == "number" then
+        return category.icon
+    end
+    -- Prefer live spell artwork so renamed or refreshed abilities show their
+    -- current Retail icon; the icon path remains the fallback.
+    local spellId = tonumber(category.iconSpell)
+    if spellId and C_Spell and C_Spell.GetSpellTexture then
+        local ok, tex = pcall(C_Spell.GetSpellTexture, spellId)
+        if ok and ((type(tex) == "string" and tex ~= "") or type(tex) == "number") then
+            return tex
+        end
+    end
+    if type(category.icon) == "string" and category.icon ~= "" then
+        return category.icon
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+local function ProviderMatches(provider, classFile, specId)
+    if not provider or provider.classFile ~= classFile then
+        return false
+    end
+    if provider.specs == nil then
+        return true
+    end
+    specId = tonumber(specId)
+    if not specId then
+        return false
+    end
+    for i = 1, #provider.specs do
+        if provider.specs[i] == specId then
+            return true
+        end
+    end
+    return false
+end
+
+function RS.CategoryCoveredBySelection(category, classFile, specId)
+    if type(category) ~= "table" or type(category.providers) ~= "table" then
+        return false
+    end
+    classFile = NormalizeClass(classFile)
+    if not classFile or not RS.IsValidSpecForClass(classFile, specId) then
+        return false
+    end
+    for i = 1, #category.providers do
+        if ProviderMatches(category.providers[i], classFile, specId) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Static spec -> signup role for the role totals line. "melee"/"ranged" split
+-- damage specs; tanks and healers are role-locked. Devourer (1480) is a caster
+-- spec per Blizzard, so it counts as ranged DPS.
+RS.SPEC_ROLES = {
+    [71] = "melee", [72] = "melee", [73] = "tank",
+    [65] = "healer", [66] = "tank", [70] = "melee",
+    [253] = "ranged", [254] = "ranged", [255] = "ranged",
+    [259] = "melee", [260] = "melee", [261] = "melee",
+    [256] = "healer", [257] = "healer", [258] = "ranged",
+    [250] = "tank", [251] = "melee", [252] = "melee",
+    [262] = "ranged", [263] = "melee", [264] = "healer",
+    [62] = "ranged", [63] = "ranged", [64] = "ranged",
+    [265] = "ranged", [266] = "ranged", [267] = "ranged",
+    [268] = "tank", [269] = "melee", [270] = "healer",
+    [102] = "ranged", [103] = "melee", [104] = "tank", [105] = "healer",
+    [577] = "melee", [581] = "tank", [1480] = "ranged",
+    [1467] = "ranged", [1468] = "healer", [1473] = "ranged",
+}
+
+--- Role for a specialization ID, or nil when unknown/incomplete.
+function RS.SpecRole(specId)
+    return RS.SPEC_ROLES[tonumber(specId)]
+end
+
+--- Count Tanks / Healers / Ranged DPS / Melee DPS from MAIN selections only.
+-- Mirrors BuildSummary semantics: one role per non-deleted entry with a valid
+-- main spec, so stored alternates never inflate the participating headcount
+-- and incomplete signups contribute nothing.
+function RS.BuildRoleTotals(entries)
+    local totals = { tank = 0, healer = 0, ranged = 0, melee = 0 }
+    if type(entries) ~= "table" then
+        return totals
+    end
+    for _, entry in pairs(entries) do
+        if type(entry) == "table" and not entry.deleted then
+            local classFile = NormalizeClass(entry.mainClass)
+            local specId = tonumber(entry.mainSpec)
+            if classFile and RS.IsValidSpecForClass(classFile, specId) then
+                local role = RS.SpecRole(specId)
+                if role then
+                    totals[role] = totals[role] + 1
+                end
+            end
+        end
+    end
+    return totals
+end
+
+--- Build class counts + coverage from completed MAIN selections only.
+-- entries: iterable of { mainClass, mainSpec, deleted? }
+function RS.BuildSummary(entries)
+    local counts = {}
+    for i = 1, #RS.CLASS_ORDER do
+        counts[RS.CLASS_ORDER[i]] = 0
+    end
+
+    local majorCovered = {}
+    local utilityCovered = {}
+    -- Provider-count overlays: eligible completed mains per category. Counted
+    -- once per main even when several provider rules match, and derived only
+    -- from the same completed-main selections as the coverage booleans.
+    local providerCounts = {}
+    local function markCategories(list, covered)
+        for i = 1, #list do
+            local cat = list[i]
+            covered[cat.id] = false
+            providerCounts[cat.id] = 0
+        end
+    end
+
+    local function CountProviders(cat, classFile, specId)
+        local list = cat.overlayProviders or cat.providers
+        if type(list) ~= "table" then
+            return false
+        end
+        for i = 1, #list do
+            if ProviderMatches(list[i], classFile, specId) then
+                return true
+            end
+        end
+        return false
+    end
+
+    markCategories(RS.MAJOR_CATEGORIES, majorCovered)
+    markCategories(RS.UTILITY_CATEGORIES, utilityCovered)
+
+    if type(entries) == "table" then
+        for _, entry in pairs(entries) do
+            if type(entry) == "table" and not entry.deleted then
+                local classFile = NormalizeClass(entry.mainClass)
+                local specId = tonumber(entry.mainSpec)
+                if classFile and counts[classFile] ~= nil and RS.IsValidSpecForClass(classFile, specId) then
+                    counts[classFile] = counts[classFile] + 1
+                    for i = 1, #RS.MAJOR_CATEGORIES do
+                        local cat = RS.MAJOR_CATEGORIES[i]
+                        if RS.CategoryCoveredBySelection(cat, classFile, specId) then
+                            majorCovered[cat.id] = true
+                            if CountProviders(cat, classFile, specId) then
+                                providerCounts[cat.id] = providerCounts[cat.id] + 1
+                            end
+                        end
+                    end
+                    for i = 1, #RS.UTILITY_CATEGORIES do
+                        local cat = RS.UTILITY_CATEGORIES[i]
+                        if RS.CategoryCoveredBySelection(cat, classFile, specId) then
+                            utilityCovered[cat.id] = true
+                            if CountProviders(cat, classFile, specId) then
+                                providerCounts[cat.id] = providerCounts[cat.id] + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return {
+        classCounts = counts,
+        major = majorCovered,
+        utility = utilityCovered,
+        providerCounts = providerCounts,
+    }
+end
