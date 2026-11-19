@@ -96,6 +96,33 @@ Colors and tooltip text are recomputed on every totals refresh (plan switches, m
 
 Each hover keeps the full localized role name and adds the current assessment, e.g. "3 healers for 20 signups. Typical range: 4–5. Slightly below the usual range.", "8 total DPS. Roster target: at least 9.", or "10 melee / 4 ranged. Melee-heavy; fewer ranged options for encounter assignments." Wording uses terms like "Typical balance", "Encounter-dependent", and "Outside the usual range" rather than claiming a composition is objectively optimal or impossible.
 
+### Tier Tokens (Summary sidebar)
+
+Between **Classes** and **Major Buffs/Debuffs**, the Summary sidebar shows a **Tier Tokens** group: four armor icons with adjacent counts in a compact responsive grid — **Cloth / Woven**, **Leather / Cured**, **Mail / Cast**, **Plate / Forged**. Only the number changes color; icons, sizing, and spacing match the Classes grid, and zero-count icons take the same grey treatment as zero-count classes.
+
+**Counting.** Token counts reuse the main-only class counts (`summary.classCounts`): only completed main selections contribute, grouped by armor family. Alternatives, incomplete drafts, and deleted entries contribute nothing, and the four group counts always sum to the total eligible mains `N`:
+
+- Cloth / Woven: Mage, Priest, Warlock
+- Leather / Cured: Demon Hunter, Druid, Monk, Rogue
+- Mail / Cast: Evoker, Hunter, Shaman
+- Plate / Forged: Death Knight, Paladin, Warrior
+
+This is Midnight's armor-based class-set grouping (see the [Midnight Season 1 class sets guide](https://www.icy-veins.com/wow/midnight-season-1-class-sets-guide) as background); it does not claim to apply to past or future expansions.
+
+**Crowding assessment.** Unlike the healer heuristic, this applies at any roster size and measures **roster competition**, not actual gear need or drop probability. The assessment is deliberately asymmetric: underrepresentation is never a problem and never receives orange or red. For a category with `C` participants out of `N` total eligible mains (`N > 0`):
+
+- `fairMax = ceil(N / 4)` (the rounded even share — with 14 signups a balanced 4/4/3/3 roster is all yellow)
+- `wiggle = max(1, floor(N * 0.05 + 0.5))`
+- **Yellow:** `C <= fairMax`
+- **Orange:** `fairMax < C <= fairMax + wiggle`
+- **Red:** `C > fairMax + wiggle`
+
+Representative boundaries: N=14 → yellow 0–4, orange 5, red 6+; N=20 → yellow 0–5, orange 6, red 7+; N=25 → yellow 0–7, orange 8, red 9+; N=30 → yellow 0–8, orange 9–10, red 11+; N=40 → yellow 0–10, orange 11–12, red 13+.
+
+For `N = 0` all four icons are grey with yellow zero counts, and the tooltip explains there are no completed signups (no division by zero, no misleading percentages). Percentages in tooltips are rounded for display only; colors come from the integer rules above.
+
+**Tooltips.** Hovering an icon or count shows the armor type and token family, the eligible classes, the current count/total/percentage, the even-share target, and the crowding assessment ("Slightly crowded." / "Outside the usual range." / "Within the even-share range."). Counts, colors, greying, and tooltip data refresh on every summary repaint (plan switches, main-spec changes, deletions, remote updates) and reset when crowding decreases. Everything derives from existing signup data — no persisted counters, sync fields, polling, or idle work.
+
 ### Background references
 
 The thresholds are the owner's chosen planning heuristics. Public guides illustrate that real encounter requirements vary; they informed the general shape of the bands but are **not** the source of the color policy:

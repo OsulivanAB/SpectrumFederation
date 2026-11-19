@@ -96,6 +96,14 @@ local COL_MAIN_X = 140
 local COL_ALT_X = COL_MAIN_X + 36
 local CLASS_COUNT_WIDTH = 24
 
+-- Roster-planning guidance palette shared by the role totals and the tier
+-- token groups. Advisory heuristics only, not Blizzard requirements.
+local GUIDANCE_COLORS = {
+	yellow = { 1, 0.82, 0.18 },
+	orange = { 1, 0.6, 0.1 },
+	red = { 1, 0.2, 0.2 },
+}
+
 local function TrackCreate(frame)
 	session.frameCreateCount = session.frameCreateCount + 1
 	return frame
@@ -518,13 +526,18 @@ local function MakeIconButton(parent, size)
 		tex:SetAllPoints()
 		b.icon = tex
 		b:SetScript("OnEnter", function(self)
-			if self.tooltipTitle or self.tooltipText then
+			if self.tooltipTitle or self.tooltipText or self.tooltipLines then
 				GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 				if self.tooltipTitle then
 					GameTooltip:SetText(self.tooltipTitle, 1, 1, 1)
 				end
 				if self.tooltipText then
 					GameTooltip:AddLine(self.tooltipText, 0.9, 0.9, 0.9, true)
+				end
+				if self.tooltipLines then
+					for i = 1, #self.tooltipLines do
+						GameTooltip:AddLine(self.tooltipLines[i], 0.9, 0.9, 0.9, true)
+					end
 				end
 				GameTooltip:Show()
 			end
@@ -540,6 +553,7 @@ local function MakeIconButton(parent, size)
 	btn:SetSize(size or ICON, size or ICON)
 	btn.tooltipTitle = nil
 	btn.tooltipText = nil
+	btn.tooltipLines = nil
 	btn.__sfRaidSignupSpecSlot = nil
 	SafeClearScript(btn, "OnClick")
 	btn:Show()
@@ -1399,6 +1413,78 @@ local function SidebarCols(width, pitch)
 	return math.max(1, math.min(5, math.floor((width + 8) / pitch)))
 end
 
+-- Tier token groups: Midnight armor-based class-set families. Presentation
+-- only; counts reuse the main-only class summary. This mapping describes
+-- Midnight, not past or future expansions, and measures roster competition,
+-- not actual gear need or drop probability.
+local TOKEN_GROUP_TEXTURES = {
+	cloth = "Interface\\Icons\\INV_Chest_Cloth_21",
+	leather = "Interface\\Icons\\INV_Chest_Leather_03",
+	mail = "Interface\\Icons\\INV_Chest_Chain",
+	plate = "Interface\\Icons\\INV_Chest_Plate01",
+}
+local TOKEN_GROUP_DEFAULT_NAMES = {
+	cloth = "Cloth — Woven",
+	leather = "Leather — Cured",
+	mail = "Mail — Cast",
+	plate = "Plate — Forged",
+}
+
+local function TokenGroups()
+	local rs = RS()
+	return (rs and rs.ARMOR_TOKEN_GROUPS) or {}
+end
+
+-- Crowding assessment for one token group. Deliberately asymmetric: low
+-- representation is never penalized; only counts above the rounded even
+-- share can reach orange or red. fairMax = ceil(N/4) keeps an exactly
+-- balanced 14-signup roster (4/4/3/3) yellow.
+local function AssessTokenCrowding(count, total)
+	if total <= 0 then
+		return { level = "yellow", fairMax = 0, empty = true }
+	end
+	local fairMax = math.ceil(total / 4)
+	local wiggle = math.max(1, math.floor(total * 0.05 + 0.5))
+	local level
+	if count <= fairMax then
+		level = "yellow"
+	elseif count <= fairMax + wiggle then
+		level = "orange"
+	else
+		level = "red"
+	end
+	return { level = level, fairMax = fairMax, empty = false }
+end
+Page._AssessTokenCrowdingForTests = AssessTokenCrowding
+
+local function TokenTooltipLines(group, count, total)
+	local lines = {}
+	local names = {}
+	for i = 1, #(group.classes or {}) do
+		names[#names + 1] = ClassName(group.classes[i])
+	end
+	lines[#lines + 1] = table.concat(names, ", ")
+	if total <= 0 then
+		lines[#lines + 1] = Loc("RAID_SIGNUP_TOKEN_EMPTY", "No completed signups yet.")
+		return lines
+	end
+	-- Percentage is display-only; colors come from the integer rules.
+	local pct = math.floor(count * 100 / total + 0.5)
+	lines[#lines + 1] = string.format(Loc("RAID_SIGNUP_TOKEN_LINE_COUNT", "%d of %d signups: %d%%"),
+		count, total, pct)
+	local assess = AssessTokenCrowding(count, total)
+	lines[#lines + 1] = string.format(Loc("RAID_SIGNUP_TOKEN_LINE_TARGET", "Even-share target: %d"),
+		assess.fairMax)
+	if assess.level == "orange" then
+		lines[#lines + 1] = Loc("RAID_SIGNUP_TOKEN_ASSESS_CROWDED", "Slightly crowded.")
+	elseif assess.level == "red" then
+		lines[#lines + 1] = Loc("RAID_SIGNUP_TOKEN_ASSESS_OVER", "Outside the usual range.")
+	else
+		lines[#lines + 1] = Loc("RAID_SIGNUP_TOKEN_ASSESS_OK", "Within the even-share range.")
+	end
+	return lines
+end
+
 PaintSummary = function(host, planId)
 	session.boardPaintCount = session.boardPaintCount + 1
 	local rs = RS()
@@ -1409,6 +1495,7 @@ PaintSummary = function(host, planId)
 	local majorCats = (rs and rs.MAJOR_CATEGORIES) or {}
 	local utilityCats = (rs and rs.UTILITY_CATEGORIES) or {}
 	local w = SidebarWidth(host)
+	local tokenGroups = TokenGroups()
 
 	local classPitch = ICON + 6 + CLASS_COUNT_WIDTH + 8
 	local iconPitch = ICON + 8
@@ -1416,6 +1503,7 @@ PaintSummary = function(host, planId)
 	local iconCols = SidebarCols(w, iconPitch)
 	local rowH = ICON + 4
 	local classRows = math.max(1, math.ceil(#order / cols))
+	local tokenRows = math.max(1, math.ceil(#tokenGroups / cols))
 	local majorRows = math.max(1, math.ceil(#majorCats / iconCols))
 	local utilityRows = math.max(1, math.ceil(#utilityCats / iconCols))
 
@@ -1429,7 +1517,9 @@ PaintSummary = function(host, planId)
 	end
 	local classTitleY = -4
 	local classGridY = classTitleY - TITLE_TO_GRID
-	local majorTitleY = gridBottom(classTitleY, classRows) - GROUP_GAP
+	local tokenTitleY = gridBottom(classTitleY, classRows) - GROUP_GAP
+	local tokenGridY = tokenTitleY - TITLE_TO_GRID
+	local majorTitleY = gridBottom(tokenTitleY, tokenRows) - GROUP_GAP
 	local majorGridY = majorTitleY - TITLE_TO_GRID
 	local utilityTitleY = gridBottom(majorTitleY, majorRows) - GROUP_GAP
 	local utilityGridY = utilityTitleY - TITLE_TO_GRID
@@ -1448,6 +1538,8 @@ PaintSummary = function(host, planId)
 		ReleaseHostChildren(host)
 		host.__sfClassCounts = nil
 		host.__sfClassIcons = nil
+		host.__sfTokenIcons = nil
+		host.__sfTokenCounts = nil
 		host.__sfMajorButtons = nil
 		host.__sfUtilityButtons = nil
 
@@ -1477,6 +1569,24 @@ PaintSummary = function(host, planId)
 			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
 			host.__sfClassCounts = host.__sfClassCounts or {}
 			host.__sfClassCounts[classFile] = count
+		end
+
+		addTitle(Loc("RAID_SIGNUP_SECTION_TIER_TOKENS", "Tier Tokens"), tokenTitleY)
+		host.__sfTokenIcons = {}
+		host.__sfTokenCounts = {}
+		for i = 1, #tokenGroups do
+			local group = tokenGroups[i]
+			local idx = i - 1
+			local col = idx % cols
+			local rowIndex = math.floor(idx / cols)
+			local icon = MakeIconButton(host, ICON)
+			icon:SetPoint("TOPLEFT", host, "TOPLEFT", col * classPitch, tokenGridY - rowIndex * rowH)
+			SetIconVisual(icon, TOKEN_GROUP_TEXTURES[group.id]
+				or "Interface\\Icons\\INV_Misc_QuestionMark", true, false)
+			host.__sfTokenIcons[group.id] = icon
+			local count = AcquireFontString(host, "OVERLAY", "GameFontHighlight")
+			count:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+			host.__sfTokenCounts[group.id] = count
 		end
 
 		local function paintGroup(title, categories, coveredMap, titleY, gridY)
@@ -1537,6 +1647,44 @@ PaintSummary = function(host, planId)
 			end
 		end
 	end
+	-- Tier tokens: same main-only class counts, grouped by armor family.
+	-- Colors and greying repaint on every pass so transitions reset without
+	-- rebuilding the grid.
+	local tokenCounts = {}
+	local tokenTotal = 0
+	for i = 1, #tokenGroups do
+		local group = tokenGroups[i]
+		local c = 0
+		for j = 1, #(group.classes or {}) do
+			c = c + ((summary.classCounts and summary.classCounts[group.classes[j]]) or 0)
+		end
+		tokenCounts[group.id] = c
+		tokenTotal = tokenTotal + c
+	end
+	for i = 1, #tokenGroups do
+		local group = tokenGroups[i]
+		local c = tokenCounts[group.id] or 0
+		local fs = host.__sfTokenCounts and host.__sfTokenCounts[group.id]
+		if fs then
+			fs:SetText(tostring(c))
+		end
+		local icon = host.__sfTokenIcons and host.__sfTokenIcons[group.id]
+		if icon then
+			SetIconVisual(icon, TOKEN_GROUP_TEXTURES[group.id]
+				or "Interface\\Icons\\INV_Misc_QuestionMark", true, c <= 0)
+		end
+		local assess = AssessTokenCrowding(c, tokenTotal)
+		local color = GUIDANCE_COLORS[assess.level] or GUIDANCE_COLORS.yellow
+		if fs then
+			fs:SetTextColor(color[1], color[2], color[3])
+		end
+		if icon then
+			icon.tooltipTitle = Loc("RAID_SIGNUP_TOKEN_" .. string.upper(group.id) .. "_NAME",
+				TOKEN_GROUP_DEFAULT_NAMES[group.id] or group.id)
+			icon.tooltipLines = TokenTooltipLines(group, c, tokenTotal)
+		end
+	end
+
 	refreshButtons(host.__sfMajorButtons, summary.major, rs and rs.MAJOR_CATEGORIES)
 	refreshButtons(host.__sfUtilityButtons, summary.utility, rs and rs.UTILITY_CATEGORIES)
 end
@@ -2287,12 +2435,6 @@ end
 -- heuristics owned by the guild, not Blizzard requirements or guarantees that
 -- a composition can complete an encounter. Only the numeric text color
 -- changes; icons, sizing, spacing, and hover regions are untouched.
-local ROLE_ASSESS_COLORS = {
-	yellow = { 1, 0.82, 0.18 },
-	orange = { 1, 0.6, 0.1 },
-	red = { 1, 0.2, 0.2 },
-}
-
 local function FormatLoc(key, default, ...)
 	return string.format(Loc(key, default), ...)
 end
@@ -2408,7 +2550,7 @@ PaintRoleTotals = function(panel)
 			-- Recompute color and tooltip on every paint so counts returning to
 			-- their normal range reset correctly.
 			local assess = assessment[key]
-			local color = assess and ROLE_ASSESS_COLORS[assess.level] or ROLE_ASSESS_COLORS.yellow
+			local color = assess and GUIDANCE_COLORS[assess.level] or GUIDANCE_COLORS.yellow
 			slot.count:SetTextColor(color[1], color[2], color[3])
 			if slot.hover then
 				slot.hover.__sfRoleTooltip = assess and assess.text or nil

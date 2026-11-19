@@ -3012,6 +3012,7 @@ do
         local classPitch = 22 + 6 + 24 + 8
         local cols = math.max(1, math.min(5, math.floor((w + 8) / classPitch)))
         local classRows = math.ceil(#RS.CLASS_ORDER / cols)
+        local tokenRows = math.max(1, math.ceil(#(RS.ARMOR_TOKEN_GROUPS or {}) / cols))
         local iconPitch = 22 + 8
         local iconCols = math.max(1, math.min(5, math.floor((w + 8) / iconPitch)))
         local majorRows = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / iconCols))
@@ -3021,7 +3022,8 @@ do
         local function gridBottom(titleY, rows)
             return titleY - 20 - (rows - 1) * 26 - 22
         end
-        local majorTitleY = gridBottom(-4, classRows) - 8
+        local tokenTitleY = gridBottom(-4, classRows) - 8
+        local majorTitleY = gridBottom(tokenTitleY, tokenRows) - 8
         local utilityTitleY = gridBottom(majorTitleY, majorRows) - 8
         local expectedH = -gridBottom(utilityTitleY, utilityRows) + 4
         assertEq(host:GetHeight(), expectedH, "summary height sized to stacked groups")
@@ -4199,6 +4201,229 @@ local function RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
 end
 RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
+
+-- Tier Tokens summary group: armor-family mapping, crowding color boundaries,
+-- tooltips, empty roster, and refresh transitions.
+local function RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
+    local assess = UIPage._AssessTokenCrowdingForTests
+    assertTrue(assess ~= nil, "token crowding helper exposed for tests")
+    local function level(count, total)
+        local a = assess and assess(count, total)
+        return a and a.level
+    end
+
+    -- Mapping: every class exactly once; group sizes 3/4/3/3 in order.
+    local groups = RS.ARMOR_TOKEN_GROUPS or {}
+    assertEq(#groups, 4, "four token groups")
+    local seenClasses = {}
+    local mappedCount = 0
+    local dupes = 0
+    local sizes = {}
+    for i = 1, #groups do
+        sizes[#sizes + 1] = #(groups[i].classes or {})
+        for _, cf in ipairs(groups[i].classes or {}) do
+            if seenClasses[cf] then
+                dupes = dupes + 1
+            else
+                seenClasses[cf] = true
+                mappedCount = mappedCount + 1
+            end
+        end
+    end
+    assertEq(dupes, 0, "no class in two token groups")
+    assertEq(mappedCount, #RS.CLASS_ORDER, "every class mapped exactly once")
+    assertEq(table.concat(sizes, "/"), "3/4/3/3", "cloth/leather/mail/plate sizes")
+    for _, cf in ipairs(RS.CLASS_ORDER) do
+        assertTrue(seenClasses[cf], "class mapped: " .. tostring(cf))
+    end
+
+    -- Crowding boundaries (owner examples).
+    local function band(N)
+        local a = assess and assess(0, N) or {}
+        return a.fairMax, math.max(1, math.floor(N * 0.05 + 0.5))
+    end
+    -- N=14: yellow 0-4, orange 5, red 6+
+    assertEq(level(4, 14), "yellow", "N=14 C=4 yellow")
+    assertEq(level(5, 14), "orange", "N=14 C=5 orange")
+    assertEq(level(6, 14), "red", "N=14 C=6 red")
+    -- N=20: yellow 0-5, orange 6, red 7+
+    assertEq(level(5, 20), "yellow", "N=20 C=5 yellow")
+    assertEq(level(6, 20), "orange", "N=20 C=6 orange")
+    assertEq(level(7, 20), "red", "N=20 C=7 red")
+    -- N=25: yellow 0-7, orange 8, red 9+
+    assertEq(level(7, 25), "yellow", "N=25 C=7 yellow")
+    assertEq(level(8, 25), "orange", "N=25 C=8 orange")
+    assertEq(level(9, 25), "red", "N=25 C=9 red")
+    -- N=30: yellow 0-8, orange 9-10, red 11+
+    assertEq(level(8, 30), "yellow", "N=30 C=8 yellow")
+    assertEq(level(9, 30), "orange", "N=30 C=9 orange")
+    assertEq(level(10, 30), "orange", "N=30 C=10 orange")
+    assertEq(level(11, 30), "red", "N=30 C=11 red")
+    -- N=40: yellow 0-10, orange 11-12, red 13+
+    assertEq(level(10, 40), "yellow", "N=40 C=10 yellow")
+    assertEq(level(11, 40), "orange", "N=40 C=11 orange")
+    assertEq(level(12, 40), "orange", "N=40 C=12 orange")
+    assertEq(level(13, 40), "red", "N=40 C=13 red")
+    -- Asymmetry: low/zero representation never leaves yellow.
+    assertEq(level(0, 40), "yellow", "zero count yellow at N=40")
+    assertEq(level(1, 40), "yellow", "single participant yellow at N=40")
+    assertEq(level(0, 14), "yellow", "zero count yellow at N=14")
+    -- N=0: no division, yellow, flagged empty.
+    local empty = assess and assess(0, 0) or {}
+    assertEq(empty.level, "yellow", "empty roster yellow")
+    assertTrue(empty.empty, "empty roster flagged")
+    assertEq(empty.fairMax, 0, "empty roster fair share zero")
+    -- Non-divisible sizes use the rounded fair share (14 -> 4, not 3.5).
+    local fm14 = band(14)
+    assertEq(fm14, 4, "N=14 fair share rounds up to 4")
+
+    -- UI path: real plan, real refreshes, pooled summary.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local status, _, tokenPlanId = RS:CreatePlan("Token Plan")
+    assertEq(status, "accepted", "officer creates token-test plan")
+    RS:SelectPlan(tokenPlanId)
+    local function addEntry(nick, classFile)
+        local specs = RS.CLASS_SPECS[classFile]
+        status, _, entryId = RS:UpsertEntry({
+            planId = tokenPlanId, nickname = nick,
+            mainClass = classFile, mainSpec = specs[1],
+        })
+        assertEq(status, "accepted", "token-test entry accepted: " .. nick)
+        return entryId
+    end
+    local ids = {}
+    for _, cf in ipairs(RS.CLASS_ORDER) do
+        ids[#ids + 1] = addEntry("Tok" .. cf, cf)
+    end
+    UIPage:Refresh(panel, { force = true })
+
+    local host = panel.__sfRaidSignupSummaryHost
+    assertTrue(host ~= nil, "summary host exists")
+    if not (host and host.__sfTokenCounts) then
+        assertTrue(false, "tier token counts built in summary")
+        assertTrue(false, "tier token icons built in summary")
+        for _, entryId in ipairs(ids) do
+            local live = RS.GetEntry(RS:EnsureGuildRecord("club:42"), entryId)
+            if live and not live.deleted then
+                RS:DeleteEntry(entryId, { expectedVer = live.ver })
+            end
+        end
+        RS:SelectPlan(tabPlanId)
+        UIPage:Refresh(panel, { force = true })
+        return
+    end
+    local function tokenCountText(id)
+        local fs = host.__sfTokenCounts and host.__sfTokenCounts[id]
+        return fs and fs:GetText()
+    end
+    local function tokenColor(id)
+        local fs = host.__sfTokenCounts and host.__sfTokenCounts[id]
+        local tc = fs and fs._textColor
+        return tc and tc[2]
+    end
+    local function tokenIcon(id)
+        return host.__sfTokenIcons and host.__sfTokenIcons[id]
+    end
+    -- One of each class: cloth 3, leather 4, mail 3, plate 3; N=13 -> fairMax 4.
+    assertEq(tokenCountText("cloth"), "3", "cloth count 3")
+    assertEq(tokenCountText("leather"), "4", "leather count 4")
+    assertEq(tokenCountText("mail"), "3", "mail count 3")
+    assertEq(tokenCountText("plate"), "3", "plate count 3")
+    assertEq(tokenColor("cloth"), 0.82, "cloth yellow within share")
+    assertEq(tokenColor("leather"), 0.82, "leather yellow at fair share")
+    local clothIcon = tokenIcon("cloth")
+    assertTrue(clothIcon ~= nil, "cloth token icon exists")
+    assertTrue(clothIcon.icon and clothIcon.icon._desaturated == false,
+        "populated token icon not greyed")
+    -- Containment: every token icon sits inside the sidebar width.
+    local sideW = host:GetWidth()
+    for id, icon in pairs(host.__sfTokenIcons or {}) do
+        local maxX = -1
+        for _, pt in ipairs(icon._points or {}) do
+            if pt[1] == "TOPLEFT" then
+                maxX = math.max(maxX, pt[4])
+            end
+        end
+        assertTrue(maxX >= 0 and maxX + 22 <= sideW + 0.5,
+            "token icon " .. id .. " inside sidebar")
+    end
+
+    -- Tooltip path: hover shows armor/family, classes, count/percent, target,
+    -- and assessment.
+    local realTooltip = GameTooltip
+    local tooltipLines = {}
+    GameTooltip = {
+        SetOwner = function() end,
+        SetText = function(_, t) tooltipLines[#tooltipLines + 1] = t end,
+        AddLine = function(_, t) tooltipLines[#tooltipLines + 1] = t end,
+        Show = function() end,
+        Hide = function() end,
+    }
+    tooltipLines = {}
+    clothIcon._scripts.OnEnter(clothIcon)
+    assertEq(tooltipLines[1], "Cloth — Woven", "token tooltip title")
+    assertTrue(tooltipLines[2] and tooltipLines[2]:find("MAGE")
+        and tooltipLines[2]:find("PRIEST") and tooltipLines[2]:find("WARLOCK"),
+        "token tooltip lists eligible classes")
+    assertEq(tooltipLines[3], "3 of 13 signups: 23%", "token tooltip count and percent")
+    assertEq(tooltipLines[4], "Even-share target: 4", "token tooltip even-share target")
+    assertEq(tooltipLines[5], "Within the even-share range.", "token tooltip assessment")
+
+    -- Crowding transition: two more cloth mains -> cloth 5 of 15 (fairMax 4,
+    -- wiggle 1) -> orange; one more -> 6 of 16 -> red.
+    ids[#ids + 1] = addEntry("TokMage2", "MAGE")
+    ids[#ids + 1] = addEntry("TokMage3", "MAGE")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(tokenCountText("cloth"), "5", "cloth count 5")
+    assertEq(tokenColor("cloth"), 0.6, "cloth orange one past fair share")
+    assertEq(tokenColor("leather"), 0.82, "leather stays yellow")
+    ids[#ids + 1] = addEntry("TokMage4", "MAGE")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(tokenCountText("cloth"), "6", "cloth count 6")
+    assertEq(tokenColor("cloth"), 0.2, "cloth red beyond wiggle")
+    tooltipLines = {}
+    clothIcon._scripts.OnEnter(clothIcon)
+    assertEq(tooltipLines[3], "6 of 16 signups: 38%", "crowded tooltip percent")
+    assertEq(tooltipLines[5], "Outside the usual range.", "crowded tooltip assessment")
+
+    -- Empty plan: four grey icons, yellow zero counts, empty-roster tooltip.
+    local status2, _, emptyPlanId = RS:CreatePlan("Token Empty Plan")
+    assertEq(status2, "accepted", "officer creates empty token plan")
+    RS:SelectPlan(emptyPlanId)
+    UIPage:Refresh(panel, { force = true })
+    for _, id in ipairs({ "cloth", "leather", "mail", "plate" }) do
+        assertEq(tokenCountText(id), "0", "empty plan zero count: " .. id)
+        assertEq(tokenColor(id), 0.82, "empty plan yellow zero count: " .. id)
+        local icon = tokenIcon(id)
+        assertTrue(icon and icon.icon and icon.icon._desaturated == true,
+            "empty plan token icon greyed: " .. id)
+    end
+    tooltipLines = {}
+    tokenIcon("cloth")._scripts.OnEnter(tokenIcon("cloth"))
+    assertEq(tooltipLines[#tooltipLines], "No completed signups yet.",
+        "empty roster tooltip explanation")
+
+    -- Plan switch back: pooled controls repaint with live counts/colors.
+    RS:SelectPlan(tokenPlanId)
+    UIPage:Refresh(panel, { force = true })
+    assertEq(tokenCountText("cloth"), "6", "pooled count restored after plan switch")
+    assertEq(tokenColor("cloth"), 0.2, "pooled color restored after plan switch")
+    tooltipLines = {}
+    tokenIcon("cloth")._scripts.OnEnter(tokenIcon("cloth"))
+    assertEq(tooltipLines[3], "6 of 16 signups: 38%", "pooled tooltip restored")
+    GameTooltip = realTooltip
+
+    -- Cleanup.
+    for _, entryId in ipairs(ids) do
+        local live = RS.GetEntry(RS:EnsureGuildRecord("club:42"), entryId)
+        if live and not live.deleted then
+            RS:DeleteEntry(entryId, { expectedVer = live.ver })
+        end
+    end
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
+end
+RaidSignupTokenTests(panel, UIPage, RS, tabPlanId)
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt

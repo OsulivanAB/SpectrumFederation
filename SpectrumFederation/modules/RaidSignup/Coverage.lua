@@ -10,6 +10,16 @@ RS.CLASS_ORDER = {
     "SHAMAN", "MAGE", "WARLOCK", "MONK", "DRUID", "DEMONHUNTER", "EVOKER",
 }
 
+-- Armor-based tier-token families for the Raid Signup summary (#404).
+-- Midnight class-set grouping; presentation-only, not a statement about
+-- other expansions. Every CLASS_ORDER entry belongs to exactly one group.
+RS.ARMOR_TOKEN_GROUPS = {
+    { id = "cloth",   classes = { "MAGE", "PRIEST", "WARLOCK" } },
+    { id = "leather", classes = { "DEMONHUNTER", "DRUID", "MONK", "ROGUE" } },
+    { id = "mail",    classes = { "EVOKER", "HUNTER", "SHAMAN" } },
+    { id = "plate",   classes = { "DEATHKNIGHT", "PALADIN", "WARRIOR" } },
+}
+
 -- Stable Retail specialization IDs (match SpecWeapons).
 RS.CLASS_SPECS = {
     WARRIOR = { 71, 72, 73 },

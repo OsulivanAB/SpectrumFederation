@@ -105,7 +105,7 @@ See [Raid Check](features/raid-check.md) for interpretation and inspection limit
 
 ## Raid Signup
 
-**Raid Signup** is a top-level Raid Tools category for season/tier roster plans. It does not require a Loot Helper profile or session. Officers manage named plans; members add free-text nickname entries with class/spec choices. A summary sidebar beside the signup list shows main-only class counts and planned buff/utility coverage, and the role totals add advisory color guidance for roster balance. See [Raid Signup](development/raid-signup/index.md).
+**Raid Signup** is a top-level Raid Tools category for season/tier roster plans. It does not require a Loot Helper profile or session. Officers manage named plans; members add free-text nickname entries with class/spec choices. A summary sidebar beside the signup list shows main-only class counts, tier-token crowding guidance, and planned buff/utility coverage, and the role totals add advisory color guidance for roster balance. See [Raid Signup](development/raid-signup/index.md).
 
 ## Loot Helper: Admin
 
