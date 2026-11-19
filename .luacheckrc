@@ -46,6 +46,7 @@ read_globals = {
   "C_EventScheduler",
   "C_AreaPoiInfo",
   "C_AddOns",
+  "C_CreatureInfo",
   "UnitGUID",
   "Enum",
   "GetTime",
