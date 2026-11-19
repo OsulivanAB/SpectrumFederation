@@ -82,7 +82,7 @@ local TAB_BAR_SCROLL_DROP = 34 -- 2px top pad + 28px bar + 4px gap
 local BOARD_COL_GAP = 16
 local BOARD_LEFT_RATIO = 0.62
 local BOARD_MIN_WIDTH = 480
-local BOARD_TOP_H = 62
+local BOARD_TOP_H = 69
 local BOARD_STATUS_H = 18
 local CLASS_COUNT_WIDTH = 24
 
@@ -1225,7 +1225,22 @@ PaintSummary = function(host, planId)
 	local classRows = math.max(1, math.ceil(#order / cols))
 	local majorRows = math.max(1, math.ceil(#majorCats / iconCols))
 	local utilityRows = math.max(1, math.ceil(#utilityCats / iconCols))
-	local height = 4 + 16 + classRows * rowH + 10 + 16 + majorRows * rowH + 10 + 16 + utilityRows * rowH + 4
+
+	-- Group geometry: heading, fixed heading-to-grid gap, then icon rows.
+	-- The next heading starts a small gap below the actual bottom of the
+	-- preceding grid, so wrapped rows never collide with the next heading.
+	local TITLE_TO_GRID = 20
+	local GROUP_GAP = 8
+	local function gridBottom(titleY, rows)
+		return titleY - TITLE_TO_GRID - (rows - 1) * rowH - ICON
+	end
+	local classTitleY = -4
+	local classGridY = classTitleY - TITLE_TO_GRID
+	local majorTitleY = gridBottom(classTitleY, classRows) - GROUP_GAP
+	local majorGridY = majorTitleY - TITLE_TO_GRID
+	local utilityTitleY = gridBottom(majorTitleY, majorRows) - GROUP_GAP
+	local utilityGridY = utilityTitleY - TITLE_TO_GRID
+	local height = -gridBottom(utilityTitleY, utilityRows) + 4
 	host.__sfSummaryContentH = height
 	host:SetHeight(height)
 	LayoutBoard(host.__sfRaidSignupPanel)
@@ -1246,8 +1261,7 @@ PaintSummary = function(host, planId)
 			return t
 		end
 
-		addTitle(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"), -4)
-		local classY = -24
+		addTitle(Loc("RAID_SIGNUP_SECTION_CLASSES", "Classes"), classTitleY)
 
 		-- Row-major compact grid: icon + count, CLASS_ORDER preserved.
 		for i = 1, #order do
@@ -1256,7 +1270,7 @@ PaintSummary = function(host, planId)
 			local col = idx % cols
 			local rowIndex = math.floor(idx / cols)
 			local x = col * classPitch
-			local y = classY - rowIndex * rowH
+			local y = classGridY - rowIndex * rowH
 			local icon = MakeIconButton(host, ICON)
 			icon:SetPoint("TOPLEFT", host, "TOPLEFT", x, y)
 			SetIconVisual(icon, TextureForClass(classFile), true, false)
@@ -1268,10 +1282,9 @@ PaintSummary = function(host, planId)
 			host.__sfClassCounts[classFile] = count
 		end
 
-		local function paintGroup(title, categories, coveredMap, y)
-			addTitle(title, y)
+		local function paintGroup(title, categories, coveredMap, titleY, gridY)
+			addTitle(title, titleY)
 			local buttons = {}
-			local gridY = y - 20
 			for i = 1, #categories do
 				local cat = categories[i]
 				local idx = i - 1
@@ -1288,14 +1301,12 @@ PaintSummary = function(host, planId)
 			return buttons
 		end
 
-		local majorY = classY - classRows * rowH - 10
 		host.__sfMajorButtons = paintGroup(
 			Loc("RAID_SIGNUP_MAJOR_GROUP", "Major Buffs/Debuffs"),
-			majorCats, summary.major, majorY)
-		local utilityY = majorY - majorRows * rowH - 10
+			majorCats, summary.major, majorTitleY, majorGridY)
 		host.__sfUtilityButtons = paintGroup(
 			Loc("RAID_SIGNUP_UTILITY_GROUP", "Utility"),
-			utilityCats, summary.utility, utilityY)
+			utilityCats, summary.utility, utilityTitleY, utilityGridY)
 
 		host.__sfSummaryBuilt = true
 		host.__sfSummaryBuiltW = w
@@ -1830,26 +1841,33 @@ LayoutBoard = function(panel)
 	if panel.__sfRaidSignupSummaryTitle and panel.__sfRaidSignupSummaryTitle.SetPoint then
 		panel.__sfRaidSignupSummaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
 	end
-	if panel.__sfRaidSignupLeftLine then
-		panel.__sfRaidSignupLeftLine:ClearAllPoints()
-		panel.__sfRaidSignupLeftLine:SetPoint("BOTTOMLEFT", host, "TOPLEFT", 0, -20)
-		panel.__sfRaidSignupLeftLine:SetPoint("BOTTOMRIGHT", host, "TOPLEFT", leftW, -20)
-	end
-	if panel.__sfRaidSignupRightLine then
-		panel.__sfRaidSignupRightLine:ClearAllPoints()
-		panel.__sfRaidSignupRightLine:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -20)
-		panel.__sfRaidSignupRightLine:SetPoint("BOTTOMRIGHT", host, "TOPRIGHT", 0, -20)
-	end
+	-- Position the + button first: the Signups heading line ends just before it.
 	local plus = panel.__sfRaidSignupAddBtn
 	if plus and plus.SetPoint then
 		plus:ClearAllPoints()
 		plus:SetPoint("TOPRIGHT", host, "TOPLEFT", leftW - 2, -4)
 	end
+	if panel.__sfRaidSignupLeftLine then
+		panel.__sfRaidSignupLeftLine:ClearAllPoints()
+		-- Stop ~7px before the button's left edge; tied to the button so the
+		-- gap survives content-width changes. (Button top is y=-4, line y=-20.)
+		panel.__sfRaidSignupLeftLine:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -20)
+		if plus then
+			panel.__sfRaidSignupLeftLine:SetPoint("TOPRIGHT", plus, "TOPLEFT", -7, -16)
+		else
+			panel.__sfRaidSignupLeftLine:SetPoint("TOPRIGHT", host, "TOPLEFT", leftW, -20)
+		end
+	end
+	if panel.__sfRaidSignupRightLine then
+		panel.__sfRaidSignupRightLine:ClearAllPoints()
+		panel.__sfRaidSignupRightLine:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -20)
+		panel.__sfRaidSignupRightLine:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -20)
+	end
 	if panel.__sfRaidSignupNickHeader then
-		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -42)
+		panel.__sfRaidSignupNickHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -49)
 	end
 	if panel.__sfRaidSignupSpecHeader then
-		panel.__sfRaidSignupSpecHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -42)
+		panel.__sfRaidSignupSpecHeader:SetPoint("TOPLEFT", host, "TOPLEFT", 176, -49)
 	end
 	if entriesHost then
 		entriesHost:ClearAllPoints()
@@ -1942,9 +1960,6 @@ local function BuildBoardChrome(panel, host)
 		local line = TrackRegionCreate(host:CreateTexture(nil, "ARTWORK"))
 		line:SetHeight(1)
 		line:SetColorTexture(1, 1, 1, 0.28)
-		if line.SetWidth then
-			line:SetWidth(1)
-		end
 		return line
 	end
 	panel.__sfRaidSignupLeftLine = headingLine()

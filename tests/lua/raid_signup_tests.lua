@@ -2976,8 +2976,14 @@ do
         local iconCols = math.max(1, math.min(5, math.floor((w + 8) / iconPitch)))
         local majorRows = math.max(1, math.ceil(#RS.MAJOR_CATEGORIES / iconCols))
         local utilityRows = math.max(1, math.ceil(#RS.UTILITY_CATEGORIES / iconCols))
-        local rowH = 26
-        local expectedH = 4 + 16 + classRows * rowH + 10 + 16 + majorRows * rowH + 10 + 16 + utilityRows * rowH + 4
+        -- Mirrors PaintSummary group geometry: title, 20px gap, icon rows,
+        -- 8px gap to the next heading below the actual grid bottom.
+        local function gridBottom(titleY, rows)
+            return titleY - 20 - (rows - 1) * 26 - 22
+        end
+        local majorTitleY = gridBottom(-4, classRows) - 8
+        local utilityTitleY = gridBottom(majorTitleY, majorRows) - 8
+        local expectedH = -gridBottom(utilityTitleY, utilityRows) + 4
         assertEq(host:GetHeight(), expectedH, "summary height sized to stacked groups")
         assertEq(classXs[0], classRows, "first grid column holds one icon per row")
         assertTrue(memberPanel.__sfRaidSignupBoardRow ~= nil, "board row exists")
@@ -2996,6 +3002,14 @@ do
     end
     assertEq(role.tank.count:GetText(), "0", "empty plan tank total is zero")
     assertEq(role.ranged.count:GetText(), "0", "empty plan ranged total is zero")
+    -- Signups heading divider ends just before the + button, anchored to it.
+    local dividerAnchored = false
+    for _, pt in ipairs((memberPanel.__sfRaidSignupLeftLine and memberPanel.__sfRaidSignupLeftLine._points) or {}) do
+        if pt[1] == "TOPRIGHT" and pt[2] == memberPanel.__sfRaidSignupAddBtn then
+            dividerAnchored = true
+        end
+    end
+    assertTrue(dividerAnchored, "Signups divider anchored to the + button")
 
     -- Main-only counts update; alternatives excluded
     local upsertStatus = select(1, RS:UpsertEntry({
