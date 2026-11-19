@@ -84,6 +84,13 @@ local BOARD_LEFT_RATIO = 0.62
 local BOARD_MIN_WIDTH = 480
 local BOARD_TOP_H = 69
 local BOARD_STATUS_H = 18
+-- Summary content starts just beneath its own heading divider, independent of
+-- the left column's role totals and table headings.
+local SUMMARY_CONTENT_TOP = 30
+-- Compact, bounded nickname column for collapsed signup rows. Ordinary
+-- nicknames fit; the column does not keep expanding as the row widens, and
+-- longer nicknames ellipsize (full value on hover).
+local ENTRY_NICK_W = 76
 -- Fixed columns for collapsed signup rows (Nickname | Main | Alt | Notes).
 local COL_MAIN_X = 140
 local COL_ALT_X = COL_MAIN_X + 36
@@ -748,7 +755,9 @@ end
 local function EntryColGeom(leftW, reserveActions)
 	local rightReserve = reserveActions and ENTRY_ACTION_W or 8
 	local contentW = math.max(96, (tonumber(leftW) or 0) - rightReserve)
-	local nickW = math.min(150, math.max(48, math.floor(contentW * 0.36)))
+	-- Reserve room for Main + Alt + a note sliver even at narrow widths; above
+	-- that the nickname column stays a fixed compact width.
+	local nickW = math.min(ENTRY_NICK_W, math.max(48, contentW - 110))
 	local mainX = 4 + nickW + 10
 	local altX = mainX + ICON + 12
 	local notesX = altX + ICON + 12
@@ -1908,9 +1917,19 @@ PaintEntries = function(host, planId, planOpen, caps)
 			-- dash opens the editor for that slot. Columns come from the shared
 			-- geometry so rows and headings always agree.
 			local nameFs = AcquireFieldLabel(row, entry.nickname or "")
-			ClipToWidth(nameFs, entry.nickname or "", geom.nickW)
+			local nickFull = entry.nickname or ""
+			local nickShown = ClipToWidth(nameFs, nickFull, geom.nickW)
 			nameFs:SetPoint("LEFT", row, "LEFT", 4, 0)
 			nameFs:SetTextColor(ClassColor(entry.mainClass))
+			if nickShown ~= nickFull and nickFull ~= "" then
+				-- Truncated nickname: the full stored value is available on hover.
+				local nickHover = AcquireNotesHover(row)
+				nickHover.__sfRaidSignupHover = true
+				nickHover.__sfHoverText = nickFull
+				nickHover:ClearAllPoints()
+				nickHover:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -3)
+				nickHover:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 4 + geom.nickW + 2, 3)
+			end
 			local mainBtn = MakeIconButton(row, ICON)
 			mainBtn.__sfRaidSignupSpecSlot = "main"
 			mainBtn:SetPoint("LEFT", row, "LEFT", geom.mainX, 0)
@@ -2181,11 +2200,17 @@ LayoutBoard = function(panel)
 	local headersY = ROLE_TOTALS_TOP - totalsLines * ROLE_LINE_H - ROLE_HEADER_GAP
 	local topH = -headersY + ROLE_HEADER_H
 	panel.__sfRaidSignupTopH = topH
+	-- The sidebar starts beneath its own divider, so its position never
+	-- depends on how many lines the left column's role totals wrap to.
+	panel.__sfRaidSignupSummaryTopH = SUMMARY_CONTENT_TOP
 	local entriesHost = panel.__sfRaidSignupEntriesHost
 	local summaryHost = panel.__sfRaidSignupSummaryHost
 	local entriesH = math.max(24, (entriesHost and entriesHost.__sfEntriesContentH) or 24)
 	local summaryH = math.max(24, (summaryHost and summaryHost.__sfSummaryContentH) or 24)
-	local bodyH = math.max(entriesH, summaryH)
+	-- Each column's bottom is measured from its own starting offset; the board
+	-- height, scroll extent, and divider bottom follow the taller one.
+	local leftBottom = topH + entriesH
+	local bodyBottom = math.max(leftBottom, SUMMARY_CONTENT_TOP + summaryH)
 
 	if panel.__sfRaidSignupSummaryTitle and panel.__sfRaidSignupSummaryTitle.SetPoint then
 		panel.__sfRaidSignupSummaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
@@ -2231,14 +2256,14 @@ LayoutBoard = function(panel)
 	end
 	if summaryHost then
 		summaryHost:ClearAllPoints()
-		summaryHost:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -topH)
+		summaryHost:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -SUMMARY_CONTENT_TOP)
 		summaryHost:SetSize(rightW, summaryH)
 	end
 	local vdiv = panel.__sfRaidSignupVDivider
 	if vdiv then
 		vdiv:ClearAllPoints()
 		vdiv:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -20)
-		vdiv:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -(topH + bodyH))
+		vdiv:SetPoint("BOTTOMLEFT", host, "TOPLEFT", leftW + math.floor(BOARD_COL_GAP / 2), -bodyBottom)
 	end
 	local status = panel.__sfRaidSignupStatusFs
 	if status then
@@ -2249,7 +2274,7 @@ LayoutBoard = function(panel)
 		end
 	end
 
-	local total = topH + bodyH + BOARD_STATUS_H + 6
+	local total = bodyBottom + BOARD_STATUS_H + 6
 	host:SetHeight(total)
 	local row = panel.__sfRaidSignupBoardRow
 	if row then

@@ -3486,6 +3486,31 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     assertTrue(clippedNick ~= nil, "long nickname clipped with ellipsis")
     assertTrue((clippedNick:GetStringWidth() or 0) <= narrowGeom.nickW,
         "clipped nickname fits its column width")
+    assertTrue(narrowGeom.nickW >= 48 and narrowGeom.nickW <= 80,
+        "nickname column is compact and bounded")
+    assertTrue((clippedNick:GetStringWidth() or 0) + 4 <= narrowGeom.mainX - 4,
+        "clipped nickname clears the Main column")
+    -- Truncated nicknames keep the full stored value on hover.
+    local nickHover = nil
+    local function FindNickHover(root)
+        local function walk(f)
+            if nickHover or not f then
+                return
+            end
+            if f.__sfHoverText == longNick then
+                nickHover = f
+                return
+            end
+            if f.GetChildren then
+                for _, k in ipairs({ f:GetChildren() }) do
+                    walk(k)
+                end
+            end
+        end
+        walk(root)
+    end
+    FindNickHover(entriesHost)
+    assertTrue(nickHover ~= nil, "truncated nickname shows its full value on hover")
 
     -- 2. Role totals: one line at the owner's width, deliberate wrap when narrow,
     -- and multi-digit counts recalculate without leaving the column.
@@ -3512,6 +3537,8 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
         return n
     end
     assertEq(DistinctTotalLines(), 1, "multi-digit totals stay on one line at full width")
+    assertEq(panel.__sfEntryGeom.nickW, narrowGeom.nickW,
+        "nickname column width is consistent across window widths")
     local wideHeaderY = select(2, TopLeftOffset(panel.__sfRaidSignupMainHeader))
     assertEq(wideHeaderY, -49, "single-line totals keep the approved header position")
     boardHost._w = 548 -- narrow: totals must reflow, not cross the divider
@@ -3522,6 +3549,38 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     assertTrue(narrowHeaderY < wideHeaderY, "column headers move down with wrapped totals")
     assertEq(entriesY, narrowHeaderY - 20,
         "signup rows start below the wrapped totals and headers")
+
+    -- 2b. Summary content starts beneath its own divider, independent of the
+    -- left column's role totals wrapping onto extra lines.
+    boardHost._w = nil -- 720 fallback: totals on one line
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true })
+    local summaryTopY = select(2, TopLeftOffset(summaryHost))
+    local entriesTopSingle = select(2, TopLeftOffset(entriesHost))
+    assertTrue(summaryTopY ~= nil
+        and summaryTopY == -(panel.__sfRaidSignupSummaryTopH or -1),
+        "summary host anchored to its own top offset")
+    assertTrue(summaryTopY < 0 and math.abs(summaryTopY) < math.abs(entriesTopSingle),
+        "summary content starts above the signup entries")
+    local classTitle = FindFontStringByText(summaryHost, "Classes")
+    assertTrue(classTitle ~= nil, "Classes heading rendered in the sidebar")
+    local _, classTitleY = TopLeftOffset(classTitle)
+    assertTrue(classTitleY ~= nil and classTitleY >= -8,
+        "Classes heading sits just beneath the Summary divider")
+    boardHost._w = 548 -- totals wrap here; the sidebar must not move
+    UIPage:Refresh(panel, { force = true })
+    UIPage:Refresh(panel, { force = true })
+    assertEq(select(2, TopLeftOffset(summaryHost)), summaryTopY,
+        "wrapping role totals does not push the summary down")
+    assertTrue(select(2, TopLeftOffset(entriesHost)) < entriesTopSingle,
+        "left column headers move down while the summary stays put")
+    local _, rightHostY = TopLeftOffset(summaryHost)
+    local summaryBottom = math.abs(rightHostY) + (summaryHost:GetHeight() or 0)
+    local entriesBottom = math.abs(entriesTopSingle) + (entriesHost:GetHeight() or 0)
+    assertTrue(boardHost:GetHeight() >= summaryBottom + 24 - 1,
+        "board height contains the raised summary column")
+    assertTrue(boardHost:GetHeight() >= entriesBottom + 24 - 1,
+        "board height still contains the signup entries")
 
     -- 3. Summary: a 2px resize across the class-grid threshold rebuilds geometry.
     boardHost._w = 650
