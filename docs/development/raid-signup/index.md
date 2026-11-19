@@ -49,7 +49,62 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
   reused so allocations plateau after warm-up. Control callbacks read live selected plan /
   permissions. Idle visible page does not poll or broadcast.
 
-### Gossip multi-hop note
+### Role-total guidance colors
+
+The Signups tab shows four compact role totals beneath the plan list: **Tanks**, **Healers**, **Ranged DPS**, and **Melee DPS**. Each is a small role icon plus a count. Only the **number** changes color; icons, sizing, spacing, and hover regions are fixed. Hovering a group shows the full localized role name plus a one-line assessment of the current totals.
+
+Colors are **roster-planning guidance**, not Blizzard requirements and not a guarantee that a composition can complete an encounter. The thresholds below are owner-selected advisory values; encounter-specific needs (mechanics, assignments, enrage timers) always take precedence. The heuristics do not model every difficulty, special raid format, player skill, gear level, or bench arrangement, and the guidance never restricts roster size, saving, or signup permissions.
+
+### Counting rules
+
+Totals reuse the main-only aggregation (`RS.BuildRoleTotals`): only **completed main specs** count. Alternatives and incomplete drafts are excluded. From the four role counts:
+
+- `T` = tanks, `H` = healers, `M` = melee DPS, `R` = ranged DPS
+- `D = M + R` (combined DPS)
+- `N = T + H + M + R` (total signups)
+
+Colors and tooltip text are recomputed on every totals refresh (plan switches, main-spec changes, deletions, remote updates) and reset when a count returns to its normal range. No assessment state is persisted or synchronized; everything derives from the existing signup data.
+
+### Tanks
+
+- Exactly **2** tanks: yellow.
+- Any other count: red.
+- Tooltip states the two-tank planning target.
+
+### Healers
+
+- Fewer than **2** healers: red, at any roster size.
+- For rosters with **10–30** total signups (`N`), the typical band is:
+  - Lower bound: `max(2, floor(N / 5 + 0.5))`
+  - Upper bound: `max(lowerBound, floor(N / 4))`
+- **Yellow:** `H` inside the inclusive band. **Orange:** `H` exactly one below or one above the band, provided `H >= 2`. **Red:** anything else.
+- Representative bands: N=10 → yellow {2}; N=14–15 → yellow {3}; N=20 → yellow 4–5; N=25 → yellow 5–6; N=30 → yellow 6–7.
+- Outside 10–30 signups, the raid-size-based balance assessment is **not applied**: with 2+ healers the number stays its normal yellow and the tooltip explicitly says the balance assessment is not applied at this size (it is not described as optimal). Fewer than 2 healers is still red.
+
+### Melee / ranged DPS
+
+- If `D < 9`, **both** DPS numbers are red. This overrides the split assessment. Nine is the owner's preferred roster target, not the game's minimum raid-entry requirement — a 2/2/6 composition has six DPS and ten total players.
+- When `D >= 9`, the melee share of combined DPS (`M / D`) is graded with exact integer comparisons (no display rounding at the boundaries):
+  - **Yellow:** 20% through 65% melee, inclusive.
+  - **Orange:** below 20%, or above 65% through 85%.
+  - **Red:** above 85% melee.
+- Both DPS numbers always share the same balance color.
+- The asymmetry is deliberate: a **ranged-heavy** composition receives at worst orange unless the combined-DPS minimum fails, while a heavily melee-skewed one turns red above 85%.
+- For `D = 14`: 6/8 yellow, 9/5 yellow, 10/4 orange, 12/2 red, 2/12 orange, 0/14 orange.
+
+### Tooltip wording
+
+Each hover keeps the full localized role name and adds the current assessment, e.g. "3 healers for 20 signups. Typical range: 4–5. Slightly below the usual range.", "8 total DPS. Roster target: at least 9.", or "10 melee / 4 ranged. Melee-heavy; fewer ranged options for encounter assignments." Wording uses terms like "Typical balance", "Encounter-dependent", and "Outside the usual range" rather than claiming a composition is objectively optimal or impossible.
+
+### Background references
+
+The thresholds are the owner's chosen planning heuristics. Public guides illustrate that real encounter requirements vary; they informed the general shape of the bands but are **not** the source of the color policy:
+
+- [Method.gg — March on Quel'Danas: Midnight Falls](https://www.method.gg/guides/march-on-queldanas/midnight-falls)
+- [Method.gg — Nerub-ar Palace: Rashanan](https://www.method.gg/guides/nerubar-palace/rashanan)
+- [Method.gg — Liberation of Undermine: Sprocketmonger Lockenstock](https://www.method.gg/guides/liberation-of-undermine/sprocketmonger-lockenstock)
+
+## Gossip multi-hop note
 
 Phase 1 Guild Gossip authenticates the current hop sender. Member-authored entries admit when the transport sender is the creator or an officer. Non-officer relays of someone else's newer entry return `relay_lacks_authority`. Peers still converge when they pull from the author or through an officer hub.
 

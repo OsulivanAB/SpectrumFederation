@@ -3623,6 +3623,7 @@ local function RaidSignupLayoutRegressionTests(panel, UIPage, RS, tabPlanId)
     GameTooltip = {
         SetOwner = function() end,
         SetText = function(_, t) tooltipTitles[#tooltipTitles + 1] = t end,
+        AddLine = function() end,
         Show = function() end,
         Hide = function() end,
     }
@@ -4001,6 +4002,203 @@ local function RaidSignupSummaryPresentationTests(panel, UIPage, RS, tabPlanId)
     UIPage:Refresh(panel, { force = true })
 end
 RaidSignupSummaryPresentationTests(panel, UIPage, RS, tabPlanId)
+
+-- Role-total guidance colors: threshold boundaries, healer rounding, DPS
+-- minimum precedence, and live color/tooltip transitions through refresh.
+local function RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
+    local assess = UIPage._AssessRoleTotalsForTests
+    assertTrue(assess ~= nil, "assessment helper exposed for tests")
+
+    local function levelOf(totals, role)
+        local a = assess and assess(totals)
+        return a and a[role] and a[role].level
+    end
+    local function textOf(totals, role)
+        local a = assess and assess(totals)
+        return a and a[role] and a[role].text
+    end
+
+    -- Tanks: exactly two yellow, anything else red.
+    assertEq(levelOf({ tank = 2, healer = 0, ranged = 0, melee = 0 }, "tank"), "yellow",
+        "two tanks yellow")
+    assertEq(levelOf({ tank = 1, healer = 0, ranged = 0, melee = 0 }, "tank"), "red",
+        "one tank red")
+    assertEq(levelOf({ tank = 3, healer = 0, ranged = 0, melee = 0 }, "tank"), "red",
+        "three tanks red")
+    assertTrue((textOf({ tank = 2, healer = 0, ranged = 0, melee = 0 }, "tank") or ""):find("target: 2"),
+        "tank tooltip explains the two-tank target")
+
+    -- Healers: rounding band per roster size N (tank=0, melee=0, ranged=N-H).
+    local function healerCase(N, H)
+        local a = assess and assess({ tank = 0, healer = H, ranged = N - H, melee = 0 }) or {}
+        return a.healer and a.healer.level
+    end
+    -- N=10 -> yellow {2}; orange 3; red 0-1 or 4+
+    assertEq(healerCase(10, 2), "yellow", "N=10 H=2 yellow")
+    assertEq(healerCase(10, 3), "orange", "N=10 H=3 orange")
+    assertEq(healerCase(10, 4), "red", "N=10 H=4 red")
+    assertEq(healerCase(10, 1), "red", "N=10 H=1 red")
+    -- N=14/15 -> yellow {3}; orange 2 or 4
+    assertEq(healerCase(14, 3), "yellow", "N=14 H=3 yellow")
+    assertEq(healerCase(14, 2), "orange", "N=14 H=2 orange")
+    assertEq(healerCase(14, 4), "orange", "N=14 H=4 orange")
+    assertEq(healerCase(14, 5), "red", "N=14 H=5 red")
+    assertEq(healerCase(15, 3), "yellow", "N=15 H=3 yellow")
+    -- N=20 -> yellow 4-5; orange 3 or 6; red 0-2 or 7+
+    assertEq(healerCase(20, 4), "yellow", "N=20 H=4 yellow")
+    assertEq(healerCase(20, 5), "yellow", "N=20 H=5 yellow")
+    assertEq(healerCase(20, 3), "orange", "N=20 H=3 orange")
+    assertEq(healerCase(20, 6), "orange", "N=20 H=6 orange")
+    assertEq(healerCase(20, 2), "red", "N=20 H=2 red")
+    assertEq(healerCase(20, 7), "red", "N=20 H=7 red")
+    -- N=25 -> yellow 5-6; orange 4 or 7
+    assertEq(healerCase(25, 5), "yellow", "N=25 H=5 yellow")
+    assertEq(healerCase(25, 6), "yellow", "N=25 H=6 yellow")
+    assertEq(healerCase(25, 4), "orange", "N=25 H=4 orange")
+    assertEq(healerCase(25, 7), "orange", "N=25 H=7 orange")
+    -- N=30 -> yellow 6-7; orange 5 or 8
+    assertEq(healerCase(30, 6), "yellow", "N=30 H=6 yellow")
+    assertEq(healerCase(30, 7), "yellow", "N=30 H=7 yellow")
+    assertEq(healerCase(30, 5), "orange", "N=30 H=5 orange")
+    assertEq(healerCase(30, 8), "orange", "N=30 H=8 orange")
+    -- Outside 10-30: H>=2 stays normal yellow with an explicit not-assessed note.
+    local ungraded = textOf({ tank = 0, healer = 2, ranged = 7, melee = 0 }, "healer")
+    assertEq(levelOf({ tank = 0, healer = 2, ranged = 7, melee = 0 }, "healer"), "yellow",
+        "N=9 healer ungraded yellow")
+    assertTrue((ungraded or ""):find("not assessed"), "ungraded healer tooltip states not assessed")
+    assertEq(levelOf({ tank = 0, healer = 6, ranged = 25, melee = 0 }, "healer"), "yellow",
+        "N=31 healer ungraded yellow")
+    -- Fewer than two healers is red at any roster size.
+    assertEq(levelOf({ tank = 0, healer = 1, ranged = 20, melee = 0 }, "healer"), "red",
+        "H=1 red even at N=21")
+    assertEq(levelOf({ tank = 0, healer = 0, ranged = 5, melee = 0 }, "healer"), "red",
+        "H=0 red at small roster")
+
+    -- DPS: combined minimum overrides the split; boundaries are exact.
+    local function dpsCase(M, R)
+        local a = assess and assess({ tank = 2, healer = 2, ranged = R, melee = M }) or {}
+        return {
+            melee = a.melee or {},
+            ranged = a.ranged or {},
+        }
+    end
+    local minDps = dpsCase(3, 5)
+    assertEq(minDps.melee.level, "red", "D=8 melee red")
+    assertEq(minDps.ranged.level, "red", "D=8 ranged red (same color)")
+    assertTrue((minDps.melee.text or ""):find("at least 9"), "DPS minimum tooltip")
+    -- Owner examples at D=14.
+    assertEq(dpsCase(6, 8).melee.level, "yellow", "6/8 yellow")
+    assertEq(dpsCase(9, 5).melee.level, "yellow", "9/5 yellow")
+    assertEq(dpsCase(10, 4).melee.level, "orange", "10/4 orange")
+    assertEq(dpsCase(12, 2).melee.level, "red", "12/2 red")
+    assertEq(dpsCase(2, 12).melee.level, "orange", "2/12 orange")
+    assertEq(dpsCase(0, 14).melee.level, "orange", "0/14 orange")
+    -- Exact boundaries: 20% and 65% inclusive, 85% exclusive.
+    assertEq(dpsCase(2, 8).melee.level, "yellow", "20% boundary yellow (D=10)")
+    assertEq(dpsCase(13, 7).melee.level, "yellow", "65% boundary yellow (D=20)")
+    assertEq(dpsCase(14, 6).melee.level, "orange", "just above 65% orange")
+    assertEq(dpsCase(17, 3).melee.level, "orange", "85% boundary orange (D=20)")
+    assertEq(dpsCase(18, 2).melee.level, "red", "above 85% red")
+    -- Ranged-heavy never exceeds orange while D >= 9.
+    assertEq(dpsCase(0, 9).melee.level, "orange", "0/9 ranged-heavy orange")
+
+    -- UI path: colors and tooltips follow real refreshes and transitions.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local status, _, colorPlanId = RS:CreatePlan("Role Color Plan")
+    assertEq(status, "accepted", "officer creates color-test plan")
+    RS:SelectPlan(colorPlanId)
+    local function addEntry(nick, classFile, specId)
+        status, _, entryId = RS:UpsertEntry({
+            planId = colorPlanId, nickname = nick, mainClass = classFile, mainSpec = specId,
+        })
+        assertEq(status, "accepted", "color-test entry accepted: " .. nick)
+        return entryId
+    end
+    local ids = {}
+    ids[#ids + 1] = addEntry("ColTank1", "PALADIN", 66)
+    ids[#ids + 1] = addEntry("ColTank2", "PALADIN", 66)
+    ids[#ids + 1] = addEntry("ColHeal1", "PALADIN", 65)
+    ids[#ids + 1] = addEntry("ColMelee1", "WARRIOR", 71)
+    ids[#ids + 1] = addEntry("ColRange1", "MAGE", 62)
+    UIPage:Refresh(panel, { force = true })
+
+    local role = panel.__sfRaidSignupRole
+    local function countColor(key)
+        local tc = role[key].count._textColor
+        return tc and tc[2]
+    end
+    -- T=2,H=1,M=1,R=1 -> N=5, D=2.
+    assertEq(countColor("tank"), 0.82, "tank count yellow at 2 tanks")
+    assertEq(countColor("healer"), 0.2, "healer count red below two at any size")
+    assertEq(countColor("melee"), 0.2, "melee count red below DPS minimum")
+    assertEq(countColor("ranged"), 0.2, "ranged count red below DPS minimum")
+    assertTrue((role.healer.hover.__sfRoleTooltip or ""):find("at least 2"),
+        "under-staffed healer tooltip on the live hover region")
+
+    -- Grow to D=9 (7 more ranged): DPS flips to orange, healer stays red (H=1).
+    for i = 1, 7 do
+        ids[#ids + 1] = addEntry("ColRange" .. (i + 1), "MAGE", 62)
+    end
+    UIPage:Refresh(panel, { force = true })
+    assertEq(countColor("melee"), 0.6, "melee count orange at D=9 ranged-heavy")
+    assertEq(countColor("ranged"), 0.6, "ranged count shares the DPS color")
+    assertEq(countColor("healer"), 0.2, "healer count red below two")
+    assertTrue((role.melee.hover.__sfRoleTooltip or ""):find("Ranged%-heavy"),
+        "ranged-heavy tooltip text")
+
+    -- Tooltip path: hover shows the role name plus the assessment line.
+    local realTooltip = GameTooltip
+    local tooltipLines = {}
+    GameTooltip = {
+        SetOwner = function() end,
+        SetText = function(_, t) tooltipLines[#tooltipLines + 1] = t end,
+        AddLine = function(_, t) tooltipLines[#tooltipLines + 1] = t end,
+        Show = function() end,
+        Hide = function() end,
+    }
+    local meleeEnter = role.melee.hover._scripts.OnEnter
+    tooltipLines = {}
+    meleeEnter(role.melee.hover)
+    assertEq(tooltipLines[1], "Melee DPS", "tooltip keeps the full role name")
+    assertTrue(tooltipLines[2] and tooltipLines[2]:find("Ranged%-heavy"),
+        "tooltip shows the DPS assessment line")
+    GameTooltip = realTooltip
+
+    -- Add a second healer (N=13 -> band {3}, H=2 one below -> orange).
+    ids[#ids + 1] = addEntry("ColHeal2", "PALADIN", 65)
+    UIPage:Refresh(panel, { force = true })
+    assertEq(countColor("healer"), 0.6, "healer count orange one below band")
+    assertTrue((role.healer.hover.__sfRoleTooltip or ""):find("Slightly below"),
+        "healer tooltip explains the band position")
+
+    -- Turn one ranged entry into melee: M=2,R=7,D=9 -> balanced yellow again.
+    local record = RS:EnsureGuildRecord("club:42")
+    local rangeEntryId = ids[5]
+    local cur = RS.GetEntry(record, rangeEntryId)
+    status, _, rangeEntryId = RS:UpsertEntry({
+        planId = colorPlanId,
+        entryId = rangeEntryId,
+        nickname = "ColRange1",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+    })
+    assertEq(status, "accepted", "ranged entry switched to melee")
+    assertTrue(cur ~= nil, "entry snapshot for ver lookup")
+    UIPage:Refresh(panel, { force = true })
+    assertEq(countColor("melee"), 0.82, "melee count back to yellow when balanced")
+    assertEq(countColor("ranged"), 0.82, "ranged count resets with the split")
+
+    -- Cleanup: remove color-test entries and restore the tab plan.
+    for _, entryId in ipairs(ids) do
+        local live = RS.GetEntry(record, entryId)
+        if live and not live.deleted then
+            RS:DeleteEntry(entryId, { expectedVer = live.ver })
+        end
+    end
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
+end
+RaidSignupRoleTotalColorTests(panel, UIPage, RS, tabPlanId)
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt

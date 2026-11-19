@@ -2283,6 +2283,111 @@ LayoutBoard = function(panel)
 	end
 end
 
+-- Roster-planning guidance colors for the role totals. These are advisory
+-- heuristics owned by the guild, not Blizzard requirements or guarantees that
+-- a composition can complete an encounter. Only the numeric text color
+-- changes; icons, sizing, spacing, and hover regions are untouched.
+local ROLE_ASSESS_COLORS = {
+	yellow = { 1, 0.82, 0.18 },
+	orange = { 1, 0.6, 0.1 },
+	red = { 1, 0.2, 0.2 },
+}
+
+local function FormatLoc(key, default, ...)
+	return string.format(Loc(key, default), ...)
+end
+
+-- totals: { tank, healer, ranged, melee } completed-main counts.
+-- Returns per-role { level = "yellow"|"orange"|"red", text = tooltip line }.
+local function AssessRoleTotals(totals)
+	totals = totals or {}
+	local T = tonumber(totals.tank) or 0
+	local H = tonumber(totals.healer) or 0
+	local R = tonumber(totals.ranged) or 0
+	local M = tonumber(totals.melee) or 0
+	local N = T + H + M + R
+	local D = M + R
+	local result = {}
+
+	-- Tanks: exactly two is the planning target; anything else is red.
+	result.tank = {
+		level = (T == 2) and "yellow" or "red",
+		text = FormatLoc("RAID_SIGNUP_ASSESS_TANK", "%d tanks. Typical planning target: 2.", T),
+	}
+
+	-- Healers: below two is always red. For 10-30 total signups, grade against
+	-- a roster-size band; outside that range the number stays normal yellow
+	-- with an explicit not-assessed note (never called optimal).
+	local healerLevel, healerText
+	if H < 2 then
+		healerLevel = "red"
+		healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_MIN",
+			"%d healers for %d signups. Typical planning guidance suggests at least 2 healers.", H, N)
+	elseif N >= 10 and N <= 30 then
+		local lower = math.max(2, math.floor(N / 5 + 0.5))
+		local upper = math.max(lower, math.floor(N / 4))
+		if H >= lower and H <= upper then
+			healerLevel = "yellow"
+			healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_OK",
+				"%d healers for %d signups. Typical range: %d-%d.", H, N, lower, upper)
+		elseif H == lower - 1 then
+			healerLevel = "orange"
+			healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_LOW",
+				"%d healers for %d signups. Typical range: %d-%d. Slightly below the usual range.",
+				H, N, lower, upper)
+		elseif H == upper + 1 then
+			healerLevel = "orange"
+			healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_HIGH",
+				"%d healers for %d signups. Typical range: %d-%d. Slightly above the usual range.",
+				H, N, lower, upper)
+		else
+			healerLevel = "red"
+			healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_OUT",
+				"%d healers for %d signups. Outside the usual range (typical %d-%d).",
+				H, N, lower, upper)
+		end
+	else
+		healerLevel = "yellow"
+		healerText = FormatLoc("RAID_SIGNUP_ASSESS_HEALER_UNGRADED",
+			"%d healers for %d signups. Typical-balance guidance applies to rosters of 10-30 signups; not assessed at this size.",
+			H, N)
+	end
+	result.healer = { level = healerLevel, text = healerText }
+
+	-- DPS: the combined minimum overrides the split. With D >= 9, grade the
+	-- melee share of combined DPS with integer comparisons so the 20%/65%/85%
+	-- boundaries never suffer display-rounding errors. Both DPS numbers share
+	-- the same balance color; ranged-heavy compositions stay orange at worst.
+	local dpsLevel, dpsText
+	if D < 9 then
+		dpsLevel = "red"
+		dpsText = FormatLoc("RAID_SIGNUP_ASSESS_DPS_MIN",
+			"%d total DPS. Roster planning target: at least 9.", D)
+	elseif 20 * M > 17 * D then
+		dpsLevel = "red"
+		dpsText = FormatLoc("RAID_SIGNUP_ASSESS_DPS_MELEE_OVER",
+			"%d melee / %d ranged. Melee share outside the usual range; encounter-dependent.", M, R)
+	elseif 5 * M < D or 20 * M > 13 * D then
+		dpsLevel = "orange"
+		if 5 * M < D then
+			dpsText = FormatLoc("RAID_SIGNUP_ASSESS_DPS_RANGED_HEAVY",
+				"%d melee / %d ranged. Ranged-heavy; fewer melee options for encounter assignments.", M, R)
+		else
+			dpsText = FormatLoc("RAID_SIGNUP_ASSESS_DPS_MELEE_HEAVY",
+				"%d melee / %d ranged. Melee-heavy; fewer ranged options for encounter assignments.", M, R)
+		end
+	else
+		dpsLevel = "yellow"
+		dpsText = FormatLoc("RAID_SIGNUP_ASSESS_DPS_BALANCED",
+			"%d melee / %d ranged. Balanced split; encounter-dependent.", M, R)
+	end
+	result.ranged = { level = dpsLevel, text = dpsText }
+	result.melee = { level = dpsLevel, text = dpsText }
+
+	return result
+end
+Page._AssessRoleTotalsForTests = AssessRoleTotals
+
 PaintRoleTotals = function(panel)
 	local role = panel and panel.__sfRaidSignupRole
 	if not role then
@@ -2295,10 +2400,19 @@ PaintRoleTotals = function(panel)
 		totals = rs.BuildRoleTotals(entries)
 	end
 	totals = totals or { tank = 0, healer = 0, ranged = 0, melee = 0 }
+	local assessment = AssessRoleTotals(totals)
 	for _, key in ipairs(BOARD_ROLE_ORDER) do
 		local slot = role[key]
 		if slot and slot.count and slot.count.SetText then
 			slot.count:SetText(tostring(totals[key] or 0))
+			-- Recompute color and tooltip on every paint so counts returning to
+			-- their normal range reset correctly.
+			local assess = assessment[key]
+			local color = assess and ROLE_ASSESS_COLORS[assess.level] or ROLE_ASSESS_COLORS.yellow
+			slot.count:SetTextColor(color[1], color[2], color[3])
+			if slot.hover then
+				slot.hover.__sfRoleTooltip = assess and assess.text or nil
+			end
 		end
 	end
 end
@@ -2404,6 +2518,9 @@ local function BuildBoardChrome(panel, host)
 		hover:SetScript("OnEnter", function(self)
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 			GameTooltip:SetText(self.__sfRoleName, 1, 1, 1)
+			if self.__sfRoleTooltip then
+				GameTooltip:AddLine(self.__sfRoleTooltip, 0.9, 0.9, 0.9, true)
+			end
 			GameTooltip:Show()
 		end)
 		hover:SetScript("OnLeave", function()
