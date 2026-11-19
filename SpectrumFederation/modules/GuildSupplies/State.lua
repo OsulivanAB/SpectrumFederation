@@ -285,6 +285,14 @@ local function ValidateOperationsHeads(ops, record)
                 okKey = true
             end
         end
+        -- #465: soft-delete heads are likewise alias-aware.
+        if not okKey and body.kind == (GS.KIND and GS.KIND.SOFT_DELETE_EVENT)
+            and GS.SoftDeleteTargetKey and type(record) == "table" then
+            local canonKey = GS.SoftDeleteTargetKey(record, body.target, lookup)
+            if canonKey ~= nil and canonKey == targetKey then
+                okKey = true
+            end
+        end
         if not okKey then
             return false, "invalid_operations"
         end
@@ -757,6 +765,108 @@ local function ValidateGuildRecordStructure(guildKey, record)
             end
             if not IsFiniteNonnegInt(entry.renamedAt) then
                 return false, "invalid_campaign_name"
+            end
+        end
+    end
+    -- Optional #465 soft-deletion heads: absent on older saves.
+    -- Capacity is distinct verified canons; alias keys must not inflate it
+    -- (#465 r4538978993). Shape-check every map entry.
+    if record.eventDeletions ~= nil then
+        if type(record.eventDeletions) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local canonCount = 0
+        local seenCanon = {}
+        local maxDel = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_WITHDRAWAL_EVENTS or 1024)
+        local override = tonumber(GS._softDeleteCanonicalCapacityMaxOverride)
+        if override and override >= 0 then
+            maxDel = override
+        end
+        for eventId, entry in pairs(record.eventDeletions) do
+            if type(eventId) ~= "string" or eventId == "" or #eventId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_record_shape"
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_record_shape"
+            end
+            if not IsFiniteNonnegInt(entry.deletedAt) then
+                return false, "invalid_record_shape"
+            end
+            if entry.actorName ~= nil then
+                if type(entry.actorName) ~= "string" or entry.actorName == ""
+                    or #entry.actorName > 64 then
+                    return false, "invalid_record_shape"
+                end
+            end
+            if entry.actorGuid ~= nil then
+                if type(entry.actorGuid) ~= "string" or entry.actorGuid == ""
+                    or #entry.actorGuid > 64 then
+                    return false, "invalid_guid"
+                end
+            end
+            if entry.eventKind ~= nil
+                and entry.eventKind ~= "donation"
+                and entry.eventKind ~= "adjustment"
+                and entry.eventKind ~= "withdrawal" then
+                return false, "invalid_record_shape"
+            end
+            -- Optional #465 verified accounting facts (absent when unverified).
+            if entry.verified ~= nil and entry.verified ~= true and entry.verified ~= false then
+                return false, "invalid_record_shape"
+            end
+            if entry.verified == true then
+                if entry.eventId ~= nil then
+                    if type(entry.eventId) ~= "string" or entry.eventId == ""
+                        or #entry.eventId > GS.MAX_OPERATION_ID then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.itemId ~= nil and not IsFiniteNonnegInt(entry.itemId) then
+                    return false, "invalid_record_shape"
+                end
+                if entry.quantity ~= nil then
+                    local q = tonumber(entry.quantity)
+                    if not q or q ~= q or q == math.huge or q == -math.huge then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.campaignId ~= nil then
+                    if type(entry.campaignId) ~= "string" or entry.campaignId == "" then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributed ~= nil then
+                    if type(entry.attributed) ~= "string" or entry.attributed == ""
+                        or #entry.attributed > 64 then
+                        return false, "invalid_record_shape"
+                    end
+                end
+                if entry.attributedGuid ~= nil then
+                    if type(entry.attributedGuid) ~= "string" or entry.attributedGuid == ""
+                        or #entry.attributedGuid > 64 then
+                        return false, "invalid_guid"
+                    end
+                end
+                if entry.gsProductionCredit ~= nil
+                    and entry.gsProductionCredit ~= true
+                    and entry.gsProductionCredit ~= false then
+                    return false, "invalid_record_shape"
+                end
+                local canon = entry.eventId
+                if type(canon) ~= "string" or canon == "" then
+                    canon = eventId
+                end
+                if type(canon) == "string" and canon ~= "" and not seenCanon[canon] then
+                    seenCanon[canon] = true
+                    canonCount = canonCount + 1
+                    if canonCount > maxDel then
+                        return false, "full"
+                    end
+                end
             end
         end
     end
