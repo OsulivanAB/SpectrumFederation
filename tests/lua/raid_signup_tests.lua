@@ -1089,8 +1089,8 @@ local function makeRegion(objectType)
         end
     end
     function r:SetTexCoord(l, r, t, b) self._texCoord = { l, r, t, b } end
-    function r:SetDesaturated() end
-    function r:SetVertexColor() end
+    function r:SetDesaturated(v) self._desaturated = v end
+    function r:SetVertexColor(cr, cg, cb) self._vertexColor = { cr, cg, cb } end
     function r:SetMaxLetters() end
     function r:SetAutoFocus() end
     function r:Enable() self._enabled = true end
@@ -3860,6 +3860,147 @@ local function RaidSignupRoleIconFallbackTests(UIPage)
     SF.__testAtlases = savedAtlases
 end
 RaidSignupRoleIconFallbackTests(UIPage)
+
+-- Summary presentation: shared heading left edge, and zero-count classes
+-- greyed with the missing-coverage treatment while staying enabled.
+local function RaidSignupSummaryPresentationTests(panel, UIPage, RS, tabPlanId)
+    local function pointXY(widget, point)
+        for _, pt in ipairs(widget._points or {}) do
+            if pt[1] == point then
+                return pt[4], pt[5]
+            end
+        end
+        return nil, nil
+    end
+
+    -- The Summary heading shares the sidebar's left edge after build, refresh,
+    -- and resize (never reverts to the right edge).
+    local title = panel.__sfRaidSignupSummaryTitle
+    local summaryHost = panel.__sfRaidSignupSummaryHost
+    local boardHost = panel.__sfRaidSignupBoardHost
+    assertTrue(title ~= nil and summaryHost ~= nil, "summary heading and host exist")
+    local function assertSharedLeftEdge(tag)
+        local tx = pointXY(title, "TOPLEFT")
+        local hx = pointXY(summaryHost, "TOPLEFT")
+        assertTrue(tx ~= nil, "summary heading anchored TOPLEFT: " .. tag)
+        assertTrue(hx ~= nil, "summary host anchored TOPLEFT: " .. tag)
+        assertEq(tx, hx, "summary heading shares the sidebar left edge: " .. tag)
+    end
+    assertSharedLeftEdge("initial")
+    boardHost._w = 548
+    UIPage:Refresh(panel, { force = true })
+    assertSharedLeftEdge("after resize")
+    boardHost._w = nil
+
+    -- Zero-count classes are greyed but enabled; nonzero counts are full
+    -- colour. Transitions apply on refresh without rebuilding the grid.
+    ActAs("Alice-Garona", "Player-1-Alice")
+    local status, _, greyPlanId = RS:CreatePlan("Summary Grey Plan")
+    assertEq(status, "accepted", "officer creates grey-test plan")
+    RS:SelectPlan(greyPlanId)
+    UIPage:Refresh(panel, { force = true })
+    local icons = summaryHost.__sfClassIcons
+    local counts = summaryHost.__sfClassCounts
+    assertTrue(icons ~= nil and counts ~= nil, "class grid widgets exist")
+    assertEq(summaryHost.__sfSummaryBuilt, true, "class grid built")
+
+    local function greyState(classFile)
+        local btn = icons[classFile]
+        if not (btn and btn.icon) then
+            return nil
+        end
+        return {
+            desaturated = btn.icon._desaturated == true,
+            shade = btn.icon._vertexColor and btn.icon._vertexColor[1],
+            enabled = btn._enabled ~= false,
+            count = counts[classFile] and counts[classFile]:GetText(),
+        }
+    end
+    local function assertGrey(classFile, tag)
+        local s = greyState(classFile)
+        assertTrue(s ~= nil, "class icon present: " .. classFile .. " (" .. tag .. ")")
+        assertTrue(s.desaturated, "zero-count class desaturated: " .. classFile .. " (" .. tag .. ")")
+        assertEq(s.shade, 0.45, "zero-count class grey shade: " .. classFile .. " (" .. tag .. ")")
+        assertTrue(s.enabled, "zero-count class stays enabled: " .. classFile .. " (" .. tag .. ")")
+        assertEq(s.count, "0", "zero-count class count text: " .. classFile .. " (" .. tag .. ")")
+    end
+    local function assertFull(classFile, expectedCount, tag)
+        local s = greyState(classFile)
+        assertTrue(s ~= nil, "class icon present: " .. classFile .. " (" .. tag .. ")")
+        assertTrue(not s.desaturated, "nonzero class not desaturated: " .. classFile .. " (" .. tag .. ")")
+        assertEq(s.shade, 1, "nonzero class full colour: " .. classFile .. " (" .. tag .. ")")
+        assertTrue(s.enabled, "nonzero class enabled: " .. classFile .. " (" .. tag .. ")")
+        assertEq(s.count, tostring(expectedCount),
+            "nonzero class count text: " .. classFile .. " (" .. tag .. ")")
+    end
+
+    -- Initially every class has zero signups: all grey.
+    UIPage:Refresh(panel, { force = true })
+    assertGrey("MAGE", "initial")
+    assertGrey("WARRIOR", "initial")
+
+    -- zero -> nonzero for Mage only; alt selections do not count.
+    status, _, greyEntryA = RS:UpsertEntry({
+        planId = greyPlanId,
+        nickname = "GreyMage",
+        mainClass = "MAGE",
+        mainSpec = 62,
+    })
+    assertEq(status, "accepted", "mage entry accepted")
+    UIPage:Refresh(panel, { force = true })
+    assertFull("MAGE", 1, "after adding mage")
+    assertGrey("WARRIOR", "after adding mage")
+    status, _, greyEntryB = RS:UpsertEntry({
+        planId = greyPlanId,
+        nickname = "GreyWar",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+        altClass = "MAGE",
+        altSpec = 62,
+    })
+    assertEq(status, "accepted", "warrior entry with mage alt accepted")
+    UIPage:Refresh(panel, { force = true })
+    assertFull("WARRIOR", 1, "after adding warrior")
+    assertFull("MAGE", 1, "alt mage still not counted")
+
+    -- nonzero -> zero by deleting both entries.
+    local record = RS:EnsureGuildRecord("club:42")
+    for _, entryId in ipairs({ greyEntryA, greyEntryB }) do
+        local cur = RS.GetEntry(record, entryId)
+        status = RS:DeleteEntry(entryId, { expectedVer = cur and cur.ver })
+        assertEq(status, "accepted", "grey-test entry deleted: " .. tostring(entryId))
+    end
+    UIPage:Refresh(panel, { force = true })
+    assertGrey("MAGE", "after deleting mage")
+    assertGrey("WARRIOR", "after deleting warrior")
+
+    -- Changing an entry's main class moves the count between classes.
+    status, _, greyEntryC = RS:UpsertEntry({
+        planId = greyPlanId,
+        nickname = "GreySwitch",
+        mainClass = "MAGE",
+        mainSpec = 62,
+    })
+    assertEq(status, "accepted", "switch entry accepted")
+    status, _, greyEntryC = RS:UpsertEntry({
+        planId = greyPlanId,
+        entryId = greyEntryC,
+        nickname = "GreySwitch",
+        mainClass = "WARRIOR",
+        mainSpec = 71,
+    })
+    assertEq(status, "accepted", "switch entry main class changed")
+    UIPage:Refresh(panel, { force = true })
+    assertGrey("MAGE", "after main class changed away")
+    assertFull("WARRIOR", 1, "after main class changed to")
+
+    -- Restore the tab plan for the remaining suites.
+    local cur = RS.GetEntry(RS:EnsureGuildRecord("club:42"), greyEntryC)
+    RS:DeleteEntry(greyEntryC, { expectedVer = cur and cur.ver })
+    RS:SelectPlan(tabPlanId)
+    UIPage:Refresh(panel, { force = true })
+end
+RaidSignupSummaryPresentationTests(panel, UIPage, RS, tabPlanId)
 
 local function RaidSignupRowActionTests(panel, UIPage, RS, tabPlanId)
     -- Collapsed-row actions: notes preview + full-note hover, clickable alt

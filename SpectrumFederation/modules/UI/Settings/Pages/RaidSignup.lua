@@ -1512,9 +1512,17 @@ PaintSummary = function(host, planId)
 
 	for i = 1, #order do
 		local classFile = order[i]
+		local count = (summary.classCounts and summary.classCounts[classFile]) or 0
 		local fs = host.__sfClassCounts and host.__sfClassCounts[classFile]
 		if fs then
-			fs:SetText(tostring((summary.classCounts and summary.classCounts[classFile]) or 0))
+			fs:SetText(tostring(count))
+		end
+		local icon = host.__sfClassIcons and host.__sfClassIcons[classFile]
+		if icon then
+			-- Zero-count classes take the missing-coverage grey treatment but
+			-- stay enabled. Applied on every paint so zero/nonzero transitions
+			-- work without rebuilding the grid.
+			SetIconVisual(icon, TextureForClass(classFile), true, count <= 0)
 		end
 	end
 	local function refreshButtons(buttons, coveredMap, categories)
@@ -2193,7 +2201,10 @@ LayoutBoard = function(panel)
 	local bodyBottom = math.max(leftBottom, SUMMARY_CONTENT_TOP + summaryH)
 
 	if panel.__sfRaidSignupSummaryTitle and panel.__sfRaidSignupSummaryTitle.SetPoint then
-		panel.__sfRaidSignupSummaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
+		-- Share the sidebar's left edge (the same offset as the summary host
+		-- and its heading divider) instead of floating at the column's right.
+		panel.__sfRaidSignupSummaryTitle:ClearAllPoints()
+		panel.__sfRaidSignupSummaryTitle:SetPoint("TOPLEFT", host, "TOPLEFT", leftW + BOARD_COL_GAP, -2)
 	end
 	-- Position the + button first: the Signups heading line ends just before it.
 	local plus = panel.__sfRaidSignupAddBtn
@@ -2312,7 +2323,9 @@ local function BuildBoardChrome(panel, host)
 	panel.__sfRaidSignupSignupsTitle = signupsTitle
 
 	local summaryTitle = TrackRegionCreate(host:CreateFontString(nil, "OVERLAY", "GameFontNormal"))
-	summaryTitle:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -2)
+	-- Provisional left anchor; LayoutBoard re-anchors to the sidebar's actual
+	-- left edge once the column widths are known.
+	summaryTitle:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -2)
 	summaryTitle:SetText(Loc("RAID_SIGNUP_SECTION_SUMMARY", "Summary"))
 	panel.__sfRaidSignupSummaryTitle = summaryTitle
 
