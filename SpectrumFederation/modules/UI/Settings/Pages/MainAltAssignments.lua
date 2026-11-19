@@ -219,6 +219,33 @@ local function RoleFromValidatedRecord(record, guid)
 	return info.role, info.mainGuid
 end
 
+local function TryResolveField(text, current)
+	local roster = Roster()
+	if not roster or not roster.complete or not roster.Resolve then
+		return nil
+	end
+	-- Keep current resolution if text still matches its name.
+	if current and current.nameRealm and text == current.nameRealm then
+		local row = roster.byGuid and roster.byGuid[current.guid]
+		if row then
+			return {
+				guid = row.guid,
+				nameRealm = row.nameRealm,
+				classFile = row.classFile,
+			}
+		end
+	end
+	local row, err = roster:Resolve(text)
+	if not row then
+		return nil, err
+	end
+	return {
+		guid = row.guid,
+		nameRealm = row.nameRealm,
+		classFile = row.classFile,
+	}
+end
+
 --- Autocomplete suggestions for the Main or Alt field (#470).
 -- `field` is "main" or "alt". Role eligibility uses the Guild Info graph and is
 -- applied before the visible-results cap. Relationship readiness/validation is
@@ -241,10 +268,17 @@ local function SuggestionItems(prefix, field)
 	end
 
 	local excludeGuid = nil
+	local targetMainGuid = nil
 	if field == "main" and altResolved and altResolved.guid then
 		excludeGuid = altResolved.guid
 	elseif field == "alt" and mainResolved and mainResolved.guid then
 		excludeGuid = mainResolved.guid
+	end
+	if field == "alt" then
+		-- Autocomplete selection and exact unique typed mains share the same
+		-- roster resolution path; unresolved/ambiguous names keep a nil target.
+		local resolved = select(1, TryResolveField(mainText, mainResolved))
+		targetMainGuid = resolved and resolved.guid or nil
 	end
 
 	local rows = roster:Suggest(prefix, 10, function(row)
@@ -253,11 +287,18 @@ local function SuggestionItems(prefix, field)
 		end
 		-- "main" = main with ≥1 alts; "alt" = assigned alt;
 		-- nil = unassigned or solo main (eligible for both fields).
-		local role = RoleFromValidatedRecord(record, row.guid)
+		local role, candidateMainGuid = RoleFromValidatedRecord(record, row.guid)
 		if field == "main" then
 			return role ~= "alt"
 		end
-		return role ~= "main"
+		if role == "main" then
+			return false
+		end
+		-- #483: hide alts already assigned to the Main name target before the cap.
+		if targetMainGuid and role == "alt" and candidateMainGuid == targetMainGuid then
+			return false
+		end
+		return true
 	end)
 
 	local out = {}
@@ -295,33 +336,6 @@ local function AssignEnabled()
 		return false
 	end
 	return BothResolvedDistinct()
-end
-
-local function TryResolveField(text, current)
-	local roster = Roster()
-	if not roster or not roster.complete or not roster.Resolve then
-		return nil
-	end
-	-- Keep current resolution if text still matches its name.
-	if current and current.nameRealm and text == current.nameRealm then
-		local row = roster.byGuid and roster.byGuid[current.guid]
-		if row then
-			return {
-				guid = row.guid,
-				nameRealm = row.nameRealm,
-				classFile = row.classFile,
-			}
-		end
-	end
-	local row, err = roster:Resolve(text)
-	if not row then
-		return nil, err
-	end
-	return {
-		guid = row.guid,
-		nameRealm = row.nameRealm,
-		classFile = row.classFile,
-	}
 end
 
 local function CharacterLabel(guid, record, roster)
