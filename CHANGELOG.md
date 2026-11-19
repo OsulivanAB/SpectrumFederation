@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.22-beta.1] - 2026-11-19
+
+### Fixed
+- Fix Mobile Banking banner strata layering
+
 ## [1.5.21-beta.1] - 2026-11-19
 
 ### Added
