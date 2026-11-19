@@ -337,10 +337,16 @@ local function reset(selfName)
     Sync._relinquishingCoordination = nil
 end
 
-Sync._EnforceGroupedSessionActive = function()
-    return "RAID"
-end
-Sync.UpdatePeersFromRoster = function() end
+SF_TEST_SYNC_STUBS = {
+    enforceGroupedSessionActive = Sync._EnforceGroupedSessionActive,
+    updatePeersFromRoster = Sync.UpdatePeersFromRoster,
+    stubEnforceGroupedSessionActive = function()
+        return "RAID"
+    end,
+    stubUpdatePeersFromRoster = function() end,
+}
+Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.stubEnforceGroupedSessionActive
+Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.stubUpdatePeersFromRoster
 local originalBeginAdminConvergence = Sync.BeginAdminConvergence
 Sync.BeginAdminConvergence = function()
     return true
@@ -708,6 +714,68 @@ Sync.state.peers[KINO] = { inGroup = true, online = true }
 Sync.state.peers[COORD] = { inGroup = true, online = true }
 assertEq(Sync:RequestProfileSnapshot("online-profile"), true, "profile request retries after targets return")
 assertEq(sendCount(Sync.MSG.NEED_PROFILE), 1, "returned profile target receives NEED_PROFILE")
+end)()
+
+-- Request attempts refresh peers from the live roster, and leaving the group cancels pending work.
+;(function()
+local productionIsInRaid = IsInRaid
+local productionIsInGroup = IsInGroup
+local productionGetNumGroupMembers = GetNumGroupMembers
+local productionGetRaidRosterInfo = GetRaidRosterInfo
+
+local function useProductionRoster(entries)
+    IsInRaid = function() return true end
+    IsInGroup = function() return true end
+    GetNumGroupMembers = function() return #entries end
+    GetRaidRosterInfo = function(index)
+        local entry = entries[index]
+        if not entry then return nil end
+        -- GetRaidRosterInfo reports online as 1 or nil in raids.
+        return entry.name, nil, nil, nil, nil, nil, nil, entry.online
+    end
+    Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.enforceGroupedSessionActive
+    Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.updatePeersFromRoster
+end
+
+local function restoreRosterStubs()
+    IsInRaid = productionIsInRaid
+    IsInGroup = productionIsInGroup
+    GetNumGroupMembers = productionGetNumGroupMembers
+    GetRaidRosterInfo = productionGetRaidRosterInfo
+    Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.stubEnforceGroupedSessionActive
+    Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.stubUpdatePeersFromRoster
+end
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+useProductionRoster({
+    { name = "Kino", online = 1 },
+    { name = "Coord" },
+})
+Sync:UpdatePeersFromRoster()
+assertEq(Sync.state.peers[KINO].online, 1, "raid roster keeps the numeric online flag")
+assertTrue(Sync:_PeerOnlineInGroup(KINO), "numeric online flag makes the peer reachable")
+assertTrue(not Sync:_PeerOnlineInGroup(COORD), "nil roster online makes the peer unreachable")
+local rosterReq = seedRequest("need-roster-online", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(rosterReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 1, "request attempt whispers the online roster peer")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "request attempt skips the offline roster peer")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+IsInRaid = function() return false end
+IsInGroup = function() return false end
+Sync._EnforceGroupedSessionActive = SF_TEST_SYNC_STUBS.enforceGroupedSessionActive
+Sync.UpdatePeersFromRoster = SF_TEST_SYNC_STUBS.updatePeersFromRoster
+local leaveReq = seedRequest("need-left-group", "NEED_LOGS", { KINO, COORD })
+Sync:OnRequestTimeout(leaveReq.id)
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 0, "leaving the group sends no whisper")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "leaving the group sends no whisper to any target")
+assertNil(Sync.state.requests["need-left-group"], "leaving the group drops the pending request")
+
+restoreRosterStubs()
 end)()
 
 -- Authorized coordinator NEW_LOG is not rejected as unauthorized.
