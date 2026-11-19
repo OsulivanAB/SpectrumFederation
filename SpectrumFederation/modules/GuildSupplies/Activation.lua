@@ -445,6 +445,13 @@ function GS.EventCountsTowardLiveProgress(record, event)
     if type(event) ~= "table" then
         return false
     end
+    -- #465 soft-deleted donations/adjustments leave progress and personal floors.
+    -- Include-deleted historical effectiveness reuses this gate with soft-deleted
+    -- rows still counting (assessment 6826134902).
+    if GS.IsEventSoftDeleted and GS.IsEventSoftDeleted(record, event)
+        and not GS._creditProjectionIncludeSoftDeleted then
+        return false
+    end
     -- #457 informational withdrawals never contribute to progress/rankings.
     if event.type == "withdrawal"
         or (GS.LEDGER_EVENT and event.type == GS.LEDGER_EVENT.WITHDRAWAL) then
