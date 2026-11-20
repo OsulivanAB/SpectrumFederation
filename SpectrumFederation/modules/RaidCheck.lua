@@ -7,7 +7,7 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID C_TooltipInfo TooltipUtil Enum
 -- luacheck: globals EMPTY_SOCKET_PRISMATIC EMPTY_SOCKET_META EMPTY_SOCKET_RED EMPTY_SOCKET_YELLOW EMPTY_SOCKET_BLUE
 -- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
--- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage C_ChatInfo UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
+-- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage C_ChatInfo UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit UnitIsConnected
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 -- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue geterrorhandler
 
@@ -677,6 +677,12 @@ local function CanInspectUnitNow(unit)
 		and not IsInspectPausedForCombat()
 		and CanInspect and CanInspect(unit)
 		and IsUnitInInspectRange(unit)
+end
+
+-- Raid rosters can retain disconnected members. Only an explicit false is treated
+-- as offline so test doubles and older API shims keep their previous behavior.
+local function IsKnownOfflineUnit(unit)
+	return unit ~= nil and UnitIsConnected ~= nil and UnitIsConnected(unit) == false
 end
 
 local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
@@ -4185,8 +4191,13 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 end
 
 local function SendWhisper(target, message)
-	if not target or target == "" or not message then return end
+	if not target or target == "" or not message then return false end
+	local unit = FindUnitByGuidOrId(nil, target)
+	if IsKnownOfflineUnit(unit) then
+		return false
+	end
 	SendChatMessage(message, "WHISPER", nil, target)
+	return true
 end
 
 local function FindMember(profile, memberId)
@@ -4314,7 +4325,7 @@ local function WhisperPrepared(target, cfg, playerName, pointName, pointAward)
 		message = ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName)
 	end
 
-	SendWhisper(target, message)
+	return SendWhisper(target, message)
 end
 
 local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
@@ -4339,7 +4350,7 @@ local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
 		end
 	end
 
-	SendWhisper(target, message)
+	return SendWhisper(target, message)
 end
 
 local function GetPointName(profile)
@@ -4496,7 +4507,10 @@ function RC:DeliverMissingRequirementsWhisper(target, cfg, missingList, profile,
 	if type(missingList) == "table" and #missingList > 0 then
 		list = FormatMissingList(missingList)
 	end
-	WhisperMissing(target, cfg, ShortName(target), pointName, list, mode)
+	local sent = WhisperMissing(target, cfg, ShortName(target), pointName, list, mode)
+	if not sent then
+		return false
+	end
 	local member = FindMember(profile, target)
 	if member then
 		MarkWhisperSent(member, mode, time())
@@ -4726,9 +4740,11 @@ end
 local function CollectGroupMemberIds()
 	local ids = {}
 	for _, unit in ipairs(CollectUnits()) do
-		local info = BuildUnitInfo(unit)
-		if info.id then
-			ids[#ids + 1] = info.id
+		if not IsKnownOfflineUnit(unit) then
+			local info = BuildUnitInfo(unit)
+			if info.id then
+				ids[#ids + 1] = info.id
+			end
 		end
 	end
 	return ids

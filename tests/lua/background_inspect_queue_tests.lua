@@ -251,6 +251,24 @@ sent = RC:DeliverMissingRequirementsWhisper("A-Realm", {}, { "gem" }, nil, "pre"
 assertTrue(sent == true, "an open chat accepts a missing whisper")
 assertEq(whispers, 1, "an open chat calls SendChatMessage once")
 
+UnitIsConnected = function(unit)
+	return unit ~= "raid1"
+end
+local offlineGroupIds = RC:CollectGroupMemberIds()
+assertEq(#offlineGroupIds, 0, "a disconnected raid member is not a Raid Check group member")
+sent = RC:DeliverMissingRequirementsWhisper("A-Realm", {}, { "gem" }, nil, "pre")
+assertTrue(not sent, "a known-offline target does not accept a missing whisper")
+assertEq(whispers, 1, "a known-offline target does not call SendChatMessage")
+UnitIsConnected = function(unit)
+	return unit == "raid1" or unit == "player"
+end
+local onlineGroupIds = RC:CollectGroupMemberIds()
+assertEq(onlineGroupIds[1], "A-Realm", "a connected raid member remains a Raid Check group member")
+sent = RC:DeliverMissingRequirementsWhisper("A-Realm", {}, { "gem" }, nil, "pre")
+assertTrue(sent == true, "a connected target still accepts a missing whisper")
+assertEq(whispers, 2, "a connected target calls SendChatMessage")
+UnitIsConnected = nil
+
 local tooltipCalls = 0
 C_TooltipInfo = {
 	GetHyperlink = function()
