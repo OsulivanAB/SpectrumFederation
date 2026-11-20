@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.24-beta.1] - 2026-11-20
+
+### Fixed
+- Fix Raid Check whispers to offline players
+
 ## [1.5.23] - 2026-11-19
 
 ### Changed
